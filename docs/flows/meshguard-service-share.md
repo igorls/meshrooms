@@ -121,9 +121,10 @@ Do not claim the port is closed while status is `pending-disable`.
    that port.
 3. After MeshGuard restart with the new policy, the peer can fetch the preview
    over the mesh IP; an unpaired peer cannot.
-4. Stop/expiry remove only owned rules, announce stop, and show `pending-disable`
-   until reload; after reload the port is denied again under default-deny and
-   hand-written allows the operator made are still present.
+4. Stop/expiry remove only owned rules and show `pending-disable` locally until
+   reload; after reload the port is denied again under default-deny and
+   hand-written allows the operator made are still present. Cross-node stop
+   announce is a follow-up (see above), not required of this slice.
 5. Docs state the restart limitation (including lag after stop) and the
    `vite preview` recommendation.
 6. No change to the browser site origin or to browser-room signaling.
