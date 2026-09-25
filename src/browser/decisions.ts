@@ -53,7 +53,11 @@ export type Decision = {
 };
 
 export const MAX_DECISION_OPS = 4000;
-/** Operations one member may add to a room's decisions, so nobody can fill the shared cap alone. */
+/**
+ * Operations one member may hold in a room's decisions log, so nobody can fill the shared cap alone. It bounds what is
+ * stored, not lifetime traffic: compaction drops superseded votes, and every device counts only what it holds, so
+ * devices that joined at different times still admit the same operations and fold to the same decisions.
+ */
 export const MAX_MEMBER_DECISION_OPS = 400;
 /** Devices compact their decisions past this many operations, keeping the log well under MAX_DECISION_OPS. */
 export const COMPACT_DECISIONS_AT = 2000;
