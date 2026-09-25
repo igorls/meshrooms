@@ -41,12 +41,19 @@ hand.
 
 ## Results
 
-Chrome 1 (macOS, Apple Silicon), `js` reference engine:
+macOS (Apple Silicon), Playwright with **persistent profiles**. Ephemeral (private) profiles are not representative:
+WebKit refuses OPFS there, and Chrome's ephemeral OPFS makes small reads far slower (the same cold open took 1.4 s).
 
-| Gate | Result |
-| --- | --- |
-| Writes | p50 0.20 ms, p95 0.30 ms, max 2.8 ms (2,000 × 1 KB, flush each) |
-| Cold open | 24 ms for 10,000 records (one read, replay in memory; 20,000 small reads took 1.2 s) |
-| Crash | killed at 701 flushed records; reopened with all 701 intact |
+| Gate | `wasm` (Gemini's core), Chrome | `wasm`, WebKit | `js` reference, Chrome |
+| --- | --- | --- | --- |
+| Size | 4.5 KB gzipped (7.6 KB raw) | same | n/a |
+| Writes, 1 KB + flush | p50 0.2 ms, p95 0.4 ms | < 1 ms (Safari timers are 1 ms coarse) | p50 0.1 ms, p95 0.3 ms |
+| Cold open, 10,000 records | 42 ms (20,000 OPFS reads) | 41 ms | 19 ms (one read) |
+| Crash | recovers every flushed record | same | same |
 
-OPFS in a worker is far inside the targets, so the gates mostly measure what WormDB's core adds on top.
+All four gates pass. Open items:
+- Buffered WAL replay in the core (20,000 reads now; one or a few would suffice).
+- Firefox: Playwright's Firefox does not launch on this machine; run `node run.mjs wasm` elsewhere.
+- The `js` reference engine fails in WebKit ("invalid state"); the `wasm` engine passes there.
+- Whether the core uses WormDB's real WAL format, which step 2 needs to replicate one log between browsers and
+  native nodes.
