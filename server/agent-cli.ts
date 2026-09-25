@@ -20,10 +20,11 @@
  *   bun meshrooms-agent.js stop --room <room>
  *
  * Needs only Bun. State (device key, messages) stays in ~/.meshrooms/agents unless
- * MESHROOMS_AGENT_HOME is set. The connect token is used once and never stored.
+ * MESHROOMS_AGENT_HOME is set. That folder holds one agent per room, so several agents on one machine need one folder
+ * each. The connect token is used once; only its hash is kept, to recognise a retry of the same link.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -36,6 +37,21 @@ import { TASK_STATUSES, type TaskStatus } from '../src/collab';
 import { sniff } from './attachments';
 
 const home = () => resolve(process.env.MESHROOMS_AGENT_HOME || join(homedir(), '.meshrooms', 'agents'));
+
+/**
+ * Why `connect` must not use this link, if it mustn't: the folder already holds another agent in this room (admitted,
+ * or waiting for the host) that a different link created. Without this, a second agent on the same machine silently
+ * became the first one. A retry of the link that created the agent (same hash) is fine.
+ */
+export function connectConflict(linkHash: string, previousLinkHash: string | undefined,
+  status: { memberId?: string; members?: { id: string; name: string }[]; request?: { state?: string } }, folder: string): string | undefined {
+  const present = !!status.memberId || status.request?.state === 'pending';
+  if (!present || previousLinkHash === linkHash) return undefined;
+  const name = status.members?.find(m => m.id === status.memberId)?.name;
+  return `This folder already holds ${name ? `the agent "${name}"` : 'an agent waiting for the host'} in this room, so this link was not used. `
+    + `Each agent on a machine needs its own folder: set MESHROOMS_AGENT_HOME to a new one (for example ${join(folder, '..', 'agents-<name>')}) `
+    + 'and run connect again with the same link.';
+}
 const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/i.test(v);
 
 function args(argv: string[]) {
@@ -104,8 +120,13 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     const { origin, roomId, token } = parseConnectLink(positional[0] || values['--link'] || '');
     const agent = new BrowserAgent(home(), origin, roomId);
     const identity = await agent.ensureIdentity();
-    writeFileSync(join(agent.dir, 'room.json'), JSON.stringify({ origin, roomId }), { mode: 0o600 });
+    const config = join(agent.dir, 'room.json'), link = createHash('sha256').update(token).digest('hex');
+    let previous: string | undefined;
+    try { previous = JSON.parse(readFileSync(config, 'utf8')).link; } catch { /* First connect in this folder. */ }
     let status = await agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
+    const conflict = connectConflict(link, previous, status, home());
+    if (conflict) throw new Error(conflict);
+    writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
     if (!status.memberId) {
       await agent.command('agent-redeem', { token, label: `Agent on ${hostname().slice(0, 40) || 'this machine'}` });
       status = await agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
