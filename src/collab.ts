@@ -11,6 +11,8 @@ export type Task = {
   id: string;
   title: string;
   notes: string;
+  /** A linked GitHub issue or pull request (browser rooms). */
+  issue?: string;
   status: TaskStatus;
   assigneeId?: string;
   /** Who set the current assignee, and the board revision at which it happened. */

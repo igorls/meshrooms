@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { browserProtocol, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
-import { COMPACT_AT, compactBoard, foldBoard, MAX_TASK_OPS, syncChunks, taskBody, validTaskBody, type BoardSync, type TaskChange, type TaskPacket } from '../src/browser/board';
+import { COMPACT_AT, compactBoard, foldBoard, MAX_TASK_OPS, syncChunks, taskBody, validIssueLink, validTaskBody, type BoardSync, type TaskChange, type TaskPacket } from '../src/browser/board';
 import {
   FileTransfers, IMAGE_TYPES, MAX_ATTACHMENT_BYTES, displayKind, MAX_MESSAGE_ATTACHMENTS, attachmentRef, attachmentText, isFilePacket, isSha256, retainedFiles, shownText,
   validAttachments, type AttachmentRef, type FileStore, type TransferState,
@@ -158,7 +158,7 @@ export class BrowserAgent {
   messages(): Stored[] { return readJson(this.path('messages.json'), []); }
   members(): Members { return readJson(this.path('members.json'), { members: [], devices: [] }); }
   /** The room's rules as the host set them, copied from the room service by `run`. */
-  settings(): { floor: Floor; agentAssignmentsWake?: boolean } { return readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
+  settings(): { floor: Floor; agentAssignmentsWake?: boolean; repositories?: string[] } { return readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
   /** Verified task operations in arrival order, each with the board cursor at which it arrived. */
   taskOps(): StoredOp[] { return readJson<StoredOp[]>(this.path('tasks.json'), []).map((p, i) => ({ ...p, seq: p.seq ?? i + 1 })); }
   /** Arrivals so far. Compaction drops operations but never moves the cursor back, so later assignments still wake. */
@@ -578,7 +578,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       writeJson(join(agent.dir, 'members.json'), { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
-      if (next.settings) writeJson(join(agent.dir, 'settings.json'), { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake });
+      if (next.settings) writeJson(join(agent.dir, 'settings.json'), { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, repositories: next.repositories ?? [] });
       await applyPendingProfile(agent, log);
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
       const available = (next.devices || []).filter(d => d.id !== identity.id && d.session);
@@ -756,6 +756,7 @@ export async function taskBrowser(agent: BrowserAgent, input: { requestId: strin
   if (change.title !== undefined && (!change.title.trim() || change.title.trim().length > 120)) throw new Error('Give the task a title of up to 120 characters.');
   if (change.notes !== undefined && change.notes.trim().length > 2000) throw new Error('Keep task notes to 2,000 characters.');
   if (change.assigneeId && !view.participants.some(p => p.id === change.assigneeId)) throw new Error('The assignee is not a member of this room.');
+  if (change.issue != null && !validIssueLink(change.issue)) throw new Error('Link a GitHub issue or pull request, like https://github.com/owner/name/issues/42.');
   const done = agent.taskOps().find(p => p.body.id === input.requestId);
   // A new task takes the request id as its task id, so retrying the same request never creates a second task.
   const taskId = input.taskId ?? input.requestId;

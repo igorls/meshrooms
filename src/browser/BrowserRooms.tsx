@@ -4,7 +4,7 @@ import { FloorControl, MAX_MESSAGE_FILES, MAX_UPLOAD_BYTES, MentionText, Message
 import { Wordmark } from '../prototype/RoomPrototype';
 import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
 import { deriveActivity, duration, type ActivityRecord, type AgentActivity } from './activity';
-import { taskTimeline, type TaskBody, type TaskEvent } from './board';
+import { issueLabel, mentionedRepositories, repositoryFrom, taskTimeline, type TaskBody, type TaskEvent } from './board';
 import { BrowserApi } from './client';
 import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
 import { due, foldDecisions, type Decision, type DecisionBody, type VoteBody } from './decisions';
@@ -13,7 +13,7 @@ import { BOARD_DEFAULT, BOARD_STEP, boardLimits, clampBoardWidth, saveBoardWidth
 import { BrowserPeers, type FileView, type SavedMessage } from './peers';
 import { REACTION_EMOJI, memberReacted, type ReactionChip, type ReactionEmoji } from './reactions';
 import { identity, read, write } from './storage';
-import { DEFAULT_ROOM_SETTINGS, base64, type BrowserMember, type JoinRequest, type RoomSettings, type RoomStatus } from './protocol';
+import { DEFAULT_ROOM_SETTINGS, MAX_REPOSITORIES, base64, type BrowserMember, type JoinRequest, type RoomSettings, type RoomStatus } from './protocol';
 import './browser.css';
 
 type RecentRoom = { id: string; title: string };
@@ -127,6 +127,9 @@ function describeTask(event: TaskEvent, name: (memberId: string, subject?: boole
   if (event.assigneeId !== undefined) phrases.push(event.assigneeId === null ? `unassigned ${it()}` : event.assigneeId === event.memberId ? `took ${it()}` : `assigned ${it()} to ${name(event.assigneeId)}`);
   if (event.status) phrases.push(`moved ${it()} ${statusMoves[event.status]}`);
   if (event.notes) phrases.push(`edited the notes on ${it()}`);
+  // A task made from a pasted link is titled with it already.
+  if (event.issue !== undefined && !(event.created && event.issue && issueLabel(event.issue) === event.title))
+    phrases.push(event.issue === null ? `unlinked the issue from ${it()}` : `linked ${it()} to ${issueLabel(event.issue)}`);
   return `${name(event.memberId, true)} ${phrases.length > 1 ? `${phrases.slice(0, -1).join(', ')} and ${phrases.at(-1)}` : phrases[0]}`;
 }
 type TranscriptItem = { message: SavedMessage; event?: undefined; decision?: undefined } | { event: TaskEvent; message?: undefined; decision?: undefined }
@@ -153,6 +156,7 @@ export function BrowserRooms() {
   const [liveMessage, setLiveMessage] = useState<{ id: string; text: string }>();
   const [replyId, setReplyId] = useState<string>();
   const [agentName, setAgentName] = useState('');
+  const [repositoryDraft, setRepositoryDraft] = useState('');
   const [agentLink, setAgentLink] = useState<{ name: string; url: string }>();
   const [confirming, setConfirming] = useState<string>();
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -486,7 +490,7 @@ export function BrowserRooms() {
     catch (e) { setError((e as Error).message); throw e; }
   }
   const boardActions = {
-    create: (draft: TaskDraft & { title: string }) => boardAction(engine => engine.changeTask({ title: draft.title, notes: draft.notes, assigneeId: draft.assigneeId ?? null })),
+    create: (draft: TaskDraft & { title: string }) => boardAction(engine => engine.changeTask({ title: draft.title, notes: draft.notes, assigneeId: draft.assigneeId ?? null, ...(draft.issue ? { issue: draft.issue } : {}) })),
     update: (task: Task, changes: TaskDraft) => boardAction(engine => engine.changeTask(changes, task)),
     remove: (task: Task) => boardAction(engine => engine.changeTask({}, task, true)),
   };
@@ -498,6 +502,18 @@ export function BrowserRooms() {
       // Show the accepted change now rather than at the next status poll, so the control doesn't flick back.
       setStatus(current => current && { ...current, settings: { ...(current.settings ?? DEFAULT_ROOM_SETTINGS), ...change } });
       setNotice(done);
+    });
+  }
+  const pinned = status?.repositories ?? [];
+  // Only while the details are open: scanning the conversation on every render would slow typing.
+  const mentioned = detailsOpen ? mentionedRepositories(messages.map(m => m.packet.body.text)).filter(r => !pinned.some(p => p.toLowerCase() === r.toLowerCase())) : [];
+  function pinRepository(change: { pin: string } | { unpin: string }) {
+    void act(async () => {
+      await api.command('repositories', urlRoom, change);
+      const name = 'pin' in change ? change.pin : change.unpin, same = (r: string) => r.toLowerCase() === name.toLowerCase();
+      setStatus(current => current && { ...current, repositories: 'pin' in change ? [...(current.repositories ?? []).filter(r => !same(r)), name] : (current.repositories ?? []).filter(r => !same(r)) });
+      setRepositoryDraft('');
+      setNotice('pin' in change ? `Pinned ${name}. Tasks can open issues there.` : `Unpinned ${name}.`);
     });
   }
   function pickAvatar(memberId: string) { setAvatarFor(memberId); avatarInput.current?.click(); }
@@ -677,7 +693,7 @@ export function BrowserRooms() {
             </div>
             {boardOpen && <BoardHandle workspace={workspace} width={boardWidth} onCommit={width => { setBoardWidth(width ?? BOARD_DEFAULT); saveBoardWidth(width); }} />}
             {decisionsOpen && <DecisionList decisions={decisions} onShow={showDecision} onClose={() => setDecisionsOpen(false)} />}
-            {boardOpen && <TaskBoard room={boardRoom} viewerId={status.memberId} disabled={!admitted} onClose={() => setBoardOpen(false)} actions={boardActions} highlight={highlight} working={workingOn} />}
+            {boardOpen && <TaskBoard room={boardRoom} viewerId={status.memberId} disabled={!admitted} onClose={() => setBoardOpen(false)} actions={boardActions} highlight={highlight} working={workingOn} repositories={pinned} />}
             <aside id="browser-room-details" className="browser-details" aria-label="Room details" hidden={!detailsOpen} onKeyDown={e => { if (e.key === 'Escape') closeDetails(); }}>
               <header className="browser-details-heading"><h2 tabIndex={-1} ref={detailsHeading}>Room details</h2><button className="browser-close" aria-label="Close room details" onClick={closeDetails}><RoomIcon kind="close" /></button></header>
               <section aria-label="People and agents in this room" className="browser-people"><h3>{agents.length ? 'People and agents' : 'People'} <span>{status.members!.length}</span></h3>
@@ -710,6 +726,19 @@ export function BrowserRooms() {
                   : <form onSubmit={connectAgent}><label>Agent name<input value={agentName} onChange={e => setAgentName(e.target.value)} required maxLength={64} placeholder="Codex" autoComplete="off" /></label><button className="secondary" disabled={busy || !agentName.trim()}>Connect an agent</button></form>}
                 {status.agentInvites?.map(i => <p className="browser-agent-waiting" key={i.name}>Waiting for <strong>{i.name}</strong> to connect · link expires at {new Date(i.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>)}
               </section>}
+              <section className="browser-repositories" aria-labelledby="browser-repositories-title"><h3 id="browser-repositories-title">Repositories {pinned.length > 0 && <span>{pinned.length}</span>}</h3>
+                <p>Pinned for this room, so tasks can open issues there. Meshrooms isn’t connected to GitHub: issues open on GitHub under your own account.</p>
+                {pinned.length > 0 && <ul>{pinned.map(r => <li key={r}><a href={`https://github.com/${r}`} target="_blank" rel="noopener noreferrer">{r}</a>
+                  {!isAgent(self) && <button className="browser-remove" disabled={busy} aria-label={`Unpin ${r}`} onClick={() => pinRepository({ unpin: r })}>Unpin</button>}</li>)}</ul>}
+                {!isAgent(self) && pinned.length < MAX_REPOSITORIES && <>
+                  {mentioned.length > 0 && <div className="browser-repo-suggestions" role="group" aria-label="Repositories mentioned in this room"><span>Mentioned here</span>
+                    {mentioned.map(r => <button key={r} className="browser-chip" disabled={busy} onClick={() => pinRepository({ pin: r })}>Pin {r}</button>)}</div>}
+                  <form className="browser-repo-add" onSubmit={e => { e.preventDefault(); const r = repositoryFrom(repositoryDraft); if (r) pinRepository({ pin: r }); }}>
+                    <label className="sr-only" htmlFor="browser-repo-name">Repository to pin</label>
+                    <input id="browser-repo-name" value={repositoryDraft} onChange={e => setRepositoryDraft(e.target.value)} placeholder="owner/name or a GitHub link" maxLength={300} autoComplete="off" />
+                    <button className="secondary" disabled={busy || !repositoryFrom(repositoryDraft)}>Pin</button>
+                  </form></>}
+              </section>
               <section className="browser-settings" aria-label="Room settings"><h3>Room settings</h3>
                 {host ? <>
                   <FloorControl floor={settings.floor} disabled={busy} onChange={floor => changeSettings({ floor }, floor === 'humans-first' ? 'Agents now reply only when addressed.' : 'Agents may now reply to every message from a person.')} />

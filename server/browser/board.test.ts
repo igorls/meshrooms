@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { compactBoard, foldBoard, syncChunks, taskBody, taskTimeline, validTaskBody, type TaskBody } from '../../src/browser/board';
+import { compactBoard, foldBoard, issueLabel, issueLinkFrom, mentionedRepositories, newIssueUrl, repositoryFrom, syncChunks, taskBody, taskTimeline, validIssueLink, validTaskBody, type TaskBody } from '../../src/browser/board';
 
 const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), sam = crypto.randomUUID(), codex = crypto.randomUUID();
 const device = 'a'.repeat(64);
@@ -132,4 +132,51 @@ test('the task timeline describes each winning change against the state before i
   expect(compacted[0]).toEqual({ memberId: alex, title: 'Fix header', created: true });
   expect(compacted[1]).toMatchObject({ memberId: sam, updated: true });
   expect(taskTimeline([])).toEqual([]);
+});
+
+test('a task links one GitHub issue or pull request, and only a real one', () => {
+  const link = 'https://github.com/igorls/meshrooms/issues/42';
+  // Pasted forms become the one link a task keeps.
+  expect(issueLinkFrom(' https://github.com/igorls/meshrooms/issues/42#issuecomment-1 ')).toBe(link);
+  expect(issueLinkFrom('https://www.github.com/igorls/meshrooms/pull/7/files?diff=split')).toBe('https://github.com/igorls/meshrooms/pull/7');
+  expect(issueLinkFrom('igorls/meshrooms#42')).toBe(link);
+  for (const bad of ['http://github.com/igorls/meshrooms/issues/42', 'https://github.com.evil.dev/igorls/meshrooms/issues/42', 'https://gitlab.com/a/b/issues/1',
+    'https://github.com/igorls/meshrooms/issues/x', 'https://github.com/igorls/../issues/1', 'igorls/..#1', 'javascript:alert(1)', 'meshrooms#42'])
+    expect(issueLinkFrom(bad)).toBeUndefined();
+  expect(validIssueLink('https://github.com/igorls/../issues/1')).toBe(false);
+  expect(issueLabel('https://github.com/igorls/meshrooms/pull/7')).toBe('igorls/meshrooms#7');
+  expect(repositoryFrom('https://github.com/igorls/meshrooms/tree/main/src')).toBe('igorls/meshrooms');
+  expect(repositoryFrom('igorls/meshrooms.git')).toBe('igorls/meshrooms');
+  expect(repositoryFrom('igorls')).toBeUndefined();
+  // GitHub's own form, prefilled; the person submits it with their account.
+  const opened = new URL(newIssueUrl('igorls/meshrooms', 'Fix header & footer', 'Line one\nLine two'));
+  expect(opened.origin + opened.pathname).toBe('https://github.com/igorls/meshrooms/issues/new');
+  expect([opened.searchParams.get('title'), opened.searchParams.get('body')]).toEqual(['Fix header & footer', 'Line one\nLine two']);
+  expect(() => newIssueUrl('igorls/..', 't', '')).toThrow('owner/name');
+
+  // Linking and unlinking are signed task changes like any other; an edit keeps the link.
+  const created = op(alex, { title: 'Header', issue: link });
+  const linked = foldBoard([created])[0];
+  expect(linked.issue).toBe(link);
+  const renamed = op(sam, { title: 'Header, again' }, linked);
+  expect(foldBoard([created, renamed])[0].issue).toBe(link);
+  const unlinked = op(sam, { issue: null }, foldBoard([created, renamed])[0]);
+  expect(unlinked.issue).toBeUndefined();
+  expect(foldBoard([created, renamed, unlinked])[0].issue).toBeUndefined();
+  expect(() => op(alex, { title: 'Bad', issue: 'https://example.com/issues/1' })).toThrow('GitHub issue');
+  expect(validTaskBody({ ...created, issue: 'https://example.com/igorls/meshrooms/issues/1' }, roomId)).toBe(false);
+  expect(validTaskBody(created, roomId)).toBe(true);
+  // The conversation says so.
+  const later = (body: TaskBody, at: number) => ({ ...body, at });
+  const events = taskTimeline([later(created, 1_000), later(renamed, 500_000), later(unlinked, 1_000_000)]);
+  expect(events.map(e => e.issue)).toEqual([link, undefined, null]);
+});
+
+test('repositories mentioned in the conversation are suggested for pinning, most recent first', () => {
+  expect(mentionedRepositories([
+    'see https://github.com/igorls/wormdb/issues/3.',
+    'and https://github.com/igorls/meshrooms/pull/22, https://github.com/igorls/wormdb',
+    'not https://github.com.evil.dev/x/y or http://github.com/a/b',
+  ])).toEqual(['igorls/meshrooms', 'igorls/wormdb']);
+  expect(mentionedRepositories(Array.from({ length: 9 }, (_, i) => `https://github.com/org/r${i}`), 3)).toEqual(['org/r8', 'org/r7', 'org/r6']);
 });
