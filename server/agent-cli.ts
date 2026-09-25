@@ -25,7 +25,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
@@ -53,29 +53,47 @@ export function connectConflict(linkHash: string, previousLinkHash: string | und
     + 'and run connect again with the same link.';
 }
 const BUSY = 'Another connect is running in this folder. Wait for it to finish, then try again.';
+/** Whether a process on this machine is still running; the folder is local, so the lock's owner is too. */
+function running(pid: number) {
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as { code?: string }).code === 'EPERM'; }
+}
 /**
- * One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. A lock older
- * than a minute is from a connect that crashed. Taking it over is exclusive too: only the holder of `connect.lock.reclaim`
- * may replace it, and only if it is still the same stale file, so two connects can never both reclaim it.
+ * A lock file taken over only when its owner is gone: it names its process, and a lock is stale once that process
+ * has exited, however long a live one takes (a laptop asleep mid-connect keeps it). A file with no process yet is
+ * from a crash between creating and writing it, and counts as stale after a minute. Returns what the lock looked
+ * like when found stale, so a takeover can check it is replacing that same file.
+ */
+function staleLock(path: string) {
+  try {
+    const found = statSync(path), owner = readFileSync(path, 'utf8'), pid = /^\d{1,10}$/.test(owner) ? Number(owner) : undefined;
+    const stale = pid !== undefined ? !running(pid) : Date.now() - found.mtimeMs >= 60_000;
+    return stale ? `${found.ino}:${found.mtimeMs}:${owner}` : undefined;
+  } catch { return undefined; }
+}
+function takeLock(path: string) {
+  const fd = openSync(path, 'wx');
+  writeSync(fd, String(process.pid));
+  return fd;
+}
+/**
+ * One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. A connect
+ * that crashed leaves its lock behind; taking that over is exclusive too. Only the holder of `connect.lock.reclaim`
+ * may replace it, and only while it is still the same stale file, so two connects can never both take it.
  */
 async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
   const lock = join(folder, 'connect.lock'), reclaim = `${lock}.reclaim`;
-  const stale = () => { try { const s = statSync(lock); return Date.now() - s.mtimeMs >= 60_000 ? `${s.ino}:${s.mtimeMs}` : undefined; } catch { return undefined; } };
   let fd: number;
-  try { fd = openSync(lock, 'wx'); }
+  try { fd = takeLock(lock); }
   catch {
-    const seen = stale();
+    const seen = staleLock(lock);
     if (!seen) throw new Error(BUSY);
     let guard: number;
-    try { guard = openSync(reclaim, 'wx'); }
-    catch {
-      let old = false; try { old = Date.now() - statSync(reclaim).mtimeMs >= 60_000; } catch { /* Just released. */ }
-      // Reclaiming takes milliseconds; a marker this old was left by a crash in exactly that window.
-      throw new Error(old ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY);
-    }
+    // Reclaiming takes milliseconds; a marker whose process is gone was left by a crash in exactly that window.
+    try { guard = takeLock(reclaim); }
+    catch { throw new Error(staleLock(reclaim) ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY); }
     try {
-      if (stale() !== seen) throw new Error(BUSY);
-      unlinkSync(lock); fd = openSync(lock, 'wx');
+      if (staleLock(lock) !== seen) throw new Error(BUSY);
+      unlinkSync(lock); fd = takeLock(lock);
     } finally { closeSync(guard); unlinkSync(reclaim); }
   }
   try { return await work(); } finally { closeSync(fd); try { unlinkSync(lock); } catch { /* Already gone. */ } }

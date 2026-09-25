@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -80,22 +81,32 @@ test('a refused link rolls the record back; a redeem that may have gone through 
   } finally { server.stop(true); }
 }));
 
-test("only one connect can take over a crashed connect's lock", () => inFreshHome(async folder => {
+test("a connect's lock is taken over only once its process is gone, and only by one connect", () => inFreshHome(async folder => {
   const server = fakeRoom({ status: 'maintenance', redeem: 500 }), room = crypto.randomUUID(), dir = join(folder, 'browser-agents', room);
-  const link = `http://127.0.0.1:${server.port}/agent/${room}#${token}`, lock = join(dir, 'connect.lock'), old = new Date(Date.now() - 120_000);
+  const link = `http://127.0.0.1:${server.port}/agent/${room}#${token}`, lock = join(dir, 'connect.lock'), old = new Date(Date.now() - 3_600_000);
+  // A process that has already exited.
+  const gone = String(spawnSync(process.execPath, ['-e', '0']).pid);
   try {
     mkdirSync(dir, { recursive: true });
+    // A live owner keeps its lock however old it is (a laptop asleep mid-connect).
+    writeFileSync(lock, String(process.pid)); utimesSync(lock, old, old);
+    await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
+    // A lock with no owner written yet is fresh for a minute.
     writeFileSync(lock, '');
     await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
-    // Stale, but another connect is taking it over right now.
-    utimesSync(lock, old, old); writeFileSync(`${lock}.reclaim`, '');
+    // The owner is gone, but another connect is taking the lock over right now.
+    writeFileSync(lock, gone); writeFileSync(`${lock}.reclaim`, String(process.pid));
     await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
     // A takeover that crashed says which file to delete.
-    utimesSync(`${lock}.reclaim`, old, old);
+    writeFileSync(`${lock}.reclaim`, gone);
     await expect(agentCli(['connect', link])).rejects.toThrow('Delete that file');
-    // A stale lock alone is taken over: this connect gets as far as checking the room, and leaves no lock behind.
+    // A lock whose owner is gone is taken over: this connect gets as far as checking the room, and leaves no lock behind.
     rmSync(`${lock}.reclaim`);
     await expect(agentCli(['connect', link])).rejects.toThrow('this link was not used');
     expect(existsSync(lock) || existsSync(`${lock}.reclaim`)).toBe(false);
+    // So is an old lock that never got an owner written.
+    writeFileSync(lock, ''); utimesSync(lock, old, old);
+    await expect(agentCli(['connect', link])).rejects.toThrow('this link was not used');
+    expect(existsSync(lock)).toBe(false);
   } finally { server.stop(true); }
 }));

@@ -76,7 +76,7 @@ test('a full log from before compaction is compacted when read, keeps its cursor
 test('a change run could not sign reports why, not a guess', async () => {
   const { mkdtempSync, writeFileSync, readdirSync, unlinkSync } = await import('node:fs');
   const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
-  const { BrowserAgent, decisionBrowser } = await import('../browser-agent');
+  const { BrowserAgent, decisionBrowser, noteDropped } = await import('../browser-agent');
   const roomId = crypto.randomUUID(), me = crypto.randomUUID(), igor = crypto.randomUUID(), deviceId = 'e'.repeat(64);
   const agent = new BrowserAgent(mkdtempSync(join(tmpdir(), 'mr-dropped-')), 'http://127.0.0.1:1', roomId);
   writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: me, ownerId: igor, members: [{ id: me, name: 'Opus', role: 'agent', operatorId: igor }, { id: igor, name: 'Igor' }], devices: [] }));
@@ -84,9 +84,13 @@ test('a change run could not sign reports why, not a guess', async () => {
   writeFileSync(join(agent.dir, 'decisions.json'), JSON.stringify([{ body: open, signature: 's', seq: 1 }]));
   const id = crypto.randomUUID(), outbox = join(agent.dir, 'outbox');
   const result = decisionBrowser(agent, { id, decisionId: open.decisionId, action: 'vote', optionId: 'o1', comment: 'x'.repeat(501) }, 5);
-  // Play `run`: signing fails, so it notes why and takes the change out of the outbox.
+  // Play `run`: signing fails (castVote refuses the long reason), so it notes why and takes the change out of the outbox.
   const [queued] = readdirSync(outbox);
-  writeFileSync(join(outbox, `${id}.dropped`), 'Keep the reason to 500 characters.'); unlinkSync(join(outbox, queued));
+  const { castVote, foldDecisions } = await import('../../src/browser/decisions');
+  const decision = foldDecisions([open], { ownerId: igor, members: [{ id: me, role: 'agent' }, { id: igor }] })[0];
+  let reason = '';
+  try { castVote({ roomId, deviceId, memberId: me }, decision, 'o1', 'x'.repeat(501)); } catch (error) { reason = (error as Error).message; }
+  noteDropped(outbox, id, reason); unlinkSync(join(outbox, queued));
   expect(await result).toEqual({ status: 'dropped', reason: 'Keep the reason to 500 characters.' });
   expect(readdirSync(outbox)).toEqual([]);
 });
