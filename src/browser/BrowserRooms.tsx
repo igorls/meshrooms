@@ -330,7 +330,9 @@ export function BrowserRooms() {
   async function decisionTask(d: Decision) {
     const winner = d.tally.optionIds[0], chosen = d.options.find(o => o.id === winner)?.label ?? '';
     const notes = `Decided in the room: ${d.question}\nOutcome: ${chosen} (${d.tally.tally[winner] ?? 0} of ${d.tally.voters} votes from people)`;
-    await peers.current!.changeTask({ title: chosen.slice(0, 120), notes: notes.slice(0, 2000) });
+    // The question carries the meaning ("Yes" alone says nothing); the outcome follows it.
+    const title = `${d.question.replace(/\s*\?\s*$/, '')} → ${chosen}`;
+    await peers.current!.changeTask({ title: title.length > 120 ? `${title.slice(0, 119)}…` : title, notes: notes.slice(0, 2000) });
     setBoardOpen(true); setDecisionsOpen(false); setDetailsOpen(false);
   }
   function showMessage(id: string) {
