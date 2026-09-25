@@ -25,7 +25,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
@@ -58,23 +58,30 @@ function running(pid: number) {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as { code?: string }).code === 'EPERM'; }
 }
 /**
- * A lock file taken over only when its owner is gone: it names its process, and a lock is stale once that process
- * has exited, however long a live one takes (a laptop asleep mid-connect keeps it). A file with no process yet is
- * from a crash between creating and writing it, and counts as stale after a minute. Returns what the lock looked
- * like when found stale, so a takeover can check it is replacing that same file.
+ * A lock is taken over only once the process it names has exited, however long a live one takes (a laptop asleep
+ * mid-connect keeps it). Locks are created already naming their process, so a live connect's lock never looks
+ * ownerless; a file that names no process is never taken over. Returns what the lock looked like when found stale,
+ * so a takeover can check it is replacing that same file.
  */
 function staleLock(path: string) {
   try {
-    const found = statSync(path), owner = readFileSync(path, 'utf8'), pid = /^\d{1,10}$/.test(owner) ? Number(owner) : undefined;
-    const stale = pid !== undefined ? !running(pid) : Date.now() - found.mtimeMs >= 60_000;
-    return stale ? `${found.ino}:${found.mtimeMs}:${owner}` : undefined;
+    const found = statSync(path), owner = readFileSync(path, 'utf8');
+    return /^\d{1,10}$/.test(owner) && !running(Number(owner)) ? `${found.ino}:${found.mtimeMs}:${owner}` : undefined;
   } catch { return undefined; }
 }
+/** Creates a lock with its owner already in it: written to a private file, then hard-linked into place, which fails if one exists. */
 function takeLock(path: string) {
-  const fd = openSync(path, 'wx');
-  writeSync(fd, String(process.pid));
-  return fd;
+  const draft = `${path}.${process.pid}.${randomUUID()}`;
+  writeFileSync(draft, String(process.pid), { flag: 'wx', mode: 0o600 });
+  try { linkSync(draft, path); }
+  catch (error) {
+    if ((error as { code?: string }).code === 'EEXIST') throw error;
+    // No hard links on this file system (FAT, some network shares): create it in place. A crash between creating
+    // and writing then leaves a lock that names no process, which is never taken over, only reported.
+    writeFileSync(path, String(process.pid), { flag: 'wx', mode: 0o600 });
+  } finally { unlinkSync(draft); }
 }
+const exists = (error: unknown) => (error as { code?: string }).code === 'EEXIST';
 /**
  * One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. A connect
  * that crashed leaves its lock behind; taking that over is exclusive too. Only the holder of `connect.lock.reclaim`
@@ -82,21 +89,27 @@ function takeLock(path: string) {
  */
 async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
   const lock = join(folder, 'connect.lock'), reclaim = `${lock}.reclaim`;
-  let fd: number;
-  try { fd = takeLock(lock); }
-  catch {
+  try { takeLock(lock); }
+  catch (error) {
+    if (!exists(error)) throw error;
     const seen = staleLock(lock);
-    if (!seen) throw new Error(BUSY);
-    let guard: number;
+    if (!seen) {
+      let owner: string | undefined; try { owner = readFileSync(lock, 'utf8'); } catch { /* Released meanwhile. */ }
+      throw new Error(owner !== undefined && !/^\d{1,10}$/.test(owner) ? `${lock} doesn't name the connect that made it. If no connect is running, delete that file, then try again.` : BUSY);
+    }
     // Reclaiming takes milliseconds; a marker whose process is gone was left by a crash in exactly that window.
-    try { guard = takeLock(reclaim); }
-    catch { throw new Error(staleLock(reclaim) ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY); }
+    try { takeLock(reclaim); }
+    catch (error) {
+      if (!exists(error)) throw error;
+      throw new Error(staleLock(reclaim) ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY);
+    }
     try {
       if (staleLock(lock) !== seen) throw new Error(BUSY);
-      unlinkSync(lock); fd = takeLock(lock);
-    } finally { closeSync(guard); unlinkSync(reclaim); }
+      unlinkSync(lock);
+      try { takeLock(lock); } catch (error) { throw exists(error) ? new Error(BUSY) : error; }
+    } finally { unlinkSync(reclaim); }
   }
-  try { return await work(); } finally { closeSync(fd); try { unlinkSync(lock); } catch { /* Already gone. */ } }
+  try { return await work(); } finally { try { unlinkSync(lock); } catch { /* Already gone. */ } }
 }
 const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/i.test(v);
 

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentCli, connectConflict } from '../agent-cli';
@@ -91,9 +91,10 @@ test("a connect's lock is taken over only once its process is gone, and only by 
     // A live owner keeps its lock however old it is (a laptop asleep mid-connect).
     writeFileSync(lock, String(process.pid)); utimesSync(lock, old, old);
     await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
-    // A lock with no owner written yet is fresh for a minute.
-    writeFileSync(lock, '');
-    await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
+    // A lock that names no process (only possible where hard links aren't) is never taken over, however old.
+    writeFileSync(lock, ''); utimesSync(lock, old, old);
+    await expect(agentCli(['connect', link])).rejects.toThrow("doesn't name the connect");
+    expect(existsSync(lock)).toBe(true);
     // The owner is gone, but another connect is taking the lock over right now.
     writeFileSync(lock, gone); writeFileSync(`${lock}.reclaim`, String(process.pid));
     await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
@@ -104,9 +105,7 @@ test("a connect's lock is taken over only once its process is gone, and only by 
     rmSync(`${lock}.reclaim`);
     await expect(agentCli(['connect', link])).rejects.toThrow('this link was not used');
     expect(existsSync(lock) || existsSync(`${lock}.reclaim`)).toBe(false);
-    // So is an old lock that never got an owner written.
-    writeFileSync(lock, ''); utimesSync(lock, old, old);
-    await expect(agentCli(['connect', link])).rejects.toThrow('this link was not used');
-    expect(existsSync(lock)).toBe(false);
+    // No draft files are left next to the lock.
+    expect(readdirSync(dir).filter(f => f.startsWith('connect.lock'))).toEqual([]);
   } finally { server.stop(true); }
 }));
