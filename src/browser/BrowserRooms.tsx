@@ -511,7 +511,9 @@ export function BrowserRooms() {
     void act(async () => {
       await api.command('repositories', urlRoom, change);
       const name = 'pin' in change ? change.pin : change.unpin, same = (r: string) => r.toLowerCase() === name.toLowerCase();
-      setStatus(current => current && { ...current, repositories: 'pin' in change ? [...(current.repositories ?? []).filter(r => !same(r)), name] : (current.repositories ?? []).filter(r => !same(r)) });
+      // As the service does: pinning one already pinned, in any case, leaves the list as it is.
+      setStatus(current => { if (!current) return current; const list = current.repositories ?? [];
+        return { ...current, repositories: 'pin' in change ? (list.some(same) ? list : [...list, name]) : list.filter(r => !same(r)) }; });
       setRepositoryDraft('');
       setNotice('pin' in change ? `Pinned ${name}. Tasks can open issues there.` : `Unpinned ${name}.`);
     });

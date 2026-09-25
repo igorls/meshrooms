@@ -3,18 +3,22 @@
  * signed in as whoever operates it, and the room only ever stores the issue's link.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
 import { issueLabel, issueLinkFrom } from '../src/browser/board';
 import { validRepository } from '../src/browser/protocol';
 
 /** Runs `gh` with arguments (never through a shell) and optional standard input; returns its output. */
 export type Gh = (args: string[], input?: string) => string;
+/** A `gh` that ran out of time may have done what it was asked (the issue may exist). */
+export class UncertainGh extends Error {}
 
 export const runGh: Gh = (args, input) => {
   try { return execFileSync('gh', args, { input: input ?? '', encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 60_000, windowsHide: true }); }
   catch (error) {
     const e = error as { code?: string; stderr?: string; message?: string };
     if (e.code === 'ENOENT') throw new Error('The GitHub CLI (gh) is not installed here. Install it and run gh auth login, or open the issue on GitHub yourself and link it with task-update --issue <link>.');
+    if (e.code === 'ETIMEDOUT' || (e as { signal?: string }).signal) throw new UncertainGh(`gh ${args.slice(0, 2).join(' ')} did not finish in time, so it may have gone through.`);
     throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(e.stderr || e.message || error).trim().split('\n')[0]}`);
   }
 };
@@ -58,13 +62,32 @@ export function sameIssue(a: string, b: string) {
 }
 
 /**
- * Issues this agent opened, by request id, so retrying a request whose task update failed links the issue it already
- * opened instead of opening a second one.
+ * Opens at most one issue per request id, so retrying a request whose task update failed links the issue it already
+ * opened instead of opening a second one. Each request is claimed with its own file, created exclusively, so two runs
+ * of one request can't both open an issue and no run overwrites another's record.
  */
-export function openedIssues(path: string) {
-  const read = (): Record<string, string> => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return {}; } };
-  return {
-    get: (requestId: string): string | undefined => read()[requestId],
-    set: (requestId: string, link: string) => writeFileSync(path, JSON.stringify({ ...read(), [requestId]: link }), { mode: 0o600 }),
-  };
+export function openIssueOnce(dir: string, requestId: string, open: () => string): string {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const record = join(dir, `${requestId}.txt`);
+  let claim: number;
+  try { claim = openSync(record, 'wx', 0o600); }
+  catch (error) {
+    if ((error as { code?: string }).code !== 'EEXIST') throw error;
+    const held = readFileSync(record, 'utf8'), link = issueLinkFrom(held);
+    if (link) return link;
+    const pid = Number(/^opening (\d+)$/.exec(held)?.[1]);
+    let running = false; try { process.kill(pid, 0); running = true; } catch (e) { running = (e as { code?: string }).code === 'EPERM'; }
+    if (pid && running) throw new Error('This request is already opening an issue. Wait for it, then run tasks.');
+    throw new Error('An earlier run of this request stopped while opening the issue, so it may exist. Check the repository on GitHub: link it with task-update --issue <link>, or open one with a new request id.');
+  }
+  try { writeSync(claim, `opening ${process.pid}`); } finally { closeSync(claim); }
+  let link: string;
+  try { link = open(); }
+  catch (error) {
+    // Nothing was opened, so the request can be retried; after a timeout it may have been, so the claim stays.
+    if (error instanceof UncertainGh) writeFileSync(record, 'uncertain', { mode: 0o600 }); else rmSync(record, { force: true });
+    throw error;
+  }
+  writeFileSync(record, link, { mode: 0o600 });
+  return link;
 }

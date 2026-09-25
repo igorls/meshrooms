@@ -31,7 +31,7 @@ import { join, resolve } from 'node:path';
 import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import { mayAgentSpeak } from '../src/collab';
 import { issueLinkFrom } from '../src/browser/board';
-import { createIssue, issueDraft, issueRepository, openedIssues, runGh, sameIssue } from './github-issues';
+import { createIssue, issueDraft, issueRepository, openIssueOnce, runGh, sameIssue } from './github-issues';
 
 export { parseConnectLink };
 import { REACTION_EMOJI, isReactionEmoji } from '../src/browser/reactions';
@@ -344,11 +344,11 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (!uuid(taskId)) throw new Error('Use --task with a task ID from the tasks command.');
     const task = agent.view().tasks.find(t => t.id === taskId);
     if (!task) throw new Error('That task is not on the board. Run tasks for current task IDs.');
-    const opened = openedIssues(join(agent.dir, 'issues-opened.json'));
-    if (task.issue && !opened.get(requestId)) return { status: 'already-linked', issue: task.issue, task };
+    const ledger = join(agent.dir, 'issues-opened'), retry = existsSync(join(ledger, `${requestId}.txt`));
+    if (task.issue && !retry) return { status: 'already-linked', issue: task.issue, task };
+    const repository = retry ? '' : issueRepository(agent.settings().repositories ?? [], values['--repo']);
     // A retry links the issue this request already opened rather than opening another.
-    let link = opened.get(requestId);
-    if (!link) { link = createIssue(runGh, issueRepository(agent.settings().repositories ?? [], values['--repo']), task.title, task.notes); opened.set(requestId, link); }
+    const link = openIssueOnce(ledger, requestId, () => createIssue(runGh, repository, task.title, task.notes));
     return { ...await taskBrowser(agent, { requestId, taskId, change: { issue: link } }), issue: link };
   }
   if (command === 'issue-task') {

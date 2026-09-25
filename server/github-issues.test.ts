@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createIssue, issueDraft, issueRepository, openedIssues, sameIssue, type Gh } from './github-issues';
+import { spawnSync } from 'node:child_process';
+import { createIssue, issueDraft, issueRepository, openIssueOnce, sameIssue, UncertainGh, type Gh } from './github-issues';
 
 test("an agent opens an issue for a task with its own gh, in the room's pinned repository", () => {
   expect(issueRepository(['igorls/meshrooms'])).toBe('igorls/meshrooms');
@@ -32,9 +33,23 @@ test('a task drafted from an issue or pull request takes its title and the start
   expect(sameIssue('https://github.com/a/b/issues/7', 'https://github.com/a/b/issues/8')).toBe(false);
 });
 
-test('a retried request links the issue it already opened', () => {
-  const opened = openedIssues(join(mkdtempSync(join(tmpdir(), 'mr-issues-')), 'issues-opened.json')), id = crypto.randomUUID();
-  expect(opened.get(id)).toBeUndefined();
-  opened.set(id, 'https://github.com/a/b/issues/1');
-  expect(opened.get(id)).toBe('https://github.com/a/b/issues/1');
+test('one request opens at most one issue, however it is retried', () => {
+  const dir = join(mkdtempSync(join(tmpdir(), 'mr-issues-')), 'issues-opened'), [a, b, c, d] = [0, 1, 2, 3].map(() => crypto.randomUUID());
+  let opened = 0;
+  const open = () => `https://github.com/a/b/issues/${++opened}`;
+  expect(openIssueOnce(dir, a, open)).toBe('https://github.com/a/b/issues/1');
+  expect(openIssueOnce(dir, a, open)).toBe('https://github.com/a/b/issues/1'); // a retry reuses it
+  expect(openIssueOnce(dir, b, open)).toBe('https://github.com/a/b/issues/2'); // another request keeps its own record
+  expect(openIssueOnce(dir, a, open)).toBe('https://github.com/a/b/issues/1');
+  // A run of the same request still opening its issue (this process) holds it; one that died may have opened it.
+  writeFileSync(join(dir, `${c}.txt`), `opening ${process.pid}`);
+  expect(() => openIssueOnce(dir, c, open)).toThrow('already opening');
+  writeFileSync(join(dir, `${c}.txt`), `opening ${spawnSync(process.execPath, ['-e', '0']).pid}`);
+  expect(() => openIssueOnce(dir, c, open)).toThrow('may exist');
+  // gh refused: nothing was opened, so the request can be retried. gh timed out: it may have been, so it can't.
+  expect(() => openIssueOnce(dir, d, () => { throw new Error('gh issue create failed: HTTP 403'); })).toThrow('403');
+  expect(existsSync(join(dir, `${d}.txt`))).toBe(false);
+  expect(() => openIssueOnce(dir, d, () => { throw new UncertainGh('timed out'); })).toThrow('timed out');
+  expect(() => openIssueOnce(dir, d, open)).toThrow('may exist');
+  expect(opened).toBe(2);
 });
