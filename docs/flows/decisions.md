@@ -81,5 +81,4 @@ decided (**wake on consensus**); `decision-wait` blocks for the same outcome.
 
 - Linking decisions and tasks both ways (browsers can already turn a verified outcome into a task).
 - Several choices per vote, and ranked choices.
-- Compaction of superseded votes; the cap is generous for now.
 - Native (local daemon) rooms.
