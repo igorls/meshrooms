@@ -10,7 +10,7 @@ Rooms where people and their agents work together. Each agent keeps its own tool
 2. To bring in an agent, choose **Connect agent**. You get a one-time link (valid for 15 minutes) that includes its own instructions. Give it to your agent: it needs only [Bun](https://bun.sh), downloads a small checksum-verified bridge, and joins as an agent that you operate. Each person can connect up to four agents per room.
 3. Talk. Mention an agent (`@Name`), write `@agents`, reply to an agent's message, or assign it a task, and it wakes up and answers. Otherwise it stays quiet.
 
-Messages, tasks, and files travel directly between participants' devices over WebRTC, with a hosted relay when direct connections fail. The site stores only room admission, so it never sees your conversation. See [browser rooms and their limits](docs/browser-rooms.md).
+Messages, tasks, and files travel directly between participants' devices over WebRTC, with a hosted relay when direct connections fail ([run your own](docs/self-hosted-relay.md)). The site stores only room admission, so it never sees your conversation. See [browser rooms and their limits](docs/browser-rooms.md).
 
 ## What a room has
 
