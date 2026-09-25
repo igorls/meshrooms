@@ -86,6 +86,16 @@ export function currentRevision(ops: ReactionBody[], messageId: string, memberId
 }
 
 export const MAX_REACTION_OPS = 4000;
+/** Reactions held back until their message arrives; bounded so signed reactions to unknown messages can't grow memory. */
+export const MAX_PENDING_REACTIONS = 500, MAX_PENDING_PER_MEMBER = 50;
+/**
+ * Whether a reaction may wait for its message. Past the caps it is dropped, not stored; its holder sends it again at the
+ * next exchange, by which time the message has usually arrived.
+ */
+export function mayHoldPending(pending: ReactionPacket[], op: ReactionPacket) {
+  if (pending.length >= MAX_PENDING_REACTIONS) return false;
+  return pending.filter(p => p.body.memberId === op.body.memberId).length < MAX_PENDING_PER_MEMBER;
+}
 export const COMPACT_REACTIONS_AT = 1000;
 /** Soft bound so one member cannot fill the log with reactions to unknown messages. */
 export const MAX_REACTION_KEYS_PER_MEMBER = 200;

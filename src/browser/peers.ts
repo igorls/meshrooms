@@ -9,7 +9,7 @@ import {
 import { FileTransfers, IMAGE_TYPES, MAX_MESSAGE_ATTACHMENTS, attachmentText, isFilePacket, retainedFiles, validAttachments, type AttachmentRef, type TransferState } from './files';
 import {
   COMPACT_REACTIONS_AT, MAX_REACTION_KEYS_PER_MEMBER, MAX_REACTION_OPS, compactReactions, currentRevision,
-  foldReactions, isReactionEmoji, liveKeysForMember, memberReacted, reactionSyncChunks, validReactionBody,
+  foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody,
   type ReactionChip, type ReactionEmoji, type ReactionPacket,
 } from './reactions';
 import { read, sign, update, write } from './storage';
@@ -150,7 +150,7 @@ export class BrowserPeers {
     for (const op of incoming) {
       if (this.reactionOps.some(known => known.body.id === op.body.id) || this.pendingReactions.some(known => known.body.id === op.body.id)) continue;
       if (held.has(op.body.messageId)) ready.push(op);
-      else this.pendingReactions.push(op);
+      else if (mayHoldPending(this.pendingReactions, op)) this.pendingReactions.push(op);
     }
     if (!ready.length) return;
     let next = [...this.reactionOps, ...ready];
