@@ -13,7 +13,7 @@
  * record its activity (activity.json), which `run` announces to connected devices.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { browserProtocol, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
@@ -152,7 +152,7 @@ export class BrowserAgent {
       headers: { 'Content-Type': 'application/json', Origin: this.origin },
       body: JSON.stringify({ command, publicKey: identity.publicKey, signature: await this.sign(command) }) });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.error || `Room service rejected ${action} (${response.status}).`);
+    if (!response.ok) throw Object.assign(new Error(result.error || `Room service rejected ${action} (${response.status}).`), { status: response.status });
     return result;
   }
   messages(): Stored[] { return readJson(this.path('messages.json'), []); }
@@ -506,7 +506,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
               : reviseDecision(author, current, item.action === 'option' ? { addOption: item.label } : item.action === 'close' ? { close: true } : { withdraw: true });
             if (body) await shareDecisionOp({ ...body, id: item.id });
           }
-        } catch (error) { log(`dropped decision change ${item.id}: ${error instanceof Error ? error.message : String(error)}`); }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          log(`dropped decision change ${item.id}: ${reason}`);
+          noteDropped(outbox, item.id, reason);
+        }
         unlinkSync(join(outbox, file)); continue;
       }
       if ('type' in item && item.type === 'task') {
@@ -822,6 +826,16 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
     votes: d.votes.map(v => ({ by: name(v.memberId), counts: v.counts, option: label(v.optionId), ...(v.comment ? { comment: v.comment } : {}) })) };
 }
 
+/** Why `run` could not sign a queued decision change, kept next to the outbox for the command waiting on it. */
+export function noteDropped(outbox: string, id: string, reason: string) { writeFileSync(join(outbox, `${id}.dropped`), reason, { mode: 0o600 }); }
+/** The reason `run` noted for dropping a change, read once. */
+export function takeDropped(outbox: string, id: string) {
+  const note = join(outbox, `${id}.dropped`);
+  if (!existsSync(note)) return undefined;
+  const reason = readFileSync(note, 'utf8'); rmSync(note, { force: true });
+  return reason;
+}
+
 /** Queue a decision change for `run` to sign and share; returns the decision once this device holds the change. */
 export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveOmit<DecisionIntent, 'type'>, seconds = 10) {
   const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
@@ -850,7 +864,7 @@ export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveO
       return { status: 'shared', decision: decision ? describeDecision(agent, decision) : null, decisionCursor: agent.decisionCursor(ops) };
     }
     if (!pending && agent.compactedDecisionIds().has(intent.id)) return superseded(agent, intent.decisionId, view.memberId);
-    if (!pending) return { status: 'dropped', reason: 'The change no longer applied when it was signed (the decision closed or changed). Read it again.' };
+    if (!pending) return { status: 'dropped', reason: takeDropped(join(agent.dir, 'outbox'), intent.id) ?? 'The change no longer applied when it was signed (the decision closed or changed). Read it again.' };
     await Bun.sleep(300);
   }
   return { status: 'queued-for-bridge' };
