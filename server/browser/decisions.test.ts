@@ -38,7 +38,7 @@ test('closing records the tally; only the creator, its operator, or the host may
   let d = fold([open])[0];
   const vote = castVote(as(igor), d, 'approve', 'go');
   d = fold([open, vote])[0];
-  expect(() => reviseDecision(as(dom), d, { addOption: 'Maybe' })).not.toThrow(); // building is fine; the fold rejects it for plan reviews
+  expect(() => reviseDecision(as(dom), d, { addOption: 'Maybe' })).toThrow('Plan reviews keep');
   const byDom = reviseDecision(as(dom), d, { close: true }), byOperator = reviseDecision(as(igor), d, { close: true });
   expect(fold([open, vote, byDom])[0].state).toBe('open');
   const closed = fold([open, vote, byOperator])[0];
@@ -180,4 +180,23 @@ test('wake on consensus waits for a verified outcome; withdrawals wake separatel
   const withdrawn = reviseDecision(as(vesper), fold([other])[0], { withdraw: true });
   const wakes = decisionWakes([other, withdrawn], room, vesper, 1);
   expect([wakes.resolved.length, wakes.withdrawn.map(d => d.question)]).toEqual([0, ['Drop?']]);
+});
+
+test('a departed agent’s vote is never counted as a person’s; plan reviews keep their options; capped decisions admit no votes', () => {
+  const open = openDecision({ ...as(igor), question: 'Go?', options: ['Yes', 'No'] });
+  const d = fold([open])[0];
+  const leftAgent = crypto.randomUUID();
+  const vote = castVote(as(leftAgent), d, 'o1');
+  // While the agent was a member it voted; it has since left, so current membership no longer shows its role.
+  const close = { ...reviseDecision(as(igor), d, { close: true }), outcome: { result: 'decided' as const, optionIds: ['o1'], tally: { o1: 1, o2: 0 }, voters: 1, people: 3 },
+    counted: [{ vote: vote.id, memberId: leftAgent, optionId: 'o1' }] };
+  expect(foldDecisions([open, vote, close], { ...room, former: [{ id: leftAgent, role: 'agent' }] })[0].state).toBe('open');
+  expect(foldDecisions([open, vote, close], { ...room, former: [{ id: leftAgent }] })[0].state).toBe('closed'); // legacy entry without a role
+  const plan = openDecision({ ...as(vesper), question: 'Plan?', mode: 'plan-review', context: 'x' });
+  expect(validDecisionBody({ ...plan, options: [...plan.options.slice(0, 2), { id: 'reject', label: 'Ship it anyway', addedBy: vesper }] }, roomId)).toBe(false);
+  expect(validDecisionBody({ ...plan, options: plan.options.slice(0, 2) }, roomId)).toBe(false);
+  const busy = Array.from({ length: 400 }, (_, i) => castVote(as(dom), d, 'o1', '', i + 1));
+  const overCap = openDecision({ ...as(dom), question: 'One more?', options: ['A', 'B'] });
+  const orphan = castVote(as(sam), fold([overCap])[0], 'o1');
+  expect(admissible([open, ...busy], [overCap, orphan])).toEqual([]);
 });

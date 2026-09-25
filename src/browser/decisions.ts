@@ -38,7 +38,8 @@ export type VoteBody = {
 export type DecisionPacket = { body: DecisionBody | VoteBody; signature: string };
 /** Unsigned envelope for exchanging decisions; each operation inside is verified against its own author's device. */
 export type DecisionSync = { kind: 'decisions'; roomId: string; ops: DecisionPacket[] };
-export type RoomMembers = { ownerId?: string; members: { id: string; role?: 'human' | 'agent'; operatorId?: string }[] };
+/** `former` lists members who left (from the room service's retired devices), so a departed agent is still known as one. */
+export type RoomMembers = { ownerId?: string; members: { id: string; role?: 'human' | 'agent'; operatorId?: string }[]; former?: { id: string; role?: 'human' | 'agent' }[] };
 export type Vote = { op: string; memberId: string; optionId: string | null; comment: string; at: number; counts: boolean };
 export type Decision = {
   /** `key` identifies the decision (creator and id); `id` is what people and agents quote. */
@@ -76,6 +77,8 @@ export function validDecisionBody(b: any, roomId: string): b is DecisionBody {
     && Array.isArray(b.options) && b.options.length >= 2 && b.options.length <= MAX_OPTIONS
     && b.options.every((o: any) => o && optionId(o.id) && text(o.label, 120, true) && uuid(o.addedBy) && Object.keys(o).length === 3)
     && new Set(b.options.map((o: any) => o.id)).size === b.options.length
+    && (b.mode !== 'plan-review' || (b.options.length === PLAN_REVIEW_OPTIONS.length
+      && PLAN_REVIEW_OPTIONS.every((o, i) => b.options[i].id === o.id && b.options[i].label === o.label)))
     && (typeof b.askAgents === 'boolean' || (Array.isArray(b.askAgents) && b.askAgents.length <= 16 && b.askAgents.every(uuid)))
     && (b.closesAt === null || (Number.isSafeInteger(b.closesAt) && b.closesAt > 0)) && ['open', 'closed', 'withdrawn'].includes(b.state)
     && (b.state === 'closed' ? validOutcome(b.outcome) && validCounted(b.counted) : b.outcome === undefined && b.counted === undefined)
@@ -111,7 +114,8 @@ function honestClose(next: DecisionBody, held: Map<string, VoteBody>, latest: Ma
     if (vote && (vote.memberId !== c.memberId || vote.optionId !== c.optionId || vote.decisionId !== next.decisionId || vote.createdBy !== next.createdBy)) return false;
     const newest = latest.get(`${next.createdBy}:${next.decisionId}:${c.memberId}`);
     if (newest && newest.id !== c.vote && (!vote || order(vote, newest) < 0)) return false;
-    if (room.members.some(m => m.id === c.memberId && m.role === 'agent')) return false;
+    // Agents never count as people, including ones who have since left; members who left before roles were recorded stay accepted.
+    if (room.members.some(m => m.id === c.memberId && m.role === 'agent') || room.former?.some(m => m.id === c.memberId && m.role === 'agent')) return false;
     if (!next.options.some(o => o.id === c.optionId)) return false;
   }
   const expected = tallyVotes(next.options, counted.map(c => ({ op: c.vote, memberId: c.memberId, optionId: c.optionId, comment: '', at: 0, counts: true })), outcome.people).tally;
@@ -194,6 +198,7 @@ export function openDecision(a: Author & { question: string; context?: string; m
 }
 /** The next revision of a decision: an added option, or closing it with the tally as this device sees it. */
 export function reviseDecision(a: Author, current: Decision, change: { addOption?: string; close?: boolean; withdraw?: boolean }): DecisionBody {
+  if (change.addOption !== undefined && current.mode === 'plan-review') throw new Error('Plan reviews keep Approve / Request changes / Reject.');
   const options = change.addOption ? [...current.options, { id: crypto.randomUUID().slice(0, 8), label: change.addOption.trim(), addedBy: a.memberId }] : current.options;
   const state: DecisionState = change.withdraw ? 'withdrawn' : change.close ? 'closed' : 'open';
   // A close pins the people's votes it counted, so every device can check the outcome adds up.
@@ -222,13 +227,13 @@ export const nextVoteRevision = (ops: (DecisionBody | VoteBody)[], decision: Pic
  */
 export function admissible(held: (DecisionBody | VoteBody)[], incoming: (DecisionBody | VoteBody)[]) {
   const known = new Set(held.filter(o => o.kind === 'decision').map(o => `${o.createdBy}:${o.decisionId}`));
-  for (const o of incoming) if (o.kind === 'decision') known.add(`${o.createdBy}:${o.decisionId}`);
   const per = new Map<string, number>(); for (const o of held) per.set(o.memberId, (per.get(o.memberId) ?? 0) + 1);
-  return incoming.filter(o => {
-    if (o.kind === 'vote' && !known.has(`${o.createdBy}:${o.decisionId}`)) return false;
-    const n = per.get(o.memberId) ?? 0; if (n >= MAX_MEMBER_DECISION_OPS) return false;
-    per.set(o.memberId, n + 1); return true;
-  });
+  const share = (o: DecisionBody | VoteBody) => { const n = per.get(o.memberId) ?? 0; if (n >= MAX_MEMBER_DECISION_OPS) return false; per.set(o.memberId, n + 1); return true; };
+  // Decisions first, so only those admitted under the cap make their votes admissible.
+  const admitted = new Set<DecisionBody | VoteBody>();
+  for (const o of incoming) if (o.kind === 'decision' && share(o)) { admitted.add(o); known.add(`${o.createdBy}:${o.decisionId}`); }
+  for (const o of incoming) if (o.kind === 'vote' && known.has(`${o.createdBy}:${o.decisionId}`) && share(o)) admitted.add(o);
+  return incoming.filter(o => admitted.has(o));
 }
 
 /** Split decisions into sync envelopes under the data channel limit. */

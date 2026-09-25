@@ -34,7 +34,7 @@ type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: stri
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody; signature: string };
 type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[] };
-type Members = { memberId?: string; ownerId?: string; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
+type Members = { memberId?: string; ownerId?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
 /** A queued decision change; like tasks, `run` builds it against the decision as it stands when signing. */
@@ -158,8 +158,8 @@ export class BrowserAgent {
   decisionCursor(ops = this.decisionOps()) { return ops.at(-1)?.seq ?? 0; }
   /** The room's decisions as every device folds them; people's votes count, agents' are advice. */
   decisions(ops = this.decisionOps()): Decision[] {
-    const { ownerId, members } = this.members();
-    return foldDecisions(ops.map(p => p.body), { ownerId, members });
+    const { ownerId, members, former } = this.members();
+    return foldDecisions(ops.map(p => p.body), { ownerId, members, former });
   }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined { const a = readJson<unknown>(this.path('activity.json'), undefined); return validActivity(a) ? a : undefined; }
@@ -291,7 +291,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const shareDecisionOp = async (body: DecisionBody | VoteBody) => {
     // This device's own changes obey the same per-member share as everyone's, or peers would drop them.
-    if (!admissible(agent.decisionOps().map(p => p.body), [body]).length) throw new Error('This agent has reached its share of decision changes in this room.');
+    const held = agent.decisionOps();
+    if (held.length >= MAX_DECISION_OPS) throw new Error('This room has reached its limit of decision changes.');
+    if (!admissible(held.map(p => p.body), [body]).length) throw new Error('This agent has reached its share of decision changes in this room.');
     const packet = { body, signature: await agent.sign(body) };
     storeDecisionOps([packet]);
     for (const peer of peers.values()) if (peer.channel?.readyState === 'open') peer.channel.send(JSON.stringify(packet));
@@ -461,7 +463,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await Bun.sleep(3000); continue; }
       if (epoch && next.epoch !== epoch) { for (const p of peers.values()) await p.pc.close(); peers.clear(); cursor = 0; }
       epoch = next.epoch; status = next;
-      writeJson(join(agent.dir, 'members.json'), { memberId: next.memberId, ownerId: next.ownerId, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
+      // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
+      const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
+      writeJson(join(agent.dir, 'members.json'), { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
       if (next.settings) writeJson(join(agent.dir, 'settings.json'), { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake });
       await applyPendingProfile(agent, log);
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
