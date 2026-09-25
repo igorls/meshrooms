@@ -123,7 +123,10 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     const config = join(agent.dir, 'room.json'), link = createHash('sha256').update(token).digest('hex');
     let previous: string | undefined;
     try { previous = JSON.parse(readFileSync(config, 'utf8')).link; } catch { /* First connect in this folder. */ }
-    let status = await agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
+    // Fail closed: if the room can't be checked, don't risk using this link on top of another agent's folder.
+    let status: any;
+    try { status = await agent.command('status', { session: randomUUID() }); }
+    catch (error) { throw new Error(`Couldn't check the room before connecting, so nothing was changed: ${error instanceof Error ? error.message : String(error)}`); }
     const conflict = connectConflict(link, previous, status, home());
     if (conflict) throw new Error(conflict);
     writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
