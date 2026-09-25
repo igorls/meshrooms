@@ -127,18 +127,18 @@
 .browser-joined,.browser-room-nav,.browser-requests,.browser-transcript,.browser-details{position:relative}
 .browser-person>div>span.agent-runtime{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 /* Decisions: a card in the conversation, the composer form, and the list panel. */
-.browser-decision{margin:24px 0 0;padding:16px 20px;border:1px solid var(--line);border-radius:var(--radius);background:var(--paper);max-width:72ch}
+.browser-decision{margin:20px 0 0 44px;padding:12px 16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--paper);max-width:72ch}
 .browser-decision.is-closed{background:var(--soft)}
-.browser-decision.browser-message-highlight{margin-left:0;padding-left:20px;box-shadow:inset 3px 0 0 var(--blue);background:#f1f5ff}
-.browser-decision>header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;font-size:12px;color:var(--muted)}
+.browser-decision.browser-message-highlight{padding-left:16px;box-shadow:inset 3px 0 0 var(--blue);background:#f1f5ff}
+.browser-decision>header{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;font-size:12px;color:var(--muted)}
 .browser-decision-kind{font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.04em;font-size:11px}
 .browser-decision-state{margin-left:auto;font-variant-numeric:tabular-nums}
 .browser-decision-state.is-final{color:var(--ink);font-weight:650}
-.browser-decision h3{font-size:16px;line-height:1.45;margin:8px 0 4px;overflow-wrap:anywhere}
+.browser-decision h3{font-size:15px;line-height:1.45;margin:6px 0 2px;overflow-wrap:anywhere}
 .browser-decision-context{font-size:14px;color:var(--ink)}
-.browser-decision-options{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:8px}
-.browser-decision-options li{display:flex;align-items:center;gap:12px}
-.browser-decision-options button{position:relative;flex:1;min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--paper);text-align:left;overflow:hidden;cursor:pointer}
+.browser-decision-options{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}
+.browser-decision-options li{display:flex;align-items:center;gap:10px}
+.browser-decision-options button{position:relative;flex:1;min-width:0;min-height:36px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--paper);text-align:left;overflow:hidden;cursor:pointer}
 .browser-decision-options button:disabled{cursor:default}
 .browser-decision-options button:not(:disabled):hover{border-color:var(--muted)}
 .browser-decision-options .is-chosen button{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}
@@ -146,40 +146,57 @@
 .browser-decision-label{position:relative;z-index:1;font-size:14px;overflow-wrap:anywhere}
 .browser-decision-count{position:relative;z-index:1;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
 .browser-decision-bar{position:absolute;inset:0;pointer-events:none}
-.browser-decision-bar>span{display:block;height:100%;background:#e8eefc;transition:width .2s ease}
+.browser-decision-bar>span{display:block;height:100%;background:#eef2fc;transition:width .2s ease}
 .is-winner .browser-decision-bar>span{background:#e3f1e8}
 .browser-decision-voters{display:flex;flex-shrink:0}
 .browser-decision-voters>span{margin-left:-6px}
-.browser-decision-voters .avatar{width:24px;height:24px;font-size:11px;border:2px solid var(--paper)}
-.browser-decision-advice,.browser-decision-reasons{margin-top:12px;font-size:13px}
+.browser-decision-voters .avatar{width:22px;height:22px;font-size:10px;border:2px solid var(--paper)}
+.browser-decision-advice,.browser-decision-reasons{margin-top:10px;font-size:13px}
 .browser-decision-advice h4{font-size:12px;color:var(--muted);font-weight:650}
 .browser-decision-advice h4 span{font-weight:500}
-.browser-decision-advice ul,.browser-decision-reasons ul{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}
+.browser-decision-advice ul,.browser-decision-reasons ul{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:6px}
 .browser-decision-advice li{display:flex;gap:8px;align-items:flex-start}
 .browser-decision-advice li>span:last-child{overflow-wrap:anywhere}
 .browser-decision-advice .avatar{width:22px;height:22px;font-size:10px;flex-shrink:0}
 .browser-decision-reasons summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:650}
 .browser-decision-reasons li{overflow-wrap:anywhere}
-.browser-decision-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px}
-.browser-decision-actions>input{flex:1 1 220px;min-width:0;font-size:13px}
-.browser-decision-actions form{display:flex;gap:8px;flex:1 1 220px;min-width:0}
-.browser-decision-actions form input{flex:1;min-width:0;font-size:13px}
-.browser-decision-actions button{font-size:12px}
-.browser-decision-steward{display:flex;gap:12px;align-items:center;margin-left:auto}
-.browser-decision-note{font-size:12px;color:var(--muted);margin-top:8px}
+.browser-decision-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px 16px;margin-top:8px}
+.browser-decision-links{display:flex;flex-wrap:wrap;gap:4px 16px}
+.browser-decision-inline{display:flex;gap:8px;margin-top:6px}
+.browser-decision-inline input{flex:1;min-width:0;font-size:13px}
+.browser-decision-inline button{font-size:12px}
+.browser-rooms .browser-link-button{background:none;border:0;border-radius:4px;padding:4px 2px;min-height:28px;min-width:0;color:var(--blue);font-size:12px;font-weight:650;cursor:pointer}
+.browser-rooms .browser-link-button:hover{text-decoration:underline;text-underline-offset:3px}
+.browser-rooms .browser-link-button:disabled{color:var(--muted);cursor:default;text-decoration:none}
+.browser-rooms .browser-link-button.browser-danger{color:#8d352b}
+.browser-decision-note{font-size:12px;color:var(--muted)}
+.browser-decision>.browser-decision-note{margin-top:8px}
 .browser-decision-error{font-size:12px;color:#8d352b;margin-top:8px}
-.browser-decision-form{display:grid;gap:12px;margin:0 0 12px;padding:16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--soft);max-height:min(60vh,560px);overflow-y:auto}
-.browser-decision-form>label{display:grid;gap:6px;font-size:12px;font-weight:650}
-.browser-decision-form>label span{font-weight:500;color:var(--muted)}
-.browser-decision-form input:not([type=radio]):not([type=checkbox]),.browser-decision-form textarea,.browser-decision-form select{width:100%;font-size:14px;font-weight:400}
-.browser-decision-modes,.browser-decision-settings{display:flex;flex-wrap:wrap;gap:8px 20px;font-size:13px}
-.browser-decision-modes label,.browser-decision-settings label{display:flex;gap:8px;align-items:center}
-.browser-decision-settings select{width:auto}
-.browser-decision-form fieldset{border:0;padding:0;margin:0;display:grid;gap:8px}
-.browser-decision-form legend{font-size:12px;font-weight:650;margin-bottom:6px}
-.browser-decision-form fieldset>button{justify-self:start;font-size:12px}
-.browser-decision-option-input{display:flex;gap:8px;align-items:center}
-.browser-decision-form-actions{display:flex;justify-content:flex-end;gap:8px}
+/* The composer form sits exactly over the message box's width and stays compact. */
+.browser-decision-form{display:grid;gap:10px;max-width:880px;margin:0 auto 10px;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius);background:var(--soft);max-height:min(50vh,420px);overflow-y:auto}
+.browser-decision-form-top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px}
+.browser-segmented{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--paper)}
+.browser-segmented label{position:relative;display:flex;align-items:center;padding:5px 12px;font-size:12px;font-weight:650;color:var(--muted);cursor:pointer}
+.browser-segmented label+label{border-left:1px solid var(--line)}
+.browser-segmented input{position:absolute;opacity:0;pointer-events:none}
+.browser-segmented label:has(input:checked){background:var(--ink);color:#fff}
+.browser-segmented label:has(input:focus-visible){outline:2px solid #5b85f2;outline-offset:-2px}
+.browser-decision-question{width:100%;font-size:14px}
+.browser-decision-option-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;align-items:center}
+.browser-decision-option-input{display:flex;gap:4px;align-items:center}
+.browser-decision-option-input input{flex:1;min-width:0;font-size:14px}
+.browser-rooms .browser-decision-option-grid>.browser-link-button{justify-self:start}
+.browser-decision-context summary{cursor:pointer;font-size:12px;font-weight:650;color:var(--muted)}
+.browser-decision-context summary span{font-weight:500}
+.browser-decision-context textarea{display:block;width:100%;margin-top:6px;font-size:13px}
+.browser-decision-form-bottom{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;font-size:12px;position:sticky;bottom:-12px;margin:0 -14px -12px;padding:8px 14px 12px;background:var(--soft);border-top:1px solid var(--line)}
+.browser-decision-form-bottom label{display:flex;gap:6px;align-items:center}
+.browser-decision-form-bottom select{width:auto;font-size:12px}
+.browser-decision-form-actions{display:flex;gap:8px;margin-left:auto}
+.browser-decision-form-actions button{font-size:12px}
+/* The @mention list belongs to the message box, whatever opens above it. */
+.browser-composer{position:relative}
+.browser-composer>.mention-list{left:12px;bottom:calc(100% + 6px);max-width:calc(100% - 24px)}
 .browser-decisions-panel ul{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:4px}
 .browser-decisions-panel li button{display:grid;justify-items:start;justify-content:stretch;gap:2px;width:100%;padding:10px 12px;border-radius:8px;text-align:left;background:transparent;border:0;cursor:pointer}
 .browser-decisions-panel li button:hover{background:var(--line)}
@@ -187,4 +204,4 @@
 .browser-decisions-panel li span{font-size:12px;color:var(--muted)}
 .browser-decisions-panel h3 span{color:var(--muted);font-weight:500;margin-left:8px}
 .browser-decisions-panel section>p{font-size:12px;color:var(--muted);margin-top:8px}
-@media(max-width:760px){.browser-decision{padding:14px 16px}.browser-decision-state{margin-left:0;width:100%}.browser-decision-steward{margin-left:0}}
+@media(max-width:760px){.browser-decision{margin-left:0;padding:12px 14px}.browser-decision-state{margin-left:0;width:100%}.browser-decision-form-top .browser-decision-note{display:none}.browser-decision-form-actions{margin-left:0;width:100%;justify-content:flex-end}}
