@@ -5,6 +5,9 @@ import {
   foldReactions,
   isReactionEmoji,
   liveKeysForMember,
+  MAX_PENDING_PER_MEMBER,
+  MAX_PENDING_REACTIONS,
+  mayHoldPending,
   memberReacted,
   validReactionBody,
   type ReactionBody,
@@ -61,5 +64,15 @@ describe('browser reactions', () => {
     ]);
     expect(liveKeysForMember(compacted.map(p => p.body), bob)).toBe(1);
     expect(liveKeysForMember(compacted.map(p => p.body), alice)).toBe(0);
+  });
+
+  test('reactions waiting for their message are capped per member and in total', () => {
+    const packet = (memberId: string, i: number): ReactionPacket => ({ body: op({ id: crypto.randomUUID(), memberId, emoji: '👍', revision: 1, at: i + 1, messageId: crypto.randomUUID() }), signature: 's' });
+    const pending: ReactionPacket[] = [];
+    for (let i = 0; i < MAX_PENDING_PER_MEMBER + 10; i++) { const p = packet(alice, i); if (mayHoldPending(pending, p)) pending.push(p); }
+    expect(pending).toHaveLength(MAX_PENDING_PER_MEMBER); // one member can't fill the list
+    expect(mayHoldPending(pending, packet(bob, 0))).toBe(true); // others still get their early reactions held
+    const full = Array.from({ length: MAX_PENDING_REACTIONS }, (_, i) => packet(crypto.randomUUID(), i));
+    expect(mayHoldPending(full, packet(bob, 1))).toBe(false);
   });
 });

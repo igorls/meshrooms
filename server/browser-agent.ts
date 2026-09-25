@@ -28,7 +28,7 @@ import { admissible, castVote, decisionChunks, decisionWakes, due, foldDecisions
 import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, validActivity, validNote, type Activity, type ActivityOn } from '../src/browser/activity';
 import {
   COMPACT_REACTIONS_AT, MAX_REACTION_KEYS_PER_MEMBER, MAX_REACTION_OPS, REACTION_EMOJI, compactReactions, currentRevision,
-  foldReactions, isReactionEmoji, liveKeysForMember, memberReacted, reactionSyncChunks, validReactionBody,
+  foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody,
   type ReactionBody, type ReactionEmoji, type ReactionPacket,
 } from '../src/browser/reactions';
 import { evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
@@ -335,7 +335,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (known.has(op.body.id)) continue;
       known.add(op.body.id);
       if (held.has(op.body.messageId)) ready.push(op);
-      else pendingReactions.push(op);
+      else if (mayHoldPending(pendingReactions, op)) pendingReactions.push(op);
     }
     if (!ready.length) return true;
     return storeReactionOps(ops, ready);
