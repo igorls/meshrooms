@@ -22,6 +22,16 @@
 .browser-reply-button{margin-left:auto;font-size:12px;color:var(--muted);background:transparent;border:0;border-radius:6px;padding:2px 8px;min-height:28px}
 .browser-reply-button:hover,.browser-reply-button:focus-visible{color:var(--ink);background:var(--soft)}
 .browser-message .browser-reply-reference{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;color:var(--muted);border-left:2px solid var(--line);padding-left:8px;margin:4px 0 2px}
+.browser-reactions{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px}
+.browser-reaction{display:inline-flex;align-items:center;gap:4px;min-height:28px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;background:var(--paper);font-size:12px;color:var(--ink)}
+.browser-reaction.is-mine{border-color:#9db6f3;background:#eef3fc}
+.browser-reaction:hover,.browser-reaction:focus-visible{border-color:var(--muted)}
+.browser-reaction-add{position:relative}
+.browser-reaction-picker-toggle{min-width:28px;min-height:28px;border:1px dashed var(--line);border-radius:999px;background:transparent;color:var(--muted);font-size:14px;line-height:1}
+.browser-reaction-picker-toggle:hover,.browser-reaction-picker-toggle:focus-visible,.browser-reaction-picker-toggle[aria-expanded=true]{border-color:var(--muted);color:var(--ink);background:var(--soft)}
+.browser-reaction-picker{position:absolute;left:0;bottom:calc(100% + 6px);z-index:2;display:flex;gap:4px;padding:6px;border:1px solid var(--line);border-radius:12px;background:var(--paper);box-shadow:0 8px 24px rgba(15,23,42,.08)}
+.browser-reaction-picker button{min-width:32px;min-height:32px;border:0;border-radius:8px;background:transparent;font-size:16px}
+.browser-reaction-picker button:hover,.browser-reaction-picker button:focus-visible{background:var(--soft)}
 .browser-reply-draft{max-width:880px;margin:0 auto 8px;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:var(--muted)}
 .browser-agents form,.browser-agent-link{display:grid;gap:12px;margin-top:12px}
 .browser-agents label{display:grid;gap:8px;font-weight:650}
