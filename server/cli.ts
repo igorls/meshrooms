@@ -3,10 +3,25 @@ import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, statSync, 
 import { basename, join, resolve } from 'node:path';
 import { MAX_ATTACHMENT_BYTES, MAX_MESSAGE_ATTACHMENTS, cleanName } from './attachments';
 import { defaultOptions } from './daemon';
-import { fingerprint, isUuid, tokenHash } from './model';
+import { controlCommand } from './meshguard';
+import { fingerprint, isHash, isUuid, tokenHash } from './model';
 import { ensureRunning, probeRuntime, type RuntimeRecord } from './runtime';
 import type { NodeSnapshot } from '../src/room';
 import { evaluateWake, type WakeResult } from '../src/collab';
+import {
+  appendOwnedAllow,
+  assertNoConflictingShare,
+  createShareRecord,
+  defaultMeshguardConfigDir,
+  findBroaderAllows,
+  markSharePendingDisable,
+  meshguardSocketPath,
+  peerPolicyStem,
+  readShareRecord,
+  removeOwnedRules,
+  validatePort,
+  writeShareRecord,
+} from './share';
 
 type ClientCredential = { version: 1; nodeId: string; dataDir: string; intentId: string; token: string; title: string; project: string; agentName: string };
 function parse(args: string[]) {
@@ -18,9 +33,37 @@ function parse(args: string[]) {
     values[key] = value;
   }
   const allowed = ['--data-dir', '--library', '--port', '--dev-origin', '--title', '--project', '--agent', '--request-id', '--credential', '--text', '--after', '--wait-seconds', '--room', '--descriptor',
-    '--reply-to', '--board-after', '--task', '--revision', '--status', '--notes', '--assignee', '--id', '--out', '--url', '--name'];
+    '--reply-to', '--board-after', '--task', '--revision', '--status', '--notes', '--assignee', '--id', '--out', '--url', '--name',
+    '--minutes', '--meshguard-config', '--peer-alias', '--peer-key', '--mesh-ip'];
   for (const key of Object.keys(values)) if (!allowed.includes(key)) throw new Error(`Unknown option ${key}.`);
   return { command, values, attach };
+}
+
+async function resolvePairedPeerKey(dataDir: string, roomId: string, explicit?: string): Promise<string> {
+  if (explicit) {
+    if (!isHash(explicit)) throw new Error('Use --peer-key with the paired peer\'s 64-hex MeshGuard public key.');
+    return explicit;
+  }
+  const runtime = await probeRuntime(dataDir);
+  if (!runtime) throw new Error('Start the local node, or pass --peer-key for the paired MeshGuard peer.');
+  const token = await ownerToken(dataDir, runtime);
+  const transport = await api(runtime, token, 'transport') as { enabled?: boolean; rooms?: { roomId: string; peerKey: string }[] };
+  const room = transport.rooms?.find(entry => entry.roomId === roomId);
+  if (!room || !isHash(room.peerKey)) {
+    throw new Error(`Room ${roomId} is not paired on this node. Pair it first, or pass --peer-key explicitly.`);
+  }
+  return room.peerKey;
+}
+
+async function resolveMeshAttachment(explicitMeshIp?: string): Promise<{ socket: string; meshIp: string }> {
+  const socket = meshguardSocketPath();
+  const status = await controlCommand(socket, 'STATUS');
+  if (status?.running !== true || typeof status.mesh_ip !== 'string') {
+    throw new Error('MeshGuard STATUS did not report a running daemon with mesh_ip. Is meshguard up and MESHROOMS_MESHGUARD_SOCKET correct?');
+  }
+  const meshIp = explicitMeshIp || status.mesh_ip;
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(meshIp)) throw new Error('Mesh IP must be an IPv4 address from MeshGuard STATUS.');
+  return { socket, meshIp };
 }
 function requireText(value: string | undefined, name: string, max: number) {
   if (!value?.trim() || value.length > max) throw new Error(`${name} must contain 1–${max} characters.`); return value.trim();
@@ -134,8 +177,11 @@ export async function runCli(args: string[]): Promise<unknown> {
     'task-update --credential PATH --request-id UUID --task TASK_ID --revision N [--status todo|doing|done] [--title TEXT] [--notes TEXT] [--assignee me|none|PARTICIPANT_ID]',
     'browser-join --link AGENT_LINK', 'browser-run --url ROOM_LINK', 'browser-listen --url ROOM_LINK [--after MESSAGE_ID] [--wait-seconds 30]',
     'browser-send --url ROOM_LINK --request-id UUID --text TEXT [--reply-to MESSAGE_ID]',
-    'transport', 'descriptor --room UUID', 'pair --descriptor PATH (operator-approved two-node development pairing)'],
-    options: ['--data-dir PATH', '--library PATH', '--port NUMBER', '--dev-origin URL'], note: 'Browser links expire after two minutes. Agent credential files stay private on this machine.' };
+    'transport', 'descriptor --room UUID', 'pair --descriptor PATH (operator-approved two-node development pairing)',
+    'share --room UUID --port N [--minutes 30] [--meshguard-config DIR] [--peer-alias ALIAS] [--peer-key HEX] [--mesh-ip IP]',
+    'share-stop --room UUID [--meshguard-config DIR]', 'share-status --room UUID'],
+    options: ['--data-dir PATH', '--library PATH', '--port NUMBER', '--dev-origin URL'],
+    note: 'Browser links expire after two minutes. Agent credential files stay private on this machine. Share commands are operator-only and require MeshGuard.' };
   // The browser bridge (and its WebRTC dependency) loads only for browser-* commands, so the packaged local runtime,
   // which does not ship it, starts without it.
   const bridge = () => import('./browser-agent').catch(() => {
@@ -173,8 +219,53 @@ export async function runCli(args: string[]): Promise<unknown> {
     throw new Error(`Unknown command ${command}. Run help.`);
   }
   const agentCommands = ['read', 'send', 'listen', 'tasks', 'task-add', 'task-update', 'attachment'];
+  const shareCommands = ['share', 'share-stop', 'share-status'];
   if (attach.length && command !== 'send') throw new Error('Use --attach only with send.');
-  if (!['status', 'ensure', 'open', 'start', 'transport', 'descriptor', 'pair', ...agentCommands].includes(command)) throw new Error(`Unknown command ${command}. Run help.`);
+  if (!['status', 'ensure', 'open', 'start', 'transport', 'descriptor', 'pair', ...shareCommands, ...agentCommands].includes(command)) throw new Error(`Unknown command ${command}. Run help.`);
+  if (shareCommands.includes(command)) {
+    const options = defaultOptions();
+    if (values['--data-dir']) options.dataDir = resolve(values['--data-dir']);
+    if (!isUuid(values['--room'])) throw new Error('Use --room with the paired room UUID.');
+    const roomId = values['--room'];
+    const configDir = resolve(values['--meshguard-config'] || defaultMeshguardConfigDir());
+    if (command === 'share-status') {
+      const record = readShareRecord(options.dataDir, roomId);
+      if (!record) return { state: 'missing', roomId, message: 'No local share record for this room.' };
+      return { state: 'share-status', share: record,
+        note: record.status === 'pending-enable' ? 'Rule written; restart MeshGuard before treating the URL as reachable.'
+          : record.status === 'pending-disable' ? 'Owned rules removed; port may still work until MeshGuard reloads.'
+            : undefined };
+    }
+    if (command === 'share-stop') {
+      const record = readShareRecord(options.dataDir, roomId);
+      if (!record) throw new Error(`No local share record for room ${roomId}.`);
+      if (record.status === 'stopped') return { state: 'share-stopped', share: record, note: 'Share already stopped.' };
+      if (record.ownedRules.length) removeOwnedRules(record.ownedRules);
+      const stopped = markSharePendingDisable(record);
+      writeShareRecord(options.dataDir, stopped);
+      return { state: 'share-pending-disable', share: stopped, meshguardConfig: configDir,
+        note: 'Owned MeshGuard rules removed. Restart MeshGuard before treating the port as closed.' };
+    }
+    const port = validatePort(values['--port']);
+    assertNoConflictingShare(options.dataDir, roomId);
+    const { meshIp } = await resolveMeshAttachment(values['--mesh-ip']);
+    const peerKey = await resolvePairedPeerKey(options.dataDir, roomId, values['--peer-key']);
+    const peerStem = peerPolicyStem(peerKey, values['--peer-alias']);
+    const broader = findBroaderAllows(configDir, port, peerStem);
+    if (broader.length) {
+      throw new Error(`Refusing to share: broader MeshGuard allows would admit unpaired peers to TCP ${port}. ${broader.map(item => item.detail).join(' ')}`);
+    }
+    const owned = appendOwnedAllow(configDir, peerStem, port);
+    const share = createShareRecord({
+      roomId, port, peerKey, meshIp, minutes: values['--minutes'] === undefined ? undefined : Number(values['--minutes']),
+      ownedRules: [owned],
+    });
+    writeShareRecord(options.dataDir, share);
+    return {
+      state: 'share-pending-enable', share, meshguardConfig: configDir, peerPolicy: owned.path,
+      note: 'Peer allow written with an ownership marker. Restart MeshGuard to load the policy before the mesh URL is reachable. Prefer vite preview / a static build bound to the mesh IP only.',
+    };
+  }
   if (agentCommands.includes(command)) {
     const credential = readCredential(resolve(requireText(values['--credential'], '--credential', 4096)));
     const runtime = await probeRuntime(credential.dataDir);
