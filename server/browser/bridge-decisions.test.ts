@@ -31,3 +31,23 @@ test('a forged decision cannot carry a genuine vote in with it', async () => {
   expect(await admitDecisionPackets([real], [{ body: vote, signature: 'bad' }], roomId, genuine)).toEqual([]);
   expect((await admitDecisionPackets([real], [{ body: vote, signature: 'ok' }, { body: vote, signature: 'ok' }], roomId, genuine)).length).toBe(1);
 });
+
+test('retrying a request whose vote compaction dropped reports it superseded and never overwrites the current vote', async () => {
+  const { mkdtempSync, writeFileSync, readdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
+  const { BrowserAgent, compactDecisionLog, decisionBrowser } = await import('../browser-agent');
+  const { castVote } = await import('../../src/browser/decisions');
+  const roomId = crypto.randomUUID(), me = crypto.randomUUID(), igor = crypto.randomUUID(), deviceId = 'c'.repeat(64);
+  const agent = new BrowserAgent(mkdtempSync(join(tmpdir(), 'mr-compacted-')), 'http://127.0.0.1:1', roomId);
+  writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: me, ownerId: igor, members: [{ id: me, name: 'Vesper', role: 'agent', operatorId: igor }, { id: igor, name: 'Igor' }], devices: [] }));
+  const open = openDecision({ roomId, deviceId, memberId: igor, question: 'Q', options: ['A', 'B'], askAgents: true });
+  const d = foldDecisions([open], { ownerId: igor, members: [{ id: me, role: 'agent' }, { id: igor }] })[0];
+  const first = castVote({ roomId, deviceId, memberId: me }, d, 'o1', '', 1), second = castVote({ roomId, deviceId, memberId: me }, d, 'o2', '', 2);
+  const log = [open, first, second].map((body, i) => ({ body, signature: 's', seq: i + 1 }));
+  writeFileSync(join(agent.dir, 'decisions.json'), JSON.stringify(compactDecisionLog(agent, log, me)));
+  expect(agent.decisionOps().map(p => p.body.id)).toEqual([open.id, second.id]);
+  const retry = await decisionBrowser(agent, { id: first.id, decisionId: open.decisionId, action: 'vote', optionId: 'o1', comment: '' }, 1);
+  expect(retry.status).toBe('superseded');
+  expect(readdirSync(join(agent.dir, 'outbox'))).toEqual([]); // nothing queued to be signed again
+  expect(agent.decisions()[0].votes.find(v => v.memberId === me)?.optionId).toBe('o2');
+});
