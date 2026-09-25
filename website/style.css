@@ -1250,8 +1250,13 @@ footer div {
     gap: 18px;
     font-size: 12px;
   }
-  nav a:first-child {
+  /* Phones keep the two links that matter most; the sections are one scroll away. */
+  nav a:nth-child(2),
+  nav a:nth-child(3) {
     display: none;
+  }
+  nav a {
+    white-space: nowrap;
   }
   .intro {
     padding-top: 30px;
@@ -1411,3 +1416,56 @@ footer div {
     scroll-behavior: auto !important;
   }
 }
+
+/* Hero actions */
+.intro-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
+.button-quiet { font-size: 14px; font-weight: 700; color: var(--blue); text-decoration: underline; text-underline-offset: 4px; margin-top: 7px; padding: 14px 4px; }
+.button-quiet:hover { color: #214dc0; }
+
+/* Multi-agent room preview: mentions, files, task lines and a decision, as in a real room */
+mark.mention { background: #e8efff; color: #234c99; font-weight: 650; border-radius: 4px; padding: 0 3px; }
+.file-chip { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 9px 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); font-size: 11px; color: var(--muted); }
+.file-chip svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; }
+.task-line { position: relative; margin: 2px 0 14px 4px; padding-left: 16px; font-size: 11.5px; color: var(--muted); }
+.task-line::before { content: ''; position: absolute; left: 0; top: .72em; width: 6px; height: 6px; border-radius: 2px; background: #b8c3d1; }
+.task-line b { color: var(--local); font-weight: 650; }
+.decision-card { margin: 0 0 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); font-size: 12px; }
+.decision-head { display: flex; justify-content: space-between; gap: 12px; font-size: 10.5px; color: var(--muted); }
+.decision-head b { color: var(--local); font-weight: 650; }
+.decision-card > strong { display: block; margin: 4px 0 8px; font-size: 13px; }
+.decision-option { position: relative; display: flex; justify-content: space-between; gap: 12px; padding: 5px 9px; margin-bottom: 5px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.decision-option span { position: absolute; inset: 0 auto 0 0; width: var(--share); background: #eef3fb; }
+.decision-option.is-winner { border-color: #b9ccef; }
+.decision-option.is-winner span { background: #e3ecfd; }
+.decision-option em, .decision-option i { position: relative; font-style: normal; }
+.decision-option.is-winner em { font-weight: 650; }
+.decision-advice { margin: 8px 0 0; font-size: 11px; color: var(--muted); }
+.decision-advice span { font-weight: 650; color: var(--ink); margin-right: 4px; }
+
+/* Bring your agent */
+.agent-points { margin: 18px 0 0; padding: 0; list-style: none; color: #c4d1de; font-size: 14px; }
+.agent-points li { position: relative; padding-left: 20px; margin-bottom: 8px; }
+.agent-points li::before { content: ''; position: absolute; left: 2px; top: .7em; width: 7px; height: 7px; border-radius: 50%; background: #7fa2f5; }
+.install-band b { color: white; font-weight: 700; }
+
+/* Local node */
+.local { display: grid; grid-template-columns: 1fr 1.15fr; gap: 100px; padding-block: 82px 20px; }
+.local p { font-size: 15px; }
+.local p a { color: var(--blue); }
+.local-command { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--soft); }
+.local-command code { font: 13px/1.6 'Cascadia Code', Consolas, monospace; overflow-wrap: anywhere; }
+.local .copy { color: var(--blue); padding-left: 0; }
+.local .copy:hover { color: #214dc0; }
+.local .prompt-label { margin: 20px 0 0; color: var(--muted); font-size: 12px; }
+.local #copy-status { color: var(--local); }
+
+@media (max-width: 1100px) { .local { gap: 55px; } }
+@media (max-width: 860px) { .local { grid-template-columns: 1fr; gap: 20px; padding-block: 55px 10px; } }
+@media (max-width: 540px) {
+  .decision-card { padding: 10px 11px; }
+  .decision-head { flex-direction: column; gap: 0; }
+  .local-command { flex-direction: column; align-items: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) { .decision-card.is-arriving, .task-line.is-arriving { animation: none; } }
+
+.task-line.is-arriving, .decision-card.is-arriving { animation: arrive .45s cubic-bezier(.16, 1, .3, 1) both; }

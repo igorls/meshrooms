@@ -1,7 +1,7 @@
 /**
  * Meshrooms landing page
  * - Room preview that plays like a live conversation and tours the rooms until touched
- * - Principle beacons, section reveals, copy button and install preview
+ * - Principle beacons, section reveals, copy button and an agent joining a room
  */
 
 (() => {
@@ -28,72 +28,38 @@
   const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const pause = (ms) => new Promise(r => setTimeout(r, prefersReducedMotion ? 0 : ms));
 
+  // Scenes of one browser room: people lead, agents answer when addressed, tasks and decisions happen in the conversation.
+  const MENTION = (name) => `<mark class="mention">@${name}</mark>`;
   const ROOM_DATA = {
-    'release-notes': {
-      title: 'Release notes',
+    'launch': {
+      title: 'Launch checklist',
+      people: '2 people · 2 agents',
       messages: [
-        {
-          type: 'human',
-          label: 'You <small>human</small>',
-          avatar: 'Y',
-          text: 'Here’s the paragraph I’d like to review.',
-          excerpt: {
-            source: 'Shared excerpt · draft.md',
-            code: 'Each room keeps its own members and conversation history.'
-          }
-        },
-        {
-          type: 'agent',
-          label: 'Your agent <small>agent</small>',
-          text: 'I’ll review this excerpt using my local tools and share the result here.',
-          badge: 'Saved locally'
-        }
+        { type: 'human', name: 'Igor', role: 'host', avatar: 'I', text: `${MENTION('Vesper')} can you check the header spacing on mobile before we ship?` },
+        { type: 'agent', name: 'Vesper', meta: 'Claude Code · for Igor', text: 'Found it: the gutter collapses under 400px. Fixed in my checkout and pushed for review.', badge: 'Stored on 4 devices' },
+        { type: 'task', text: 'Vesper moved “Fix mobile header” to <b>done</b>' }
       ],
-      composer: 'Share what matters to this room.'
+      composer: 'Message the room · type @ to ask an agent'
     },
-    'api-review': {
-      title: 'API review',
+    'review': {
+      title: 'Bug review',
+      people: '2 people · 2 agents',
       messages: [
-        {
-          type: 'human',
-          label: 'You <small>human</small>',
-          avatar: 'Y',
-          text: 'Can you check this handler before we pair?',
-          excerpt: {
-            source: 'Shared excerpt · handlers.ts',
-            code: 'if (credential.roomId !== roomId) return forbidden();'
-          }
-        },
-        {
-          type: 'agent',
-          label: 'Your agent <small>agent</small>',
-          text: 'Looks right. I ran the tests in my own checkout; only this reply is shared.',
-          badge: 'Saved locally'
-        }
+        { type: 'human', name: 'Dana', role: 'member', avatar: 'D', text: `${MENTION('agents')} the checkout button overlaps on tablets. Can you look?`, file: 'checkout-tablet.png' },
+        { type: 'agent', name: 'Nova', meta: 'Codex · on Linux · for Dana', text: 'Reproduced at 820px. The sticky footer ignores the safe area; patch attached to the task.', badge: 'Stored on 4 devices' },
+        { type: 'agent', name: 'Vesper', meta: 'Claude Code · for Igor', text: 'Reviewed Nova’s patch in my checkout. Tests pass on my side too.', badge: 'Stored on 4 devices' }
       ],
-      composer: 'Share a snippet with your agent.'
+      composer: 'Paste a screenshot or type @ to ask an agent'
     },
-    'reading-room': {
-      title: 'Reading room',
+    'decision': {
+      title: 'Storage decision',
+      people: '2 people · 2 agents',
       messages: [
-        {
-          type: 'human',
-          label: 'You <small>human</small>',
-          avatar: 'Y',
-          text: 'Summarize this section for the team.',
-          excerpt: {
-            source: 'Shared excerpt · notes.md',
-            code: 'Rooms may share some, all, or none of their participants.'
-          }
-        },
-        {
-          type: 'agent',
-          label: 'Your agent <small>agent</small>',
-          text: 'Membership stays per room, so the same people can meet in several rooms.',
-          badge: 'Saved locally'
-        }
+        { type: 'decision', question: 'Which storage for browser history?', by: 'Vesper', options: [{ label: 'WormDB in the browser', votes: 2, winner: true }, { label: 'Browser storage only', votes: 0 }],
+          advice: 'Nova · WormDB — we will want replication later', state: 'Decided: WormDB in the browser' },
+        { type: 'agent', name: 'Vesper', meta: 'Claude Code · for Igor', text: 'The room decided on WormDB. I’ve added the tasks to the board.', badge: 'Stored on 4 devices' }
       ],
-      composer: 'Ask your agent about your notes.'
+      composer: 'Decide together · agents advise, people vote'
     }
   };
 
@@ -105,18 +71,27 @@
   const composerPrompt = document.getElementById('composer-prompt');
   const AGENT_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 4-4 6 4 6m8-12 4 6-4 6M11 3 9 17"/></svg>';
 
+  const agentName = (m) => `${m.name} <small>agent · ${m.meta}</small>`;
   function messageHTML(m) {
+    if (m.type === 'task') return `<div class="task-line">${m.text}</div>`;
+    if (m.type === 'decision') {
+      const most = Math.max(1, ...m.options.map(o => o.votes));
+      return `
+        <div class="decision-card">
+          <div class="decision-head"><span>Decision · asked by ${m.by}</span><b>${m.state}</b></div>
+          <strong>${m.question}</strong>
+          ${m.options.map(o => `<div class="decision-option${o.winner ? ' is-winner' : ''}"><span style="--share:${(o.votes / most) * 100}%"></span><em>${o.label}</em><i>${o.votes}</i></div>`).join('')}
+          <p class="decision-advice"><span>Agents recommend</span> ${m.advice}</p>
+        </div>`;
+    }
     if (m.type === 'human') {
       return `
         <div class="message">
           <span class="avatar human">${m.avatar}</span>
           <div>
-            <strong>${m.label}</strong>
+            <strong>${m.name} <small>${m.role}</small></strong>
             <p>${m.text}</p>
-            <div class="excerpt">
-              <span>${m.excerpt.source}</span>
-              <p>${m.excerpt.code}</p>
-            </div>
+            ${m.file ? `<span class="file-chip"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="m4 16 5-5 4 4 3-3 4 4"/></svg>${m.file}</span>` : ''}
           </div>
         </div>`;
     }
@@ -124,7 +99,7 @@
       <div class="message">
         <span class="avatar agent">${AGENT_ICON}</span>
         <div>
-          <strong>${m.label}</strong>
+          <strong>${agentName(m)}</strong>
           <p>${m.text}</p>
           <span class="saved">${m.badge}</span>
         </div>
@@ -144,7 +119,7 @@
     const token = ++renderToken;
 
     if (headingPane) {
-      headingPane.innerHTML = `<strong>${data.title}</strong><span><i class="live-dot" aria-hidden="true"></i>On your machine</span>`;
+      headingPane.innerHTML = `<strong>${data.title}</strong><span><i class="live-dot" aria-hidden="true"></i>${data.people}</span>`;
     }
     if (composerPrompt) composerPrompt.textContent = data.composer;
     convPane.replaceChildren();
@@ -159,7 +134,7 @@
         const typing = fragment(`
           <div class="message typing" aria-hidden="true">
             <span class="avatar agent">${AGENT_ICON}</span>
-            <div><strong>Your agent <small>agent</small></strong><p class="dots"><i></i><i></i><i></i></p></div>
+            <div><strong>${agentName(m)}</strong><p class="dots"><i></i><i></i><i></i></p></div>
           </div>`);
         convPane.append(typing);
         await pause(1100);
@@ -217,8 +192,10 @@
     roomExampleEl?.style.setProperty('--cycle', `${CYCLE_MS}ms`);
     roomExampleEl?.classList.add('is-cycling');
     cycleTimer = setTimeout(() => {
-      const next = ROOM_ORDER[(ROOM_ORDER.indexOf(currentRoom()) + 1) % ROOM_ORDER.length];
-      selectRoom(next);
+      const index = ROOM_ORDER.indexOf(currentRoom());
+      // One tour, then rest on the first room: a loop that never ends gets old.
+      if (index === ROOM_ORDER.length - 1) { stopCycle(); selectRoom(ROOM_ORDER[0], { animate: false }); return; }
+      selectRoom(ROOM_ORDER[index + 1]);
       scheduleCycle();
     }, CYCLE_MS);
   }
@@ -321,12 +298,14 @@
   const codeEl = document.getElementById('install-command');
   const termStatus = document.getElementById('terminal-status');
 
+  // What an agent sees when it follows a connect link: joining, then waiting until someone addresses it.
+  const CONNECT_CMD = "bun meshrooms-agent.js connect '<your one-time link>'";
   const SIMULATION_STEPS = [
-    { text: '$ npx skills add igorls/meshrooms --skill meshrooms', delay: 420 },
-    { text: '· Fetching the meshrooms skill from igorls/meshrooms', delay: 520 },
-    { text: '· Adding it to your coding harness', delay: 480 },
-    { text: '✓ Skill installed.\n', delay: 360 },
-    { text: 'Next, tell your agent:\n"Use Meshrooms to start a room for this project with me."', delay: 0 }
+    { text: "$ bun meshrooms-agent.js connect '<link>' --harness 'Claude Code'", delay: 700 },
+    { text: '✓ Joined “Launch checklist” as Vesper, operated by Igor', delay: 600 },
+    { text: '$ bun meshrooms-agent.js listen --room launch-checklist', delay: 900 },
+    { text: '· idle, waiting to be addressed', delay: 1300 },
+    { text: '→ Igor: “@Vesper can you check the header spacing on mobile?”', delay: 0 }
   ];
 
   let simRunning = false;
@@ -337,12 +316,12 @@
 
     if (simCompleted) {
       // Reset
-      if (codeEl) codeEl.textContent = RAW_INSTALL_CMD;
+      if (codeEl) codeEl.textContent = CONNECT_CMD;
       if (termStatus) {
         termStatus.textContent = 'ready';
         termStatus.classList.remove('is-running');
       }
-      if (simBtn) simBtn.textContent = 'Simulate install';
+      if (simBtn) simBtn.textContent = 'Watch it join';
       simCompleted = false;
       return;
     }
@@ -350,10 +329,10 @@
     simRunning = true;
     if (simBtn) {
       simBtn.disabled = true;
-      simBtn.textContent = 'Running...';
+      simBtn.textContent = 'Joining…';
     }
     if (termStatus) {
-      termStatus.textContent = 'simulating';
+      termStatus.textContent = 'joining';
       termStatus.classList.add('is-running');
     }
     if (codeEl) codeEl.textContent = '';
@@ -372,10 +351,10 @@
     simCompleted = true;
     if (simBtn) {
       simBtn.disabled = false;
-      simBtn.textContent = 'Reset preview';
+      simBtn.textContent = 'Reset';
     }
     if (termStatus) {
-      termStatus.textContent = 'completed';
+      termStatus.textContent = 'addressed';
       termStatus.classList.remove('is-running');
     }
   }
