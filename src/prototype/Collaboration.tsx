@@ -379,17 +379,27 @@ export function imageViews(image: { width: number; height: number }, stage: { wi
 }
 
 function ImageViewer({ url, image, author, onClose }: { url: string; image: Attachment; author: string; onClose: () => void }) {
-  const stage = useRef<HTMLDivElement>(null);
-  const [views, setViews] = useState<{ start: ImageView; other?: ImageView }>({ start: 'fit' });
+  const stage = useRef<HTMLDivElement>(null), chosen = useRef<{ start: ImageView; other?: ImageView }>({ start: 'fit' });
+  const [natural, setNatural] = useState<{ width: number; height: number }>();
+  const [views, setViews] = useState(chosen.current);
   const [view, setView] = useState<ImageView>('fit');
   const other = views.other, next = view === views.start ? other : views.start;
   const toggle = other && next ? () => { setView(next); stage.current?.scrollTo(0, 0); } : undefined;
-  function measure(img: HTMLImageElement) {
+  // Choose again when the viewer changes size (a resized window, a rotated phone). Measuring the box with its scrollbar
+  // means a scrollbar appearing in one view can't flip the choice back and forth.
+  useEffect(() => {
     const box = stage.current;
-    if (!box || !img.naturalWidth || !img.naturalHeight) return;
-    const found = imageViews({ width: img.naturalWidth, height: img.naturalHeight }, { width: box.clientWidth, height: box.clientHeight });
-    setViews(found); setView(found.start);
-  }
+    if (!box || !natural) return;
+    const choose = () => {
+      const found = imageViews(natural, { width: box.offsetWidth, height: box.offsetHeight });
+      if (found.start === chosen.current.start && found.other === chosen.current.other) return;
+      chosen.current = found; setViews(found); setView(found.start);
+    };
+    choose();
+    const sizes = new ResizeObserver(choose);
+    sizes.observe(box);
+    return () => sizes.disconnect();
+  }, [natural]);
   const label = next === 'fit' ? 'Fit to screen' : next === 'width' ? 'Fit width' : 'Actual size';
   return <dialog className="image-viewer" aria-label={image.name} ref={element => { if (element && !element.open) element.showModal(); }}
     onClose={onClose} onClick={event => { if (event.target === event.currentTarget) onClose(); }}>
@@ -398,7 +408,7 @@ function ImageViewer({ url, image, author, onClose }: { url: string; image: Atta
       <a className="secondary" href={url} download={image.name}>Download</a>
       <button className="icon-button" aria-label="Close image" onClick={onClose} autoFocus><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6" /></svg></button></div>
     <div className="viewer-stage" ref={stage} tabIndex={0} aria-label={`${image.name}, scrollable`} onClick={event => { if (event.target === event.currentTarget) onClose(); }}>
-      <img src={url} alt={image.name} className={`view-${view}${toggle ? ` zoom-${VIEW_SIZES.indexOf(next!) > VIEW_SIZES.indexOf(view) ? 'in' : 'out'}` : ''}`} onLoad={event => measure(event.currentTarget)} onClick={toggle} />
+      <img src={url} alt={image.name} className={`view-${view}${toggle ? ` zoom-${VIEW_SIZES.indexOf(next!) > VIEW_SIZES.indexOf(view) ? 'in' : 'out'}` : ''}`} onLoad={event => { const img = event.currentTarget; if (img.naturalWidth && img.naturalHeight) setNatural({ width: img.naturalWidth, height: img.naturalHeight }); }} onClick={toggle} />
     </div>
   </dialog>;
 }
