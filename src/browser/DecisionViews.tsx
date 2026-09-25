@@ -45,6 +45,7 @@ type CardProps = {
 export function DecisionCard({ decision, viewerId, ownerId, members, participants, now, highlight, avatar, nameOf, onVote, onAddOption, onClose, onWithdraw, onTasks }: CardProps) {
   const [comment, setComment] = useState('');
   const [adding, setAdding] = useState('');
+  const [panel, setPanel] = useState<'none' | 'reason' | 'option'>('none');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const open = decision.state === 'open';
@@ -93,18 +94,30 @@ export function DecisionCard({ decision, viewerId, ownerId, members, participant
       <ul>{people.filter(v => v.comment).map(v => <li key={v.memberId}><strong>{nameOf(v.memberId)}</strong> · {label(v.optionId)} — {v.comment}</li>)}</ul>
     </details>}
     {open && viewerId && <div className="browser-decision-actions">
-      <label className="sr-only" htmlFor={`decision-comment-${decision.key}`}>Reason for your vote</label>
-      <input id={`decision-comment-${decision.key}`} value={comment} maxLength={500} placeholder={mine ? 'Add or change your reason, then vote again' : 'Reason (optional)'} onChange={e => setComment(e.target.value)} />
-      {decision.mode === 'choice' && decision.options.length < MAX_OPTIONS && <form onSubmit={(e: FormEvent) => { e.preventDefault(); if (adding.trim()) act(async () => { await onAddOption(adding); setAdding(''); }); }}>
-        <label className="sr-only" htmlFor={`decision-add-${decision.key}`}>Add an option</label>
-        <input id={`decision-add-${decision.key}`} value={adding} maxLength={120} placeholder="Add an option" onChange={e => setAdding(e.target.value)} />
-        <button type="submit" className="secondary" disabled={busy || !adding.trim()}>Add</button>
-      </form>}
-      {steward && <span className="browser-decision-steward">
-        <button type="button" className="secondary" disabled={busy} onClick={() => act(onClose)}>Close now</button>
-        <button type="button" className="browser-remove" disabled={busy} onClick={() => act(onWithdraw)}>Withdraw</button>
+      <span className="browser-decision-links">
+        <button type="button" className="browser-link-button" aria-expanded={panel === 'reason'} onClick={() => setPanel(panel === 'reason' ? 'none' : 'reason')}>{mine?.comment ? 'Change your reason' : 'Add a reason'}</button>
+        {decision.mode === 'choice' && decision.options.length < MAX_OPTIONS
+          && <button type="button" className="browser-link-button" aria-expanded={panel === 'option'} onClick={() => setPanel(panel === 'option' ? 'none' : 'option')}>Add option</button>}
+      </span>
+      {steward && <span className="browser-decision-links">
+        <button type="button" className="browser-link-button" disabled={busy} onClick={() => act(onClose)}>Close now</button>
+        <button type="button" className="browser-link-button browser-danger" disabled={busy} onClick={() => act(onWithdraw)}>Withdraw</button>
       </span>}
     </div>}
+    {open && viewerId && panel === 'reason' && <form className="browser-decision-inline" onSubmit={(e: FormEvent) => {
+      e.preventDefault(); const choice = mine?.optionId; if (choice) act(async () => { await onVote(choice, comment); setPanel('none'); });
+    }}>
+      <label className="sr-only" htmlFor={`decision-comment-${decision.key}`}>Reason for your vote</label>
+      <input id={`decision-comment-${decision.key}`} autoFocus value={comment} maxLength={500} placeholder={mine?.optionId ? 'Why you chose it' : 'Saved with your vote when you choose'} onChange={e => setComment(e.target.value)} />
+      {mine?.optionId && <button type="submit" className="secondary" disabled={busy}>Save</button>}
+    </form>}
+    {open && viewerId && panel === 'option' && <form className="browser-decision-inline" onSubmit={(e: FormEvent) => {
+      e.preventDefault(); if (adding.trim()) act(async () => { await onAddOption(adding); setAdding(''); setPanel('none'); });
+    }}>
+      <label className="sr-only" htmlFor={`decision-add-${decision.key}`}>Add an option</label>
+      <input id={`decision-add-${decision.key}`} autoFocus value={adding} maxLength={120} placeholder="New option" onChange={e => setAdding(e.target.value)} />
+      <button type="submit" className="secondary" disabled={busy || !adding.trim()}>Add</button>
+    </form>}
     {decision.state === 'closed' && !decision.verified && <p className="browser-decision-note">Checking the result against the counted votes as they arrive…</p>}
     {decision.state === 'closed' && decision.uncounted > 0 && <p className="browser-decision-note">{decision.uncounted} {decision.uncounted === 1 ? 'vote' : 'votes'} from people arrived after it closed and {decision.uncounted === 1 ? 'isn’t' : 'aren’t'} counted.</p>}
     {!open && decision.state === 'closed' && decision.verified && decision.tally.result === 'decided' && onTasks && <div className="browser-decision-actions"><button type="button" className="secondary" onClick={onTasks}>Turn into a task</button></div>}
@@ -134,28 +147,35 @@ export function DecisionForm({ agents, onSubmit, onCancel }: { agents: number; o
       .catch(err => { setError(err instanceof Error ? err.message : String(err)); setBusy(false); });
   }
   return <form className="browser-decision-form" onSubmit={submit} aria-label="New decision">
-    <div className="browser-decision-modes" role="radiogroup" aria-label="Kind of decision">
-      <label><input type="radio" name="decision-mode" checked={mode === 'choice'} onChange={() => setMode('choice')} />Choose between options</label>
-      <label><input type="radio" name="decision-mode" checked={mode === 'plan-review'} onChange={() => setMode('plan-review')} />Review a plan</label>
+    <div className="browser-decision-form-top">
+      <div className="browser-segmented" role="radiogroup" aria-label="Kind of decision">
+        <label><input type="radio" name="decision-mode" checked={mode === 'choice'} onChange={() => setMode('choice')} /><span>Options</span></label>
+        <label><input type="radio" name="decision-mode" checked={mode === 'plan-review'} onChange={() => setMode('plan-review')} /><span>Plan review</span></label>
+      </div>
+      <span className="browser-decision-note">People decide by majority; a tie is a draw. Agents only advise.</span>
     </div>
-    <label>Question<input value={question} maxLength={200} required placeholder={mode === 'plan-review' ? 'Approve the plan for …?' : 'Which approach should we take?'} onChange={e => setQuestion(e.target.value)} /></label>
-    <label>{mode === 'plan-review' ? 'Plan' : 'Context'} <span>(optional, Markdown)</span><textarea value={context} maxLength={4000} rows={mode === 'plan-review' ? 6 : 3} onChange={e => setContext(e.target.value)} /></label>
-    {mode === 'choice' ? <fieldset><legend>Options</legend>
+    <label className="sr-only" htmlFor="decision-question">Question</label>
+    <input id="decision-question" className="browser-decision-question" value={question} maxLength={200} required autoFocus
+      placeholder={mode === 'plan-review' ? 'Approve the plan for …?' : 'What should the room decide?'} onChange={e => setQuestion(e.target.value)} />
+    {mode === 'choice' ? <div className="browser-decision-option-grid" role="group" aria-label="Options">
       {options.map((option, i) => <span key={i} className="browser-decision-option-input">
         <input value={option} maxLength={120} aria-label={`Option ${i + 1}`} placeholder={`Option ${i + 1}`} onChange={e => setOptions(options.map((o, j) => j === i ? e.target.value : o))} />
-        {options.length > 2 && <button type="button" className="browser-close" aria-label={`Remove option ${i + 1}`} onClick={() => setOptions(options.filter((_, j) => j !== i))}>×</button>}
+        {options.length > 2 && <button type="button" className="browser-link-button" aria-label={`Remove option ${i + 1}`} onClick={() => setOptions(options.filter((_, j) => j !== i))}>×</button>}
       </span>)}
-      {options.length < MAX_OPTIONS && <button type="button" className="secondary" onClick={() => setOptions([...options, ''])}>Add option</button>}
-    </fieldset> : <p className="browser-decision-note">People answer Approve, Request changes or Reject.</p>}
-    <div className="browser-decision-settings">
-      <label><input type="checkbox" checked={askAgents} disabled={!agents} onChange={e => setAskAgents(e.target.checked)} />Ask agents for advice</label>
+      {options.length < MAX_OPTIONS && <button type="button" className="browser-link-button" aria-label="Add option" onClick={() => setOptions([...options, ''])}>+ Option</button>}
+    </div> : <p className="browser-decision-note">People answer Approve, Request changes or Reject.</p>}
+    <details className="browser-decision-context" open={mode === 'plan-review' || undefined}>
+      <summary>{mode === 'plan-review' ? 'Plan' : 'Add context'} <span>(Markdown)</span></summary>
+      <textarea aria-label={mode === 'plan-review' ? 'Plan' : 'Context'} value={context} maxLength={4000} rows={mode === 'plan-review' ? 5 : 3} onChange={e => setContext(e.target.value)} />
+    </details>
+    {error && <p className="browser-decision-error" role="alert">{error}</p>}
+    <div className="browser-decision-form-bottom">
+      <label><input type="checkbox" checked={askAgents} disabled={!agents} onChange={e => setAskAgents(e.target.checked)} />Ask agents</label>
       <label>Closes <select value={deadline} onChange={e => setDeadline(e.target.value)}>
         <option value="none">when a majority decides</option><option value="15m">in 15 minutes</option><option value="1h">in an hour</option><option value="1d">in a day</option>
       </select></label>
+      <span className="browser-decision-form-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button type="submit" className="primary" disabled={!valid || busy}>Ask the room</button></span>
     </div>
-    <p className="browser-decision-note">People’s votes decide by majority, and a tie is a draw. Agents advise but aren’t counted. Votes are visible to everyone.</p>
-    {error && <p className="browser-decision-error" role="alert">{error}</p>}
-    <div className="browser-decision-form-actions"><button type="button" className="secondary" onClick={onCancel}>Cancel</button><button type="submit" className="primary" disabled={!valid || busy}>Ask the room</button></div>
   </form>;
 }
 

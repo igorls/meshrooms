@@ -626,11 +626,10 @@ export function BrowserRooms() {
               </section>
               <div className="browser-compose-area">
                 {stick.unread > 0 && <button className="secondary browser-unread" onClick={stick.toBottom}>{stick.unread === 1 ? 'New message' : `${stick.unread} new messages`} <span aria-hidden="true">↓</span></button>}
-                {mentions.list}
                 {deciding && <DecisionForm agents={agents.length} onCancel={() => setDeciding(false)}
                   onSubmit={async draft => { await peers.current!.openDecision(draft); setDeciding(false); stick.toBottom(); }} />}
                 {reply && <div className="browser-reply-draft"><span>Replying to <strong>{reply.packet.body.memberId === status.memberId ? 'your message' : nameOf(reply.packet.body.memberId)}</strong></span><button className="browser-close" aria-label="Cancel reply" onClick={() => setReplyId(undefined)}><RoomIcon kind="close" /></button></div>}
-                <form className="browser-composer" onSubmit={send}><label className="sr-only" htmlFor="browser-message">Message {title}</label><textarea ref={composer} id="browser-message" value={text} {...mentions.inputProps}
+                <form className="browser-composer" onSubmit={send}>{mentions.list}<label className="sr-only" htmlFor="browser-message">Message {title}</label><textarea ref={composer} id="browser-message" value={text} {...mentions.inputProps}
                   onChange={e => { setText(e.target.value); mentions.track(e.target.value, e.target.selectionStart); }} onSelect={e => mentions.track(e.currentTarget.value, e.currentTarget.selectionStart)} onBlur={mentions.close}
                   onPaste={e => { const pasted = [...e.clipboardData.files]; if (pasted.length) { e.preventDefault(); addFiles(pasted); } }}
                   onKeyDown={e => { if (mentions.onKeyDown(e)) return; if (e.key === 'Escape' && reply) { setReplyId(undefined); return; } if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); send(e); } }}
