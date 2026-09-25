@@ -661,8 +661,11 @@ export async function listenRemembering(agent: BrowserAgent, seconds: number, fl
   // A cursor for a message this folder no longer holds (its messages were reset) starts over rather than failing every listen.
   const known = saved?.after !== undefined && agent.messages().some(m => m.packet.body.id === saved.after);
   const after = flags.after ?? (known ? saved!.after : undefined);
-  const decisionsAfter = flags.decisionsAfter ?? saved?.decisionsAfter;
-  const result = await listenBrowser(agent, after, seconds, flags.boardAfter ?? saved?.boardAfter ?? 0, decisionsAfter ?? 0, decisionsAfter ?? agent.decisionCursor());
+  // Saved cursors ahead of what this folder holds (its tasks or decisions were reset) are stale: start those from 0.
+  const board = saved?.boardAfter !== undefined && saved.boardAfter <= agent.boardCursor() ? saved.boardAfter : undefined;
+  const decided = saved?.decisionsAfter !== undefined && saved.decisionsAfter <= agent.decisionCursor() ? saved.decisionsAfter : undefined;
+  const decisionsAfter = flags.decisionsAfter ?? decided;
+  const result = await listenBrowser(agent, after, seconds, flags.boardAfter ?? board ?? 0, decisionsAfter ?? 0, decisionsAfter ?? agent.decisionCursor());
   agent.saveListenCursor({ ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor });
   const resumed = !!saved && (flags.after === undefined || flags.boardAfter === undefined || flags.decisionsAfter === undefined);
   return resumed ? { ...result, resumed } : result;

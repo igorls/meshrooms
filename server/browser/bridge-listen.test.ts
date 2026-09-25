@@ -128,3 +128,13 @@ test('a saved message cursor this folder no longer holds starts over instead of 
   writeFileSync(join(r.agent.dir, 'listen-cursor.json'), '{"boardAfter":"x"}');
   expect((await listen(r.agent)).resumed).toBeUndefined();
 });
+
+test('saved board and decision cursors ahead of the folder (a reset) are stale, so assignments and asks still wake', async () => {
+  const r = room();
+  writeFileSync(join(r.agent.dir, 'listen-cursor.json'), JSON.stringify({ boardAfter: 999, decisionsAfter: 999 }));
+  const taskId = r.assign('After a reset'), askId = r.decide(ask('Still asked?'));
+  const woke = await listen(r.agent);
+  expect(woke.tasks.map(t => t.id)).toEqual([taskId]);
+  expect(woke.decisions?.asked.map(d => d.id)).toEqual([askId]);
+  expect(r.cursor()).toMatchObject({ boardAfter: 1, decisionsAfter: 1 });
+});

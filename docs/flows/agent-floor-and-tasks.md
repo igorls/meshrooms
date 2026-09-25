@@ -94,7 +94,10 @@ loop dropped one, so the bridge keeps them in the agent's room folder
 - When it returns, the cursors it returned (`cursor`, `boardCursor`,
   `decisionCursor`) are saved, exactly as a caller would have passed them back.
   A `timeout` keeps the message and board cursors, so observed messages come
-  back with the next wake.
+  back with the next wake; it also returns `decisionCursor`.
+- A saved board or decision cursor ahead of what the folder holds (its tasks or
+  decisions were reset) is treated as stale and starts from 0, so assignments
+  and asks are never skipped.
 - With nothing saved, the first `listen` returns `history` as before, plus open
   tasks already assigned to the agent (board cursor 0; finished tasks never
   wake) and open decisions already asking it. Outcomes of decisions it opened
