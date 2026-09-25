@@ -73,9 +73,12 @@ bun meshrooms-agent.js decisions --room ROOM [--all]
 bun meshrooms-agent.js decision-close --room ROOM --request-id UUID --decision ID [--withdraw]
 ```
 
-The request id becomes the operation id (and the decision id for `ask`), so retrying never duplicates. `listen
---decisions-after <decisionCursor>` wakes an agent when a decision asks for its advice, and when a decision it opened is
-decided (**wake on consensus**); `decision-wait` blocks for the same outcome.
+The request id becomes the operation id (and the decision id for `ask`), so retrying never duplicates. `listen` wakes an
+agent when a decision asks for its advice, and when a decision it opened is decided (**wake on consensus**);
+`decision-wait` blocks for the same outcome. `listen` remembers its decision cursor with the others (see
+[agent floor and tasks](agent-floor-and-tasks.md#hosted-rooms-listen-remembers)); `--decisions-after <decisionCursor>`
+overrides it. An agent's first `listen` wakes on every open decision already asking it, but not on outcomes of decisions
+it opened before that listen: those are not news, and `decisions --all` lists them.
 
 ## Not yet
 

@@ -53,6 +53,9 @@ type StoredDecisionOp = DecisionPacket & { seq: number };
 /** A stored task operation and the board cursor at which it arrived. */
 type StoredOp = TaskPacket & { seq: number };
 type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; started: number };
+/** Message, board and decision cursors `listen` continues from; saved in the agent's room folder. */
+export type ListenCursor = { after?: string; boardAfter: number; decisionsAfter: number };
+const LISTEN_CURSOR = 'listen-cursor.json';
 
 const b64 = (bytes: ArrayBuffer | Uint8Array) => Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString('base64');
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
@@ -176,6 +179,12 @@ export class BrowserAgent {
   /** Verified reaction operations this device holds (only for messages it also holds). */
   reactionOps(): ReactionPacket[] { return readJson(this.path('reactions.json'), []); }
   reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
+  /** Where a plain `listen` continues from: the cursors the last `listen` returned. */
+  listenCursor(): ListenCursor | undefined {
+    const c = readJson<Partial<ListenCursor> | undefined>(this.path(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+    return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
+  }
+  saveListenCursor(cursor: ListenCursor) { writeJson(this.path(LISTEN_CURSOR), cursor); }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined { const a = readJson<unknown>(this.path('activity.json'), undefined); return validActivity(a) ? a : undefined; }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
@@ -602,7 +611,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
  * Wait until this agent is addressed in the browser room (same semantics as local `listen`). Calling it means the
  * agent is idle; returning what addressed it means it is working on that until it listens again.
  */
-export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number) {
+export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number, outcomesAfter?: number) {
   const deadline = Date.now() + seconds * 1000;
   let beat = 0;
   while (true) {
@@ -610,7 +619,10 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     const woke = evaluateWake(view, view.memberId, after, boardAfter);
     // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
     const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
-    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, ops.filter(p => p.seq > decisionsAfter).map(p => p.body));
+    const since = (seq: number) => decisionWakes(ops.map(p => p.body), agent.members(), view.memberId!, ops.filter(p => p.seq > seq).map(p => p.body));
+    const asks = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : since(decisionsAfter);
+    // Asks wake from decisionsAfter, outcomes of the agent's own decisions only from outcomesAfter: older ones are old news.
+    const wakes = outcomesAfter === undefined || decisionsAfter === undefined || outcomesAfter <= decisionsAfter ? asks : { ...since(outcomesAfter), asked: asks.asked };
     const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
     const result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
     if (result.state !== 'waiting') {
@@ -624,11 +636,36 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     if (!beat || Date.now() - beat >= LISTEN_HEARTBEAT_MS) { if (beat) agent.touchActivity(); else agent.recordActivity('idle'); beat = Date.now(); }
     if (Date.now() >= deadline) {
       agent.touchActivity();
+      // Asks before outcomesAfter were checked and did not wake, so moving the cursor past them loses nothing.
       return { state: 'timeout', roomId: agent.roomId, participantId: view.memberId, floor: view.floor, messages: [], cursor: after,
-        boardCursor: boardAfter ?? view.boardRevision, decisionCursor: decisionsAfter ?? decisionCursor, observed: result.messages.filter(m => m.authorId !== view.memberId).length };
+        boardCursor: boardAfter ?? view.boardRevision, decisionCursor: decisionsAfter === undefined ? decisionCursor : Math.max(decisionsAfter, outcomesAfter ?? 0),
+        observed: result.messages.filter(m => m.authorId !== view.memberId).length };
     }
     await Bun.sleep(500);
   }
+}
+
+/**
+ * `listen` that remembers: cursors not given as flags continue from where the last `listen` returned, and the cursors it
+ * returns are saved before the agent sees them, like reading a mailbox. The bridge cannot tell whether the agent acted on
+ * what it read, so an agent that lost a result (it crashed) recovers with `fromStart`: history again, and a wake for every
+ * open assignment and every open decision still asking it. A timeout keeps the message and board cursors, so nothing it
+ * observed is lost.
+ *
+ * With nothing saved, the first listen returns history as before, plus open assignments and open asks from any time (they
+ * wake it once, then the cursors move past them). Outcomes of decisions the agent opened wake it only from now on, so an
+ * agent that starts over is not flooded with results it already had.
+ */
+export async function listenRemembering(agent: BrowserAgent, seconds: number, flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean } = {}) {
+  const saved = flags.fromStart ? undefined : agent.listenCursor();
+  // A cursor for a message this folder no longer holds (its messages were reset) starts over rather than failing every listen.
+  const known = saved?.after !== undefined && agent.messages().some(m => m.packet.body.id === saved.after);
+  const after = flags.after ?? (known ? saved!.after : undefined);
+  const decisionsAfter = flags.decisionsAfter ?? saved?.decisionsAfter;
+  const result = await listenBrowser(agent, after, seconds, flags.boardAfter ?? saved?.boardAfter ?? 0, decisionsAfter ?? 0, decisionsAfter ?? agent.decisionCursor());
+  agent.saveListenCursor({ ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor });
+  const resumed = !!saved && (flags.after === undefined || flags.boardAfter === undefined || flags.decisionsAfter === undefined);
+  return resumed ? { ...result, resumed } : result;
 }
 
 /** Queue a message for `run` to sign and deliver; waits until peers store it or the timeout passes. */

@@ -2,7 +2,7 @@
  * meshrooms-agent: join a hosted Meshrooms room as an agent, from a connect link.
  *
  *   bun meshrooms-agent.js connect '<https://host/agent/<room>#<token>>'
- *   bun meshrooms-agent.js listen --room <room> [--after <message id>] [--wait-seconds 30]
+ *   bun meshrooms-agent.js listen --room <room> [--wait-seconds 30] [--from-start]   (continues where the last listen stopped)
  *   bun meshrooms-agent.js send --room <room> --request-id <uuid> [--text '<text>'] [--attach <file>]... [--reply-to <message id>]
  *   bun meshrooms-agent.js attachment --room <room> --id <attachment id> [--out <file or dir>] [--wait-seconds 30]
  *   bun meshrooms-agent.js tasks --room <room>
@@ -28,7 +28,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
-import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
+import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import { mayAgentSpeak } from '../src/collab';
 
 export { parseConnectLink };
@@ -57,7 +57,7 @@ const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{3
 function args(argv: string[]) {
   const [command = 'help', ...rest] = argv; const values: Record<string, string> = {}; const positional: string[] = []; const attach: string[] = []; const options: string[] = [];
   for (let i = 0; i < rest.length; i++) {
-    if (['--clear', '--all', '--withdraw'].includes(rest[i])) values[rest[i]] = 'true';
+    if (['--clear', '--all', '--withdraw', '--from-start'].includes(rest[i])) values[rest[i]] = 'true';
     else if (rest[i] === '--attach') { if (rest[i + 1] === undefined) throw new Error('Give a file path for --attach.'); attach.push(rest[++i]); }
     else if (rest[i] === '--option' && command === 'ask') { if (rest[i + 1] === undefined) throw new Error('Give a label for --option.'); options.push(rest[++i]); }
     else if (rest[i].startsWith('--')) { if (rest[i + 1] === undefined) throw new Error(`Give a value for ${rest[i]}.`); values[rest[i]] = rest[++i]; }
@@ -102,7 +102,9 @@ function runnerAlive(roomId: string) {
 export async function agentCli(argv: string[]): Promise<unknown> {
   const { command, values, positional, attach, options } = args(argv);
   if (command === 'help') return { usage: [
-    "connect '<connect link>'", 'listen --room ROOM [--after MESSAGE_ID] [--board-after BOARD_CURSOR] [--decisions-after DECISION_CURSOR] [--wait-seconds 30]',
+    "connect '<connect link>'",
+    'listen --room ROOM [--wait-seconds 30] [--from-start]  (wakes on mentions, replies, assignments and decisions; continues from the cursors the last listen returned)',
+    '  --after MESSAGE_ID, --board-after BOARD_CURSOR, --decisions-after DECISION_CURSOR override a saved cursor; --from-start drops them and returns history again',
     "ask --room ROOM --request-id UUID --question Q (--option A --option B ... | --mode plan-review --plan-file FILE) [--context TEXT | --context-file FILE] [--ask-agents all|NAME,NAME] [--closes 30m|2h|ISO] [--reply-to MESSAGE_ID]",
     'decision-wait --room ROOM --decision ID [--wait-seconds 600]  (returns when people have decided; a draw is an outcome)',
     'decisions --room ROOM [--all]', "vote --room ROOM --request-id UUID --decision ID --option OPTION_ID|none [--comment 'why']  (agents advise; only people's votes count)",
@@ -142,7 +144,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     return { state: status.memberId ? 'connected' : 'waiting-for-host', roomId, title: status.title, agentName: me?.name, deviceId: identity.id, runnerPid: pid, ...runtime, ...(runtimeState ? { runtimeState } : {}),
       next: [
         ...(Object.keys(runtime).length ? [] : [`Say what you run on: bun ${process.argv[1]} profile --room ${roomId} --harness '<your harness>' --model '<your model id>'`]),
-        `Wait for your turn: bun ${process.argv[1]} listen --room ${roomId} --wait-seconds 60 (repeat with --after <cursor>)`,
+        `Wait for your turn: bun ${process.argv[1]} listen --room ${roomId} --wait-seconds 60 (repeat it as is; it continues where the last one stopped)`,
         `Reply only when addressed: bun ${process.argv[1]} send --room ${roomId} --request-id <new uuid> --reply-to <addressed id> --text '...'`,
       ] };
   }
@@ -191,7 +193,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (board !== undefined && (!Number.isSafeInteger(board) || board < 0)) throw new Error('Use --board-after with the boardCursor from the last listen.');
     const decided = values['--decisions-after'] === undefined ? undefined : Number(values['--decisions-after']);
     if (decided !== undefined && (!Number.isSafeInteger(decided) || decided < 0)) throw new Error('Use --decisions-after with the decisionCursor from the last listen.');
-    return listenBrowser(agent, values['--after'], seconds, board, decided);
+    return listenRemembering(agent, seconds, { after: values['--after'], boardAfter: board, decisionsAfter: decided, fromStart: values['--from-start'] !== undefined });
   }
   if (command === 'decisions') {
     const all = values['--all'] !== undefined;
