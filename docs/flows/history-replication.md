@@ -51,8 +51,8 @@ A room setting next to the others: **History for newcomers**, either *Off* (the 
 - On the join screen and in the invite link's page, before someone asks to join.
 - To agents, in `status` and `listen` output, so an agent's operator knows what it will see.
 
-A later option could be *On, last N days*: messages stay `room` but peers serve only those within the window. That's
-not part of the first version.
+There is no *On, last N days* option. Peers can't be made to forget what they hold, so a window would promise more than
+peer-to-peer can keep.
 
 ## Replication
 
@@ -65,16 +65,25 @@ sees it.
    `{ kind: 'history-have', roomId, vector }`. The other side replies with the entries the requester is **allowed**
    and missing, newest first, in `{ kind: 'history', roomId, entries: packet[] }` envelopes under the 20,000-character
    limit (the same chunking as decisions). Rate limits and a per-request cap keep this bounded.
-3. **Who may receive what.** A peer serves an entry only if its `visibility` is `room`, or the requester's device was
-   admitted before the entry's time (`device.admittedAt <= entry.at`, both from the room service's clock and the
-   author's clock; see open questions). A peer serves only verified entries it holds.
+3. **Who may receive what, decided from the room service's view.** A peer looks up the requester's device in the
+   room status it got from the room service (member, role, and the member's `joinedAt`), never from anything the
+   requester claims. It serves an entry only if the entry's `visibility` is `room`, or the requester's **member**
+   joined before this peer received the entry (`member.joinedAt <= entry.receivedAt`). The boundary uses the member's
+   admission, not the device's, so a person's newly linked laptop still gets what they saw on their phone. It uses
+   the serving peer's own receipt time, not the author's clock, so a skewed author clock can't move it. A peer
+   serves only verified entries it holds.
 4. **Verification on arrival.** Every entry is checked exactly as live messages are: valid body, room id, the author
    device (current or former) signature, and the member id matching that device. A relay can't forge or alter an
    entry, because each one is signed by its author, not by the relay.
-5. **Gaps are visible.** A hole in an author's sequence means an entry is missing. It's fetched from another peer if
+5. **Equivocation is detected, not hidden.** A modified client could sign two different messages with the same
+   `(authorDevice, seq)`. Entries are stored by message id, so both are kept, and the sequence number is only used for
+   summaries and gap detection. A device that holds two entries for one `(authorDevice, seq)` marks that author device
+   as equivocating. Its entries are then shown with a warning, its vector stops advancing past the conflict, and
+   peers forward both entries so every device sees the same evidence.
+6. **Gaps are visible.** A hole in an author's sequence means an entry is missing. It's fetched from another peer if
    one has it, and otherwise shown as "some earlier messages aren't available". Withholding can't be hidden as
    deletion.
-6. **Files follow messages.** Attachments named by history entries become fetchable through the existing file
+7. **Files follow messages.** Attachments named by history entries become fetchable through the existing file
    transfer (files are servable when a verified message references them), within the same room storage cap.
 
 Entries without `seq` (sent before this change) can't be summarised by a vector. For those, an id-set exchange in hash
@@ -99,12 +108,14 @@ the same history a person would see. Agents get no special access.
 
 - **Peers can't be forced to forget.** A member who received a message can always copy it elsewhere. The setting
   controls automatic sharing to newcomers, not what members do with what they saw. The UI says so.
-- **Old keys.** Verifying old entries needs the author's device key. The room service keeps retired devices' keys,
-  but only the last 256. Rooms with history on should keep all retired keys (they're small), or entries by long-gone
-  devices can't be verified and are dropped.
-- **Clock skew.** For `members` messages, "admitted before the entry was sent" compares the room service's clock with
-  the author's. A skewed author clock can include or exclude a message near the join time. Messages sent with history
-  off are never served to later joiners by design, so the skew only affects that boundary.
+- **Old keys.** Verifying old entries needs the author's device key. The room service keeps only the last 256 retired
+  devices' keys today. Rooms with history on keep **every** retired key (each is small), so entries by long-gone
+  devices stay verifiable.
+- **Member admission time.** The room service records `joinedAt` for each member (its first admission). Peers read it
+  from room status. Today only devices carry `admittedAt`.
+- **Clock boundary.** The `members` boundary compares the room service's `joinedAt` with the serving peer's
+  `receivedAt`. Two clocks are still involved, but neither is the author's, and a message sent with history off is
+  never served to later members at all.
 - **Removal.** A removed member's messages stay, as today. A removed device stops receiving new history immediately,
   because peers close its channel.
 
@@ -114,20 +125,37 @@ the same history a person would see. Agents get no special access.
   `members`.
 - Older peers verify the signature over the whole body, so the new fields don't break them.
 
-## Open questions
+## Reserved: retractions
 
-1. Should the host setting also offer *On, last N days* in the first version?
-2. For `members` messages, should the boundary use the room service's clock instead (for example, a signed admission
-   timestamp that peers compare against the entry's arrival at the room service)? That removes author-clock skew but
-   needs the room service in the loop.
-3. Should edits and deletions (not supported today) be planned now, as signed tombstones that replicate like entries?
-4. How many retired keys should the room service keep for rooms with history on?
+Edits and deletions aren't built, but the shape is reserved now so the log format won't change later:
+
+```ts
+type RetractBody = { kind: 'retract'; roomId: string; id: string; deviceId: string; memberId: string; at: number;
+  target: string /* message id */; seq: number };
+```
+
+A retraction is valid only when signed by the target message's author device, or a later device of the same member.
+It replicates like any entry and has its own `seq`. Peers that receive it stop showing and serving the target's content
+but keep the tombstone, so the retraction reaches everyone. As with the setting, this can't make anyone forget what
+they already saw, and the UI says so.
+
+## Decided in review
+
+- No *last N days* option in v1 (peers can't be made to forget).
+- The `members` boundary is the member's admission against the serving peer's receipt time.
+- The `retract` tombstone shape is reserved now.
+- Rooms with history on keep every retired device key.
 
 ## Plan
 
-1. Add `visibility` and `seq` to new messages, and the host setting with its disclosures. Nothing is exchanged yet;
-   this ships first so every message from then on carries its consent.
+1. Add `visibility` and `seq` to new messages, `receivedAt` to stored entries, member `joinedAt` and full retired-key
+   retention to the room service, and the host setting with its disclosures. Nothing is exchanged yet; this ships
+   first so every message from then on carries its consent.
 2. The `history-have` / `history` exchange with verification, visibility checks, gap display, and file follow-up, on
-   the current storage. Tests: a newcomer receives only `room` entries; a tampered or reattributed entry is rejected;
-   a withheld entry shows a gap and is fetched from another peer.
+   the current storage. Tests:
+   - a newcomer receives only `room` entries, and a linked device receives its member's earlier `members` entries;
+   - a requester's claims don't change what it's served;
+   - a tampered or reattributed entry is rejected;
+   - two entries with one `(device, seq)` are flagged as equivocation;
+   - a withheld entry shows a gap and is fetched from another peer.
 3. Move storage to WormDB when step 1's core uses the real WAL format.
