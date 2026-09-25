@@ -95,7 +95,11 @@ export function DecisionCard({ decision, viewerId, ownerId, members, participant
     </details>}
     {open && viewerId && <div className="browser-decision-actions">
       <span className="browser-decision-links">
-        <button type="button" className="browser-link-button" aria-expanded={panel === 'reason'} onClick={() => setPanel(panel === 'reason' ? 'none' : 'reason')}>{mine?.comment ? 'Change your reason' : 'Add a reason'}</button>
+        <button type="button" className="browser-link-button" aria-expanded={panel === 'reason'} onClick={() => {
+          // Start from the reason already given, so saving without typing keeps it; a draft already typed stays.
+          if (panel !== 'reason' && !comment && mine?.comment) setComment(mine.comment);
+          setPanel(panel === 'reason' ? 'none' : 'reason');
+        }}>{mine?.comment ? 'Change your reason' : 'Add a reason'}</button>
         {decision.mode === 'choice' && decision.options.length < MAX_OPTIONS
           && <button type="button" className="browser-link-button" aria-expanded={panel === 'option'} onClick={() => setPanel(panel === 'option' ? 'none' : 'option')}>Add option</button>}
       </span>
