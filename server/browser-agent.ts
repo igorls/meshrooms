@@ -297,9 +297,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     if (next.length > COMPACT_DECISIONS_AT) { writeJson(join(agent.dir, 'decisions-cursor.json'), { seq }); next = compactDecisionLog(agent, next, status?.memberId); }
     writeJson(join(agent.dir, 'decisions.json'), next);
   };
+  // A log that filled up before compaction existed (or before this agent upgraded) is compacted before anything is refused.
+  compactStoredDecisions(agent, agent.members().memberId);
   /** Keep decision and vote operations signed by a (current or former) device of their author; duplicates are ignored. */
   const acceptDecisionOps = async (packets: unknown[]) => {
-    const ops = agent.decisionOps();
+    const ops = compactStoredDecisions(agent, status?.memberId);
     const added = await admitDecisionPackets(ops.map(p => p.body), packets, agent.roomId, async (b, signature) => {
       const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
       return !!author && author.memberId === b.memberId && await agent.verify(author.publicKey, b, signature);
@@ -308,7 +310,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const shareDecisionOp = async (body: DecisionBody | VoteBody) => {
     // This device's own changes obey the same per-member share as everyone's, or peers would drop them.
-    const held = agent.decisionOps();
+    const held = compactStoredDecisions(agent, status?.memberId);
     if (held.length >= MAX_DECISION_OPS) throw new Error('This room has reached its limit of decision changes.');
     if (!admissible(held.map(p => p.body), [body]).length) throw new Error('This agent has reached its share of decision changes in this room.');
     const packet = { body, signature: await agent.sign(body) };
@@ -865,12 +867,23 @@ export async function admitDecisionPackets(held: (DecisionBody | VoteBody)[], pa
   return accepted;
 }
 
-const COMPACTED_IDS_KEPT = 1000;
-/** Compact the log and remember which of this agent's own operations were dropped, so their request ids stay spent. */
+/**
+ * Compact the log and remember every one of this agent's own operations that was dropped, so their request ids stay
+ * spent for good (a reused request id never signs twice). The list grows only with this agent's own changes.
+ */
 export function compactDecisionLog(agent: BrowserAgent, ops: StoredDecisionOp[], memberId: string | undefined): StoredDecisionOp[] {
   const next = compactDecisions(ops), kept = new Set(next.map(p => p.body.id));
   const dropped = ops.filter(p => !kept.has(p.body.id) && p.body.memberId === memberId).map(p => p.body.id);
-  if (dropped.length) writeJson(join(agent.dir, 'decisions-done.json'), [...agent.compactedDecisionIds(), ...dropped].slice(-COMPACTED_IDS_KEPT));
+  if (dropped.length) writeJson(join(agent.dir, 'decisions-done.json'), [...new Set([...agent.compactedDecisionIds(), ...dropped])]);
+  return next;
+}
+/** The stored log, compacted first if it grew past the threshold; the arrival cursor is kept. */
+export function compactStoredDecisions(agent: BrowserAgent, memberId: string | undefined): StoredDecisionOp[] {
+  const ops = agent.decisionOps();
+  if (ops.length <= COMPACT_DECISIONS_AT) return ops;
+  writeJson(join(agent.dir, 'decisions-cursor.json'), { seq: agent.decisionCursor(ops) });
+  const next = compactDecisionLog(agent, ops, memberId);
+  writeJson(join(agent.dir, 'decisions.json'), next);
   return next;
 }
 function superseded(agent: BrowserAgent, decisionId: string, me: string | undefined) {
