@@ -203,7 +203,9 @@ export function BrowserRooms() {
   /** Task changes read as quiet lines between messages, placed by time. They are local views, never sent. */
   const timeline = useMemo(() => taskTimeline(taskOps), [taskOps]);
   /** Decisions as every device folds them: people's votes count, agents' are advice. */
-  const decisions = useMemo(() => foldDecisions(decisionOps, { ownerId: status?.ownerId, members: status?.members ?? [] }), [decisionOps, status?.ownerId, status?.members]);
+  // Departed members keep their role, so a removed agent's vote can never be counted as a person's.
+  const former = useMemo(() => [...new Map((status?.formerDevices ?? []).map(d => [d.memberId, { id: d.memberId, ...(d.role ? { role: d.role } : {}) }])).values()], [status?.formerDevices]);
+  const decisions = useMemo(() => foldDecisions(decisionOps, { ownerId: status?.ownerId, members: status?.members ?? [], former }), [decisionOps, status?.ownerId, status?.members, former]);
   const openDecisions = decisions.filter(d => d.state === 'open').length;
   const items = useMemo((): TranscriptItem[] => {
     // Task lines and decision cards sit between messages by time; messages keep their arrival order.
