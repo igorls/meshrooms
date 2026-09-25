@@ -1,6 +1,8 @@
 // Automated gate run: serves this folder on localhost (a secure context, so OPFS works), runs the gates in each
 // available browser, and kills a page mid-write for the crash test. Usage: node run.mjs [js|wasm] [playwright path]
 import { createServer } from 'node:http';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
@@ -26,10 +28,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const results = {};
 for (const [name, type, options] of [['chrome', chromium, { channel: 'chrome' }], ['firefox', firefox, {}], ['webkit', webkit, {}]]) {
-  let browser;
-  try { browser = await type.launch({ headless: true, ...options }); } catch (e) { results[name] = { skipped: e.message.split('\n')[0] }; continue; }
+  // A persistent profile, as real visitors have: WebKit refuses OPFS in ephemeral (private) contexts.
+  const profile = mkdtempSync(join(tmpdir(), `wormdb-spike-${name}-`));
+  let context;
+  try { context = await type.launchPersistentContext(profile, { headless: true, timeout: 60_000, ...options }); } catch (e) { results[name] = { skipped: e.message.split('\n')[0] }; rmSync(profile, { recursive: true, force: true }); continue; }
   try {
-    const context = await browser.newContext();
     const page = await context.newPage();
     await page.goto(url);
     const gates = await page.evaluate(e => window.spike.run(e), engine);
@@ -42,7 +45,7 @@ for (const [name, type, options] of [['chrome', chromium, { channel: 'chrome' }]
     const pass = Object.fromEntries(await Promise.all(Object.entries({ ...gates, crash }).map(async ([g, r]) => [g, !r?.error && await page.evaluate(([g, r]) => window.spike.pass(g, r), [g, r])])));
     results[name] = { ...gates, crash, pass };
   } catch (e) { results[name] = { error: e.message.split('\n')[0] }; }
-  finally { await browser.close(); }
+  finally { await context.close(); rmSync(profile, { recursive: true, force: true }); }
 }
 server.close();
 console.log(JSON.stringify({ engine, results }, null, 2));

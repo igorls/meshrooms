@@ -17,7 +17,7 @@ class JsEngine {
     this.handle = await openHandle(name); this.offsets = []; this.lengths = [];
     // One read of the whole log, then replay in memory: many small OPFS reads dominate the cost otherwise.
     const size = this.handle.getSize(), log = new Uint8Array(size), head = new DataView(log.buffer);
-    this.handle.read(log, { at: 0 });
+    if (size) this.handle.read(log, { at: 0 }); // WebKit rejects zero-length reads
     let at = 0;
     while (at + 8 <= size) {
       const length = head.getUint32(at, true), crc = head.getUint32(at + 4, true);
