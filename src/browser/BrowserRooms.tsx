@@ -6,6 +6,8 @@ import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
 import { deriveActivity, duration, type ActivityRecord, type AgentActivity } from './activity';
 import { taskTimeline, type TaskBody, type TaskEvent } from './board';
 import { BrowserApi } from './client';
+import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
+import { due, foldDecisions, type Decision, type DecisionBody, type VoteBody } from './decisions';
 import { IMAGE_TYPES, attachmentRef, displayKind, shownText, type AttachmentRef } from './files';
 import { BOARD_DEFAULT, BOARD_STEP, boardLimits, clampBoardWidth, saveBoardWidth, savedBoardWidth } from './panel';
 import { BrowserPeers, type FileView, type SavedMessage } from './peers';
@@ -21,7 +23,7 @@ const urlRoom = location.pathname.match(/^\/r\/([a-f0-9-]{36})$/)?.[1] || '';
 type ChosenFile = PendingFile & { ref?: AttachmentRef; bytes?: Uint8Array };
 const fileNames = (body: SavedMessage['packet']['body']) => body.attachments?.map(a => a.name).join(', ') || '';
 
-function RoomIcon({ kind }: { kind: 'people' | 'link' | 'close' | 'chat' | 'send' | 'tasks' | 'clip' | 'plus' | 'collapse' | 'expand' }) {
+function RoomIcon({ kind }: { kind: 'people' | 'link' | 'close' | 'chat' | 'send' | 'tasks' | 'clip' | 'plus' | 'collapse' | 'expand' | 'vote' }) {
   const paths = {
     people: <><circle cx="9" cy="8" r="3" /><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6M21 21v-3a6 6 0 0 0-3-5" /></>,
     link: <><path d="m10 14 4-4M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" /></>,
@@ -33,6 +35,7 @@ function RoomIcon({ kind }: { kind: 'people' | 'link' | 'close' | 'chat' | 'send
     plus: <path d="M12 5v14M5 12h14" />,
     collapse: <path d="m11 17-5-5 5-5M18 17l-5-5 5-5" />,
     expand: <path d="m13 17 5-5-5-5M6 17l5-5-5-5" />,
+    vote: <path d="M4 21h16M6 17V5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v12M9 10l2 2 4-4" />,
   };
   return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[kind]}</svg>;
 }
@@ -125,7 +128,9 @@ function describeTask(event: TaskEvent, name: (memberId: string, subject?: boole
   if (event.notes) phrases.push(`edited the notes on ${it()}`);
   return `${name(event.memberId, true)} ${phrases.length > 1 ? `${phrases.slice(0, -1).join(', ')} and ${phrases.at(-1)}` : phrases[0]}`;
 }
-type TranscriptItem = { message: SavedMessage; event?: undefined } | { event: TaskEvent; message?: undefined };
+type TranscriptItem = { message: SavedMessage; event?: undefined; decision?: undefined } | { event: TaskEvent; message?: undefined; decision?: undefined }
+  | { decision: Decision; message?: undefined; event?: undefined };
+const itemAt = (item: TranscriptItem) => item.message?.packet.body.at ?? item.event?.at ?? item.decision!.createdAt;
 
 export function BrowserRooms() {
   const [api] = useState(() => new BrowserApi());
@@ -162,6 +167,10 @@ export function BrowserRooms() {
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [taskOps, setTaskOps] = useState<TaskBody[]>([]);
+  const [decisionOps, setDecisionOps] = useState<(DecisionBody | VoteBody)[]>([]);
+  const [decisionsOpen, setDecisionsOpen] = useState(false);
+  const [deciding, setDeciding] = useState(false);
+  const closing = useRef(new Set<string>());
   const [highlight, setHighlight] = useState<string>();
   const [activity, setActivity] = useState<Record<string, ActivityRecord>>({});
   const [now, setNow] = useState(() => Date.now());
@@ -193,14 +202,32 @@ export function BrowserRooms() {
   const nameOf = (memberId: string) => status?.members?.find(m => m.id === memberId)?.name || 'Former member';
   /** Task changes read as quiet lines between messages, placed by time. They are local views, never sent. */
   const timeline = useMemo(() => taskTimeline(taskOps), [taskOps]);
+  /** Decisions as every device folds them: people's votes count, agents' are advice. */
+  const decisions = useMemo(() => foldDecisions(decisionOps, { ownerId: status?.ownerId, members: status?.members ?? [] }), [decisionOps, status?.ownerId, status?.members]);
+  const openDecisions = decisions.filter(d => d.state === 'open').length;
   const items = useMemo((): TranscriptItem[] => {
+    // Task lines and decision cards sit between messages by time; messages keep their arrival order.
+    const inserts: TranscriptItem[] = [...timeline.map(event => ({ event })), ...decisions.map(decision => ({ decision }))].sort((a, b) => itemAt(a) - itemAt(b));
     const merged: TranscriptItem[] = []; let next = 0;
     for (const message of messages) {
-      while (next < timeline.length && timeline[next].at <= message.packet.body.at) merged.push({ event: timeline[next++] });
+      while (next < inserts.length && itemAt(inserts[next]) <= message.packet.body.at) merged.push(inserts[next++]);
       merged.push({ message });
     }
-    return [...merged, ...timeline.slice(next).map(event => ({ event }))];
-  }, [messages, timeline]);
+    return [...merged, ...inserts.slice(next)];
+  }, [messages, timeline, decisions]);
+  // Close this person's own decisions once the result can't change or the deadline passes (agents' bridges do the same).
+  useEffect(() => {
+    if (!status?.memberId) return;
+    const tick = () => {
+      const at = Date.now();
+      if (decisions.some(d => d.state === 'open' && d.closesAt)) setNow(at);
+      for (const d of decisions) if (d.createdBy === status.memberId && due(d, at) && !closing.current.has(`${d.key}:${d.revision}`)) {
+        closing.current.add(`${d.key}:${d.revision}`);
+        void peers.current?.reviseDecision(d, { close: true }).catch(() => closing.current.delete(`${d.key}:${d.revision}`));
+      }
+    };
+    tick(); const timer = setInterval(tick, 5000); return () => clearInterval(timer);
+  }, [decisions, status?.memberId]);
 
   useEffect(() => {
     let disposed = false, timer: ReturnType<typeof setTimeout>, wake: (() => void) | undefined;
@@ -237,7 +264,7 @@ export function BrowserRooms() {
           }
           setMessages(m); setConnected(c);
         }, message => { if (!disposed) setNetwork(message); }, (board, ops) => { if (!disposed) { setTasks(board); setTaskOps(ops); } }, view => { if (!disposed) setFiles(view); },
-        records => { if (!disposed) { setActivity(records); setNow(Date.now()); } });
+        records => { if (!disposed) { setActivity(records); setNow(Date.now()); } }, ops => { if (!disposed) setDecisionOps(ops); });
         peers.current = engine; await engine.load();
         while (!disposed) {
           try {
@@ -291,7 +318,15 @@ export function BrowserRooms() {
     const timeout = setTimeout(() => setHighlight(undefined), 2400);
     return () => clearTimeout(timeout);
   }, [highlight]);
-  function showTask(taskId: string) { setBoardOpen(true); setDetailsOpen(false); setHighlight(taskId); }
+  function showTask(taskId: string) { setBoardOpen(true); setDetailsOpen(false); setDecisionsOpen(false); setHighlight(taskId); }
+  function showDecision(key: string) { setHighlight(key); document.getElementById(`decision-${key}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+  /** A decided option becomes a task on the board, noting where it was decided. */
+  async function decisionTask(d: Decision) {
+    const winner = d.tally.optionIds[0], chosen = d.options.find(o => o.id === winner)?.label ?? '';
+    const notes = `Decided in the room: ${d.question}\nOutcome: ${chosen} (${d.tally.tally[winner] ?? 0} of ${d.tally.voters} votes from people)`;
+    await peers.current!.changeTask({ title: chosen.slice(0, 120), notes: notes.slice(0, 2000) });
+    setBoardOpen(true); setDecisionsOpen(false); setDetailsOpen(false);
+  }
   function showMessage(id: string) {
     setDetailsOpen(false); setHighlight(id);
     requestAnimationFrame(() => document.getElementById(`message-${id}`)?.scrollIntoView({ block: 'center' }));
@@ -523,7 +558,7 @@ export function BrowserRooms() {
         </section> : <>
           <header className="browser-room-header">
             <div className="browser-room-heading"><h1>{title}</h1><p>{people} {people === 1 ? 'person' : 'people'}{agents.length ? ` and ${agents.length} agent${agents.length === 1 ? '' : 's'}` : ''} in this room{working ? ` · ${working} working` : ''}</p></div>
-            <div className="browser-room-actions"><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else { setDetailsOpen(true); setBoardOpen(false); } }}><RoomIcon kind="people" />Room details</button><button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
+            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else { setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false); } }}><RoomIcon kind="people" />Room details</button><button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
           </header>
           <p className="sr-only" role="status">{host && status.requests?.length ? `${status.requests.length} request${status.requests.length === 1 ? '' : 's'} waiting to join. Use the join requests section to admit or decline.` : ''}</p>
           {host && !!status.requests?.length && <section className="browser-requests" aria-label="Join requests"><h2>Waiting to join <span>{status.requests.length}</span></h2>
@@ -543,8 +578,17 @@ export function BrowserRooms() {
                 <div className="browser-message-list">
                   {!messages.length && <div className="browser-empty"><RoomIcon kind="chat" /><h2>{status.members!.length > 1 ? 'Ready for your first message' : status.requests?.length ? 'Your conversation starts here' : 'Bring someone into the room'}</h2><p>{status.members!.length > 1 ? 'Send a message below to start the conversation.' : status.requests?.length ? 'Someone is waiting to join. Admit them above to get started.' : 'Share the room link with someone, or open it on another device.'}</p></div>}
                   {items.map((item, index) => {
-                    const previous = items[index - 1], at = item.message?.packet.body.at ?? item.event!.at;
-                    const day = (!index || !sameDay(previous.message?.packet.body.at ?? previous.event!.at, at)) && <div className="browser-day"><span>{dayLabel(at)}</span></div>;
+                    const previous = items[index - 1], at = itemAt(item);
+                    const day = (!index || !sameDay(itemAt(previous), at)) && <div className="browser-day"><span>{dayLabel(at)}</span></div>;
+                    if (item.decision) {
+                      const d = item.decision;
+                      return <Fragment key={`decision-${d.key}`}>{day}<DecisionCard decision={d} viewerId={status.memberId} ownerId={status.ownerId} members={status.members!} participants={participants} now={now}
+                        highlight={highlight === d.key} nameOf={id => id === status.memberId ? 'You' : nameOf(id)}
+                        avatar={id => <MemberAvatar member={status.members!.find(m => m.id === id)} roomId={urlRoom} fallback={nameOf(id)} />}
+                        onVote={(optionId, comment) => peers.current!.vote(d, optionId, comment)} onAddOption={label => peers.current!.reviseDecision(d, { addOption: label })}
+                        onClose={() => peers.current!.reviseDecision(d, { close: true })} onWithdraw={() => peers.current!.reviseDecision(d, { withdraw: true })}
+                        onTasks={() => void decisionTask(d)} /></Fragment>;
+                    }
                     if (item.event) {
                       const event = item.event, line = describeTask(event, (id, subject) => id === status.memberId ? subject ? 'You' : 'you' : nameOf(id));
                       const time = <time dateTime={new Date(at).toISOString()}>{new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>;
@@ -581,6 +625,8 @@ export function BrowserRooms() {
               <div className="browser-compose-area">
                 {stick.unread > 0 && <button className="secondary browser-unread" onClick={stick.toBottom}>{stick.unread === 1 ? 'New message' : `${stick.unread} new messages`} <span aria-hidden="true">↓</span></button>}
                 {mentions.list}
+                {deciding && <DecisionForm agents={agents.length} onCancel={() => setDeciding(false)}
+                  onSubmit={async draft => { await peers.current!.openDecision(draft); setDeciding(false); stick.toBottom(); }} />}
                 {reply && <div className="browser-reply-draft"><span>Replying to <strong>{reply.packet.body.memberId === status.memberId ? 'your message' : nameOf(reply.packet.body.memberId)}</strong></span><button className="browser-close" aria-label="Cancel reply" onClick={() => setReplyId(undefined)}><RoomIcon kind="close" /></button></div>}
                 <form className="browser-composer" onSubmit={send}><label className="sr-only" htmlFor="browser-message">Message {title}</label><textarea ref={composer} id="browser-message" value={text} {...mentions.inputProps}
                   onChange={e => { setText(e.target.value); mentions.track(e.target.value, e.target.selectionStart); }} onSelect={e => mentions.track(e.currentTarget.value, e.currentTarget.selectionStart)} onBlur={mentions.close}
@@ -590,11 +636,13 @@ export function BrowserRooms() {
                   <PendingFiles files={chosen} onRemove={removeFile} onRetry={key => { const item = chosen.find(f => f.key === key); if (item) prepareFile(item); }} />
                   <div><span className="browser-compose-tools"><input ref={fileInput} type="file" multiple hidden onChange={e => { addFiles(e.target.files); e.target.value = ''; }} />
                     <button type="button" className="secondary browser-attach" title="Attach screenshots or files (you can also paste or drop them)" onClick={() => fileInput.current?.click()}><RoomIcon kind="clip" /><span>Attach</span></button>
+                    <button type="button" className="secondary browser-attach" aria-expanded={deciding} title="Ask the room to decide between options, or to review a plan" onClick={() => setDeciding(!deciding)}><RoomIcon kind="vote" /><span>Decide</span></button>
                     <span className="browser-key-hint">Enter to send · Shift + Enter for a new line</span></span><button className="primary" disabled={!canSend}><span>Send</span><RoomIcon kind="send" /></button></div></form>
                 <p className="browser-connection" role="status"><span className={`browser-connection-dot ${connected.length ? 'is-connected' : ''}`} aria-hidden="true" />{connected.length ? `Connected to ${connected.length} other device${connected.length === 1 ? '' : 's'}` : status.devices!.length > 1 ? 'Waiting for another device to connect' : 'You’re the first one here'}</p>
               </div>
             </div>
             {boardOpen && <BoardHandle workspace={workspace} width={boardWidth} onCommit={width => { setBoardWidth(width ?? BOARD_DEFAULT); saveBoardWidth(width); }} />}
+            {decisionsOpen && <DecisionList decisions={decisions} onShow={showDecision} onClose={() => setDecisionsOpen(false)} />}
             {boardOpen && <TaskBoard room={boardRoom} viewerId={status.memberId} disabled={!admitted} onClose={() => setBoardOpen(false)} actions={boardActions} highlight={highlight} working={workingOn} />}
             <aside id="browser-room-details" className="browser-details" aria-label="Room details" hidden={!detailsOpen} onKeyDown={e => { if (e.key === 'Escape') closeDetails(); }}>
               <header className="browser-details-heading"><h2 tabIndex={-1} ref={detailsHeading}>Room details</h2><button className="browser-close" aria-label="Close room details" onClick={closeDetails}><RoomIcon kind="close" /></button></header>
