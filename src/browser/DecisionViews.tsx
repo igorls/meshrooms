@@ -16,6 +16,8 @@ export function decisionSummary(decision: Decision) {
   const label = (id: string) => decision.options.find(o => o.id === id)?.label ?? 'an option';
   if (decision.state === 'withdrawn') return 'Withdrawn';
   const t = decision.tally;
+  // A close counts only once its pinned votes arrive and add up; until then the result is not shown as final.
+  if (decision.state === 'closed' && !decision.verified) return 'Checking the result';
   if (decision.state === 'closed') {
     if (t.result === 'decided') return `Decided: ${label(t.optionIds[0])}`;
     if (t.result === 'draw') return `Draw: ${t.optionIds.map(label).join(', ')}`;
@@ -53,7 +55,7 @@ export function DecisionCard({ decision, viewerId, ownerId, members, participant
   const people = decision.votes.filter(v => v.counts && v.optionId);
   const advice = decision.votes.filter(v => !v.counts && v.optionId);
   const most = Math.max(1, ...decision.options.map(o => decision.tally.tally[o.id] ?? 0));
-  const winners = decision.state === 'closed' ? decision.tally.optionIds : [];
+  const winners = decision.state === 'closed' && decision.verified ? decision.tally.optionIds : [];
   const label = (id: string | null) => decision.options.find(o => o.id === id)?.label ?? 'an option';
   const act = (work: () => Promise<void>) => { setBusy(true); setError(''); work().catch(e => setError(e instanceof Error ? e.message : String(e))).finally(() => setBusy(false)); };
   const creator = nameOf(decision.createdBy);

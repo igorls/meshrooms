@@ -156,6 +156,8 @@ export class BrowserPeers {
     await write(this.decisionKey, next); this.decisionOps = next; this.notifyDecisions();
   }
   private async publishDecision(body: DecisionBody | VoteBody) {
+    // The same per-member limit applies to this device's own operations as to those it receives.
+    if (!admissible(this.decisionOps.map(op => op.body), [body]).length) throw new Error('You have reached this room’s limit for decision changes.');
     const packet: DecisionPacket = { body, signature: await sign(body) };
     await this.addDecisionOps([packet]);
     for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* Decisions are exchanged again on reconnect. */ } }
