@@ -25,7 +25,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
@@ -51,6 +51,18 @@ export function connectConflict(linkHash: string, previousLinkHash: string | und
   return `This folder already holds ${name ? `the agent "${name}"` : 'an agent waiting for the host'} in this room, so this link was not used. `
     + `Each agent on a machine needs its own folder: set MESHROOMS_AGENT_HOME to a new one (for example ${join(folder, '..', 'agents-<name>')}) `
     + 'and run connect again with the same link.';
+}
+/** One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. */
+async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
+  const lock = join(folder, 'connect.lock');
+  let fd: number;
+  try { fd = openSync(lock, 'wx'); }
+  catch {
+    // A lock older than a minute is from a connect that crashed.
+    if (Date.now() - statSync(lock).mtimeMs < 60_000) throw new Error('Another connect is running in this folder. Wait for it to finish, then try again.');
+    unlinkSync(lock); fd = openSync(lock, 'wx');
+  }
+  try { return await work(); } finally { closeSync(fd); try { unlinkSync(lock); } catch { /* Already gone. */ } }
 }
 const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/i.test(v);
 
@@ -121,19 +133,21 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     const agent = new BrowserAgent(home(), origin, roomId);
     const identity = await agent.ensureIdentity();
     const config = join(agent.dir, 'room.json'), link = createHash('sha256').update(token).digest('hex');
-    let previous: string | undefined;
-    try { previous = JSON.parse(readFileSync(config, 'utf8')).link; } catch { /* First connect in this folder. */ }
-    // Fail closed: if the room can't be checked, don't risk using this link on top of another agent's folder.
-    let status: any;
-    try { status = await agent.command('status', { session: randomUUID() }); }
-    catch (error) { throw new Error(`Couldn't check the room before connecting, so nothing was changed: ${error instanceof Error ? error.message : String(error)}`); }
-    const conflict = connectConflict(link, previous, status, home());
-    if (conflict) throw new Error(conflict);
-    writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
-    if (!status.memberId) {
-      await agent.command('agent-redeem', { token, label: `Agent on ${hostname().slice(0, 40) || 'this machine'}` });
-      status = await agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
-    }
+    let status: any = await withConnectLock(agent.dir, async () => {
+      let saved: string | undefined, previous: string | undefined;
+      try { saved = readFileSync(config, 'utf8'); previous = JSON.parse(saved).link; } catch { /* First connect in this folder. */ }
+      // Fail closed: if the room can't be checked, don't risk using this link on top of another agent's folder.
+      let current: any;
+      try { current = await agent.command('status', { session: randomUUID() }); }
+      catch (error) { throw new Error(`Couldn't check the room before connecting, so this link was not used: ${error instanceof Error ? error.message : String(error)}`); }
+      const conflict = connectConflict(link, previous, current, home());
+      if (conflict) throw new Error(conflict);
+      writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
+      if (current.memberId) return current;
+      try { await agent.command('agent-redeem', { token, label: `Agent on ${hostname().slice(0, 40) || 'this machine'}` }); }
+      catch (error) { if (saved === undefined) unlinkSync(config); else writeFileSync(config, saved, { mode: 0o600 }); throw error; }
+      return agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
+    });
     // Everyone sees which harness and model an agent runs on; the agent reports it, the room cannot verify it.
     const runtime = { ...(values['--harness'] ? { harness: values['--harness'] } : {}), ...(values['--model'] ? { model: values['--model'] } : {}) };
     // Waiting for the host: the runner reports these once the agent is admitted, so they are not lost.
