@@ -159,3 +159,6 @@ they already saw, and the UI says so.
    - two entries with one `(device, seq)` are flagged as equivocation;
    - a withheld entry shows a gap and is fetched from another peer.
 3. Move storage to WormDB when step 1's core uses the real WAL format.
+4. With step 3 (MeshGuard in the browser), the same `history-have` / `history` envelopes and visibility rules travel on
+   MeshGuard's application channel too, so a native node and a browser peer exchange identical packets. Until then,
+   native rooms keep their durable WormDB log locally, and this design stays browser-room first.
