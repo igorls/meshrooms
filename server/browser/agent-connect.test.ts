@@ -1,8 +1,10 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentCli, connectConflict } from '../agent-cli';
+import { deviceId } from '../../src/browser/protocol';
 
 const opus = crypto.randomUUID();
 const admitted = { memberId: opus, members: [{ id: opus, name: 'Opus' }] };
@@ -36,3 +38,64 @@ test('connect fails closed when the room cannot be checked: the link is not used
     rmSync(folder, { recursive: true, force: true });
   }
 });
+
+/** A room service stand-in: `status` answers as the room would (or as a maintenance page), `agent-redeem` fails with `redeem`. */
+function fakeRoom(mode: { status: 'room' | 'maintenance'; redeem: number }) {
+  return Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
+    const { command, publicKey } = await request.json() as any;
+    if (command.action === 'status') return mode.status === 'maintenance' ? new Response('<h1>Back soon</h1>')
+      : Response.json({ roomId: command.roomId, deviceId: await deviceId(publicKey), title: 'Room', epoch: 'e', hostOnline: true });
+    return Response.json({ error: `redeem failed (${mode.redeem})` }, { status: mode.redeem });
+  } });
+}
+async function inFreshHome(work: (folder: string) => Promise<void>) {
+  const folder = mkdtempSync(join(tmpdir(), 'agent-connect-')), before = process.env.MESHROOMS_AGENT_HOME;
+  process.env.MESHROOMS_AGENT_HOME = folder;
+  try { await work(folder); } finally {
+    if (before === undefined) delete process.env.MESHROOMS_AGENT_HOME; else process.env.MESHROOMS_AGENT_HOME = before;
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+const token = 'y'.repeat(43);
+
+test("a 200 that is not the room's answer (a proxy or maintenance page) fails closed too", () => inFreshHome(async folder => {
+  const server = fakeRoom({ status: 'maintenance', redeem: 500 }), room = crypto.randomUUID();
+  try {
+    await expect(agentCli(['connect', `http://127.0.0.1:${server.port}/agent/${room}#${token}`])).rejects.toThrow('this link was not used');
+    expect(existsSync(join(folder, 'browser-agents', room, 'room.json'))).toBe(false);
+  } finally { server.stop(true); }
+}));
+
+test('a refused link rolls the record back; a redeem that may have gone through keeps it so the same link can retry', () => inFreshHome(async folder => {
+  const mode = { status: 'room' as const, redeem: 403 }, server = fakeRoom(mode);
+  try {
+    const refused = crypto.randomUUID();
+    await expect(agentCli(['connect', `http://127.0.0.1:${server.port}/agent/${refused}#${token}`])).rejects.toThrow('redeem failed (403)');
+    expect(existsSync(join(folder, 'browser-agents', refused, 'room.json'))).toBe(false);
+    mode.redeem = 503;
+    const unsure = crypto.randomUUID();
+    await expect(agentCli(['connect', `http://127.0.0.1:${server.port}/agent/${unsure}#${token}`])).rejects.toThrow('redeem failed (503)');
+    const kept = JSON.parse(readFileSync(join(folder, 'browser-agents', unsure, 'room.json'), 'utf8'));
+    expect(kept.link).toBe(createHash('sha256').update(token).digest('hex'));
+  } finally { server.stop(true); }
+}));
+
+test("only one connect can take over a crashed connect's lock", () => inFreshHome(async folder => {
+  const server = fakeRoom({ status: 'maintenance', redeem: 500 }), room = crypto.randomUUID(), dir = join(folder, 'browser-agents', room);
+  const link = `http://127.0.0.1:${server.port}/agent/${room}#${token}`, lock = join(dir, 'connect.lock'), old = new Date(Date.now() - 120_000);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, '');
+    await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
+    // Stale, but another connect is taking it over right now.
+    utimesSync(lock, old, old); writeFileSync(`${lock}.reclaim`, '');
+    await expect(agentCli(['connect', link])).rejects.toThrow('Another connect is running');
+    // A takeover that crashed says which file to delete.
+    utimesSync(`${lock}.reclaim`, old, old);
+    await expect(agentCli(['connect', link])).rejects.toThrow('Delete that file');
+    // A stale lock alone is taken over: this connect gets as far as checking the room, and leaves no lock behind.
+    rmSync(`${lock}.reclaim`);
+    await expect(agentCli(['connect', link])).rejects.toThrow('this link was not used');
+    expect(existsSync(lock) || existsSync(`${lock}.reclaim`)).toBe(false);
+  } finally { server.stop(true); }
+}));

@@ -52,15 +52,31 @@ export function connectConflict(linkHash: string, previousLinkHash: string | und
     + `Each agent on a machine needs its own folder: set MESHROOMS_AGENT_HOME to a new one (for example ${join(folder, '..', 'agents-<name>')}) `
     + 'and run connect again with the same link.';
 }
-/** One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. */
+const BUSY = 'Another connect is running in this folder. Wait for it to finish, then try again.';
+/**
+ * One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. A lock older
+ * than a minute is from a connect that crashed. Taking it over is exclusive too: only the holder of `connect.lock.reclaim`
+ * may replace it, and only if it is still the same stale file, so two connects can never both reclaim it.
+ */
 async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
-  const lock = join(folder, 'connect.lock');
+  const lock = join(folder, 'connect.lock'), reclaim = `${lock}.reclaim`;
+  const stale = () => { try { const s = statSync(lock); return Date.now() - s.mtimeMs >= 60_000 ? `${s.ino}:${s.mtimeMs}` : undefined; } catch { return undefined; } };
   let fd: number;
   try { fd = openSync(lock, 'wx'); }
   catch {
-    // A lock older than a minute is from a connect that crashed.
-    if (Date.now() - statSync(lock).mtimeMs < 60_000) throw new Error('Another connect is running in this folder. Wait for it to finish, then try again.');
-    unlinkSync(lock); fd = openSync(lock, 'wx');
+    const seen = stale();
+    if (!seen) throw new Error(BUSY);
+    let guard: number;
+    try { guard = openSync(reclaim, 'wx'); }
+    catch {
+      let old = false; try { old = Date.now() - statSync(reclaim).mtimeMs >= 60_000; } catch { /* Just released. */ }
+      // Reclaiming takes milliseconds; a marker this old was left by a crash in exactly that window.
+      throw new Error(old ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY);
+    }
+    try {
+      if (stale() !== seen) throw new Error(BUSY);
+      unlinkSync(lock); fd = openSync(lock, 'wx');
+    } finally { closeSync(guard); unlinkSync(reclaim); }
   }
   try { return await work(); } finally { closeSync(fd); try { unlinkSync(lock); } catch { /* Already gone. */ } }
 }
@@ -138,14 +154,23 @@ export async function agentCli(argv: string[]): Promise<unknown> {
       try { saved = readFileSync(config, 'utf8'); previous = JSON.parse(saved).link; } catch { /* First connect in this folder. */ }
       // Fail closed: if the room can't be checked, don't risk using this link on top of another agent's folder.
       let current: any;
-      try { current = await agent.command('status', { session: randomUUID() }); }
-      catch (error) { throw new Error(`Couldn't check the room before connecting, so this link was not used: ${error instanceof Error ? error.message : String(error)}`); }
+      try {
+        current = await agent.command('status', { session: randomUUID() });
+        // A proxy or maintenance page can answer 200 with something else; only the room's own answer about this device counts.
+        if (current?.roomId !== roomId || current?.deviceId !== identity.id) throw new Error('the room service gave an unexpected answer');
+      } catch (error) { throw new Error(`Couldn't check the room before connecting, so this link was not used: ${error instanceof Error ? error.message : String(error)}`); }
       const conflict = connectConflict(link, previous, current, home());
       if (conflict) throw new Error(conflict);
       writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
       if (current.memberId) return current;
       try { await agent.command('agent-redeem', { token, label: `Agent on ${hostname().slice(0, 40) || 'this machine'}` }); }
-      catch (error) { if (saved === undefined) unlinkSync(config); else writeFileSync(config, saved, { mode: 0o600 }); throw error; }
+      catch (error) {
+        // Roll back only when the room refused the link. After a timeout or a server error the redeem may have gone
+        // through, so the record stays and a retry with this same link carries on.
+        const refused = (error as { status?: number }).status;
+        if (refused !== undefined && refused >= 400 && refused < 500) { if (saved === undefined) unlinkSync(config); else writeFileSync(config, saved, { mode: 0o600 }); }
+        throw error;
+      }
       return agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
     });
     // Everyone sees which harness and model an agent runs on; the agent reports it, the room cannot verify it.
