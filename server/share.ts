@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -180,6 +180,29 @@ export function findAmbiguousPeerAllow(configDir: string, peerStem: string, port
   return readRules(path).find(rule => rule.action === 'allow' && ruleCoversTcpPort(rule, port) && !rule.ownershipId);
 }
 
+/** First-match MeshGuard semantics: an earlier deny makes a later allow unreachable. */
+export function findPrecedingDeny(configDir: string, peerStem: string, port: number): ParsedPolicyRule | undefined {
+  const first = readRules(peerPolicyPath(configDir, peerStem)).find(rule => ruleCoversTcpPort(rule, port));
+  return first?.action === 'deny' ? first : undefined;
+}
+
+/** Prefer the paired key; `--peer-key` must match when a pair is known, else it is a fallback for unread rooms/tests. */
+export function resolveSharePeerKey(explicit: string | undefined, paired: string | undefined): string {
+  if (paired !== undefined) {
+    if (!isHash(paired)) throw new Error('Paired peer key must be 64 lowercase hex characters.');
+    if (explicit !== undefined) {
+      if (!isHash(explicit)) throw new Error('Use --peer-key with the paired peer\'s 64-hex MeshGuard public key.');
+      if (explicit !== paired) throw new Error('Use --peer-key that matches the peer paired to this room.');
+    }
+    return paired;
+  }
+  if (explicit !== undefined) {
+    if (!isHash(explicit)) throw new Error('Use --peer-key with the paired peer\'s 64-hex MeshGuard public key.');
+    return explicit;
+  }
+  throw new Error('Start the local node, or pass --peer-key for the paired MeshGuard peer.');
+}
+
 export function hexToBase64Pubkey(peerKey: string): string {
   if (!isHash(peerKey)) throw new Error('Peer keys must be 64 lowercase hex characters.');
   return Buffer.from(peerKey, 'hex').toString('base64');
@@ -206,17 +229,32 @@ export function peerPolicyPath(configDir: string, peerStem: string): string {
   return join(configDir, 'services', 'peer', `${peerStem}.policy`);
 }
 
+export function validateMeshIp(meshIp: string): string {
+  const parts = meshIp.split('.');
+  if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part))) {
+    throw new Error('Mesh IP must be an IPv4 address from MeshGuard STATUS.');
+  }
+  for (const part of parts) {
+    const octet = Number(part);
+    if (octet < 0 || octet > 255) throw new Error('Mesh IP must be an IPv4 address from MeshGuard STATUS.');
+  }
+  return meshIp;
+}
+
 export function shareUrl(meshIp: string, port: number): string {
-  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(meshIp)) throw new Error('Mesh IP must be an IPv4 address from MeshGuard STATUS.');
-  return `http://${meshIp}:${validatePort(port)}/`;
+  return `http://${validateMeshIp(meshIp)}:${validatePort(port)}/`;
 }
 
 export function appendOwnedAllow(configDir: string, peerStem: string, port: number, id = randomUUID()): OwnedRule {
   validatePort(port);
   if (!isUuid(id)) throw new Error('Owned rules require a UUID id.');
-  const ambiguous = findAmbiguousPeerAllow(configDir, peerStem, port);
-  if (ambiguous) throw new Error(`Refusing to share: ${peerPolicyPath(configDir, peerStem)} already has an unmarked allow covering TCP ${port} (${ambiguous.raw}).`);
   const path = peerPolicyPath(configDir, peerStem);
+  const deny = findPrecedingDeny(configDir, peerStem, port);
+  if (deny) {
+    throw new Error(`Refusing to share: ${path} already has a deny covering TCP ${port} (${deny.raw}); an appended allow would be unreachable.`);
+  }
+  const ambiguous = findAmbiguousPeerAllow(configDir, peerStem, port);
+  if (ambiguous) throw new Error(`Refusing to share: ${path} already has an unmarked allow covering TCP ${port} (${ambiguous.raw}).`);
   mkdirSync(join(configDir, 'services', 'peer'), { recursive: true, mode: 0o700 });
   const marker = ownershipMarker(id);
   const line = `allow tcp ${port}`;
@@ -261,6 +299,33 @@ export function sharesDir(dataDir: string): string {
 export function shareRecordPath(dataDir: string, roomId: string): string {
   if (!isUuid(roomId)) throw new Error('Use --room with a room UUID.');
   return join(sharesDir(dataDir), `${roomId}.json`);
+}
+
+export function shareLockPath(dataDir: string, roomId: string): string {
+  if (!isUuid(roomId)) throw new Error('Use --room with a room UUID.');
+  return join(sharesDir(dataDir), `${roomId}.lock`);
+}
+
+/** Exclusive wx lock around conflict check + policy/record mutation for one room. */
+export function withShareLock<T>(dataDir: string, roomId: string, fn: () => T): T {
+  const directory = sharesDir(dataDir);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lockPath = shareLockPath(dataDir, roomId);
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') {
+      throw new Error(`Another share operation is in progress for room ${roomId}. Retry shortly.`);
+    }
+    throw error;
+  }
+  try {
+    return fn();
+  } finally {
+    try { closeSync(fd); } catch { /* best-effort */ }
+    try { unlinkSync(lockPath); } catch { /* best-effort */ }
+  }
 }
 
 export function isShareRecord(value: unknown): value is ShareRecord {
@@ -321,7 +386,7 @@ export function createShareRecord(input: {
   const started = new Date();
   const expires = new Date(started.getTime() + minutes * 60_000);
   return {
-    roomId: input.roomId, port, peerKey: input.peerKey, meshIp: input.meshIp,
+    roomId: input.roomId, port, peerKey: input.peerKey, meshIp: validateMeshIp(input.meshIp),
     startedAt: started.toISOString(), expiresAt: expires.toISOString(), status: 'pending-enable',
     ownedRules: input.ownedRules, url: shareUrl(input.meshIp, port),
   };
@@ -337,6 +402,37 @@ export function confirmShareReload(record: ShareRecord): ShareRecord {
   if (record.status === 'pending-enable') return { ...record, status: 'active' };
   if (record.status === 'pending-disable') return { ...record, status: 'stopped' };
   return record;
+}
+
+/** Expiry is checked on CLI `share` / `share-status` / `share-stop`, not by a background timer. */
+export function isShareExpired(record: ShareRecord, now = Date.now()): boolean {
+  if (record.status !== 'pending-enable' && record.status !== 'active') return false;
+  const expires = Date.parse(record.expiresAt);
+  return Number.isFinite(expires) && now > expires;
+}
+
+/** Remove owned rules; pending-enable → stopped, active → pending-disable (await MeshGuard reload). */
+export function expireShareRecord(record: ShareRecord): ShareRecord {
+  if (record.status !== 'pending-enable' && record.status !== 'active') return record;
+  if (record.ownedRules.length) removeOwnedRules(record.ownedRules);
+  if (record.status === 'active') return markSharePendingDisable({ ...record, ownedRules: [] });
+  return { ...record, status: 'stopped', ownedRules: [] };
+}
+
+export function enforceShareExpiry(dataDir: string, roomId: string, now = Date.now()): ShareRecord | undefined {
+  const record = readShareRecord(dataDir, roomId);
+  if (!record || !isShareExpired(record, now)) return record;
+  const expired = expireShareRecord(record);
+  writeShareRecord(dataDir, expired);
+  return expired;
+}
+
+/** Clear expired live shares so they stop blocking a new share. */
+export function enforceAllShareExpiries(dataDir: string, now = Date.now()): void {
+  for (const share of listShareRecords(dataDir)) {
+    if (!isShareExpired(share, now)) continue;
+    writeShareRecord(dataDir, expireShareRecord(share));
+  }
 }
 
 export function defaultMeshguardConfigDir(): string {

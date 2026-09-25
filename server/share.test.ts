@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { testDirectory } from './test-directory';
@@ -7,9 +7,13 @@ import {
   appendOwnedAllow,
   confirmShareReload,
   createShareRecord,
+  enforceShareExpiry,
+  expireShareRecord,
   findAmbiguousPeerAllow,
   findBroaderAllows,
+  findPrecedingDeny,
   hexToBase64Pubkey,
+  isShareExpired,
   markSharePendingDisable,
   ownershipMarker,
   parseOwnershipMarker,
@@ -18,7 +22,9 @@ import {
   peerPolicyStem,
   readShareRecord,
   removeOwnedRules,
+  resolveSharePeerKey,
   ruleCoversTcpPort,
+  validateMeshIp,
   validatePort,
   writeShareRecord,
 } from './share';
@@ -138,4 +144,91 @@ test('peer policy stems use MeshGuard base64 (or alias), not hex filenames', () 
   expect(peerPolicyStem(peerKey)).toBe(hexToBase64Pubkey(peerKey));
   expect(peerPolicyStem(peerKey, 'node-b')).toBe('node-b');
   expect(() => peerPolicyStem(peerKey, '../x')).toThrow('peer-alias');
+});
+
+test('validateMeshIp requires four octets in 0–255', () => {
+  expect(validateMeshIp('10.99.0.1')).toBe('10.99.0.1');
+  expect(validateMeshIp('0.0.0.0')).toBe('0.0.0.0');
+  expect(validateMeshIp('255.255.255.255')).toBe('255.255.255.255');
+  expect(() => validateMeshIp('999.999.999.999')).toThrow('IPv4');
+  expect(() => validateMeshIp('10.99.0')).toThrow('IPv4');
+  expect(() => validateMeshIp('10.99.0.1.2')).toThrow('IPv4');
+  expect(() => validateMeshIp('10.99.0.256')).toThrow('IPv4');
+  expect(() => validateMeshIp('10.99.-1.1')).toThrow('IPv4');
+  expect(() => createShareRecord({
+    roomId: randomUUID(), port: 4173, peerKey, meshIp: '999.1.1.1', ownedRules: [],
+  })).toThrow('IPv4');
+});
+
+test('preceding peer deny blocks an unreachable owned allow', () => {
+  const directory = testDirectory('share-deny');
+  try {
+    const config = join(directory.path, 'meshguard');
+    mkdirSync(join(config, 'services', 'peer'), { recursive: true });
+    writeFileSync(join(config, 'services', 'default'), 'deny\n');
+    const stem = peerPolicyStem(peerKey);
+    const path = peerPolicyPath(config, stem);
+
+    writeFileSync(path, 'deny all\n');
+    expect(findPrecedingDeny(config, stem, 4173)?.raw).toBe('deny all');
+    expect(() => appendOwnedAllow(config, stem, 4173)).toThrow('unreachable');
+
+    writeFileSync(path, 'deny tcp 4173\n');
+    expect(() => appendOwnedAllow(config, stem, 4173)).toThrow('unreachable');
+
+    writeFileSync(path, 'deny tcp all\n');
+    expect(() => appendOwnedAllow(config, stem, 4173)).toThrow('unreachable');
+
+    writeFileSync(path, 'allow tcp 22\ndeny tcp 4173\n');
+    expect(() => appendOwnedAllow(config, stem, 4173)).toThrow('unreachable');
+
+    writeFileSync(path, 'allow tcp 22\n');
+    const owned = appendOwnedAllow(config, stem, 4173);
+    expect(readFileSync(path, 'utf8')).toContain('allow tcp 4173');
+    removeOwnedRules([owned]);
+  } finally { directory.cleanup(); }
+});
+
+test('expired pending-enable and active shares remove owned rules', () => {
+  const directory = testDirectory('share-expiry');
+  try {
+    const config = join(directory.path, 'meshguard');
+    mkdirSync(join(config, 'services'), { recursive: true });
+    writeFileSync(join(config, 'services', 'default'), 'deny\n');
+    const stem = peerPolicyStem(peerKey);
+    const owned = appendOwnedAllow(config, stem, 4173);
+    const roomId = randomUUID();
+    const past = new Date(Date.now() - 60_000).toISOString();
+    let record = createShareRecord({
+      roomId, port: 4173, peerKey, meshIp: '10.99.0.1', minutes: 30, ownedRules: [owned],
+    });
+    record = { ...record, startedAt: past, expiresAt: past };
+    expect(isShareExpired(record)).toBe(true);
+    writeShareRecord(directory.path, record);
+
+    const expired = enforceShareExpiry(directory.path, roomId)!;
+    expect(expired.status).toBe('stopped');
+    expect(expired.ownedRules).toEqual([]);
+    expect(existsSync(peerPolicyPath(config, stem)) && readFileSync(peerPolicyPath(config, stem), 'utf8').includes('allow tcp 4173')).toBe(false);
+
+    const ownedActive = appendOwnedAllow(config, stem, 4173);
+    let active = createShareRecord({
+      roomId: randomUUID(), port: 4173, peerKey, meshIp: '10.99.0.1', minutes: 30, ownedRules: [ownedActive],
+    });
+    active = confirmShareReload({ ...active, startedAt: past, expiresAt: past });
+    expect(active.status).toBe('active');
+    expect(isShareExpired(active)).toBe(true);
+    const after = expireShareRecord(active);
+    expect(after.status).toBe('pending-disable');
+    expect(after.ownedRules).toEqual([]);
+    expect(existsSync(peerPolicyPath(config, stem)) && readFileSync(peerPolicyPath(config, stem), 'utf8').includes('allow tcp 4173')).toBe(false);
+  } finally { directory.cleanup(); }
+});
+
+test('resolveSharePeerKey requires an explicit key to match a known pair', () => {
+  expect(resolveSharePeerKey(undefined, peerKey)).toBe(peerKey);
+  expect(resolveSharePeerKey(peerKey, peerKey)).toBe(peerKey);
+  expect(() => resolveSharePeerKey(otherKey, peerKey)).toThrow('matches the peer paired');
+  expect(resolveSharePeerKey(peerKey, undefined)).toBe(peerKey);
+  expect(() => resolveSharePeerKey(undefined, undefined)).toThrow('peer-key');
 });
