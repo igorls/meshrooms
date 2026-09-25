@@ -155,3 +155,29 @@ test('stewardship stays with the creator after someone else adds an option', () 
   expect(fold([...domOps, retitled])[0].question).toBe('Ship today?');
   expect(fold([...domOps, reviseDecision(as(sam), fold(domOps)[0], { withdraw: true })])[0].state).toBe('withdrawn');
 });
+
+test('a close must pin each person’s latest vote, and its head count must cover its votes', () => {
+  const open = openDecision({ ...as(vesper), question: 'Which?', options: ['X', 'Y'] });
+  let d = fold([open])[0];
+  const x = castVote(as(igor), d, 'o1'), y = castVote(as(igor), d, 'o2', '', 2);
+  const before = fold([open, x])[0];
+  const stale = reviseDecision(as(vesper), before, { close: true }); // pins X after Igor has changed to Y
+  expect(fold([open, x, y, stale])[0].state).toBe('open');
+  const honest = reviseDecision(as(vesper), fold([open, x, y])[0], { close: true });
+  expect(fold([open, x, y, honest])[0]).toMatchObject({ state: 'closed', outcome: { optionIds: ['o2'] } });
+  const shrunk = { ...honest, outcome: { ...honest.outcome!, people: 0 } };
+  expect(fold([open, x, y, shrunk])[0].state).toBe('open');
+});
+
+test('wake on consensus waits for a verified outcome; withdrawals wake separately', () => {
+  const open = openDecision({ ...as(vesper), question: 'Go?', options: ['Yes', 'No'] });
+  const vote = castVote(as(igor), fold([open])[0], 'o1');
+  const close = reviseDecision(as(vesper), fold([open, vote])[0], { close: true });
+  expect(decisionWakes([open, close], room, vesper, 0).resolved).toEqual([]); // the pinned vote hasn't arrived
+  const later = [open, close, vote];
+  expect(decisionWakes(later, room, vesper, 2).resolved.map(d => d.verified)).toEqual([true]); // it arrives: now verified, wake
+  const other = openDecision({ ...as(vesper), question: 'Drop?', options: ['A', 'B'] });
+  const withdrawn = reviseDecision(as(vesper), fold([other])[0], { withdraw: true });
+  const wakes = decisionWakes([other, withdrawn], room, vesper, 1);
+  expect([wakes.resolved.length, wakes.withdrawn.map(d => d.question)]).toEqual([0, ['Drop?']]);
+});

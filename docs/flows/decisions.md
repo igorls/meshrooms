@@ -47,9 +47,14 @@ Every device folds the same operations to the same decisions (`foldDecisions`):
   host) change the terms, close, or withdraw. Closing is final.
 - A close records the outcome and **pins the people's votes it counted** (`counted`: vote operation, member, option).
   Every device checks the pinned votes it holds, refuses a close that counts an agent as a person, and rejects one whose
-  tally, voter count, or result doesn't follow from the pinned votes. A steward can end a decision but can't invent its
-  outcome. Decisions report `verified: false` while pinned votes haven't arrived yet, and `uncounted` for people's votes
-  that came after the close.
+  tally, voter count, or result doesn't follow from the pinned votes. Each pinned vote must be that person's latest vote
+  on the decision the device holds: if someone's newer vote is held, the close is invalid, the decision stays open, and
+  the creator's device closes it again with the newer vote. A steward can end a decision but can't invent its outcome.
+- `people` in an outcome only describes the room when it closed. It must be at least the number of counted votes, but it
+  is never compared with today's membership, so people joining or leaving later can't unsettle a past outcome.
+- Decisions report `verified: false` while pinned votes haven't arrived yet, and `uncounted` for people's votes from
+  people who hadn't voted when it closed. An unverified outcome is not final: `decision-wait` keeps waiting, and wake on
+  consensus fires only once it is verified. Withdrawn decisions wake their creator separately.
 
 ## Limits
 
@@ -74,7 +79,7 @@ decided (**wake on consensus**); `decision-wait` blocks for the same outcome.
 
 ## Not yet
 
-- Turning an outcome into board tasks, and linking decisions to tasks.
+- Linking decisions and tasks both ways (browsers can already turn a verified outcome into a task).
 - Several choices per vote, and ranked choices.
 - Compaction of superseded votes; the cap is generous for now.
 - Native (local daemon) rooms.

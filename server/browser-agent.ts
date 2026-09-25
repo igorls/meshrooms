@@ -297,6 +297,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     if (added.length) storeDecisionOps(added);
   };
   const shareDecisionOp = async (body: DecisionBody | VoteBody) => {
+    // This device's own changes obey the same per-member share as everyone's, or peers would drop them.
+    if (!admissible(agent.decisionOps().map(p => p.body), [body]).length) throw new Error('This agent has reached its share of decision changes in this room.');
     const packet = { body, signature: await agent.sign(body) };
     storeDecisionOps([packet]);
     for (const peer of peers.values()) if (peer.channel?.readyState === 'open') peer.channel.send(JSON.stringify(packet));
@@ -512,15 +514,16 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     const woke = evaluateWake(view, view.memberId, after, boardAfter);
     // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
     const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
-    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, decisionsAfter);
-    const decided = wakes.asked.length || wakes.resolved.length;
+    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, decisionsAfter);
+    const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
     const result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
     if (result.state !== 'waiting') {
       // History without anything for this agent is catching up, not work.
       if (result.addressed.length || result.tasks.length || decided) agent.recordActivity('working', { messages: result.addressed.slice(-8), tasks: result.tasks.map(t => t.id).slice(-8) });
       else agent.recordActivity('idle');
       return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, ...result, decisionCursor,
-        ...(decided ? { decisions: { asked: wakes.asked.map(d => describeDecision(agent, d)), resolved: wakes.resolved.map(d => describeDecision(agent, d)) } } : {}) };
+        ...(decided ? { decisions: { asked: wakes.asked.map(d => describeDecision(agent, d)), resolved: wakes.resolved.map(d => describeDecision(agent, d)),
+          ...(wakes.withdrawn.length ? { withdrawn: wakes.withdrawn.map(d => describeDecision(agent, d)) } : {}) } } : {}) };
     }
     if (!beat || Date.now() - beat >= LISTEN_HEARTBEAT_MS) { if (beat) agent.touchActivity(); else agent.recordActivity('idle'); beat = Date.now(); }
     if (Date.now() >= deadline) {
@@ -645,7 +648,9 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
   return { id: d.id, question: d.question, ...(d.context ? { context: d.context } : {}), mode: d.mode, state: d.state, createdBy: name(d.createdBy),
     options: d.options.map(o => ({ id: o.id, label: o.label, people: d.tally.tally[o.id] ?? 0 })),
     ...(d.closesAt ? { closesAt: new Date(d.closesAt).toISOString() } : {}),
-    ...(d.state === 'closed' && d.outcome ? { outcome: { result: d.outcome.result, options: d.outcome.optionIds.map(label), voters: d.outcome.voters, people: d.outcome.people } }
+    // An outcome is final only once every vote it counted has arrived here (verified); uncounted votes came after it closed.
+    ...(d.state === 'closed' && d.outcome ? { outcome: { result: d.outcome.result, options: d.outcome.optionIds.map(label), voters: d.outcome.voters, people: d.outcome.people,
+      verified: d.verified, ...(d.uncounted ? { uncounted: d.uncounted } : {}) } }
       : { leading: d.tally.result === 'no-votes' ? [] : d.tally.optionIds.map(label), voters: d.tally.voters, people: d.tally.people, settled: d.settled }),
     votes: d.votes.map(v => ({ by: name(v.memberId), counts: v.counts, option: label(v.optionId), ...(v.comment ? { comment: v.comment } : {}) })) };
 }
@@ -687,7 +692,11 @@ export async function waitDecision(agent: BrowserAgent, decisionId: string, seco
   while (true) {
     const d = pickDecision(agent.decisions(), decisionId, agent.members().memberId);
     if (!d) throw new Error('That decision is not in this room. Run decisions for current ids.');
-    if (d.state !== 'open' || Date.now() >= deadline) { agent.touchActivity(); return { state: d.state === 'open' ? 'timeout' : d.state, decision: describeDecision(agent, d) }; }
+    const final = d.state === 'withdrawn' || (d.state === 'closed' && d.verified);
+    if (final || Date.now() >= deadline) {
+      agent.touchActivity();
+      return { state: final ? d.state : d.state === 'closed' ? 'verifying' : 'timeout', decision: describeDecision(agent, d) };
+    }
     await Bun.sleep(1000);
   }
 }

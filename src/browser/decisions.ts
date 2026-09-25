@@ -98,14 +98,19 @@ function steward(room: RoomMembers, creator: string, memberId: string) {
 }
 
 /**
- * Whether a close's outcome follows from the votes it pins: every pinned vote this device holds matches, no pinned voter
- * is a known agent, and the tally, voters and result are exactly what those votes give.
+ * Whether a close's outcome follows from the votes it pins: every pinned vote this device holds matches and is that
+ * person's latest vote here (so an older, changed vote can't be pinned), no pinned voter is a known agent, and the tally,
+ * voters and result are exactly what those votes give. `people` only describes the room when it closed (it never decides
+ * the result), so it is checked for sense, not against today's membership, which would unsettle past outcomes.
  */
-function honestClose(next: DecisionBody, held: Map<string, VoteBody>, room: RoomMembers) {
+function honestClose(next: DecisionBody, held: Map<string, VoteBody>, latest: Map<string, VoteBody>, room: RoomMembers) {
   const counted = next.counted!, outcome = next.outcome!;
+  if (outcome.people < counted.length) return false;
   for (const c of counted) {
     const vote = held.get(c.vote);
     if (vote && (vote.memberId !== c.memberId || vote.optionId !== c.optionId || vote.decisionId !== next.decisionId || vote.createdBy !== next.createdBy)) return false;
+    const newest = latest.get(`${next.createdBy}:${next.decisionId}:${c.memberId}`);
+    if (newest && newest.id !== c.vote && (!vote || order(vote, newest) < 0)) return false;
     if (room.members.some(m => m.id === c.memberId && m.role === 'agent')) return false;
     if (!next.options.some(o => o.id === c.optionId)) return false;
   }
@@ -115,8 +120,8 @@ function honestClose(next: DecisionBody, held: Map<string, VoteBody>, room: Room
 }
 
 /** Whether `next` may follow `current`: options only grow, only stewards change the terms or close, and closing is final and honest. */
-function extends_(current: DecisionBody, next: DecisionBody, room: RoomMembers, held: Map<string, VoteBody>) {
-  if (next.state === 'closed' && !honestClose(next, held, room)) return false;
+function extends_(current: DecisionBody, next: DecisionBody, room: RoomMembers, held: Map<string, VoteBody>, latest: Map<string, VoteBody>) {
+  if (next.state === 'closed' && !honestClose(next, held, latest, room)) return false;
   if (current.state !== 'open' || next.revision !== current.revision + 1 || next.mode !== current.mode) return false;
   if (next.options.length < current.options.length || !current.options.every((o, i) => sameOption(o, next.options[i]))) return false;
   const added = next.options.slice(current.options.length);
@@ -157,7 +162,7 @@ export function foldDecisions(ops: (DecisionBody | VoteBody)[], room: RoomMember
     const first = chain[0];
     if (first.revision !== 1 || first.state !== 'open' || first.memberId !== first.createdBy) continue;
     let current = first;
-    for (const op of chain.slice(1)) if (extends_(current, op, room, held)) current = op;
+    for (const op of chain.slice(1)) if (extends_(current, op, room, held, ballots)) current = op;
     const votes: Vote[] = [...ballots.values()].filter(v => `${v.createdBy}:${v.decisionId}` === key && roleOf(v.memberId) !== undefined
       && (v.optionId === null || current.options.some(o => o.id === v.optionId)))
       .map(v => ({ op: v.id, memberId: v.memberId, optionId: v.optionId, comment: v.comment, at: v.at, counts: roleOf(v.memberId) === 'human' }));
@@ -247,6 +252,10 @@ export function decisionWakes(ops: (DecisionBody | VoteBody)[], room: RoomMember
   const mine = (o: DecisionBody | VoteBody, d: Decision) => o.kind === 'decision' && o.decisionId === d.id && o.createdBy === d.createdBy;
   const asked = decisions.filter(d => d.state === 'open' && d.createdBy !== agentId && (d.askAgents === true || (Array.isArray(d.askAgents) && d.askAgents.includes(agentId)))
     && !d.votes.some(v => v.memberId === agentId) && fresh.some(o => mine(o, d)));
-  const resolved = decisions.filter(d => d.state !== 'open' && d.createdBy === agentId && fresh.some(o => mine(o, d) && (o as DecisionBody).state !== 'open'));
-  return { asked, resolved };
+  // Wake on a verified outcome only; a close whose pinned votes are still arriving wakes once the last of them lands.
+  const pinned = (d: Decision) => new Set(ops.filter(o => mine(o, d) && (o as DecisionBody).state === 'closed').flatMap(o => (o as DecisionBody).counted?.map(c => c.vote) ?? []));
+  const resolved = decisions.filter(d => d.state === 'closed' && d.verified && d.createdBy === agentId
+    && fresh.some(o => (mine(o, d) && (o as DecisionBody).state === 'closed') || (o.kind === 'vote' && pinned(d).has(o.id))));
+  const withdrawn = decisions.filter(d => d.state === 'withdrawn' && d.createdBy === agentId && fresh.some(o => mine(o, d) && (o as DecisionBody).state === 'withdrawn'));
+  return { asked, resolved, withdrawn };
 }
