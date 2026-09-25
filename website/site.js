@@ -265,14 +265,12 @@
 
   // --- 3. Principles Viewport Telemetry ---
   const principleCards = document.querySelectorAll('.principle-card');
-  const principleList = document.querySelector('.principles');
   function setActivePrinciple(card) {
     const index = Array.from(principleCards).indexOf(card);
     principleCards.forEach((c, i) => {
       c.classList.toggle('is-active', i === index);
       c.classList.toggle('is-past', i < index);
     });
-    principleList?.style.setProperty('--progress', String(principleCards.length > 1 ? index / (principleCards.length - 1) : 1));
   }
   if ('IntersectionObserver' in window && principleCards.length > 0) {
     const principleObserver = new IntersectionObserver((entries) => {
