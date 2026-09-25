@@ -7,8 +7,8 @@
  * humans-first rules as local rooms (src/collab.ts), so agents behave identically.
  *
  * State lives in a private directory (identity, messages, task operations, outbox, files).
- * `run` is the only process that talks to peers; `listen` reads its state, `send`/`task`
- * queue outgoing messages and task changes that `run` signs and delivers, and `attachment`
+ * `run` is the only process that talks to peers; `listen` reads its state, `send`/`task`/`react`
+ * queue outgoing messages and changes that `run` signs and delivers, and `attachment`
  * asks `run` (through wants/) to fetch a file it does not hold yet. The agent's commands also
  * record its activity (activity.json), which `run` announces to connected devices.
  */
@@ -26,17 +26,24 @@ import { cleanName, defaultName, sniff } from '../src/attachments';
 import { admissible, castVote, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
   type Decision, type DecisionBody, type DecisionMode, type DecisionPacket, type DecisionSync, type VoteBody } from '../src/browser/decisions';
 import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, validActivity, validNote, type Activity, type ActivityOn } from '../src/browser/activity';
+import {
+  COMPACT_REACTIONS_AT, MAX_REACTION_KEYS_PER_MEMBER, MAX_REACTION_OPS, REACTION_EMOJI, compactReactions, currentRevision,
+  foldReactions, isReactionEmoji, liveKeysForMember, memberReacted, reactionSyncChunks, validReactionBody,
+  type ReactionBody, type ReactionEmoji, type ReactionPacket,
+} from '../src/browser/reactions';
 import { evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
 
 type Identity = { id: string; publicKey: string; privateJwk: JsonWebKey };
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
-type Packet = { body: MessageBody | ReceiptBody; signature: string };
+type Packet = { body: MessageBody | ReceiptBody | ReactionBody; signature: string };
 type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[] };
 type Members = { memberId?: string; ownerId?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
+/** A queued reaction toggle; `run` signs it against the current folded chips and revision. */
+type ReactionIntent = { type: 'reaction'; id: string; messageId: string; emoji: ReactionEmoji; blocked?: 'log-full' };
 /** A queued decision change; like tasks, `run` builds it against the decision as it stands when signing. */
 type DecisionIntent = { type: 'decision'; id: string; decisionId: string } & (
   | { action: 'open'; question: string; context: string; mode: DecisionMode; options: string[]; askAgents: boolean | string[]; closesAt: number | null }
@@ -161,6 +168,9 @@ export class BrowserAgent {
     const { ownerId, members, former } = this.members();
     return foldDecisions(ops.map(p => p.body), { ownerId, members, former });
   }
+  /** Verified reaction operations this device holds (only for messages it also holds). */
+  reactionOps(): ReactionPacket[] { return readJson(this.path('reactions.json'), []); }
+  reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined { const a = readJson<unknown>(this.path('activity.json'), undefined); return validActivity(a) ? a : undefined; }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
@@ -304,6 +314,52 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     for (const d of agent.decisions()) if (d.createdBy === status.memberId && due(d, Date.now()))
       await shareDecisionOp(reviseDecision({ roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId }, d, { close: true }));
   });
+  /** Verified reactions whose message has not arrived yet; retried when that message is stored. */
+  let pendingReactions: ReactionPacket[] = [];
+  /** Persist ready reaction ops; refuse past the cap after compaction instead of truncating live keys. */
+  const storeReactionOps = (ops: ReactionPacket[], added: ReactionPacket[]) => {
+    if (!added.length) return true;
+    let next = [...ops, ...added];
+    if (next.length > COMPACT_REACTIONS_AT) next = compactReactions(next);
+    if (next.length > MAX_REACTION_OPS) return false;
+    writeJson(join(agent.dir, 'reactions.json'), next);
+    return true;
+  };
+  /** Keep verified reactions for held messages; unknown messages stay pending until the message is stored. */
+  const addReactionOps = (incoming: ReactionPacket[]) => {
+    const held = new Set(agent.messages().map(m => m.packet.body.id));
+    const ops = agent.reactionOps();
+    const known = new Set([...ops.map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
+    const ready: ReactionPacket[] = [];
+    for (const op of incoming) {
+      if (known.has(op.body.id)) continue;
+      known.add(op.body.id);
+      if (held.has(op.body.messageId)) ready.push(op);
+      else pendingReactions.push(op);
+    }
+    if (!ready.length) return true;
+    return storeReactionOps(ops, ready);
+  };
+  const flushPendingReactions = (messageId: string) => {
+    const due = pendingReactions.filter(op => op.body.messageId === messageId);
+    if (!due.length) return;
+    pendingReactions = pendingReactions.filter(op => op.body.messageId !== messageId);
+    if (!addReactionOps(due)) pendingReactions.push(...due);
+  };
+  /** Keep reaction operations signed by a current or former device of their author; duplicates are ignored. */
+  const acceptReactions = async (packets: unknown[]) => {
+    const accepted: ReactionPacket[] = [];
+    const known = new Set([...agent.reactionOps().map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
+    for (const packet of packets as ReactionPacket[]) {
+      const b = packet?.body;
+      if (!validReactionBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
+      const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
+      if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
+      known.add(b.id);
+      accepted.push({ body: b, signature: packet.signature });
+    }
+    if (accepted.length) addReactionOps(accepted);
+  };
   /**
    * Files named by verified messages. The store and transfers know nothing about messages, so other signed records
    * (task artifacts, later) can make a file servable the same way.
@@ -348,9 +404,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (state === 'closed') { if (peers.get(id) === peer) transfers.closed(id); return; }
       if (state !== 'open') return;
       log(`channel open to ${id.slice(0, 8)}`);
-      // Exchange boards so either side catches up on tasks changed while apart.
+      // Exchange boards, decisions, and reactions so either side catches up while apart.
       for (const chunk of syncChunks(agent.roomId, agent.taskOps().map(({ body, signature }) => ({ body, signature })))) channel.send(JSON.stringify(chunk));
       for (const chunk of decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature })))) channel.send(JSON.stringify(chunk));
+      for (const chunk of reactionSyncChunks(agent.roomId, agent.reactionOps())) channel.send(JSON.stringify(chunk));
       transfers.opened(id);
       activity.opened(channel);
       flush();
@@ -373,6 +430,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       const decisions = packet as unknown as DecisionSync;
       if (decisions?.kind === 'decisions') { if (decisions.roomId === agent.roomId && Array.isArray(decisions.ops)) await acceptDecisionOps(decisions.ops); return; }
       if (['decision', 'vote'].includes((packet?.body as { kind?: string })?.kind ?? '')) { await acceptDecisionOps([packet]); return; }
+      const reactions = packet as unknown as { kind?: string; roomId?: string; ops?: unknown };
+      if (reactions?.kind === 'reactions') { if (reactions.roomId === agent.roomId && Array.isArray(reactions.ops)) await acceptReactions(reactions.ops); return; }
+      if ((packet?.body as { kind?: string })?.kind === 'reaction') { await acceptReactions([packet]); return; }
       const b = packet?.body;
       if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
         || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return;
@@ -382,7 +442,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
         const messages = agent.messages(); const existing = messages.find(m => m.packet.body.id === b.id);
         if (existing && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
-        if (!existing) { if (messages.length >= 1000) return; save([...messages, { packet: packet as Stored['packet'], targets: [], receipts: [] }]); }
+        if (!existing) {
+          if (messages.length >= 1000) return;
+          save([...messages, { packet: packet as Stored['packet'], targets: [], receipts: [] }]);
+          flushPendingReactions(b.id);
+        }
         const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: b.id, deviceId: identity.id };
         if (channel.readyState === 'open') channel.send(JSON.stringify({ body: receipt, signature: await agent.sign(receipt) }));
       } else if (b.kind === 'receipt') {
@@ -410,7 +474,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const deliverOutbox = () => transaction(async () => {
     const outbox = join(agent.dir, 'outbox');
     for (const file of readdirSync(outbox).filter(f => f.endsWith('.json')).sort()) {
-      const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | null>(join(outbox, file), null);
+      const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | null>(join(outbox, file), null);
       if (!item || !status?.memberId) continue;
       if ('type' in item && item.type === 'decision') {
         const ops = agent.decisionOps(), author = { roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId };
@@ -441,6 +505,31 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         }
         unlinkSync(join(outbox, file)); continue;
       }
+      if ('type' in item && item.type === 'reaction') {
+        const ops = agent.reactionOps();
+        if (ops.some(p => p.body.id === item.id)) { unlinkSync(join(outbox, file)); continue; }
+        // Wait until the message is held; do not drop the outbox item forever.
+        if (!agent.messages().some(m => m.packet.body.id === item.messageId)) continue;
+        const bodies = ops.map(p => p.body);
+        const remove = memberReacted(agent.reactionChips(), item.messageId, item.emoji, status.memberId);
+        if (!remove && liveKeysForMember(bodies, status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
+          unlinkSync(join(outbox, file)); continue;
+        }
+        const body: ReactionBody = {
+          kind: 'reaction', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId,
+          messageId: item.messageId, emoji: item.emoji,
+          revision: currentRevision(bodies, item.messageId, status.memberId, item.emoji) + 1,
+          at: Date.now(), ...(remove ? { removed: true as const } : {}),
+        };
+        const packet = { body, signature: await agent.sign(body) };
+        if (!storeReactionOps(ops, [packet])) {
+          // Log full: leave queued and mark so reactBrowser can report log-full distinctly.
+          writeJson(join(outbox, file), { ...item, blocked: 'log-full' });
+          continue;
+        }
+        for (const peer of peers.values()) if (peer.channel?.readyState === 'open') peer.channel.send(JSON.stringify(packet));
+        unlinkSync(join(outbox, file)); continue;
+      }
       if (!('text' in item)) continue;
       const messages = agent.messages();
       const files = item.attachments;
@@ -449,6 +538,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         const body: MessageBody = { kind: 'message', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId,
           text: item.text || (files ? attachmentText(files) : ''), at: Date.now(), ...(item.replyTo ? { replyTo: item.replyTo } : {}), ...(files ? { attachments: files } : {}) };
         save([...messages, { packet: { body, signature: await agent.sign(body) }, targets: (status.devices || []).filter(d => d.id !== identity.id).map(d => d.id), receipts: [] }]);
+        flushPendingReactions(item.id);
       }
       unlinkSync(join(outbox, file));
     }
@@ -636,6 +726,37 @@ export async function taskBrowser(agent: BrowserAgent, input: { requestId: strin
     await Bun.sleep(300);
   }
   return { taskId, status: 'queued-for-bridge' };
+}
+
+/** Queue a reaction toggle for `run` to sign and share. Humans and agents use the same fixed emoji set. */
+export async function reactBrowser(agent: BrowserAgent, input: { requestId: string; messageId: string; emoji: string }) {
+  const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
+  if (!isReactionEmoji(input.emoji)) throw new Error(`Use one of these emoji: ${REACTION_EMOJI.join(' ')}`);
+  if (!view.messages.some(m => m.id === input.messageId)) throw new Error('That message is not in this browser room.');
+  const emoji = input.emoji;
+  const bodies = agent.reactionOps().map(p => p.body);
+  const already = memberReacted(agent.reactionChips(), input.messageId, emoji, view.memberId);
+  if (!already && liveKeysForMember(bodies, view.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
+    throw new Error('You have too many reactions in this room. Remove some before adding more.');
+  }
+  if (!agent.reactionOps().some(p => p.body.id === input.requestId)) {
+    writeJson(join(agent.dir, 'outbox', `${Date.now()}-${input.requestId}.json`), { type: 'reaction', id: input.requestId, messageId: input.messageId, emoji } satisfies ReactionIntent);
+  }
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const pendingFile = readdirSync(join(agent.dir, 'outbox')).find(f => f.endsWith(`-${input.requestId}.json`));
+    if (agent.reactionOps().some(p => p.body.id === input.requestId)) {
+      return { messageId: input.messageId, emoji, removed: already, status: 'shared', reactions: agent.reactionChips().filter(c => c.messageId === input.messageId) };
+    }
+    if (pendingFile) {
+      const pending = readJson<ReactionIntent | null>(join(agent.dir, 'outbox', pendingFile), null);
+      if (pending?.blocked === 'log-full') return { messageId: input.messageId, emoji, status: 'log-full' as const };
+    } else {
+      return { messageId: input.messageId, emoji, status: 'dropped', reason: 'The message was gone before this reaction was signed.' };
+    }
+    await Bun.sleep(300);
+  }
+  return { messageId: input.messageId, emoji, status: 'queued-for-bridge' };
 }
 
 /** A decision as an agent reads it: names instead of ids, and which votes count. */

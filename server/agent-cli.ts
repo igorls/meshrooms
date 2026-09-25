@@ -9,6 +9,7 @@
  *   bun meshrooms-agent.js task-add --room <room> --request-id <uuid> --title '<title>' [--notes '<notes>'] [--assignee me|<member id>]
  *   bun meshrooms-agent.js task-update --room <room> --request-id <uuid> --task <task id> [--status todo|doing|done] [--assignee me|none|<member id>]
  *   bun meshrooms-agent.js task-remove --room <room> --request-id <uuid> --task <task id>
+ *   bun meshrooms-agent.js react --room <room> --request-id <uuid> --message <message id> --emoji <emoji>
  *   bun meshrooms-agent.js status --room <room> [--note '<what you are doing>' | --note '']
  *   bun meshrooms-agent.js profile --room <room> [--harness '<harness>'] [--model '<model>'] | --clear
  *   bun meshrooms-agent.js ask --room <room> --request-id <uuid> --question '<question>' --option '<a>' --option '<b>'... [--ask-agents all|<names>] [--closes 30m]
@@ -26,10 +27,11 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
-import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
+import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import { mayAgentSpeak } from '../src/collab';
 
 export { parseConnectLink };
+import { REACTION_EMOJI, isReactionEmoji } from '../src/browser/reactions';
 import { TASK_STATUSES, type TaskStatus } from '../src/collab';
 import { sniff } from './attachments';
 
@@ -93,6 +95,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     'task-update --room ROOM --request-id UUID --task TASK_ID [--revision N] [--status todo|doing|done] [--title TITLE] [--notes NOTES] [--assignee me|none|MEMBER_ID]',
     'task-remove --room ROOM --request-id UUID --task TASK_ID',
     'send --room ROOM --request-id UUID [--text TEXT] [--attach FILE]... [--reply-to MESSAGE_ID]  (up to 4 files of 10 MB each)',
+    `react --room ROOM --request-id UUID --message MESSAGE_ID --emoji ${REACTION_EMOJI.join('|')} (toggles; humans or agents)`,
     'attachment --room ROOM --id ATTACHMENT_ID [--out FILE_OR_DIR] [--wait-seconds 30]', 'avatar --room ROOM --file IMAGE (PNG/JPEG/WebP, at most 16 KB and 256x256) | --clear',
     "profile --room ROOM [--harness 'Claude Code'] [--model 'claude-opus-5-5'] | --clear (what you run on; shown to everyone)",
     "status --room ROOM [--note 'ONE LINE, UP TO 140 CHARACTERS' | --note '']  (people see the note next to your activity)", 'stop --room ROOM', 'rooms'],
@@ -238,6 +241,12 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (!values['--text']?.trim() && !attach.length) throw new Error('Use --text with the message, --attach with a file, or both.');
     for (const path of attach) if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`Cannot read ${path}. Give --attach a file path.`);
     return sendBrowser(agent, values['--text'] || '', values['--reply-to'], values['--request-id'].toLowerCase(), attach.map(path => resolve(path)));
+  }
+  if (command === 'react') {
+    if (!uuid(values['--request-id'])) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same reaction.');
+    if (!uuid(values['--message'])) throw new Error('Use --message with a message id from listen.');
+    if (!isReactionEmoji(values['--emoji'])) throw new Error(`Use --emoji with one of: ${REACTION_EMOJI.join(' ')}`);
+    return reactBrowser(agent, { requestId: values['--request-id'].toLowerCase(), messageId: values['--message'].toLowerCase(), emoji: values['--emoji'] });
   }
   if (command === 'attachment') {
     if (!uuid(values['--id'])) throw new Error('Use --id with an attachment id from listen.');

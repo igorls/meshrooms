@@ -7,6 +7,11 @@ import {
   type Decision, type DecisionBody, type DecisionPacket, type VoteBody,
 } from './decisions';
 import { FileTransfers, IMAGE_TYPES, MAX_MESSAGE_ATTACHMENTS, attachmentText, isFilePacket, retainedFiles, validAttachments, type AttachmentRef, type TransferState } from './files';
+import {
+  COMPACT_REACTIONS_AT, MAX_REACTION_KEYS_PER_MEMBER, MAX_REACTION_OPS, compactReactions, currentRevision,
+  foldReactions, isReactionEmoji, liveKeysForMember, memberReacted, reactionSyncChunks, validReactionBody,
+  type ReactionChip, type ReactionEmoji, type ReactionPacket,
+} from './reactions';
 import { read, sign, update, write } from './storage';
 import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRecord } from './activity';
 
@@ -14,7 +19,7 @@ import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRe
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
 const isId = (value: unknown) => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
-type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body'] | DecisionBody | VoteBody; signature: string };
+type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body'] | DecisionBody | VoteBody | ReactionPacket['body']; signature: string };
 export type SavedMessage = { packet: Packet & { body: MessageBody }; targets: string[]; receipts: string[] };
 type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; started: number };
 /** A file of this room as this browser sees it: a blob URL once verified and stored, else how fetching goes. */
@@ -35,6 +40,10 @@ export class BrowserPeers {
   private ops: TaskPacket[] = [];
   private decisionKey: string;
   private decisionOps: DecisionPacket[] = [];
+  private reactionKey: string;
+  private reactionOps: ReactionPacket[] = [];
+  /** Verified reactions whose message has not arrived yet; retried when that message is stored. */
+  private pendingReactions: ReactionPacket[] = [];
   private filesKey: string;
   private index: FileIndex = {};
   private refs = new Map<string, AttachmentRef>();
@@ -48,10 +57,12 @@ export class BrowserPeers {
     private changed: (messages: SavedMessage[], connected: string[], added?: SavedMessage) => void, private error: (message: string) => void,
     private boardChanged: (tasks: Task[], ops: TaskBody[]) => void = () => {}, private filesChanged: (files: Record<string, FileView>) => void = () => {},
     private activityChanged: (activity: Record<string, ActivityRecord>) => void = () => {},
-    private decisionsChanged: (ops: (DecisionBody | VoteBody)[]) => void = () => {}) {
+    private decisionsChanged: (ops: (DecisionBody | VoteBody)[]) => void = () => {},
+    private reactionsChanged: (chips: ReactionChip[]) => void = () => {}) {
     this.key = `messages:${deviceId}:${roomId}`;
     this.boardKey = `board:${deviceId}:${roomId}`;
     this.decisionKey = `decisions:${deviceId}:${roomId}`;
+    this.reactionKey = `reactions:${deviceId}:${roomId}`;
     this.filesKey = `files:${deviceId}:${roomId}`;
     this.files = new FileTransfers({ roomId, referenced: sha => this.refs.get(sha), changed: () => this.notifyFiles(),
       store: { has: sha => sha in this.index, get: sha => this.readFile(sha), put: (sha, bytes, type) => this.storeFile(sha, bytes, type) },
@@ -61,10 +72,13 @@ export class BrowserPeers {
   async load() {
     this.messages = await read<SavedMessage[]>(this.key) || []; this.ops = await read<TaskPacket[]>(this.boardKey) || [];
     this.decisionOps = await read<DecisionPacket[]>(this.decisionKey) || [];
+    this.reactionOps = await read<ReactionPacket[]>(this.reactionKey) || [];
     this.index = await read<FileIndex>(this.filesKey) || {};
     for (const sha of Object.keys(this.index)) await this.fileUrl(sha);
-    this.notify(); this.notifyBoard(); this.notifyDecisions(); this.syncFiles();
+    this.notify(); this.notifyBoard(); this.notifyDecisions(); this.notifyReactions(); this.syncFiles();
   }
+  private notifyReactions() { if (!this.stopped) this.reactionsChanged(foldReactions(this.reactionOps.map(op => op.body))); }
+  chips() { return foldReactions(this.reactionOps.map(op => op.body)); }
   private fileKey(sha: string) { return `file:${this.deviceId}:${this.roomId}:${sha}`; }
   private fileChain<T>(work: () => Promise<T>): Promise<T> { const next = this.fileSerial.then(work); this.fileSerial = next.catch(() => {}); return next; }
   private async readFile(sha: string) {
@@ -129,6 +143,66 @@ export class BrowserPeers {
       await this.addOps([packet]);
       for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* The board is exchanged again on reconnect. */ } }
     });
+  }
+  private async addReactionOps(incoming: ReactionPacket[]) {
+    const held = new Set(this.messages.map(m => m.packet.body.id));
+    const ready: ReactionPacket[] = [];
+    for (const op of incoming) {
+      if (this.reactionOps.some(known => known.body.id === op.body.id) || this.pendingReactions.some(known => known.body.id === op.body.id)) continue;
+      if (held.has(op.body.messageId)) ready.push(op);
+      else this.pendingReactions.push(op);
+    }
+    if (!ready.length) return;
+    let next = [...this.reactionOps, ...ready];
+    if (next.length > COMPACT_REACTIONS_AT) next = compactReactions(next);
+    if (next.length > MAX_REACTION_OPS) throw new Error('This room’s reactions log is full in this preview.');
+    await write(this.reactionKey, next); this.reactionOps = next; this.notifyReactions();
+  }
+  private async flushPendingReactions(messageId: string) {
+    const due = this.pendingReactions.filter(op => op.body.messageId === messageId);
+    if (!due.length) return;
+    this.pendingReactions = this.pendingReactions.filter(op => op.body.messageId !== messageId);
+    await this.addReactionOps(due);
+  }
+  /** Toggle one of the fixed emoji on a message. Humans and agents use the same path. */
+  async react(messageId: string, emoji: ReactionEmoji) {
+    return this.transaction(async () => {
+      if (!this.status?.memberId || this.stopped) throw new Error('Join the room before reacting.');
+      if (!isReactionEmoji(emoji)) throw new Error('Choose one of the room’s reaction emoji.');
+      if (!this.messages.some(m => m.packet.body.id === messageId)) throw new Error('That message is not in this browser.');
+      const bodies = this.reactionOps.map(op => op.body);
+      const remove = memberReacted(this.chips(), messageId, emoji, this.status.memberId);
+      if (!remove && liveKeysForMember(bodies, this.status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
+        throw new Error('You have too many reactions in this room. Remove some before adding more.');
+      }
+      const body = {
+        kind: 'reaction' as const, roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId,
+        memberId: this.status.memberId, messageId, emoji,
+        revision: currentRevision(bodies, messageId, this.status.memberId, emoji) + 1,
+        at: Date.now(), ...(remove ? { removed: true as const } : {}),
+      };
+      const packet: ReactionPacket = { body, signature: await sign(body) };
+      await this.addReactionOps([packet]);
+      for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') {
+        try { peer.channel.send(JSON.stringify(packet)); } catch { /* Reactions are exchanged again on reconnect. */ }
+      }
+    });
+  }
+  private async acceptReactions(sync: { roomId?: unknown; ops?: unknown }) {
+    if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
+    const accepted: ReactionPacket[] = [];
+    for (const op of sync.ops as ReactionPacket[]) {
+      const author = this.status?.devices?.find(d => d.id === op?.body?.deviceId) ?? this.status?.formerDevices?.find(d => d.id === op?.body?.deviceId);
+      if (!author || !validReactionBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
+      if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
+    }
+    try { await this.addReactionOps(accepted); }
+    catch { /* Cap full: keep the local log; peers retry after compaction elsewhere. */ }
+  }
+  private sendReactions(channel: RTCDataChannel) {
+    for (const chunk of reactionSyncChunks(this.roomId, this.reactionOps)) {
+      try { channel.send(JSON.stringify(chunk)); } catch { return; }
+    }
   }
   /** Operations relayed in a board exchange are checked against each author's own device, not the sender's. */
   private async acceptBoard(sync: { roomId?: unknown; ops?: unknown }) {
@@ -220,6 +294,7 @@ export class BrowserPeers {
     const added = messages.length > this.messages.length ? messages.at(-1) : undefined;
     await write(this.key, messages); this.messages = messages; this.notify(added);
     if (added?.packet.body.attachments) this.syncFiles();
+    if (added) await this.flushPendingReactions(added.packet.body.id);
   }
   /** Files are stored here before the message that names them, so this browser can serve them as soon as peers ask. */
   async send(text: string, replyTo?: string, files: { ref: AttachmentRef; bytes: Uint8Array }[] = []) {
@@ -254,7 +329,7 @@ export class BrowserPeers {
   }
   private connectChannel(peer: Peer, id: string, channel: RTCDataChannel) {
     peer.channel = channel;
-    channel.onopen = () => { this.flush(); this.sendBoard(channel); this.sendDecisions(channel); this.files.opened(id); this.notify(); };
+    channel.onopen = () => { this.flush(); this.sendBoard(channel); this.sendDecisions(channel); this.sendReactions(channel); this.files.opened(id); this.notify(); };
     channel.onclose = () => { if (this.peers.get(id) === peer) { this.files.closed(id); this.forget(id); } this.notify(); };
     channel.onmessage = event => {
       if (typeof event.data !== 'string' || event.data.length > 20_000) return;
@@ -273,6 +348,7 @@ export class BrowserPeers {
         const device = this.status.devices?.find(d => d.id === id); if (!device) return;
         if ((packet as unknown as { kind?: unknown })?.kind === 'board') { await this.acceptBoard(packet as never); return; }
         if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never); return; }
+        if ((packet as unknown as { kind?: unknown })?.kind === 'reactions') { await this.acceptReactions(packet as never); return; }
         const b = packet?.body;
         if (!b || b.roomId !== this.roomId || b.deviceId !== id || !isId(b.id) || typeof packet.signature !== 'string' || !await verify(device.publicKey, b, packet.signature)) return;
         if (b.kind === 'message') {
@@ -297,6 +373,8 @@ export class BrowserPeers {
         } else if (b.kind === 'decision' || b.kind === 'vote') {
           if ((validDecisionBody(b, this.roomId) || validVoteBody(b, this.roomId)) && b.memberId === device.memberId
             && admissible(this.decisionOps.map(op => op.body), [b]).length) await this.addDecisionOps([{ body: b, signature: packet.signature }]);
+        } else if (b.kind === 'reaction') {
+          if (validReactionBody(b, this.roomId) && b.memberId === device.memberId) await this.addReactionOps([{ body: b, signature: packet.signature }]);
         }
       }).catch(e => this.error(e.message)).finally(() => { this.pendingIncoming--; });
     };
