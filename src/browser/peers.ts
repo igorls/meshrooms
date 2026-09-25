@@ -187,17 +187,19 @@ export class BrowserPeers {
     const held = new Set(this.decisionOps.map(op => op.body.id));
     const candidates = (sync.ops as DecisionPacket[]).filter(op => (validDecisionBody(op?.body, this.roomId) || validVoteBody(op?.body, this.roomId))
       && typeof op.signature === 'string' && !held.has(op.body.id));
-    // Votes only for decisions held (or arriving alongside), and a per-member cap, before any signature work.
-    const admitted = new Set(admissible(this.decisionOps.map(op => op.body), candidates.map(op => op.body)));
-    const accepted: DecisionPacket[] = [];
-    for (const op of candidates) {
-      const b = op.body;
-      if (!admitted.has(b)) continue;
+    const authentic = async ({ body: b, signature }: DecisionPacket) => {
       const author = this.status?.devices?.find(d => d.id === b.deviceId) ?? this.status?.formerDevices?.find(d => d.id === b.deviceId);
-      if (!author || b.memberId !== author.memberId) continue;
-      if (await verify(author.publicKey, b, op.signature)) accepted.push({ body: b, signature: op.signature });
-    }
-    await this.addDecisionOps(accepted);
+      return !!author && b.memberId === author.memberId && await verify(author.publicKey, b, signature);
+    };
+    // Decisions first, so a vote is admitted only against a decision held or just verified (a forged decision in the
+    // batch can't carry votes in); then the per-member cap, before the more numerous votes are verified.
+    const decisions: DecisionPacket[] = [];
+    for (const op of candidates) if (op.body.kind === 'decision' && await authentic(op)) decisions.push(op);
+    const votes = candidates.filter(op => op.body.kind === 'vote');
+    const admitted = new Set(admissible(this.decisionOps.map(op => op.body), [...decisions, ...votes].map(op => op.body)));
+    const accepted = decisions.filter(op => admitted.has(op.body));
+    for (const op of votes) if (admitted.has(op.body) && await authentic(op)) accepted.push(op);
+    await this.addDecisionOps(accepted.map(({ body, signature }) => ({ body, signature })));
   }
   private sendDecisions(channel: RTCDataChannel) {
     for (const chunk of decisionChunks(this.roomId, this.decisionOps)) { try { channel.send(JSON.stringify(chunk)); } catch { return; } }
