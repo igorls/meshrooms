@@ -35,42 +35,54 @@ class JsEngine {
     this.offsets.push(this.end + 8); this.lengths.push(payload.length); this.end += 8 + payload.length;
     return this.offsets.length - 1;
   }
+  count() { return this.offsets.length; }
   get(index) { const out = new Uint8Array(this.lengths[index]); this.handle.read(out, { at: this.offsets[index] }); return out; }
   flush() { this.handle.flush(); }
   close() { this.handle.flush(); this.handle.close(); }
 }
 
 /**
- * WormDB core compiled to wasm32. Expected exports (see README): memory, alloc(len) -> ptr, wdb_open() -> count,
- * wdb_append(ptr, len) -> index, wdb_get(index, outPtr, cap) -> len, wdb_flush(), wdb_close(). File I/O is imported
- * from env: fs_size() -> u64 as f64, fs_read(ptr, len, at) -> n, fs_write(ptr, len, at) -> n, fs_flush(), fs_truncate(size).
+ * WormDB core compiled to wasm32 (Gemini's build). Host imports, module `opfs`: opfs_size() -> i64,
+ * opfs_read(buf, len, offset: i64) -> i32, opfs_write(buf, len, offset: i64) -> i32, opfs_flush() -> i32,
+ * opfs_truncate(size: i64) -> i32, opfs_now_ms() -> i64. Exports: memory, wormdb_alloc(len) / wormdb_free(ptr, len),
+ * wormdb_open() -> i32, wormdb_set(k, kLen, v, vLen) -> i32, wormdb_get(k, kLen) -> ptr (0 if absent) with
+ * wormdb_get_len(), wormdb_flush(), wormdb_close(). Records are keyed by their number (u32 little-endian).
  */
 class WasmEngine {
   async open(name) {
     this.handle = await openHandle(name);
-    const view = (ptr, len) => new Uint8Array(this.exports.memory.buffer, ptr, len);
-    const env = {
-      fs_size: () => this.handle.getSize(),
-      fs_read: (ptr, len, at) => this.handle.read(view(ptr, len), { at: Number(at) }),
-      fs_write: (ptr, len, at) => this.handle.write(view(ptr, len), { at: Number(at) }),
-      fs_flush: () => this.handle.flush(),
-      fs_truncate: (size) => this.handle.truncate(Number(size)),
+    const view = (ptr, len) => new Uint8Array(this.x.memory.buffer, ptr, len);
+    const opfs = {
+      opfs_size: () => BigInt(this.handle.getSize()),
+      opfs_read: (ptr, len, at) => { this.reads = (this.reads || 0) + 1; this.readBytes = (this.readBytes || 0) + len; return this.handle.read(view(ptr, len), { at: Number(at) }); },
+      opfs_write: (ptr, len, at) => this.handle.write(view(ptr, len), { at: Number(at) }),
+      opfs_flush: () => { this.handle.flush(); return 0; },
+      opfs_truncate: (size) => { this.handle.truncate(Number(size)); return 0; },
+      opfs_now_ms: () => BigInt(Date.now()),
     };
-    const { instance } = await WebAssembly.instantiateStreaming(fetch('wormdb.wasm'), { env });
-    this.exports = instance.exports;
-    return this.exports.wdb_open();
+    const { instance } = await WebAssembly.instantiateStreaming(fetch('wormdb.wasm'), { opfs });
+    this.x = instance.exports;
+    const status = this.x.wormdb_open();
+    if (status < 0) throw new Error(`wormdb_open failed (${status})`);
+    this.key = this.x.wormdb_alloc(4); this.next = 0;
+    return status;
   }
+  withKey(index, fn) { new DataView(this.x.memory.buffer).setUint32(this.key, index, true); return fn(this.key); }
+  count() { let n = 0; while (this.get(n)) n++; this.next = n; return n; }
   append(payload) {
-    const ptr = this.exports.alloc(payload.length);
-    new Uint8Array(this.exports.memory.buffer, ptr, payload.length).set(payload);
-    return this.exports.wdb_append(ptr, payload.length);
+    const ptr = this.x.wormdb_alloc(payload.length);
+    new Uint8Array(this.x.memory.buffer, ptr, payload.length).set(payload);
+    const index = this.next++, status = this.withKey(index, k => this.x.wormdb_set(k, 4, ptr, payload.length));
+    this.x.wormdb_free(ptr, payload.length);
+    if (status < 0) throw new Error(`wormdb_set failed (${status})`);
+    return index;
   }
   get(index) {
-    const cap = 1 << 16, ptr = this.exports.alloc(cap), len = this.exports.wdb_get(index, ptr, cap);
-    return new Uint8Array(this.exports.memory.buffer, ptr, len).slice();
+    const ptr = this.withKey(index, k => this.x.wormdb_get(k, 4));
+    return ptr ? new Uint8Array(this.x.memory.buffer, ptr, this.x.wormdb_get_len()).slice() : undefined;
   }
-  flush() { this.exports.wdb_flush(); }
-  close() { this.exports.wdb_close(); this.handle.close(); }
+  flush() { if (this.x.wormdb_flush() < 0) throw new Error('wormdb_flush failed'); }
+  close() { this.x.wormdb_close(); this.handle.close(); }
 }
 
 const engines = { js: () => new JsEngine(), wasm: () => new WasmEngine() };
@@ -95,10 +107,11 @@ const tasks = {
     const db = engines[engine](); await db.open(file);
     for (let i = 0; i < count; i++) db.append(record(i, size));
     db.close();
-    const again = engines[engine](), t = performance.now(), found = await again.open(file), ms = performance.now() - t;
-    const ok = [0, count >> 1, count - 1].every(i => new DataView(again.get(i).buffer).getUint32(0, true) === i);
+    const again = engines[engine](), t = performance.now(); await again.open(file); const ms = performance.now() - t;
+    const reads = again.reads, readBytes = again.readBytes;
+    const found = again.count(), ok = [0, count >> 1, count - 1].every(i => { const r = again.get(i); return !!r && new DataView(r.buffer).getUint32(0, true) === i; });
     again.close();
-    return { count, size, found, ms, readsOk: ok };
+    return { count, size, found, ms, readsOk: ok, ...(reads ? { opfsReadsDuringOpen: reads, avgReadBytes: Math.round(readBytes / reads) } : {}) };
   },
   // Crash test, first half: append and flush until the page is killed, reporting each flushed index.
   async crashWrite({ engine, size = 1024 }) {
@@ -111,7 +124,7 @@ const tasks = {
   },
   // Crash test, second half: reopen after the kill; every record up to the last reported flush must be intact.
   async crashVerify({ engine, flushed }) {
-    const db = engines[engine](), found = await db.open(`bench-crash-${engine}`);
+    const db = engines[engine](); await db.open(`bench-crash-${engine}`); const found = db.count();
     let intact = true;
     for (let i = 0; i < found; i++) if (new DataView(db.get(i).buffer).getUint32(0, true) !== i) { intact = false; break; }
     db.close();
