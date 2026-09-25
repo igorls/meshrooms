@@ -23,7 +23,7 @@ import {
   validAttachments, type AttachmentRef, type FileStore, type TransferState,
 } from '../src/browser/files';
 import { cleanName, defaultName, sniff } from '../src/attachments';
-import { admissible, castVote, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
+import { admissible, castVote, COMPACT_DECISIONS_AT, compactDecisions, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
   type Decision, type DecisionBody, type DecisionMode, type DecisionPacket, type DecisionSync, type VoteBody } from '../src/browser/decisions';
 import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, validActivity, validNote, type Activity, type ActivityOn } from '../src/browser/activity';
 import {
@@ -162,7 +162,8 @@ export class BrowserAgent {
   boardCursor(ops = this.taskOps()) { return Math.max(readJson(this.path('board.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
   /** Verified decision and vote operations in arrival order, each with the decision cursor at which it arrived. */
   decisionOps(): StoredDecisionOp[] { return readJson<StoredDecisionOp[]>(this.path('decisions.json'), []); }
-  decisionCursor(ops = this.decisionOps()) { return ops.at(-1)?.seq ?? 0; }
+  /** Arrivals so far; compaction drops votes but never moves the cursor back, so later wakes still fire. */
+  decisionCursor(ops = this.decisionOps()) { return Math.max(readJson(this.path('decisions-cursor.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
   /** The room's decisions as every device folds them; people's votes count, agents' are advice. */
   decisions(ops = this.decisionOps()): Decision[] {
     const { ownerId, members, former } = this.members();
@@ -288,7 +289,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const storeDecisionOps = (added: DecisionPacket[]) => {
     const ops = agent.decisionOps(); let seq = agent.decisionCursor(ops);
-    writeJson(join(agent.dir, 'decisions.json'), [...ops, ...added.map(p => ({ ...p, seq: ++seq }))]);
+    let next: StoredDecisionOp[] = [...ops, ...added.map(p => ({ ...p, seq: ++seq }))];
+    if (next.length > COMPACT_DECISIONS_AT) { writeJson(join(agent.dir, 'decisions-cursor.json'), { seq }); next = compactDecisions(next); }
+    writeJson(join(agent.dir, 'decisions.json'), next);
   };
   /** Keep decision and vote operations signed by a (current or former) device of their author; duplicates are ignored. */
   const acceptDecisionOps = async (packets: unknown[]) => {
@@ -601,7 +604,7 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     const woke = evaluateWake(view, view.memberId, after, boardAfter);
     // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
     const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
-    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, decisionsAfter);
+    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, ops.filter(p => p.seq > decisionsAfter).map(p => p.body));
     const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
     const result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
     if (result.state !== 'waiting') {

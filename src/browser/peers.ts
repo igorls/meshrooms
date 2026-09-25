@@ -3,7 +3,7 @@ import { COMPACT_AT, MAX_TASK_OPS, compactBoard, foldBoard, syncChunks, taskBody
 import { verify, type BrowserDevice, type RoomStatus } from './protocol';
 import { BrowserApi } from './client';
 import {
-  MAX_DECISION_OPS, admissible, castVote, decisionChunks, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
+  COMPACT_DECISIONS_AT, MAX_DECISION_OPS, admissible, castVote, compactDecisions, decisionChunks, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
   type Decision, type DecisionBody, type DecisionPacket, type VoteBody,
 } from './decisions';
 import { FileTransfers, IMAGE_TYPES, MAX_MESSAGE_ATTACHMENTS, attachmentText, isFilePacket, retainedFiles, validAttachments, type AttachmentRef, type TransferState } from './files';
@@ -225,8 +225,10 @@ export class BrowserPeers {
     const known = new Set(this.decisionOps.map(op => op.body.id));
     const fresh = incoming.filter(op => !known.has(op.body.id) && (known.add(op.body.id), true));
     if (!fresh.length) return;
-    if (this.decisionOps.length + fresh.length > MAX_DECISION_OPS) throw new Error('This room’s decisions log is full in this preview.');
-    const next = [...this.decisionOps, ...fresh];
+    let next = [...this.decisionOps, ...fresh];
+    // Compaction keeps the same decisions with fewer votes; only a busy log needs it.
+    if (next.length > COMPACT_DECISIONS_AT) next = compactDecisions(next);
+    if (next.length > MAX_DECISION_OPS) throw new Error('This room’s decisions log is full in this preview.');
     await write(this.decisionKey, next); this.decisionOps = next; this.notifyDecisions();
   }
   private async publishDecision(body: DecisionBody | VoteBody) {
