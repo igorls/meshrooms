@@ -54,20 +54,17 @@ test('one request opens at most one issue, however it is retried', () => {
   expect(opened).toBe(2);
 });
 
-test('two runs adding the same issue: the second finds the first', () => {
+test('two runs adding the same issue: the second finds the first, and a stopped run is finished by retrying it', () => {
   const dir = join(mkdtempSync(join(tmpdir(), 'mr-issue-tasks-')), 'issue-tasks'), [a, b, c] = [0, 1, 2].map(() => crypto.randomUUID());
-  const link = 'https://github.com/igorls/meshrooms/issues/7', board = new Set<string>(), onBoard = (id: string) => board.has(id);
-  expect(claimIssueTask(dir, link, a, onBoard)).toBeUndefined();
-  expect(claimIssueTask(dir, 'https://github.com/IGORLS/Meshrooms/pull/7', b, onBoard)).toBe(a); // same issue, still running
-  expect(claimIssueTask(dir, link, a, onBoard)).toBeUndefined(); // a retry of the same request
-  // The first run died: its task on the board keeps the claim; without it, the issue can be added again.
-  const gone = spawnSync(process.execPath, ['-e', '0']).pid;
-  writeFileSync(join(dir, 'igorls_meshrooms_7.txt'), `${a} ${gone}`);
-  board.add(a);
-  expect(claimIssueTask(dir, link, b, onBoard)).toBe(a);
-  board.delete(a); // removed from the board since
-  expect(claimIssueTask(dir, link, b, onBoard)).toBeUndefined();
-  // A failed attempt gives the claim up.
+  const link = 'https://github.com/igorls/meshrooms/issues/7';
+  expect(claimIssueTask(dir, link, a)).toBeUndefined();
+  expect(claimIssueTask(dir, 'https://github.com/IGORLS/Meshrooms/pull/7', b)).toEqual({ requestId: a, running: true }); // same issue, still running
+  expect(claimIssueTask(dir, link, a)).toBeUndefined(); // a retry of the same request
+  // The first run stopped: nobody takes its claim over; retrying its own request id finishes it.
+  writeFileSync(join(dir, 'igorls_meshrooms_7.txt'), `${a} ${spawnSync(process.execPath, ['-e', '0']).pid}`);
+  expect(claimIssueTask(dir, link, b)).toEqual({ requestId: a, running: false });
+  expect(claimIssueTask(dir, link, a)).toBeUndefined();
+  // Released once the task is on the board (or nothing was queued), the issue can be claimed again.
   releaseIssueTask(dir, link);
-  expect(claimIssueTask(dir, link, c, onBoard)).toBeUndefined();
+  expect(claimIssueTask(dir, link, c)).toBeUndefined();
 });

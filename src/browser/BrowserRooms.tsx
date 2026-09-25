@@ -505,8 +505,9 @@ export function BrowserRooms() {
     });
   }
   const pinned = status?.repositories ?? [];
-  // Only while the details are open: scanning the conversation on every render would slow typing.
-  const mentioned = detailsOpen ? mentionedRepositories(messages.map(m => m.packet.body.text)).filter(r => !pinned.some(p => p.toLowerCase() === r.toLowerCase())) : [];
+  // Only while the details are open: scanning the conversation on every render would slow typing. Messages are
+  // stored as they arrived from peers, so order them by when they were sent for newest-first suggestions.
+  const mentioned = detailsOpen ? mentionedRepositories([...messages].sort((a, b) => a.packet.body.at - b.packet.body.at).map(m => m.packet.body.text)).filter(r => !pinned.some(p => p.toLowerCase() === r.toLowerCase())) : [];
   function pinRepository(change: { pin: string } | { unpin: string }) {
     void act(async () => {
       await api.command('repositories', urlRoom, change);

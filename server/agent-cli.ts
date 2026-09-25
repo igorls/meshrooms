@@ -361,13 +361,15 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     const assignee = values['--assignee'], assigneeId = assignee === undefined ? undefined : assignee === 'me' ? view.memberId! : assignee.toLowerCase();
     if (assigneeId && !uuid(assigneeId)) throw new Error('Use --assignee me or a member id from the tasks command.');
     // Another run of this agent may be adding the same issue right now; a new task's id is its request id.
-    const claims = join(agent.dir, 'issue-tasks');
-    const onBoard = (id: string) => view.tasks.some(t => t.id === id) || readdirSync(join(agent.dir, 'outbox')).some(f => f.endsWith(`-${id}.json`));
-    const holder = claimIssueTask(claims, link, requestId, onBoard);
-    if (holder) return { status: 'already-being-added', requestId: holder };
+    const claims = join(agent.dir, 'issue-tasks'), holder = claimIssueTask(claims, link, requestId);
+    if (holder?.running) return { status: 'already-being-added', requestId: holder.requestId };
+    if (holder) throw new Error(`An earlier issue-task for this issue (request ${holder.requestId}) stopped before finishing. Run it again with --request-id ${holder.requestId}.`);
     let draft: ReturnType<typeof issueDraft>;
     try { draft = issueDraft(runGh, link); } catch (error) { releaseIssueTask(claims, link); throw error; }
-    return taskBrowser(agent, { requestId, change: { ...draft, ...(assigneeId ? { assigneeId } : {}) } });
+    const result = await taskBrowser(agent, { requestId, change: { ...draft, ...(assigneeId ? { assigneeId } : {}) } });
+    // Once the task is on the board, the on-board check covers this issue; the claim stays while it is still queued.
+    if (result.status === 'shared' || result.status === 'dropped') releaseIssueTask(claims, link);
+    return result;
   }
   if (command === 'send') {
     if (!uuid(values['--request-id'])) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same message.');
