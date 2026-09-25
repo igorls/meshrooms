@@ -38,7 +38,8 @@ export type RoomStatus = {
   formerDevices?: FormerDevice[];
   settings?: RoomSettings;
 };
-export type FormerDevice = { id: string; publicKey: string; memberId: string };
+/** `role` is the member's role when the device left, so a departed agent's signed votes can never pass as a person's. */
+export type FormerDevice = { id: string; publicKey: string; memberId: string; role?: 'human' | 'agent' };
 export const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 export function base64(bytes: ArrayBuffer) { return btoa(String.fromCharCode(...new Uint8Array(bytes))); }
 export function unbase64(value: string) { return Uint8Array.from(atob(value), c => c.charCodeAt(0)); }

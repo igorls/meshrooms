@@ -273,6 +273,9 @@ test('agent links are capped per person, and agents leave with their operator', 
     expect(after.members!.map(m => m.name)).toEqual(['Alex', 'Vesper']);
     expect(after.devices).toHaveLength(2);
     expect((await samAgent.status(room)).memberId).toBeUndefined();
+    // Departed devices keep their member's role, so a removed agent's signed votes never pass as a person's.
+    const roles = Object.fromEntries(after.formerDevices!.map(d => [d.role, (after.formerDevices!.filter(x => x.role === d.role)).length]));
+    expect(roles).toEqual({ human: 1, agent: 4 });
     const again = await client(lobby);
     await expect(again.send('agent-redeem', room, { token: codex, label: 'Windows node' })).rejects.toThrow('already used or has expired');
   } finally { lobby.close(); }
@@ -335,7 +338,7 @@ test('keys of devices that left stay available to members, so their task changes
     expect((await host.status(room)).formerDevices).toBeUndefined();
     await sam.send('remove', room, { deviceId: samStatus.deviceId });
     const after = await host.status(room);
-    expect(after.formerDevices).toEqual([{ id: samStatus.deviceId, publicKey: samStatus.devices!.find(d => d.id === samStatus.deviceId)!.publicKey, memberId: samStatus.memberId! }]);
+    expect(after.formerDevices).toEqual([{ id: samStatus.deviceId, publicKey: samStatus.devices!.find(d => d.id === samStatus.deviceId)!.publicKey, memberId: samStatus.memberId!, role: 'human' }]);
     expect((await sam.status(room)).formerDevices).toBeUndefined(); // not shown outside the room
   } finally { lobby.close(); }
 });
