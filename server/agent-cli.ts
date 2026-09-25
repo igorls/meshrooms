@@ -31,7 +31,7 @@ import { join, resolve } from 'node:path';
 import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import { mayAgentSpeak } from '../src/collab';
 import { issueLinkFrom } from '../src/browser/board';
-import { createIssue, issueDraft, issueRepository, openIssueOnce, runGh, sameIssue } from './github-issues';
+import { claimIssueTask, createIssue, issueDraft, issueRepository, openIssueOnce, releaseIssueTask, runGh, sameIssue } from './github-issues';
 
 export { parseConnectLink };
 import { REACTION_EMOJI, isReactionEmoji } from '../src/browser/reactions';
@@ -360,7 +360,14 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (existing && !agent.taskOps().some(p => p.body.id === requestId)) return { status: 'already-on-board', task: existing };
     const assignee = values['--assignee'], assigneeId = assignee === undefined ? undefined : assignee === 'me' ? view.memberId! : assignee.toLowerCase();
     if (assigneeId && !uuid(assigneeId)) throw new Error('Use --assignee me or a member id from the tasks command.');
-    return taskBrowser(agent, { requestId, change: { ...issueDraft(runGh, link), ...(assigneeId ? { assigneeId } : {}) } });
+    // Another run of this agent may be adding the same issue right now; a new task's id is its request id.
+    const claims = join(agent.dir, 'issue-tasks');
+    const onBoard = (id: string) => view.tasks.some(t => t.id === id) || readdirSync(join(agent.dir, 'outbox')).some(f => f.endsWith(`-${id}.json`));
+    const holder = claimIssueTask(claims, link, requestId, onBoard);
+    if (holder) return { status: 'already-being-added', requestId: holder };
+    let draft: ReturnType<typeof issueDraft>;
+    try { draft = issueDraft(runGh, link); } catch (error) { releaseIssueTask(claims, link); throw error; }
+    return taskBrowser(agent, { requestId, change: { ...draft, ...(assigneeId ? { assigneeId } : {}) } });
   }
   if (command === 'send') {
     if (!uuid(values['--request-id'])) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same message.');

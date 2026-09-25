@@ -91,3 +91,29 @@ export function openIssueOnce(dir: string, requestId: string, open: () => string
   writeFileSync(record, link, { mode: 0o600 });
   return link;
 }
+
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as { code?: string }).code === 'EPERM'; } };
+
+/**
+ * Claims adding a task for one issue, so two runs of this agent (with different request ids) can't both add it: the
+ * claim is a file per issue, created exclusively, naming the request and its process. Returns undefined when this
+ * request holds the claim, or the request id already adding the issue. A claim whose process is gone and whose task
+ * isn't on the board (it never landed, or someone removed it since) is taken over, so the issue can be added again.
+ */
+export function claimIssueTask(dir: string, link: string, requestId: string, onBoard: (requestId: string) => boolean): string | undefined {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const [, owner, name, , number] = new URL(link).pathname.split('/');
+  const claim = join(dir, `${owner}_${name}_${number}.txt`.toLowerCase()), mine = `${requestId} ${process.pid}`;
+  try { writeFileSync(claim, mine, { flag: 'wx', mode: 0o600 }); return undefined; }
+  catch (error) { if ((error as { code?: string }).code !== 'EEXIST') throw error; }
+  const [holder = '', pid = ''] = readFileSync(claim, 'utf8').split(' ');
+  if (holder === requestId) return undefined; // a retry of the same request
+  if (onBoard(holder) || alive(Number(pid))) return holder;
+  writeFileSync(claim, mine, { mode: 0o600 });
+  return undefined;
+}
+/** Gives up a claim when adding the task failed before it was queued. */
+export function releaseIssueTask(dir: string, link: string) {
+  const [, owner, name, , number] = new URL(link).pathname.split('/');
+  rmSync(join(dir, `${owner}_${name}_${number}.txt`.toLowerCase()), { force: true });
+}

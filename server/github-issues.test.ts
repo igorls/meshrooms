@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createIssue, issueDraft, issueRepository, openIssueOnce, sameIssue, UncertainGh, type Gh } from './github-issues';
+import { claimIssueTask, createIssue, issueDraft, issueRepository, openIssueOnce, releaseIssueTask, sameIssue, UncertainGh, type Gh } from './github-issues';
 
 test("an agent opens an issue for a task with its own gh, in the room's pinned repository", () => {
   expect(issueRepository(['igorls/meshrooms'])).toBe('igorls/meshrooms');
@@ -52,4 +52,22 @@ test('one request opens at most one issue, however it is retried', () => {
   expect(() => openIssueOnce(dir, d, () => { throw new UncertainGh('timed out'); })).toThrow('timed out');
   expect(() => openIssueOnce(dir, d, open)).toThrow('may exist');
   expect(opened).toBe(2);
+});
+
+test('two runs adding the same issue: the second finds the first', () => {
+  const dir = join(mkdtempSync(join(tmpdir(), 'mr-issue-tasks-')), 'issue-tasks'), [a, b, c] = [0, 1, 2].map(() => crypto.randomUUID());
+  const link = 'https://github.com/igorls/meshrooms/issues/7', board = new Set<string>(), onBoard = (id: string) => board.has(id);
+  expect(claimIssueTask(dir, link, a, onBoard)).toBeUndefined();
+  expect(claimIssueTask(dir, 'https://github.com/IGORLS/Meshrooms/pull/7', b, onBoard)).toBe(a); // same issue, still running
+  expect(claimIssueTask(dir, link, a, onBoard)).toBeUndefined(); // a retry of the same request
+  // The first run died: its task on the board keeps the claim; without it, the issue can be added again.
+  const gone = spawnSync(process.execPath, ['-e', '0']).pid;
+  writeFileSync(join(dir, 'igorls_meshrooms_7.txt'), `${a} ${gone}`);
+  board.add(a);
+  expect(claimIssueTask(dir, link, b, onBoard)).toBe(a);
+  board.delete(a); // removed from the board since
+  expect(claimIssueTask(dir, link, b, onBoard)).toBeUndefined();
+  // A failed attempt gives the claim up.
+  releaseIssueTask(dir, link);
+  expect(claimIssueTask(dir, link, c, onBoard)).toBeUndefined();
 });
