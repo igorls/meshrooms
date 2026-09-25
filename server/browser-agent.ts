@@ -282,18 +282,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   /** Keep decision and vote operations signed by a (current or former) device of their author; duplicates are ignored. */
   const acceptDecisionOps = async (packets: unknown[]) => {
-    const ops = agent.decisionOps(); const known = new Set(ops.map(p => p.body.id)); const added: DecisionPacket[] = [];
-    // Votes need a decision this device holds (or one arriving in the same batch), and each member has a share of the cap.
-    const valid = (packets as DecisionPacket[]).filter(p => validDecisionBody(p?.body, agent.roomId) || validVoteBody(p?.body, agent.roomId));
-    const keep = new Set(admissible(ops.map(p => p.body), valid.map(p => p.body)).map(b => b.id));
-    for (const packet of valid.filter(p => keep.has(p.body.id))) {
-      const b = packet.body;
-      if (ops.length + added.length >= MAX_DECISION_OPS) break;
-      if (!(validDecisionBody(b, agent.roomId) || validVoteBody(b, agent.roomId)) || known.has(b.id) || typeof packet.signature !== 'string') continue;
+    const ops = agent.decisionOps();
+    const added = await admitDecisionPackets(ops.map(p => p.body), packets, agent.roomId, async (b, signature) => {
       const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
-      if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
-      known.add(b.id); added.push({ body: b, signature: packet.signature });
-    }
+      return !!author && author.memberId === b.memberId && await agent.verify(author.publicKey, b, signature);
+    });
     if (added.length) storeDecisionOps(added);
   };
   const shareDecisionOp = async (body: DecisionBody | VoteBody) => {
@@ -711,4 +704,28 @@ export function pickDecision(decisions: Decision[], id: string, me: string | und
   if (matches.length <= 1) return matches[0];
   const own = matches.find(d => d.createdBy === me); if (own) return own;
   throw new Error('Several decisions share that id. Ask the person who opened yours for its question, and use decisions to find it.');
+}
+
+/**
+ * The decision operations of a batch this device keeps. Signatures are checked before the hold rule is applied, so a
+ * forged decision can't make a genuine vote for it look admissible: decisions (few) are verified first, then votes are
+ * admitted only against held or verified decisions and per-member shares, then the admitted votes are verified.
+ */
+export async function admitDecisionPackets(held: (DecisionBody | VoteBody)[], packets: unknown[], roomId: string,
+  genuine: (body: DecisionBody | VoteBody, signature: string) => Promise<boolean>): Promise<DecisionPacket[]> {
+  const known = new Set(held.map(b => b.id)), seen = new Set<string>();
+  const fresh = (packets as DecisionPacket[]).filter(p => typeof p?.signature === 'string' && (validDecisionBody(p.body, roomId) || validVoteBody(p.body, roomId))
+    && !known.has(p.body.id) && !seen.has(p.body.id) && seen.add(p.body.id));
+  const decisions: DecisionPacket[] = [];
+  for (const p of fresh) if (p.body.kind === 'decision' && await genuine(p.body, p.signature)) decisions.push(p);
+  const votes = fresh.filter(p => p.body.kind === 'vote');
+  const keep = new Set(admissible(held, [...decisions, ...votes].map(p => p.body)).map(b => b.id));
+  const accepted: DecisionPacket[] = [];
+  for (const p of fresh) {
+    if (held.length + accepted.length >= MAX_DECISION_OPS) break;
+    if (!keep.has(p.body.id)) continue;
+    if (p.body.kind === 'vote' && !await genuine(p.body, p.signature)) continue;
+    accepted.push({ body: p.body, signature: p.signature });
+  }
+  return accepted;
 }
