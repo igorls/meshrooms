@@ -2,6 +2,10 @@ import type { Task } from '../collab';
 import { COMPACT_AT, MAX_TASK_OPS, compactBoard, foldBoard, syncChunks, taskBody, validTaskBody, type TaskBody, type TaskChange, type TaskPacket } from './board';
 import { verify, type BrowserDevice, type RoomStatus } from './protocol';
 import { BrowserApi } from './client';
+import {
+  MAX_DECISION_OPS, admissible, castVote, decisionChunks, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
+  type Decision, type DecisionBody, type DecisionPacket, type VoteBody,
+} from './decisions';
 import { FileTransfers, IMAGE_TYPES, MAX_MESSAGE_ATTACHMENTS, attachmentText, isFilePacket, retainedFiles, validAttachments, type AttachmentRef, type TransferState } from './files';
 import { read, sign, update, write } from './storage';
 import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRecord } from './activity';
@@ -10,7 +14,7 @@ import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRe
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
 const isId = (value: unknown) => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
-type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body']; signature: string };
+type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body'] | DecisionBody | VoteBody; signature: string };
 export type SavedMessage = { packet: Packet & { body: MessageBody }; targets: string[]; receipts: string[] };
 type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; started: number };
 /** A file of this room as this browser sees it: a blob URL once verified and stored, else how fetching goes. */
@@ -29,6 +33,8 @@ export class BrowserPeers {
   private key: string;
   private boardKey: string;
   private ops: TaskPacket[] = [];
+  private decisionKey: string;
+  private decisionOps: DecisionPacket[] = [];
   private filesKey: string;
   private index: FileIndex = {};
   private refs = new Map<string, AttachmentRef>();
@@ -41,9 +47,11 @@ export class BrowserPeers {
   constructor(private api: BrowserApi, private roomId: string, private deviceId: string, private session: string,
     private changed: (messages: SavedMessage[], connected: string[], added?: SavedMessage) => void, private error: (message: string) => void,
     private boardChanged: (tasks: Task[], ops: TaskBody[]) => void = () => {}, private filesChanged: (files: Record<string, FileView>) => void = () => {},
-    private activityChanged: (activity: Record<string, ActivityRecord>) => void = () => {}) {
+    private activityChanged: (activity: Record<string, ActivityRecord>) => void = () => {},
+    private decisionsChanged: (ops: (DecisionBody | VoteBody)[]) => void = () => {}) {
     this.key = `messages:${deviceId}:${roomId}`;
     this.boardKey = `board:${deviceId}:${roomId}`;
+    this.decisionKey = `decisions:${deviceId}:${roomId}`;
     this.filesKey = `files:${deviceId}:${roomId}`;
     this.files = new FileTransfers({ roomId, referenced: sha => this.refs.get(sha), changed: () => this.notifyFiles(),
       store: { has: sha => sha in this.index, get: sha => this.readFile(sha), put: (sha, bytes, type) => this.storeFile(sha, bytes, type) },
@@ -52,9 +60,10 @@ export class BrowserPeers {
   }
   async load() {
     this.messages = await read<SavedMessage[]>(this.key) || []; this.ops = await read<TaskPacket[]>(this.boardKey) || [];
+    this.decisionOps = await read<DecisionPacket[]>(this.decisionKey) || [];
     this.index = await read<FileIndex>(this.filesKey) || {};
     for (const sha of Object.keys(this.index)) await this.fileUrl(sha);
-    this.notify(); this.notifyBoard(); this.syncFiles();
+    this.notify(); this.notifyBoard(); this.notifyDecisions(); this.syncFiles();
   }
   private fileKey(sha: string) { return `file:${this.deviceId}:${this.roomId}:${sha}`; }
   private fileChain<T>(work: () => Promise<T>): Promise<T> { const next = this.fileSerial.then(work); this.fileSerial = next.catch(() => {}); return next; }
@@ -136,6 +145,65 @@ export class BrowserPeers {
   private sendBoard(channel: RTCDataChannel) {
     for (const chunk of syncChunks(this.roomId, this.ops)) { try { channel.send(JSON.stringify(chunk)); } catch { return; } }
   }
+  private notifyDecisions() { if (!this.stopped) this.decisionsChanged(this.decisionOps.map(op => op.body)); }
+  /** Keeps decision operations we have not seen; a full log refuses new ones rather than dropping live state. */
+  private async addDecisionOps(incoming: DecisionPacket[]) {
+    const known = new Set(this.decisionOps.map(op => op.body.id));
+    const fresh = incoming.filter(op => !known.has(op.body.id) && (known.add(op.body.id), true));
+    if (!fresh.length) return;
+    if (this.decisionOps.length + fresh.length > MAX_DECISION_OPS) throw new Error('This room’s decisions log is full in this preview.');
+    const next = [...this.decisionOps, ...fresh];
+    await write(this.decisionKey, next); this.decisionOps = next; this.notifyDecisions();
+  }
+  private async publishDecision(body: DecisionBody | VoteBody) {
+    // The same per-member limit applies to this device's own operations as to those it receives.
+    if (!admissible(this.decisionOps.map(op => op.body), [body]).length) throw new Error('You have reached this room’s limit for decision changes.');
+    const packet: DecisionPacket = { body, signature: await sign(body) };
+    await this.addDecisionOps([packet]);
+    for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* Decisions are exchanged again on reconnect. */ } }
+  }
+  private author() {
+    if (!this.status?.memberId || this.stopped) throw new Error('Join the room before taking part in decisions.');
+    return { roomId: this.roomId, deviceId: this.deviceId, memberId: this.status.memberId };
+  }
+  /** Open a decision for the room: a question with options, or a plan review. Signed here and sent to every device. */
+  openDecision(input: Omit<Parameters<typeof openDecision>[0], 'roomId' | 'deviceId' | 'memberId'>) {
+    return this.transaction(async () => { const body = openDecision({ ...this.author(), ...input }); await this.publishDecision(body); return body.decisionId; });
+  }
+  /** Add an option, close (recording the tally this device sees) or withdraw a decision. */
+  reviseDecision(decision: Decision, change: Parameters<typeof reviseDecision>[2]) {
+    return this.transaction(async () => { await this.publishDecision(reviseDecision(this.author(), decision, change)); });
+  }
+  /** Vote for an option, or `null` to take the vote back. A later vote from the same member replaces this one. */
+  vote(decision: Decision, optionId: string | null, comment = '') {
+    return this.transaction(async () => {
+      const a = this.author();
+      await this.publishDecision(castVote(a, decision, optionId, comment, nextVoteRevision(this.decisionOps.map(op => op.body), decision, a.memberId)));
+    });
+  }
+  /** Decision operations relayed in an exchange are checked against each author's own device, not the sender's. */
+  private async acceptDecisions(sync: { roomId?: unknown; ops?: unknown }) {
+    if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
+    const held = new Set(this.decisionOps.map(op => op.body.id));
+    const candidates = (sync.ops as DecisionPacket[]).filter(op => (validDecisionBody(op?.body, this.roomId) || validVoteBody(op?.body, this.roomId))
+      && typeof op.signature === 'string' && !held.has(op.body.id));
+    const authentic = async ({ body: b, signature }: DecisionPacket) => {
+      const author = this.status?.devices?.find(d => d.id === b.deviceId) ?? this.status?.formerDevices?.find(d => d.id === b.deviceId);
+      return !!author && b.memberId === author.memberId && await verify(author.publicKey, b, signature);
+    };
+    // Decisions first, so a vote is admitted only against a decision held or just verified (a forged decision in the
+    // batch can't carry votes in); then the per-member cap, before the more numerous votes are verified.
+    const decisions: DecisionPacket[] = [];
+    for (const op of candidates) if (op.body.kind === 'decision' && await authentic(op)) decisions.push(op);
+    const votes = candidates.filter(op => op.body.kind === 'vote');
+    const admitted = new Set(admissible(this.decisionOps.map(op => op.body), [...decisions, ...votes].map(op => op.body)));
+    const accepted = decisions.filter(op => admitted.has(op.body));
+    for (const op of votes) if (admitted.has(op.body) && await authentic(op)) accepted.push(op);
+    await this.addDecisionOps(accepted.map(({ body, signature }) => ({ body, signature })));
+  }
+  private sendDecisions(channel: RTCDataChannel) {
+    for (const chunk of decisionChunks(this.roomId, this.decisionOps)) { try { channel.send(JSON.stringify(chunk)); } catch { return; } }
+  }
   private notifyActivity() { if (!this.stopped) this.activityChanged(Object.fromEntries(this.activity)); }
   private forget(id: string) { if (this.activity.delete(id)) this.notifyActivity(); }
   /** Only an agent's own device speaks for it, on its own channel. */
@@ -186,7 +254,7 @@ export class BrowserPeers {
   }
   private connectChannel(peer: Peer, id: string, channel: RTCDataChannel) {
     peer.channel = channel;
-    channel.onopen = () => { this.flush(); this.sendBoard(channel); this.files.opened(id); this.notify(); };
+    channel.onopen = () => { this.flush(); this.sendBoard(channel); this.sendDecisions(channel); this.files.opened(id); this.notify(); };
     channel.onclose = () => { if (this.peers.get(id) === peer) { this.files.closed(id); this.forget(id); } this.notify(); };
     channel.onmessage = event => {
       if (typeof event.data !== 'string' || event.data.length > 20_000) return;
@@ -204,6 +272,7 @@ export class BrowserPeers {
         if (this.stopped || !this.status?.memberId || this.peers.get(id) !== peer) return;
         const device = this.status.devices?.find(d => d.id === id); if (!device) return;
         if ((packet as unknown as { kind?: unknown })?.kind === 'board') { await this.acceptBoard(packet as never); return; }
+        if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never); return; }
         const b = packet?.body;
         if (!b || b.roomId !== this.roomId || b.deviceId !== id || !isId(b.id) || typeof packet.signature !== 'string' || !await verify(device.publicKey, b, packet.signature)) return;
         if (b.kind === 'message') {
@@ -225,6 +294,9 @@ export class BrowserPeers {
           if (m?.targets.includes(id) && !m.receipts.includes(id)) await this.save(this.messages.map(x => x === m ? { ...x, receipts: [...x.receipts, id] } : x));
         } else if (b.kind === 'task') {
           if (validTaskBody(b, this.roomId) && b.memberId === device.memberId) await this.addOps([{ body: b, signature: packet.signature }]);
+        } else if (b.kind === 'decision' || b.kind === 'vote') {
+          if ((validDecisionBody(b, this.roomId) || validVoteBody(b, this.roomId)) && b.memberId === device.memberId
+            && admissible(this.decisionOps.map(op => op.body), [b]).length) await this.addDecisionOps([{ body: b, signature: packet.signature }]);
         }
       }).catch(e => this.error(e.message)).finally(() => { this.pendingIncoming--; });
     };

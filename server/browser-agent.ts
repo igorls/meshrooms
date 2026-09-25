@@ -23,6 +23,8 @@ import {
   validAttachments, type AttachmentRef, type FileStore, type TransferState,
 } from '../src/browser/files';
 import { cleanName, defaultName, sniff } from '../src/attachments';
+import { admissible, castVote, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
+  type Decision, type DecisionBody, type DecisionMode, type DecisionPacket, type DecisionSync, type VoteBody } from '../src/browser/decisions';
 import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, validActivity, validNote, type Activity, type ActivityOn } from '../src/browser/activity';
 import { evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
@@ -32,9 +34,15 @@ type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: stri
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody; signature: string };
 type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[] };
-type Members = { memberId?: string; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
+type Members = { memberId?: string; ownerId?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
+/** A queued decision change; like tasks, `run` builds it against the decision as it stands when signing. */
+type DecisionIntent = { type: 'decision'; id: string; decisionId: string } & (
+  | { action: 'open'; question: string; context: string; mode: DecisionMode; options: string[]; askAgents: boolean | string[]; closesAt: number | null }
+  | { action: 'vote'; optionId: string | null; comment: string }
+  | { action: 'option'; label: string } | { action: 'close' } | { action: 'withdraw' });
+type StoredDecisionOp = DecisionPacket & { seq: number };
 /** A stored task operation and the board cursor at which it arrived. */
 type StoredOp = TaskPacket & { seq: number };
 type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; started: number };
@@ -145,6 +153,14 @@ export class BrowserAgent {
   taskOps(): StoredOp[] { return readJson<StoredOp[]>(this.path('tasks.json'), []).map((p, i) => ({ ...p, seq: p.seq ?? i + 1 })); }
   /** Arrivals so far. Compaction drops operations but never moves the cursor back, so later assignments still wake. */
   boardCursor(ops = this.taskOps()) { return Math.max(readJson(this.path('board.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
+  /** Verified decision and vote operations in arrival order, each with the decision cursor at which it arrived. */
+  decisionOps(): StoredDecisionOp[] { return readJson<StoredDecisionOp[]>(this.path('decisions.json'), []); }
+  decisionCursor(ops = this.decisionOps()) { return ops.at(-1)?.seq ?? 0; }
+  /** The room's decisions as every device folds them; people's votes count, agents' are advice. */
+  decisions(ops = this.decisionOps()): Decision[] {
+    const { ownerId, members, former } = this.members();
+    return foldDecisions(ops.map(p => p.body), { ownerId, members, former });
+  }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined { const a = readJson<unknown>(this.path('activity.json'), undefined); return validActivity(a) ? a : undefined; }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
@@ -260,6 +276,34 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     }
     if (added.length) storeOps(ops, added);
   };
+  const storeDecisionOps = (added: DecisionPacket[]) => {
+    const ops = agent.decisionOps(); let seq = agent.decisionCursor(ops);
+    writeJson(join(agent.dir, 'decisions.json'), [...ops, ...added.map(p => ({ ...p, seq: ++seq }))]);
+  };
+  /** Keep decision and vote operations signed by a (current or former) device of their author; duplicates are ignored. */
+  const acceptDecisionOps = async (packets: unknown[]) => {
+    const ops = agent.decisionOps();
+    const added = await admitDecisionPackets(ops.map(p => p.body), packets, agent.roomId, async (b, signature) => {
+      const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
+      return !!author && author.memberId === b.memberId && await agent.verify(author.publicKey, b, signature);
+    });
+    if (added.length) storeDecisionOps(added);
+  };
+  const shareDecisionOp = async (body: DecisionBody | VoteBody) => {
+    // This device's own changes obey the same per-member share as everyone's, or peers would drop them.
+    const held = agent.decisionOps();
+    if (held.length >= MAX_DECISION_OPS) throw new Error('This room has reached its limit of decision changes.');
+    if (!admissible(held.map(p => p.body), [body]).length) throw new Error('This agent has reached its share of decision changes in this room.');
+    const packet = { body, signature: await agent.sign(body) };
+    storeDecisionOps([packet]);
+    for (const peer of peers.values()) if (peer.channel?.readyState === 'open') peer.channel.send(JSON.stringify(packet));
+  };
+  /** Close this agent's own decisions once the result can no longer change or their deadline passes (wake on consensus follows). */
+  const closeDueDecisions = () => transaction(async () => {
+    if (!status?.memberId) return;
+    for (const d of agent.decisions()) if (d.createdBy === status.memberId && due(d, Date.now()))
+      await shareDecisionOp(reviseDecision({ roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId }, d, { close: true }));
+  });
   /**
    * Files named by verified messages. The store and transfers know nothing about messages, so other signed records
    * (task artifacts, later) can make a file servable the same way.
@@ -306,6 +350,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       log(`channel open to ${id.slice(0, 8)}`);
       // Exchange boards so either side catches up on tasks changed while apart.
       for (const chunk of syncChunks(agent.roomId, agent.taskOps().map(({ body, signature }) => ({ body, signature })))) channel.send(JSON.stringify(chunk));
+      for (const chunk of decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature })))) channel.send(JSON.stringify(chunk));
       transfers.opened(id);
       activity.opened(channel);
       flush();
@@ -325,6 +370,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       const sync = packet as unknown as BoardSync;
       if (sync?.kind === 'board') { if (sync.roomId === agent.roomId && Array.isArray(sync.ops)) await acceptOps(sync.ops); return; }
       if ((packet?.body as { kind?: string })?.kind === 'task') { await acceptOps([packet]); return; }
+      const decisions = packet as unknown as DecisionSync;
+      if (decisions?.kind === 'decisions') { if (decisions.roomId === agent.roomId && Array.isArray(decisions.ops)) await acceptDecisionOps(decisions.ops); return; }
+      if (['decision', 'vote'].includes((packet?.body as { kind?: string })?.kind ?? '')) { await acceptDecisionOps([packet]); return; }
       const b = packet?.body;
       if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
         || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return;
@@ -362,8 +410,23 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const deliverOutbox = () => transaction(async () => {
     const outbox = join(agent.dir, 'outbox');
     for (const file of readdirSync(outbox).filter(f => f.endsWith('.json')).sort()) {
-      const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | null>(join(outbox, file), null);
+      const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | null>(join(outbox, file), null);
       if (!item || !status?.memberId) continue;
+      if ('type' in item && item.type === 'decision') {
+        const ops = agent.decisionOps(), author = { roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId };
+        const current = pickDecision(agent.decisions(ops), item.decisionId, status.memberId);
+        try {
+          if (!ops.some(p => p.body.id === item.id)) {
+            const body = item.action === 'open' ? (current ? undefined : openDecision({ ...author, decisionId: item.decisionId, question: item.question, context: item.context,
+                mode: item.mode, options: item.options, askAgents: item.askAgents, closesAt: item.closesAt }))
+              : !current ? undefined
+              : item.action === 'vote' ? castVote(author, current, item.optionId, item.comment, nextVoteRevision(ops.map(p => p.body), current, status.memberId))
+              : reviseDecision(author, current, item.action === 'option' ? { addOption: item.label } : item.action === 'close' ? { close: true } : { withdraw: true });
+            if (body) await shareDecisionOp({ ...body, id: item.id });
+          }
+        } catch (error) { log(`dropped decision change ${item.id}: ${error instanceof Error ? error.message : String(error)}`); }
+        unlinkSync(join(outbox, file)); continue;
+      }
       if ('type' in item && item.type === 'task') {
         const ops = agent.taskOps();
         if (!ops.some(p => p.body.id === item.id)) {
@@ -400,7 +463,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await Bun.sleep(3000); continue; }
       if (epoch && next.epoch !== epoch) { for (const p of peers.values()) await p.pc.close(); peers.clear(); cursor = 0; }
       epoch = next.epoch; status = next;
-      writeJson(join(agent.dir, 'members.json'), { memberId: next.memberId, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
+      // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
+      const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
+      writeJson(join(agent.dir, 'members.json'), { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
       if (next.settings) writeJson(join(agent.dir, 'settings.json'), { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake });
       await applyPendingProfile(agent, log);
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
@@ -426,6 +491,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         }
       }
       await deliverOutbox();
+      await closeDueDecisions();
       transfers.tick(); fetchWanted();
       if (Date.now() - pruned > 60_000) { prune(); pruned = Date.now(); }
     } catch (error) { log(`status: ${error instanceof Error ? error.message : String(error)}`); }
@@ -437,23 +503,30 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
  * Wait until this agent is addressed in the browser room (same semantics as local `listen`). Calling it means the
  * agent is idle; returning what addressed it means it is working on that until it listens again.
  */
-export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number) {
+export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number) {
   const deadline = Date.now() + seconds * 1000;
   let beat = 0;
   while (true) {
     const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
-    const result = evaluateWake(view, view.memberId, after, boardAfter);
+    const woke = evaluateWake(view, view.memberId, after, boardAfter);
+    // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
+    const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
+    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, decisionsAfter);
+    const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
+    const result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
     if (result.state !== 'waiting') {
       // History without anything for this agent is catching up, not work.
-      if (result.addressed.length || result.tasks.length) agent.recordActivity('working', { messages: result.addressed.slice(-8), tasks: result.tasks.map(t => t.id).slice(-8) });
+      if (result.addressed.length || result.tasks.length || decided) agent.recordActivity('working', { messages: result.addressed.slice(-8), tasks: result.tasks.map(t => t.id).slice(-8) });
       else agent.recordActivity('idle');
-      return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, ...result };
+      return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, ...result, decisionCursor,
+        ...(decided ? { decisions: { asked: wakes.asked.map(d => describeDecision(agent, d)), resolved: wakes.resolved.map(d => describeDecision(agent, d)),
+          ...(wakes.withdrawn.length ? { withdrawn: wakes.withdrawn.map(d => describeDecision(agent, d)) } : {}) } } : {}) };
     }
     if (!beat || Date.now() - beat >= LISTEN_HEARTBEAT_MS) { if (beat) agent.touchActivity(); else agent.recordActivity('idle'); beat = Date.now(); }
     if (Date.now() >= deadline) {
       agent.touchActivity();
       return { state: 'timeout', roomId: agent.roomId, participantId: view.memberId, floor: view.floor, messages: [], cursor: after,
-        boardCursor: boardAfter ?? view.boardRevision, observed: result.messages.filter(m => m.authorId !== view.memberId).length };
+        boardCursor: boardAfter ?? view.boardRevision, decisionCursor: decisionsAfter ?? decisionCursor, observed: result.messages.filter(m => m.authorId !== view.memberId).length };
     }
     await Bun.sleep(500);
   }
@@ -563,4 +636,100 @@ export async function taskBrowser(agent: BrowserAgent, input: { requestId: strin
     await Bun.sleep(300);
   }
   return { taskId, status: 'queued-for-bridge' };
+}
+
+/** A decision as an agent reads it: names instead of ids, and which votes count. */
+export function describeDecision(agent: BrowserAgent, d: Decision) {
+  const { members } = agent.members(), name = (id: string) => members.find(m => m.id === id)?.name ?? 'Former member';
+  const label = (id: string | null) => id === null ? null : d.options.find(o => o.id === id)?.label ?? id;
+  return { id: d.id, question: d.question, ...(d.context ? { context: d.context } : {}), mode: d.mode, state: d.state, createdBy: name(d.createdBy),
+    options: d.options.map(o => ({ id: o.id, label: o.label, people: d.tally.tally[o.id] ?? 0 })),
+    ...(d.closesAt ? { closesAt: new Date(d.closesAt).toISOString() } : {}),
+    // An outcome is final only once every vote it counted has arrived here (verified); uncounted votes came after it closed.
+    ...(d.state === 'closed' && d.outcome ? { outcome: { result: d.outcome.result, options: d.outcome.optionIds.map(label), voters: d.outcome.voters, people: d.outcome.people,
+      verified: d.verified, ...(d.uncounted ? { uncounted: d.uncounted } : {}) } }
+      : { leading: d.tally.result === 'no-votes' ? [] : d.tally.optionIds.map(label), voters: d.tally.voters, people: d.tally.people, settled: d.settled }),
+    votes: d.votes.map(v => ({ by: name(v.memberId), counts: v.counts, option: label(v.optionId), ...(v.comment ? { comment: v.comment } : {}) })) };
+}
+
+/** Queue a decision change for `run` to sign and share; returns the decision once this device holds the change. */
+export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveOmit<DecisionIntent, 'type'>, seconds = 10) {
+  const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
+  const current = pickDecision(agent.decisions(), intent.decisionId, view.memberId);
+  const done = agent.decisionOps().some(p => p.body.id === intent.id);
+  if (!done && intent.action !== 'open') {
+    if (!current) throw new Error('That decision is not in this room. Run decisions for current ids.');
+    if (current.state !== 'open') throw new Error(`This decision is already ${current.state}.`);
+    if (intent.action === 'vote' && intent.optionId !== null && !current.options.some(o => o.id === intent.optionId))
+      throw new Error(`Choose one of: ${current.options.map(o => `${o.id} (${o.label})`).join(', ')}.`);
+    const { ownerId, members } = agent.members();
+    const steward = current.createdBy === view.memberId || view.memberId === ownerId || members.some(m => m.id === current.createdBy && m.operatorId === view.memberId);
+    if ((intent.action === 'close' || intent.action === 'withdraw') && !steward) throw new Error('Only the person or agent who opened it, its operator, or the host can close it.');
+    if (intent.action === 'option' && current.mode === 'plan-review') throw new Error('Plan reviews keep Approve / Request changes / Reject.');
+  }
+  if (!done) writeJson(join(agent.dir, 'outbox', `${Date.now()}-${intent.id}.json`), { type: 'decision', ...intent });
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    const pending = readdirSync(join(agent.dir, 'outbox')).some(f => f.endsWith(`-${intent.id}.json`));
+    const ops = agent.decisionOps();
+    if (ops.some(p => p.body.id === intent.id)) {
+      agent.touchActivity();
+      const decision = pickDecision(agent.decisions(ops), intent.decisionId, view.memberId);
+      return { status: 'shared', decision: decision ? describeDecision(agent, decision) : null, decisionCursor: agent.decisionCursor(ops) };
+    }
+    if (!pending) return { status: 'dropped', reason: 'The change no longer applied when it was signed (the decision closed or changed). Read it again.' };
+    await Bun.sleep(300);
+  }
+  return { status: 'queued-for-bridge' };
+}
+
+/** Block until a decision closes (the multiplayer form of waiting for a user's answer), or the wait ends. */
+export async function waitDecision(agent: BrowserAgent, decisionId: string, seconds: number) {
+  const deadline = Date.now() + seconds * 1000;
+  while (true) {
+    const d = pickDecision(agent.decisions(), decisionId, agent.members().memberId);
+    if (!d) throw new Error('That decision is not in this room. Run decisions for current ids.');
+    const final = d.state === 'withdrawn' || (d.state === 'closed' && d.verified);
+    if (final || Date.now() >= deadline) {
+      agent.touchActivity();
+      return { state: final ? d.state : d.state === 'closed' ? 'verifying' : 'timeout', decision: describeDecision(agent, d) };
+    }
+    await Bun.sleep(1000);
+  }
+}
+type DistributiveOmit<T, K extends keyof any> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * A decision by the id people quote. Ids are unique per creator, so a copy someone else signed with the same id is a
+ * different decision: prefer this agent's own, and refuse to guess between other people's.
+ */
+export function pickDecision(decisions: Decision[], id: string, me: string | undefined) {
+  const matches = decisions.filter(d => d.id === id);
+  if (matches.length <= 1) return matches[0];
+  const own = matches.find(d => d.createdBy === me); if (own) return own;
+  throw new Error('Several decisions share that id. Ask the person who opened yours for its question, and use decisions to find it.');
+}
+
+/**
+ * The decision operations of a batch this device keeps. Signatures are checked before the hold rule is applied, so a
+ * forged decision can't make a genuine vote for it look admissible: decisions (few) are verified first, then votes are
+ * admitted only against held or verified decisions and per-member shares, then the admitted votes are verified.
+ */
+export async function admitDecisionPackets(held: (DecisionBody | VoteBody)[], packets: unknown[], roomId: string,
+  genuine: (body: DecisionBody | VoteBody, signature: string) => Promise<boolean>): Promise<DecisionPacket[]> {
+  const known = new Set(held.map(b => b.id)), seen = new Set<string>();
+  const fresh = (packets as DecisionPacket[]).filter(p => typeof p?.signature === 'string' && (validDecisionBody(p.body, roomId) || validVoteBody(p.body, roomId))
+    && !known.has(p.body.id) && !seen.has(p.body.id) && seen.add(p.body.id));
+  const decisions: DecisionPacket[] = [];
+  for (const p of fresh) if (p.body.kind === 'decision' && await genuine(p.body, p.signature)) decisions.push(p);
+  const votes = fresh.filter(p => p.body.kind === 'vote');
+  const keep = new Set(admissible(held, [...decisions, ...votes].map(p => p.body)).map(b => b.id));
+  const accepted: DecisionPacket[] = [];
+  for (const p of fresh) {
+    if (held.length + accepted.length >= MAX_DECISION_OPS) break;
+    if (!keep.has(p.body.id)) continue;
+    if (p.body.kind === 'vote' && !await genuine(p.body, p.signature)) continue;
+    accepted.push({ body: p.body, signature: p.signature });
+  }
+  return accepted;
 }

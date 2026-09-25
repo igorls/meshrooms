@@ -11,6 +11,11 @@
  *   bun meshrooms-agent.js task-remove --room <room> --request-id <uuid> --task <task id>
  *   bun meshrooms-agent.js status --room <room> [--note '<what you are doing>' | --note '']
  *   bun meshrooms-agent.js profile --room <room> [--harness '<harness>'] [--model '<model>'] | --clear
+ *   bun meshrooms-agent.js ask --room <room> --request-id <uuid> --question '<question>' --option '<a>' --option '<b>'... [--ask-agents all|<names>] [--closes 30m]
+ *   bun meshrooms-agent.js ask --room <room> --request-id <uuid> --question '<question>' --mode plan-review --plan-file plan.md
+ *   bun meshrooms-agent.js decision-wait --room <room> --decision <id> [--wait-seconds 600]
+ *   bun meshrooms-agent.js decisions --room <room> [--all]
+ *   bun meshrooms-agent.js vote --room <room> --request-id <uuid> --decision <id> --option <option id>|none [--comment '<why>']
  *   bun meshrooms-agent.js stop --room <room>
  *
  * Needs only Bun. State (device key, messages) stays in ~/.meshrooms/agents unless
@@ -21,7 +26,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
-import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, listenBrowser, parseConnectLink, runBridge, sendBrowser, taskBrowser } from './browser-agent';
+import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
+import { mayAgentSpeak } from '../src/collab';
 
 export { parseConnectLink };
 import { TASK_STATUSES, type TaskStatus } from '../src/collab';
@@ -31,14 +37,15 @@ const home = () => resolve(process.env.MESHROOMS_AGENT_HOME || join(homedir(), '
 const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/i.test(v);
 
 function args(argv: string[]) {
-  const [command = 'help', ...rest] = argv; const values: Record<string, string> = {}; const positional: string[] = []; const attach: string[] = [];
+  const [command = 'help', ...rest] = argv; const values: Record<string, string> = {}; const positional: string[] = []; const attach: string[] = []; const options: string[] = [];
   for (let i = 0; i < rest.length; i++) {
-    if (rest[i] === '--clear') values['--clear'] = 'true';
+    if (['--clear', '--all', '--withdraw'].includes(rest[i])) values[rest[i]] = 'true';
     else if (rest[i] === '--attach') { if (rest[i + 1] === undefined) throw new Error('Give a file path for --attach.'); attach.push(rest[++i]); }
+    else if (rest[i] === '--option' && command === 'ask') { if (rest[i + 1] === undefined) throw new Error('Give a label for --option.'); options.push(rest[++i]); }
     else if (rest[i].startsWith('--')) { if (rest[i + 1] === undefined) throw new Error(`Give a value for ${rest[i]}.`); values[rest[i]] = rest[++i]; }
     else positional.push(rest[i]);
   }
-  return { command, values, positional, attach };
+  return { command, values, positional, attach, options };
 }
 
 /** Rooms this machine's agents belong to, by id, with their origins. */
@@ -75,9 +82,13 @@ function runnerAlive(roomId: string) {
 }
 
 export async function agentCli(argv: string[]): Promise<unknown> {
-  const { command, values, positional, attach } = args(argv);
+  const { command, values, positional, attach, options } = args(argv);
   if (command === 'help') return { usage: [
-    "connect '<connect link>'", 'listen --room ROOM [--after MESSAGE_ID] [--board-after BOARD_CURSOR] [--wait-seconds 30]',
+    "connect '<connect link>'", 'listen --room ROOM [--after MESSAGE_ID] [--board-after BOARD_CURSOR] [--decisions-after DECISION_CURSOR] [--wait-seconds 30]',
+    "ask --room ROOM --request-id UUID --question Q (--option A --option B ... | --mode plan-review --plan-file FILE) [--context TEXT | --context-file FILE] [--ask-agents all|NAME,NAME] [--closes 30m|2h|ISO] [--reply-to MESSAGE_ID]",
+    'decision-wait --room ROOM --decision ID [--wait-seconds 600]  (returns when people have decided; a draw is an outcome)',
+    'decisions --room ROOM [--all]', "vote --room ROOM --request-id UUID --decision ID --option OPTION_ID|none [--comment 'why']  (agents advise; only people's votes count)",
+    "decision-option --room ROOM --request-id UUID --decision ID --label LABEL", 'decision-close --room ROOM --request-id UUID --decision ID [--withdraw]',
     'tasks --room ROOM', "task-add --room ROOM --request-id UUID --title TITLE [--notes NOTES] [--assignee me|MEMBER_ID]",
     'task-update --room ROOM --request-id UUID --task TASK_ID [--revision N] [--status todo|doing|done] [--title TITLE] [--notes NOTES] [--assignee me|none|MEMBER_ID]',
     'task-remove --room ROOM --request-id UUID --task TASK_ID',
@@ -154,7 +165,57 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 300) throw new Error('Use --wait-seconds between 1 and 300.');
     const board = values['--board-after'] === undefined ? undefined : Number(values['--board-after']);
     if (board !== undefined && (!Number.isSafeInteger(board) || board < 0)) throw new Error('Use --board-after with the boardCursor from the last listen.');
-    return listenBrowser(agent, values['--after'], seconds, board);
+    const decided = values['--decisions-after'] === undefined ? undefined : Number(values['--decisions-after']);
+    if (decided !== undefined && (!Number.isSafeInteger(decided) || decided < 0)) throw new Error('Use --decisions-after with the decisionCursor from the last listen.');
+    return listenBrowser(agent, values['--after'], seconds, board, decided);
+  }
+  if (command === 'decisions') {
+    const all = values['--all'] !== undefined;
+    return agent.decisions().filter(d => all || d.state === 'open').map(d => describeDecision(agent, d));
+  }
+  if (command === 'decision-wait') {
+    const seconds = Number(values['--wait-seconds'] || 600);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) throw new Error('Use --wait-seconds between 1 and 3600.');
+    if (!uuid(values['--decision'])) throw new Error('Use --decision with the id from ask or decisions.');
+    return waitDecision(agent, values['--decision'].toLowerCase(), seconds);
+  }
+  if (['ask', 'vote', 'decision-option', 'decision-close'].includes(command)) {
+    const id = values['--request-id']?.toLowerCase();
+    if (!uuid(id)) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same change.');
+    const view = agent.view(), me = view.memberId!;
+    if (command === 'ask') {
+      // Asking the room is speaking: the same humans-first rule as send applies.
+      const replyTo = values['--reply-to']?.toLowerCase();
+      if (!mayAgentSpeak(view, me, replyTo)) throw new Error('This room is humans-first: open a decision when a person addressed you (pass --reply-to) or while you hold work a person assigned you.');
+      const mode = (values['--mode'] ?? 'choice') as 'choice' | 'plan-review';
+      if (!['choice', 'plan-review'].includes(mode)) throw new Error('Use --mode choice or plan-review.');
+      const read = (key: string) => values[key] === undefined ? undefined : readFileSync(resolve(values[key]), 'utf8');
+      const context = values['--context'] ?? read('--context-file') ?? values['--plan'] ?? read('--plan-file') ?? '';
+      if (mode === 'plan-review' && !context.trim()) throw new Error('Give the plan with --plan-file (or --plan) for a plan review.');
+      if (mode === 'choice' && (options.length < 2 || options.length > 8)) throw new Error('Give 2 to 8 --option values.');
+      const who = values['--ask-agents'];
+      const askAgents = who === undefined || who === 'none' ? false : who === 'all' ? true : who.split(',').map(name => {
+        const member = view.participants.find(p => p.role === 'agent' && p.name.toLowerCase() === name.trim().replace(/^@/, '').toLowerCase());
+        if (!member) throw new Error(`No agent named ${name.trim()} in this room.`); return member.id;
+      });
+      const closes = values['--closes'], relative = closes && /^(\d+)(m|h)$/.exec(closes);
+      const closesAt = !closes ? null : relative ? Date.now() + Number(relative[1]) * (relative[2] === 'h' ? 3_600_000 : 60_000) : Date.parse(closes);
+      if (closesAt !== null && (!Number.isFinite(closesAt) || closesAt <= Date.now())) throw new Error('Use --closes like 30m, 2h, or a future ISO time.');
+      return decisionBrowser(agent, { id, decisionId: id, action: 'open', question: values['--question'] ?? '', context, mode,
+        options: mode === 'choice' ? options : [], askAgents, closesAt });
+    }
+    const decisionId = values['--decision']?.toLowerCase();
+    if (!uuid(decisionId)) throw new Error('Use --decision with the id from ask or decisions.');
+    if (command === 'vote') {
+      const decision = pickDecision(agent.decisions(), decisionId, me);
+      const asked = !!decision && (decision.askAgents === true || (Array.isArray(decision.askAgents) && decision.askAgents.includes(me)));
+      if (!asked && !mayAgentSpeak(view, me, values['--reply-to']?.toLowerCase())) throw new Error('Give advice when a decision asks agents, or when a person addressed you (pass --reply-to).');
+      const option = values['--option'];
+      if (!option) throw new Error('Use --option with an option id from the decision, or none to take your advice back.');
+      return decisionBrowser(agent, { id, decisionId, action: 'vote', optionId: option === 'none' ? null : option, comment: values['--comment'] ?? '' });
+    }
+    if (command === 'decision-option') return decisionBrowser(agent, { id, decisionId, action: 'option', label: values['--label'] ?? '' });
+    return decisionBrowser(agent, { id, decisionId, action: values['--withdraw'] !== undefined ? 'withdraw' : 'close' });
   }
   if (command === 'task-add' || command === 'task-update' || command === 'task-remove') {
     const requestId = values['--request-id']?.toLowerCase();

@@ -191,6 +191,7 @@ export class BrowserLobby {
             if (!actor || (!isHost && actor.memberId !== target.memberId && !operates)) fail(403, 'You cannot remove this device.');
             if (target.memberId === room.ownerId && room.devices.filter(d => d.memberId === room.ownerId).length === 1) fail(409, 'Keep at least one host device.');
             const removed = [target];
+            const roles = new Map(room.members.map(m => [m.id, m.role ?? 'human'] as const));
             room.devices = room.devices.filter(d => d.id !== target.id);
             // Agents leave with their operator: an agent never stays in a room its operator has left.
             const present = (memberId: string) => room.devices.some(d => d.memberId === memberId);
@@ -203,7 +204,7 @@ export class BrowserLobby {
             room.requests = room.requests.filter(r => !removed.some(d => d.id === r.device.id) && !(r.kind === 'agent' && r.operatorId && !present(r.operatorId)));
             if (room.invites) room.invites = room.invites.filter(i => present(i.operatorId));
             for (const device of removed) { this.presence.delete(`${room.id}:${device.id}`); this.signals.delete(`${room.id}:${device.id}`); }
-            room.retired = [...(room.retired || []).filter(d => !removed.some(r => r.id === d.id)), ...removed.map(({ id, publicKey, memberId }) => ({ id, publicKey, memberId }))].slice(-RETIRED_DEVICES);
+            room.retired = [...(room.retired || []).filter(d => !removed.some(r => r.id === d.id)), ...removed.map(({ id, publicKey, memberId }) => ({ id, publicKey, memberId, ...(roles.has(memberId) ? { role: roles.get(memberId)! } : {}) }))].slice(-RETIRED_DEVICES);
             break;
           }
           case 'profile': {
