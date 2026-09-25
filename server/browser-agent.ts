@@ -23,7 +23,7 @@ import {
   validAttachments, type AttachmentRef, type FileStore, type TransferState,
 } from '../src/browser/files';
 import { cleanName, defaultName, sniff } from '../src/attachments';
-import { admissible, castVote, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
+import { admissible, castVote, COMPACT_DECISIONS_AT, compactDecisions, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
   type Decision, type DecisionBody, type DecisionMode, type DecisionPacket, type DecisionSync, type VoteBody } from '../src/browser/decisions';
 import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, validActivity, validNote, type Activity, type ActivityOn } from '../src/browser/activity';
 import {
@@ -162,7 +162,12 @@ export class BrowserAgent {
   boardCursor(ops = this.taskOps()) { return Math.max(readJson(this.path('board.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
   /** Verified decision and vote operations in arrival order, each with the decision cursor at which it arrived. */
   decisionOps(): StoredDecisionOp[] { return readJson<StoredDecisionOp[]>(this.path('decisions.json'), []); }
-  decisionCursor(ops = this.decisionOps()) { return ops.at(-1)?.seq ?? 0; }
+  /** Arrivals so far; compaction drops votes but never moves the cursor back, so later wakes still fire. */
+  /** Ids of this agent's own decision changes that compaction dropped, so a retried request is never signed twice. */
+  compactedDecisionIds(): Set<string> { return new Set(readJson<string[]>(this.path('decisions-done.json'), [])); }
+  /** Whether this device already made the change with that request id: still in the log, or dropped by compaction since. */
+  madeDecisionOp(id: string, ops = this.decisionOps()) { return ops.some(p => p.body.id === id) || this.compactedDecisionIds().has(id); }
+  decisionCursor(ops = this.decisionOps()) { return Math.max(readJson(this.path('decisions-cursor.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
   /** The room's decisions as every device folds them; people's votes count, agents' are advice. */
   decisions(ops = this.decisionOps()): Decision[] {
     const { ownerId, members, former } = this.members();
@@ -288,11 +293,15 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const storeDecisionOps = (added: DecisionPacket[]) => {
     const ops = agent.decisionOps(); let seq = agent.decisionCursor(ops);
-    writeJson(join(agent.dir, 'decisions.json'), [...ops, ...added.map(p => ({ ...p, seq: ++seq }))]);
+    let next: StoredDecisionOp[] = [...ops, ...added.map(p => ({ ...p, seq: ++seq }))];
+    if (next.length > COMPACT_DECISIONS_AT) { writeJson(join(agent.dir, 'decisions-cursor.json'), { seq }); next = compactDecisionLog(agent, next, status?.memberId); }
+    writeJson(join(agent.dir, 'decisions.json'), next);
   };
+  // A log that filled up before compaction existed (or before this agent upgraded) is compacted before anything is refused.
+  compactStoredDecisions(agent, agent.members().memberId);
   /** Keep decision and vote operations signed by a (current or former) device of their author; duplicates are ignored. */
   const acceptDecisionOps = async (packets: unknown[]) => {
-    const ops = agent.decisionOps();
+    const ops = compactStoredDecisions(agent, status?.memberId);
     const added = await admitDecisionPackets(ops.map(p => p.body), packets, agent.roomId, async (b, signature) => {
       const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
       return !!author && author.memberId === b.memberId && await agent.verify(author.publicKey, b, signature);
@@ -301,7 +310,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const shareDecisionOp = async (body: DecisionBody | VoteBody) => {
     // This device's own changes obey the same per-member share as everyone's, or peers would drop them.
-    const held = agent.decisionOps();
+    const held = compactStoredDecisions(agent, status?.memberId);
     if (held.length >= MAX_DECISION_OPS) throw new Error('This room has reached its limit of decision changes.');
     if (!admissible(held.map(p => p.body), [body]).length) throw new Error('This agent has reached its share of decision changes in this room.');
     const packet = { body, signature: await agent.sign(body) };
@@ -480,7 +489,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         const ops = agent.decisionOps(), author = { roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId };
         const current = pickDecision(agent.decisions(ops), item.decisionId, status.memberId);
         try {
-          if (!ops.some(p => p.body.id === item.id)) {
+          if (!agent.madeDecisionOp(item.id, ops)) {
             const body = item.action === 'open' ? (current ? undefined : openDecision({ ...author, decisionId: item.decisionId, question: item.question, context: item.context,
                 mode: item.mode, options: item.options, askAgents: item.askAgents, closesAt: item.closesAt }))
               : !current ? undefined
@@ -601,7 +610,7 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     const woke = evaluateWake(view, view.memberId, after, boardAfter);
     // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
     const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
-    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, decisionsAfter);
+    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, ops.filter(p => p.seq > decisionsAfter).map(p => p.body));
     const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
     const result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
     if (result.state !== 'waiting') {
@@ -777,7 +786,9 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
 export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveOmit<DecisionIntent, 'type'>, seconds = 10) {
   const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
   const current = pickDecision(agent.decisions(), intent.decisionId, view.memberId);
-  const done = agent.decisionOps().some(p => p.body.id === intent.id);
+  const done = agent.madeDecisionOp(intent.id);
+  // A retry of a change compaction has since dropped: it was made, and a later change of this agent replaced it.
+  if (done && !agent.decisionOps().some(p => p.body.id === intent.id)) return superseded(agent, intent.decisionId, view.memberId);
   if (!done && intent.action !== 'open') {
     if (!current) throw new Error('That decision is not in this room. Run decisions for current ids.');
     if (current.state !== 'open') throw new Error(`This decision is already ${current.state}.`);
@@ -798,6 +809,7 @@ export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveO
       const decision = pickDecision(agent.decisions(ops), intent.decisionId, view.memberId);
       return { status: 'shared', decision: decision ? describeDecision(agent, decision) : null, decisionCursor: agent.decisionCursor(ops) };
     }
+    if (!pending && agent.compactedDecisionIds().has(intent.id)) return superseded(agent, intent.decisionId, view.memberId);
     if (!pending) return { status: 'dropped', reason: 'The change no longer applied when it was signed (the decision closed or changed). Read it again.' };
     await Bun.sleep(300);
   }
@@ -853,4 +865,29 @@ export async function admitDecisionPackets(held: (DecisionBody | VoteBody)[], pa
     accepted.push({ body: p.body, signature: p.signature });
   }
   return accepted;
+}
+
+/**
+ * Compact the log and remember every one of this agent's own operations that was dropped, so their request ids stay
+ * spent for good (a reused request id never signs twice). The list grows only with this agent's own changes.
+ */
+export function compactDecisionLog(agent: BrowserAgent, ops: StoredDecisionOp[], memberId: string | undefined): StoredDecisionOp[] {
+  const next = compactDecisions(ops), kept = new Set(next.map(p => p.body.id));
+  const dropped = ops.filter(p => !kept.has(p.body.id) && p.body.memberId === memberId).map(p => p.body.id);
+  if (dropped.length) writeJson(join(agent.dir, 'decisions-done.json'), [...new Set([...agent.compactedDecisionIds(), ...dropped])]);
+  return next;
+}
+/** The stored log, compacted first if it grew past the threshold; the arrival cursor is kept. */
+export function compactStoredDecisions(agent: BrowserAgent, memberId: string | undefined): StoredDecisionOp[] {
+  const ops = agent.decisionOps();
+  if (ops.length <= COMPACT_DECISIONS_AT) return ops;
+  writeJson(join(agent.dir, 'decisions-cursor.json'), { seq: agent.decisionCursor(ops) });
+  const next = compactDecisionLog(agent, ops, memberId);
+  writeJson(join(agent.dir, 'decisions.json'), next);
+  return next;
+}
+function superseded(agent: BrowserAgent, decisionId: string, me: string | undefined) {
+  const decision = pickDecision(agent.decisions(), decisionId, me);
+  return { status: 'superseded', reason: 'This change was made earlier and a later change of yours has replaced it; nothing was signed again.',
+    decision: decision ? describeDecision(agent, decision) : null };
 }

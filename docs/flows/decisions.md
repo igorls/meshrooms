@@ -58,7 +58,7 @@ Every device folds the same operations to the same decisions (`foldDecisions`):
 
 ## Limits
 
-At most 4000 decision operations per room, and 400 per member; votes are accepted only for decisions the device holds
+At most 4000 decision operations per room, and 400 held per member (a bound on storage, not on lifetime traffic: after compaction a member holds its decisions and one latest vote per decision); votes are accepted only for decisions the device holds
 (or that arrive in the same batch). Questions are up to 200 characters, options up to 120, context up to 4000, reasons
 up to 500.
 
@@ -81,5 +81,4 @@ decided (**wake on consensus**); `decision-wait` blocks for the same outcome.
 
 - Linking decisions and tasks both ways (browsers can already turn a verified outcome into a task).
 - Several choices per vote, and ranked choices.
-- Compaction of superseded votes; the cap is generous for now.
 - Native (local daemon) rooms.

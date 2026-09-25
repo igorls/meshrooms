@@ -53,8 +53,14 @@ export type Decision = {
 };
 
 export const MAX_DECISION_OPS = 4000;
-/** Operations one member may add to a room's decisions, so nobody can fill the shared cap alone. */
+/**
+ * Operations one member may hold in a room's decisions log, so nobody can fill the shared cap alone. It bounds what is
+ * stored, not lifetime traffic: compaction drops superseded votes, and every device counts only what it holds, so
+ * devices that joined at different times still admit the same operations and fold to the same decisions.
+ */
 export const MAX_MEMBER_DECISION_OPS = 400;
+/** Devices compact their decisions past this many operations, keeping the log well under MAX_DECISION_OPS. */
+export const COMPACT_DECISIONS_AT = 2000;
 export const MAX_OPTIONS = 8;
 export const PLAN_REVIEW_OPTIONS: Omit<DecisionOption, 'addedBy'>[] = [
   { id: 'approve', label: 'Approve' }, { id: 'changes', label: 'Request changes' }, { id: 'reject', label: 'Reject' }];
@@ -249,11 +255,11 @@ export function decisionChunks(roomId: string, ops: DecisionPacket[]): DecisionS
 }
 
 /**
- * What should wake an agent, among operations it received after `after` (a position in its arrival-ordered list):
+ * What should wake an agent, among the operations it received since it last listened (`fresh`, a subset of `ops`):
  * decisions asking for its advice that it hasn't given, and its own decisions that just closed (wake on consensus).
  */
-export function decisionWakes(ops: (DecisionBody | VoteBody)[], room: RoomMembers, agentId: string, after: number) {
-  const decisions = foldDecisions(ops, room), fresh = ops.slice(after);
+export function decisionWakes(ops: (DecisionBody | VoteBody)[], room: RoomMembers, agentId: string, fresh: (DecisionBody | VoteBody)[]) {
+  const decisions = foldDecisions(ops, room);
   const mine = (o: DecisionBody | VoteBody, d: Decision) => o.kind === 'decision' && o.decisionId === d.id && o.createdBy === d.createdBy;
   const asked = decisions.filter(d => d.state === 'open' && d.createdBy !== agentId && (d.askAgents === true || (Array.isArray(d.askAgents) && d.askAgents.includes(agentId)))
     && !d.votes.some(v => v.memberId === agentId) && fresh.some(o => mine(o, d)));
@@ -263,4 +269,21 @@ export function decisionWakes(ops: (DecisionBody | VoteBody)[], room: RoomMember
     && fresh.some(o => (mine(o, d) && (o as DecisionBody).state === 'closed') || (o.kind === 'vote' && pinned(d).has(o.id))));
   const withdrawn = decisions.filter(d => d.state === 'withdrawn' && d.createdBy === agentId && fresh.some(o => mine(o, d) && (o as DecisionBody).state === 'withdrawn'));
   return { asked, resolved, withdrawn };
+}
+
+/**
+ * Drop votes nobody needs to fold the same decisions: each member's latest vote per decision stays, and so does every
+ * vote a close pins, so closed outcomes stay verifiable. Decision operations are all kept (there are few, and a close
+ * that doesn't apply yet may apply once its pinned votes arrive). Signed packets are never altered, and this depends
+ * on nothing but the operations, so devices that compact and devices that don't still fold to the same decisions.
+ */
+export function compactDecisions<T extends { body: DecisionBody | VoteBody }>(packets: T[]): T[] {
+  const latest = new Map<string, VoteBody>(), pinned = new Set<string>();
+  for (const { body: op } of packets) {
+    if (op.kind === 'decision') { for (const c of op.counted ?? []) pinned.add(c.vote); continue; }
+    const key = `${op.createdBy}:${op.decisionId}:${op.memberId}`, seen = latest.get(key);
+    if (!seen || order(seen, op) < 0) latest.set(key, op);
+  }
+  const keep = new Set([...latest.values()].map(v => v.id));
+  return packets.filter(({ body }) => body.kind === 'decision' || keep.has(body.id) || pinned.has(body.id));
 }
