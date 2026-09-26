@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import { AGENTS_MENTION, TASK_STATUSES, groupTasks, matchesTaskFilter, mentionSegments, type Floor, type Task, type TaskFilter, type TaskStatus } from '../collab';
 import { parseMarkdown, repoRef, safeHref, type Block, type Inline, type RepoRef } from '../markdown';
 import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
+import { issueLabel, issueLinkFrom, newIssueUrl } from '../browser/board';
 
 const statusLabels: Record<TaskStatus, string> = { todo: 'To do', doing: 'In progress', done: 'Done' };
 
@@ -196,8 +197,11 @@ function Chevron({ open }: { open: boolean }) {
   return <svg className={`board-chevron ${open ? 'open' : ''}`} width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 4 4 4-4 4" /></svg>;
 }
 
-/** `working` names the agents currently working on each task, by task id (browser rooms report agent activity). */
-export function TaskBoard({ room, viewerId, disabled, onClose, actions, highlight, working }: { room: RoomSnapshot; viewerId?: string; disabled: boolean; onClose: () => void; actions: BoardActions; highlight?: string; working?: Record<string, string[]> }) {
+/**
+ * `working` names the agents currently working on each task, by task id (browser rooms report agent activity).
+ * `repositories`, the room's pinned GitHub repositories, turns on issue links (browser rooms); tasks open issues there.
+ */
+export function TaskBoard({ room, viewerId, disabled, onClose, actions, highlight, working, repositories }: { room: RoomSnapshot; viewerId?: string; disabled: boolean; onClose: () => void; actions: BoardActions; highlight?: string; working?: Record<string, string[]>; repositories?: string[] }) {
   const [title, setTitle] = useState(''); const [assignee, setAssignee] = useState(''); const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState<TaskFilter>('all');
   const [doneOpen, setDoneOpen] = useState(() => { try { return localStorage.getItem(DONE_KEY) === 'open'; } catch { return false; } });
@@ -231,9 +235,12 @@ export function TaskBoard({ room, viewerId, disabled, onClose, actions, highligh
     const next = !doneOpen; setDoneOpen(next);
     try { localStorage.setItem(DONE_KEY, next ? 'open' : 'closed'); } catch { /* storage may be unavailable */ }
   }
+  // A pasted issue or pull request link becomes a task linked to it; its title can be edited after.
+  const pastedIssue = repositories ? issueLinkFrom(title) : undefined, tooLong = !pastedIssue && title.trim().length > 120;
   async function submit(event: React.FormEvent) {
-    event.preventDefault(); if (!title.trim() || busy) return; setBusy(true);
-    try { await actions.create({ title: title.trim(), assigneeId: assignee || undefined }); setTitle(''); setAssignee(''); }
+    event.preventDefault(); if (!title.trim() || busy || tooLong) return; setBusy(true);
+    const draft = pastedIssue ? { title: issueLabel(pastedIssue), issue: pastedIssue } : { title: title.trim() };
+    try { await actions.create({ ...draft, assigneeId: assignee || undefined }); setTitle(''); setAssignee(''); }
     catch { /* The room view reports the error; keep the draft for a retry. */ }
     finally { setBusy(false); }
   }
@@ -242,10 +249,11 @@ export function TaskBoard({ room, viewerId, disabled, onClose, actions, highligh
       <button className="icon-button" aria-label="Close tasks" onClick={onClose}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6" /></svg></button></div>
     <form className="task-add" onSubmit={submit}>
       <label className="sr-only" htmlFor="task-title">New task</label>
-      <input id="task-title" value={title} onChange={e => setTitle(e.target.value)} placeholder="Add a task…" maxLength={120} />
+      <input id="task-title" value={title} onChange={e => setTitle(e.target.value)} placeholder={repositories ? 'Add a task, or paste an issue link…' : 'Add a task…'} maxLength={repositories ? 200 : 120} aria-describedby={pastedIssue || tooLong ? 'task-title-hint' : undefined} />
       <div><label className="sr-only" htmlFor="task-assignee">Assign to</label>
         <select id="task-assignee" value={assignee} onChange={e => setAssignee(e.target.value)}><option value="">Unassigned</option>{local.map(p => <option key={p.id} value={p.id}>{p.id === viewerId ? `${p.name} (you)` : p.name}{p.role === 'agent' ? ' · agent' : ''}</option>)}</select>
-        <button className="primary" type="submit" disabled={disabled || busy || !title.trim()}>{busy ? 'Adding…' : 'Add'}</button></div>
+        <button className="primary" type="submit" disabled={disabled || busy || !title.trim() || tooLong}>{busy ? 'Adding…' : 'Add'}</button></div>
+      {(pastedIssue || tooLong) && <p className="task-add-hint" id="task-title-hint">{pastedIssue ? `Adds a task linked to ${issueLabel(pastedIssue)}.` : 'Keep task titles to 120 characters.'}</p>}
     </form>
     {tasks.length > 0 && <div className="board-filters" role="group" aria-label="Show tasks">{filters.map(f =>
       <button key={f.key} aria-pressed={active === f.key} onClick={() => setFilter(f.key)}>{f.label}<span>{openMatching(f.key)}<span className="sr-only"> open</span></span></button>)}</div>}
@@ -261,7 +269,7 @@ export function TaskBoard({ room, viewerId, disabled, onClose, actions, highligh
           : <>{statusLabels[status]}{count}</>}</h3>
         {!folded && <div className="board-list" id={done ? 'board-done-list' : undefined}>
           {items.length === 0 ? <p className="board-empty">{active === 'all' ? emptyText[status] : 'None match this filter.'}</p>
-            : <ul>{shown.map(task => <TaskCard key={task.id} task={task} room={room} viewerId={viewerId} disabled={disabled} actions={actions} highlighted={task.id === highlight} working={working?.[task.id]} />)}</ul>}
+            : <ul>{shown.map(task => <TaskCard key={task.id} task={task} room={room} viewerId={viewerId} disabled={disabled} actions={actions} highlighted={task.id === highlight} working={working?.[task.id]} repositories={repositories} />)}</ul>}
           {done && items.length > DONE_PREVIEW && <button className="board-more" onClick={() => setAllDone(!allDone)}>{allDone ? 'Show recent only' : `Show all ${items.length}`}</button>}
         </div>}
       </section>;
@@ -269,7 +277,7 @@ export function TaskBoard({ room, viewerId, disabled, onClose, actions, highligh
   </aside>;
 }
 
-function TaskCard({ task, room, viewerId, disabled, actions, highlighted, working }: { task: Task; room: RoomSnapshot; viewerId?: string; disabled: boolean; actions: BoardActions; highlighted?: boolean; working?: string[] }) {
+function TaskCard({ task, room, viewerId, disabled, actions, highlighted, working, repositories }: { task: Task; room: RoomSnapshot; viewerId?: string; disabled: boolean; actions: BoardActions; highlighted?: boolean; working?: string[]; repositories?: string[] }) {
   const card = useRef<HTMLLIElement>(null);
   useEffect(() => {
     if (!highlighted) return;
@@ -290,6 +298,7 @@ function TaskCard({ task, room, viewerId, disabled, actions, highlighted, workin
     </div>
     <div className="task-meta">
       {assignee ? <span className={`task-assignee ${assignee.role}`}><span className={`mention-avatar ${assignee.role === 'agent' ? 'agent' : ''}`} aria-hidden="true">{assignee.name.slice(0, 1).toUpperCase()}</span>{assignee.id === viewerId ? 'You' : assignee.name}{assignee.role === 'agent' && <span className="role-label">agent</span>}</span> : <span className="task-assignee none">Unassigned</span>}
+      {task.issue && <IssueChip link={task.issue} />}
       {!!working?.length && <span className="task-working">{working.join(', ')} working</span>}
       {task.notes && !expanded && <button className="task-notes-toggle" aria-expanded={notesOpen} onClick={() => setNotesOpen(!notesOpen)}>Notes<Chevron open={notesOpen} /></button>}
     </div>
@@ -298,6 +307,7 @@ function TaskCard({ task, room, viewerId, disabled, actions, highlighted, workin
       <label>Assignee<select value={task.assigneeId || ''} disabled={lock} onChange={e => run(() => actions.update(task, { assigneeId: e.target.value || null }))}><option value="">Unassigned</option>{local.map(p => <option key={p.id} value={p.id}>{p.id === viewerId ? `${p.name} (you)` : p.name}{p.role === 'agent' ? ' · agent' : ''}</option>)}</select></label>
       <label>Status<select value={task.status} disabled={lock} onChange={e => run(() => actions.update(task, { status: e.target.value as TaskStatus }))}>{TASK_STATUSES.map(s => <option key={s} value={s}>{statusLabels[s]}</option>)}</select></label>
       <label>Notes<textarea value={notes ?? task.notes} onChange={e => setNotes(e.target.value)} maxLength={2000} rows={3} placeholder="Acceptance criteria, branch, links…" /></label>
+      {repositories && <TaskIssue task={task} repositories={repositories} disabled={lock} link={issue => run(() => actions.update(task, { issue }))} />}
       <div className="task-actions">
         <button className="text-button danger" disabled={lock} onClick={() => run(() => actions.remove(task))}>Remove</button>
         <button className="secondary" disabled={lock || notes === null || notes === task.notes} onClick={() => run(async () => { await actions.update(task, { notes: notes ?? '' }); setNotes(null); })}>Save notes</button>
@@ -305,6 +315,45 @@ function TaskCard({ task, room, viewerId, disabled, actions, highlighted, workin
       <p className="task-history">Added by {name(task.createdBy)} · updated by {name(task.updatedBy)} {new Date(task.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
     </div>}
   </li>;
+}
+
+function IssueChip({ link }: { link: string }) {
+  const pull = link.includes('/pull/');
+  return <a className="task-issue-chip" href={link} target="_blank" rel="noopener noreferrer" title={`Open ${pull ? 'the pull request' : 'the issue'} on GitHub`}>
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">{pull
+      ? <><circle cx="4" cy="3.5" r="1.8" /><circle cx="4" cy="12.5" r="1.8" /><circle cx="12" cy="12.5" r="1.8" /><path d="M4 5.3v5.4M12 10.7V6.5a2 2 0 0 0-2-2H7.5m1.5-2-2 2 2 2" /></>
+      : <><circle cx="8" cy="8" r="6" /><circle cx="8" cy="8" r="1.2" fill="currentColor" /></>}</svg>
+    {issueLabel(link)}<span className="sr-only"> (opens GitHub)</span></a>;
+}
+
+/**
+ * A task's GitHub side. Meshrooms holds no GitHub token: "Open on GitHub" opens GitHub's own new-issue page, prefilled,
+ * for the person to submit with their account; they paste the new issue's link back. Agents do both with their `gh`.
+ */
+function TaskIssue({ task, repositories, disabled, link }: { task: Task; repositories: string[]; disabled: boolean; link: (issue: string | null) => void }) {
+  const [repository, setRepository] = useState(repositories[0] ?? ''); const [draft, setDraft] = useState(''); const [opened, setOpened] = useState(false);
+  const pasted = issueLinkFrom(draft), field = useRef<HTMLInputElement>(null);
+  const target = repositories.includes(repository) ? repository : repositories[0];
+  if (task.issue) return <div className="task-issue">
+    <span>Linked to <IssueChip link={task.issue} /></span>
+    <button className="text-button" disabled={disabled} onClick={() => link(null)}>Unlink</button>
+  </div>;
+  function open() {
+    window.open(newIssueUrl(target!, task.title, task.notes), '_blank', 'noopener,noreferrer');
+    setOpened(true); field.current?.focus();
+  }
+  return <div className="task-issue">
+    {target ? <div className="task-issue-open">
+      {repositories.length > 1 ? <label>Open as an issue in<select value={target} onChange={e => setRepository(e.target.value)}>{repositories.map(r => <option key={r} value={r}>{r}</option>)}</select></label>
+        : <span>Open as an issue in <strong>{target}</strong></span>}
+      <button type="button" className="secondary" disabled={disabled} onClick={open}>Open on GitHub</button>
+    </div> : <p className="task-issue-hint">Pin a repository in Room details to open issues from tasks.</p>}
+    <form onSubmit={e => { e.preventDefault(); if (pasted) { link(pasted); setDraft(''); setOpened(false); } }}>
+      <label>{opened ? 'Paste the new issue’s link' : 'Link an issue or pull request'}<input ref={field} value={draft} onChange={e => setDraft(e.target.value)} placeholder="github.com/owner/name/issues/42 or owner/name#42" maxLength={300} /></label>
+      <button className="secondary" disabled={disabled || !pasted}>Link</button>
+    </form>
+    {opened && <p className="task-issue-hint">Submit the issue on GitHub, then paste its link here.</p>}
+  </div>;
 }
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;

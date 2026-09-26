@@ -81,6 +81,16 @@
 .avatar-picture{object-fit:cover;padding:0;background:var(--line)}
 .browser-picture>div{display:flex;align-items:center;gap:12px;margin-top:12px}
 .browser-picture .browser-remove{padding:0}
+.browser-repositories ul{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:4px}
+.browser-repositories li{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;min-width:0}
+.browser-repositories li a{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;color:#234c99}
+.browser-repositories li .browser-remove{padding:6px 0;font-size:12px;flex-shrink:0}
+.browser-repo-suggestions{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:12px}
+.browser-repo-suggestions>span{width:100%;font-size:12px;font-weight:650}
+.browser-chip{font-size:12px;font-weight:600;padding:6px 10px;min-height:32px;border:1px dashed #9fb0c6;border-radius:999px;background:#fff;color:var(--ink);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.browser-chip:not(:disabled):hover{border-style:solid;border-color:var(--blue)}
+.browser-repo-add{display:flex;gap:8px;margin-top:12px}
+.browser-repo-add input{flex:1;min-width:0;font-size:12px}
 .browser-person .browser-picture-link{display:block;min-height:0;margin-top:4px;font-size:12px}
 /* Attachments: files move between devices, so they can be on their way or no longer kept here. */
 .browser-composer .pending-files{padding:8px 0 0}.browser-compose-tools{display:flex;align-items:center;gap:12px;margin-right:auto}.browser-composer .browser-attach{min-width:0;display:inline-flex;align-items:center;gap:6px;padding-inline:12px}

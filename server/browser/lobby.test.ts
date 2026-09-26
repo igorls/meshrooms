@@ -462,3 +462,32 @@ test('agents report their harness and model; only the agent or its operator sets
     expect((await host.status(room)).members!.find(m => m.id === samId)).not.toHaveProperty('harness');
   } finally { lobby.close(); }
 });
+
+test('people pin repositories one at a time; agents and strangers cannot', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam'), stranger = await client(lobby), agent = await client(lobby);
+    expect((await host.status(room)).repositories).toBeUndefined();
+    // Any person pins, not only the host; two pins at once both stay.
+    await sam.send('repositories', room, { pin: 'igorls/meshrooms' });
+    await host.send('repositories', room, { pin: 'igorls/wormdb' });
+    await host.send('repositories', room, { pin: 'IGORLS/Meshrooms' }); // already pinned, in any case
+    expect((await sam.status(room)).repositories).toEqual(['igorls/meshrooms', 'igorls/wormdb']);
+    for (const bad of ['igorls', 'igorls/..', 'a/b/c', 'https://github.com/igorls/meshrooms', 'x'.repeat(40) + '/r'])
+      await expect(host.send('repositories', room, { pin: bad })).rejects.toThrow('owner/name');
+    await expect(host.send('repositories', room, { pin: 'a/b', unpin: 'c/d' })).rejects.toThrow('owner/name');
+    await expect(stranger.send('repositories', room, { pin: 'a/b' })).rejects.toThrow('Only people');
+    const { token } = await sam.send('agent-invite', room, { name: 'Codex' }) as { token: string };
+    await agent.send('agent-redeem', room, { token, label: 'Laptop' });
+    await expect(agent.send('repositories', room, { pin: 'a/b' })).rejects.toThrow('Only people');
+    for (let i = 0; i < 6; i++) await host.send('repositories', room, { pin: `org/repo-${i}` });
+    await expect(host.send('repositories', room, { pin: 'org/one-too-many' })).rejects.toThrow('Unpin one first');
+    await sam.send('repositories', room, { unpin: 'IGORLS/WORMDB' });
+    expect((await host.status(room)).repositories).toHaveLength(7);
+    for (const r of (await host.status(room)).repositories!) await host.send('repositories', room, { unpin: r });
+    expect((await host.status(room)).repositories).toBeUndefined();
+    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Work' }); // never shown outside the room
+  } finally { lobby.close(); }
+});

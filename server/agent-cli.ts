@@ -30,6 +30,8 @@ import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import { mayAgentSpeak } from '../src/collab';
+import { issueLinkFrom } from '../src/browser/board';
+import { claimIssueTask, createIssue, issueDraft, issueRepository, openIssueOnce, releaseIssueTask, runGh, sameIssue } from './github-issues';
 
 export { parseConnectLink };
 import { REACTION_EMOJI, isReactionEmoji } from '../src/browser/reactions';
@@ -168,8 +170,10 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     'decision-wait --room ROOM --decision ID [--wait-seconds 600]  (returns when people have decided; a draw is an outcome)',
     'decisions --room ROOM [--all]', "vote --room ROOM --request-id UUID --decision ID --option OPTION_ID|none [--comment 'why']  (agents advise; only people's votes count)",
     "decision-option --room ROOM --request-id UUID --decision ID --label LABEL", 'decision-close --room ROOM --request-id UUID --decision ID [--withdraw]',
-    'tasks --room ROOM', "task-add --room ROOM --request-id UUID --title TITLE [--notes NOTES] [--assignee me|MEMBER_ID]",
-    'task-update --room ROOM --request-id UUID --task TASK_ID [--revision N] [--status todo|doing|done] [--title TITLE] [--notes NOTES] [--assignee me|none|MEMBER_ID]',
+    'tasks --room ROOM', "task-add --room ROOM --request-id UUID --title TITLE [--notes NOTES] [--assignee me|MEMBER_ID] [--issue LINK|owner/name#N]",
+    'task-update --room ROOM --request-id UUID --task TASK_ID [--revision N] [--status todo|doing|done] [--title TITLE] [--notes NOTES] [--assignee me|none|MEMBER_ID] [--issue LINK|owner/name#N|none]',
+    'task-issue --room ROOM --request-id UUID --task TASK_ID [--repo owner/name]  (opens a GitHub issue for the task with your own gh, then links it)',
+    'issue-task --room ROOM --request-id UUID --issue LINK|owner/name#N [--assignee me|MEMBER_ID]  (adds a task from a GitHub issue or pull request, read with your own gh)',
     'task-remove --room ROOM --request-id UUID --task TASK_ID',
     'send --room ROOM --request-id UUID [--text TEXT] [--attach FILE]... [--reply-to MESSAGE_ID]  (up to 4 files of 10 MB each)',
     `react --room ROOM --request-id UUID --message MESSAGE_ID --emoji ${REACTION_EMOJI.join('|')} (toggles; humans or agents)`,
@@ -254,7 +258,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
   }
   if (command === 'tasks') {
     const view = agent.view();
-    return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, boardCursor: view.boardRevision, tasks: view.tasks,
+    return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, boardCursor: view.boardRevision, tasks: view.tasks, repositories: agent.settings().repositories ?? [],
       participants: view.participants.map(({ id, name, role, operatorId }) => ({ id, name, role, operatorId })) };
   }
   if (command === 'stop') { const pid = runnerAlive(agent.roomId); if (pid) process.kill(pid); return { stopped: !!pid }; }
@@ -329,8 +333,43 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (assigneeId && !uuid(assigneeId)) throw new Error('Use --assignee me, none, or a member id from the tasks command.');
     const revision = values['--revision'] === undefined ? undefined : Number(values['--revision']);
     if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 1)) throw new Error('Use --revision with the task revision you last read.');
+    const given = values['--issue'], issue = given === undefined ? undefined : given === 'none' ? null : issueLinkFrom(given);
+    if (issue === undefined && given !== undefined) throw new Error('Use --issue with a GitHub issue or pull request link, owner/name#42, or none.');
     return taskBrowser(agent, { requestId, taskId: command === 'task-add' ? undefined : taskId, revision, removed: command === 'task-remove',
-      change: { title: values['--title'], notes: values['--notes'], status: status as TaskStatus | undefined, assigneeId } });
+      change: { title: values['--title'], notes: values['--notes'], status: status as TaskStatus | undefined, assigneeId, ...(issue !== undefined ? { issue } : {}) } });
+  }
+  if (command === 'task-issue') {
+    const requestId = values['--request-id']?.toLowerCase(), taskId = values['--task']?.toLowerCase();
+    if (!uuid(requestId)) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same change.');
+    if (!uuid(taskId)) throw new Error('Use --task with a task ID from the tasks command.');
+    const task = agent.view().tasks.find(t => t.id === taskId);
+    if (!task) throw new Error('That task is not on the board. Run tasks for current task IDs.');
+    const ledger = join(agent.dir, 'issues-opened'), retry = existsSync(join(ledger, `${requestId}.txt`));
+    if (task.issue && !retry) return { status: 'already-linked', issue: task.issue, task };
+    const repository = retry ? '' : issueRepository(agent.settings().repositories ?? [], values['--repo']);
+    // A retry links the issue this request already opened rather than opening another.
+    const link = openIssueOnce(ledger, requestId, () => createIssue(runGh, repository, task.title, task.notes));
+    return { ...await taskBrowser(agent, { requestId, taskId, change: { issue: link } }), issue: link };
+  }
+  if (command === 'issue-task') {
+    const requestId = values['--request-id']?.toLowerCase();
+    if (!uuid(requestId)) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same change.');
+    const link = issueLinkFrom(values['--issue'] ?? '');
+    if (!link) throw new Error('Use --issue with a GitHub issue or pull request link, or owner/name#42.');
+    const view = agent.view(), existing = view.tasks.find(t => t.issue && sameIssue(t.issue, link));
+    if (existing && !agent.taskOps().some(p => p.body.id === requestId)) return { status: 'already-on-board', task: existing };
+    const assignee = values['--assignee'], assigneeId = assignee === undefined ? undefined : assignee === 'me' ? view.memberId! : assignee.toLowerCase();
+    if (assigneeId && !uuid(assigneeId)) throw new Error('Use --assignee me or a member id from the tasks command.');
+    // Another run of this agent may be adding the same issue right now; a new task's id is its request id.
+    const claims = join(agent.dir, 'issue-tasks'), holder = claimIssueTask(claims, link, requestId);
+    if (holder?.running) return { status: 'already-being-added', requestId: holder.requestId };
+    if (holder) throw new Error(`An earlier issue-task for this issue (request ${holder.requestId}) stopped before finishing. Run it again with --request-id ${holder.requestId}.`);
+    let draft: ReturnType<typeof issueDraft>;
+    try { draft = issueDraft(runGh, link); } catch (error) { releaseIssueTask(claims, link); throw error; }
+    const result = await taskBrowser(agent, { requestId, change: { ...draft, ...(assigneeId ? { assigneeId } : {}) } });
+    // Claim stays while queued for the bridge; run releases it when it signs or drops the outbox item.
+    if (result.status === 'shared' || result.status === 'dropped') releaseIssueTask(claims, link);
+    return result;
   }
   if (command === 'send') {
     if (!uuid(values['--request-id'])) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same message.');

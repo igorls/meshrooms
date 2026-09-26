@@ -36,6 +36,7 @@ function createMockSourceFixture(baseDir: string) {
   writeFileSync(join(serverDir, 'http.ts'), '// mock http\n');
   writeFileSync(join(serverDir, 'instance.ts'), '// mock instance\n');
   writeFileSync(join(serverDir, 'browser-agent.ts'), '// shipped as its own bundle\n');
+  writeFileSync(join(serverDir, 'github-issues.ts'), '// part of the agent bundle\n');
   writeFileSync(join(serverDir, 'agent-cli.ts'), '// shipped as its own bundle\n');
 
   // Excluded test & helper files in server
@@ -184,6 +185,7 @@ describeWin('Runtime Packaging (packageRuntime)', () => {
     expect(existsSync(join(outputDir, 'src', 'attachments.ts'))).toBe(true);
     // The browser bridge ships as its own bundle, never in the local runtime.
     expect(existsSync(join(outputDir, 'server', 'browser-agent.ts'))).toBe(false);
+    expect(existsSync(join(outputDir, 'server', 'github-issues.ts'))).toBe(false);
     expect(existsSync(join(outputDir, 'server', 'agent-cli.ts'))).toBe(false);
     expect(existsSync(join(outputDir, 'skills', 'meshrooms', 'SKILL.md'))).toBe(true);
     expect(existsSync(join(outputDir, '.local', 'native', 'wormdb_ffi.dll'))).toBe(true);
