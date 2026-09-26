@@ -2,7 +2,7 @@
 export const browserProtocol = 'meshrooms-browser-v1';
 export type Command = {
   protocol: typeof browserProtocol; origin: string; id: string; at: number;
-  action: 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile';
+  action: 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'repositories';
   roomId: string; payload: Record<string, unknown>;
 };
 export type SignedCommand = { command: Command; publicKey: string; signature: string };
@@ -37,7 +37,14 @@ export type RoomStatus = {
   /** Keys of devices that have left, so their earlier signed task changes still verify for people who join later. */
   formerDevices?: FormerDevice[];
   settings?: RoomSettings;
+  /** GitHub `owner/name` repositories people pinned for this room; tasks open issues in them. */
+  repositories?: string[];
 };
+/** Repositories a room can pin; names only, never anyone's GitHub credentials. */
+export const MAX_REPOSITORIES = 8;
+/** `owner/name` of a GitHub repository. `.` and `..` are not names, so a link built from one stays on that repository. */
+export const validRepository = (v: unknown): v is string =>
+  typeof v === 'string' && /^[A-Za-z0-9-]{1,39}\/[\w.-]{1,100}$/.test(v) && !/\/\.{1,2}$/.test(v);
 /** `role` is the member's role when the device left, so a departed agent's signed votes can never pass as a person's. */
 export type FormerDevice = { id: string; publicKey: string; memberId: string; role?: 'human' | 'agent' };
 export const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));

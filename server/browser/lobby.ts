@@ -1,12 +1,12 @@
 import { Database } from 'bun:sqlite';
 import { sniff } from '../attachments';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
-import { browserProtocol, deviceId, verify, type BrowserDevice, type BrowserMember, type FormerDevice, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, DEFAULT_ROOM_SETTINGS } from '../../src/browser/protocol';
+import { browserProtocol, deviceId, MAX_REPOSITORIES, validRepository, verify, type BrowserDevice, type BrowserMember, type FormerDevice, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, DEFAULT_ROOM_SETTINGS } from '../../src/browser/protocol';
 
 /** Only a hash of an agent link's token is kept; the link itself is shown once to the person who made it. */
 type StoredInvite = { tokenHash: string; operatorId: string; name: string; expiresAt: number };
 /** `retired` keeps the public keys of devices that left, so their earlier signed task changes still verify. */
-type Room = { id: string; title: string; ownerId: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; retired?: FormerDevice[]; settings?: Partial<RoomSettings> };
+type Room = { id: string; title: string; ownerId: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; retired?: FormerDevice[]; settings?: Partial<RoomSettings>; repositories?: string[] };
 const RETIRED_DEVICES = 256;
 const INVITE_TTL = 900_000, INVITES_PER_PERSON = 4, AGENTS_PER_OPERATOR = 4;
 const tokenHash = (token: string) => createHash('sha256').update(token).digest('hex');
@@ -244,6 +244,21 @@ export class BrowserLobby {
             member.avatar = hash;
             break;
           }
+          case 'repositories': {
+            // People pin repositories like pinning in a chat: any person, not only the host; agents don't. One change
+            // at a time (pin or unpin a name), so two people pinning at once both keep theirs.
+            if (!actor || !isPerson(room, actor.memberId)) fail(403, 'Only people in this room can pin repositories.');
+            const { pin, unpin } = c.payload, name = pin ?? unpin;
+            if ((pin === undefined) === (unpin === undefined) || !validRepository(name)) fail(400, 'Pin or unpin one GitHub repository, as owner/name.');
+            const list = room.repositories ?? [], same = (r: string) => r.toLowerCase() === name.toLowerCase();
+            if (pin !== undefined && !list.some(same)) {
+              if (list.length >= MAX_REPOSITORIES) fail(400, `A room pins up to ${MAX_REPOSITORIES} repositories. Unpin one first.`);
+              room.repositories = [...list, name];
+            }
+            if (unpin !== undefined) room.repositories = list.filter(r => !same(r));
+            if (!room.repositories?.length) delete room.repositories;
+            break;
+          }
           case 'settings': {
             if (!isHost) fail(403, 'Only the host can change room settings.');
             const next: Partial<RoomSettings> = { ...room.settings };
@@ -306,6 +321,7 @@ export class BrowserLobby {
     if (actor.memberId === room.ownerId) result.requests = room.requests.filter(r => r.state === 'pending' && r.expiresAt > this.now()).map(r => { const { code, ...rest } = r; return rest; });
     if (room.retired?.length) result.formerDevices = room.retired;
     result.settings = settingsOf(room);
+    if (room.repositories?.length) result.repositories = room.repositories;
     const invites = (room.invites || []).filter(i => i.operatorId === actor.memberId && i.expiresAt > this.now());
     if (invites.length) result.agentInvites = invites.map(({ name, expiresAt }) => ({ name, expiresAt }));
     const key = `${room.id}:${id}`;

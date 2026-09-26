@@ -50,7 +50,7 @@ export type PackageManifest = {
 
 const REQUIRED_SERVER_FILES = ['daemon.ts', 'cli.ts', 'runtime.ts'];
 // The browser-room agent bridge ships separately as dist/agent/meshrooms-agent.js; the local runtime never loads it.
-const EXCLUDED_SERVER_FILES = new Set(['test-directory.ts', 'mockRoom.ts', 'browser-agent.ts', 'agent-cli.ts']);
+const EXCLUDED_SERVER_FILES = new Set(['test-directory.ts', 'mockRoom.ts', 'browser-agent.ts', 'agent-cli.ts', 'github-issues.ts']);
 
 function computeSha256(filePath: string): string {
   const content = readFileSync(filePath);

@@ -40,7 +40,7 @@ export type RoomSnapshot = RoomInfo & {
   /** Absent on backends without agent floor control or a task board (the demo node). */
   floor?: Floor; tasks?: Task[]; boardRevision?: number;
 };
-export type TaskDraft = { title?: string; notes?: string; status?: Task['status']; assigneeId?: string | null };
+export type TaskDraft = { title?: string; notes?: string; status?: Task['status']; assigneeId?: string | null; issue?: string | null };
 export type NodeSnapshot = {
   backend: 'demo' | 'local';
   storage: 'memory' | 'wormdb';

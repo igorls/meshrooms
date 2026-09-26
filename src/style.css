@@ -144,6 +144,21 @@
 .task-actions .secondary{font-size:11px;min-height:34px;padding:7px 12px}
 .text-button.danger{color:#8d352b;font-size:11px}
 .task-history{font-size:9px;color:var(--muted);line-height:1.6}
+/* GitHub issue links (browser rooms) */
+.task-add-hint{font-size:10px;color:var(--muted);margin:0}
+.task-issue-chip{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;color:#234c99;text-decoration:none;border:1px solid #c9d6ee;background:#f3f6fd;border-radius:999px;padding:2px 8px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-issue-chip:hover{background:#e7eefb;text-decoration:underline}
+.task-issue{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--line);border-radius:8px;background:#fafbfd}
+.task-issue>span{display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:11px;color:#475569}
+.task-issue:has(>span){flex-direction:row;align-items:center;justify-content:space-between}
+.task-issue-open{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px}
+.task-issue-open>label,.task-issue-open>span{flex:1 1 160px;font-size:10px;font-weight:650;color:#475569}
+.task-issue-open .secondary,.task-issue form .secondary{font-size:11px;min-height:34px;padding:7px 12px}
+.task-issue form{display:flex;align-items:flex-end;gap:8px}
+.task-issue form label{flex:1;min-width:0}
+.task-issue form input{font-size:11px;width:100%}
+.task-issue-hint{font-size:10px;color:var(--muted);margin:0}
+.task-issue .text-button{font-size:11px;min-height:32px}
 @media(min-width:1150px){.room-layout.with-board{grid-template-columns:260px minmax(0,1fr) 340px}}
 @media(max-width:1149px){.room-layout.with-board>.main-room{display:none}.task-board{border-left:0}}
 @media(max-width:1100px){.mention-list{left:26px;max-width:calc(100% - 52px)}}
