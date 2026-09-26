@@ -40,7 +40,9 @@ type MessageBody = { /* existing fields */ visibility?: 'members' | 'room' };
 
 Since the author signs the visibility, changing the setting later is never retroactive. Turning history on exposes
 only what is said from then on, and turning it off stops sharing new messages but keeps earlier `room` messages
-shareable, because their authors agreed to that. The host can't reinterpret what people said.
+shareable, because their authors agreed to that. The host can't reinterpret what people said. A client with a stale
+setting could still sign `room` just after the host turned history off; that remains the author's own consent. The
+composer shows the visibility that will be signed ("New members will see this") so it is never a surprise.
 
 ### The host setting
 
@@ -48,7 +50,9 @@ A room setting next to the others: **History for newcomers**, either *Off* (the 
 `members`) or *On* (new messages are `room`). The setting is shown:
 
 - In the room header and in Room details ("New members can read messages from now on").
-- On the join screen and in the invite link's page, before someone asks to join.
+- On the join screen and in the invite link's page, before someone asks to join. The unauthenticated room
+  endpoint (today `{ roomId, title }`) and pre-admission `status` grow to include it; agent `status` and
+  `listen` expose it the same way.
 - To agents, in `status` and `listen` output, so an agent's operator knows what it will see.
 
 There is no *On, last N days* option. Peers can't be made to forget what they hold, so a window would promise more than
@@ -64,7 +68,9 @@ sees it.
 2. **Exchange on connect.** When a channel opens, each side sends
    `{ kind: 'history-have', roomId, vector }`. The other side replies with the entries the requester is **allowed**
    and missing, newest first, in `{ kind: 'history', roomId, entries: packet[] }` envelopes under the 20,000-character
-   limit (the same chunking as decisions). Rate limits and a per-request cap keep this bounded.
+   limit (the same chunking as decisions). Rate limits and a per-request cap keep this bounded. After applying a
+   chunk, the requester sends an updated `history-have`; the peer continues until the requester's allowed vector
+   converges or that peer has nothing more to serve, so a newcomer is not stuck re-fetching only the newest page.
 3. **Who may receive what, decided from the room service's view.** A peer looks up the requester's device in the
    room status it got from the room service (member, role, and the member's `joinedAt`), never from anything the
    requester claims. It serves an entry only if the entry's `visibility` is `room`, or the requester's **member**
@@ -84,7 +90,8 @@ sees it.
    one has it, and otherwise shown as "some earlier messages aren't available". Withholding can't be hidden as
    deletion.
 7. **Files follow messages.** Attachments named by history entries become fetchable through the existing file
-   transfer (files are servable when a verified message references them), within the same room storage cap.
+   transfer (files are servable when a message the requester may see references them), within the same room
+   storage cap. A file first shared in a `members` message follows the same authorization as that message.
 
 Entries without `seq` (sent before this change) can't be summarised by a vector. For those, an id-set exchange in hash
 buckets is enough, and since they are all `members`-only, they're only exchanged between devices that already qualify.
