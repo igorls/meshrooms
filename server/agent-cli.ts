@@ -367,7 +367,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     let draft: ReturnType<typeof issueDraft>;
     try { draft = issueDraft(runGh, link); } catch (error) { releaseIssueTask(claims, link); throw error; }
     const result = await taskBrowser(agent, { requestId, change: { ...draft, ...(assigneeId ? { assigneeId } : {}) } });
-    // Once the task is on the board, the on-board check covers this issue; the claim stays while it is still queued.
+    // Claim stays while queued for the bridge; run releases it when it signs or drops the outbox item.
     if (result.status === 'shared' || result.status === 'dropped') releaseIssueTask(claims, link);
     return result;
   }

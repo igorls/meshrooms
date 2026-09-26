@@ -33,6 +33,7 @@ import {
 } from '../src/browser/reactions';
 import { evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
+import { releaseIssueTask } from './github-issues';
 
 type Identity = { id: string; publicKey: string; privateJwk: JsonWebKey };
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
@@ -525,7 +526,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             for (const peer of peers.values()) if (peer.channel?.readyState === 'open') peer.channel.send(JSON.stringify(packet));
           }
         }
-        unlinkSync(join(outbox, file)); continue;
+        unlinkSync(join(outbox, file));
+        // issue-task holds a claim while this outbox item is pending; release once run is done with it.
+        if (typeof item.change.issue === 'string') releaseIssueTask(join(agent.dir, 'issue-tasks'), item.change.issue);
+        continue;
       }
       if ('type' in item && item.type === 'reaction') {
         const ops = agent.reactionOps();

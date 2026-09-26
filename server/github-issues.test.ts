@@ -65,6 +65,7 @@ test('two runs adding the same issue: the second finds the first, and a stopped 
   expect(claimIssueTask(dir, link, b)).toEqual({ requestId: a, running: false });
   expect(claimIssueTask(dir, link, a)).toBeUndefined();
   // Released once the task is on the board (or nothing was queued), the issue can be claimed again.
+  // The bridge also releases when it finishes an outbox item that linked an issue (queued-for-bridge path).
   releaseIssueTask(dir, link);
   expect(claimIssueTask(dir, link, c)).toBeUndefined();
 });
