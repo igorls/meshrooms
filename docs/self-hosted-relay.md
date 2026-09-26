@@ -39,7 +39,7 @@ MESHGUARD_OPTS="--announce 203.0.113.10 --open"
 - `--announce <ip>` sets the public address instead of discovering it with STUN. Use the host's real public IPv4.
 - `--open` accepts all peers without trust enforcement, which is what makes it *public*. For a relay only your own
   nodes may use, leave `--open` out and authorize peers with `meshguard trust <public key> --name <label>`, or trust
-  an organization's key with `meshguard trust --org`.
+  an organization's key with `meshguard trust --org <org public key>`.
 
 The service runs `meshguard up $MESHGUARD_OPTS` under systemd with `MESHGUARD_CONFIG_DIR=/etc/meshguard` and a hardened
 unit (`NoNewPrivileges`, `ProtectSystem=strict`, only `CAP_NET_ADMIN`, `CAP_NET_RAW` and `CAP_NET_BIND_SERVICE`).

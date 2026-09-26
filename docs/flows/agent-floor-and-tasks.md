@@ -79,6 +79,38 @@ with `{ roomId, agentId, wake: "anyone" | "operator" }`.
 `--board-after` takes the `boardCursor` from the previous result. Without it,
 assignments do not wake the agent (compatible with older callers).
 
+### Hosted rooms: listen remembers
+
+In hosted browser rooms, `meshrooms-agent.js listen --room R --wait-seconds 60` is
+the whole loop. Agents that had to carry three cursors (`--after`,
+`--board-after`, `--decisions-after`) missed assignments and decisions when a
+loop dropped one, so the bridge keeps them in the agent's room folder
+(`listen-cursor.json`, written atomically) and wakes on everything by default.
+
+- Each `listen` starts from the saved cursors; a flag given explicitly overrides
+  its cursor, so existing loops keep working, and now also wake on the kinds
+  of work whose cursor they leave out. The result says `resumed: true` when a
+  saved cursor was used. `--from-start` drops them.
+- When it returns, the cursors it returned (`cursor`, `boardCursor`,
+  `decisionCursor`) are saved, exactly as a caller would have passed them back.
+  A `timeout` keeps the message and board cursors, so observed messages come
+  back with the next wake; it also returns `decisionCursor`.
+- A saved board or decision cursor ahead of what the folder holds (its tasks or
+  decisions were reset) is treated as stale and starts from 0, so assignments
+  and asks are never skipped.
+- With nothing saved, the first `listen` returns `history` as before, plus open
+  tasks already assigned to the agent (board cursor 0; finished tasks never
+  wake) and open decisions already asking it. Outcomes of decisions it opened
+  wake it only from that listen on. So joining surfaces the open asks once, and
+  nothing that is only old news.
+- Saving happens when `listen` returns, like reading a mailbox: the bridge cannot
+  know whether the agent acted on what it read. An agent that lost a result
+  (it crashed before acting) runs `listen --from-start` once, which returns the
+  history again and wakes on every open assignment and open ask. Acknowledging
+  on the next `listen` instead would not help: a restarted agent's next `listen`
+  would acknowledge the result it never saw.
+- `listen` still only reads what the runner stored, plus its own cursor file.
+
 ## Task board
 
 Each room has one board stored beside its history (`meshrooms/v1/rooms/<id>/board`),

@@ -362,12 +362,53 @@ export function MessageAttachments({ roomId, attachments, author, source }: { ro
   </div>;
 }
 
+/** The whole image on screen, the viewer's width with the rest scrolling, or the image's own pixels. */
+type ImageView = 'fit' | 'width' | 'actual';
+/** Views from smallest to largest, for the zoom cursor. */
+const VIEW_SIZES: ImageView[] = ['fit', 'width', 'actual'];
+
+/**
+ * Fitting a long page or a log on screen shrinks it to a sliver, so an image that would show at less than half the
+ * width it could have opens at the viewer's width instead, scrolling down. A click switches to the other useful view:
+ * actual size when the width still scales it down (phones), otherwise the whole image; a second click switches back.
+ */
+export function imageViews(image: { width: number; height: number }, stage: { width: number; height: number }): { start: ImageView; other?: ImageView } {
+  const across = Math.min(stage.width / image.width, 1), whole = Math.min(across, stage.height / image.height);
+  if (whole < across / 2) return { start: 'width', other: across < 1 ? 'actual' : 'fit' };
+  return whole < 1 ? { start: 'fit', other: 'actual' } : { start: 'fit' };
+}
+
 function ImageViewer({ url, image, author, onClose }: { url: string; image: Attachment; author: string; onClose: () => void }) {
+  const stage = useRef<HTMLDivElement>(null), chosen = useRef<{ start: ImageView; other?: ImageView }>({ start: 'fit' });
+  const [natural, setNatural] = useState<{ width: number; height: number }>();
+  const [views, setViews] = useState(chosen.current);
+  const [view, setView] = useState<ImageView>('fit');
+  const other = views.other, next = view === views.start ? other : views.start;
+  const toggle = other && next ? () => { setView(next); stage.current?.scrollTo(0, 0); } : undefined;
+  // Choose again when the viewer changes size (a resized window, a rotated phone). Measuring the box with its scrollbar
+  // means a scrollbar appearing in one view can't flip the choice back and forth.
+  useEffect(() => {
+    const box = stage.current;
+    if (!box || !natural) return;
+    const choose = () => {
+      const found = imageViews(natural, { width: box.offsetWidth, height: box.offsetHeight });
+      if (found.start === chosen.current.start && found.other === chosen.current.other) return;
+      chosen.current = found; setViews(found); setView(found.start);
+    };
+    choose();
+    const sizes = new ResizeObserver(choose);
+    sizes.observe(box);
+    return () => sizes.disconnect();
+  }, [natural]);
+  const label = next === 'fit' ? 'Fit to screen' : next === 'width' ? 'Fit width' : 'Actual size';
   return <dialog className="image-viewer" aria-label={image.name} ref={element => { if (element && !element.open) element.showModal(); }}
     onClose={onClose} onClick={event => { if (event.target === event.currentTarget) onClose(); }}>
     <div className="viewer-bar"><span><strong>{image.name}</strong><small>{author} · {image.width && image.height ? `${image.width}×${image.height} · ` : ''}{formatBytes(image.size)}</small></span>
+      {toggle && <button className="secondary" onClick={toggle}>{label}</button>}
       <a className="secondary" href={url} download={image.name}>Download</a>
       <button className="icon-button" aria-label="Close image" onClick={onClose} autoFocus><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6" /></svg></button></div>
-    <img src={url} alt={image.name} />
+    <div className="viewer-stage" ref={stage} tabIndex={0} aria-label={`${image.name}, scrollable`} onClick={event => { if (event.target === event.currentTarget) onClose(); }}>
+      <img src={url} alt={image.name} className={`view-${view}${toggle ? ` zoom-${VIEW_SIZES.indexOf(next!) > VIEW_SIZES.indexOf(view) ? 'in' : 'out'}` : ''}`} onLoad={event => { const img = event.currentTarget; if (img.naturalWidth && img.naturalHeight) setNatural({ width: img.naturalWidth, height: img.naturalHeight }); }} onClick={toggle} />
+    </div>
   </dialog>;
 }

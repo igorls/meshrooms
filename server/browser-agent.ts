@@ -13,7 +13,7 @@
  * record its activity (activity.json), which `run` announces to connected devices.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { browserProtocol, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
@@ -53,6 +53,9 @@ type StoredDecisionOp = DecisionPacket & { seq: number };
 /** A stored task operation and the board cursor at which it arrived. */
 type StoredOp = TaskPacket & { seq: number };
 type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; started: number };
+/** Message, board and decision cursors `listen` continues from; saved in the agent's room folder. */
+export type ListenCursor = { after?: string; boardAfter: number; decisionsAfter: number };
+const LISTEN_CURSOR = 'listen-cursor.json';
 
 const b64 = (bytes: ArrayBuffer | Uint8Array) => Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString('base64');
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
@@ -149,7 +152,7 @@ export class BrowserAgent {
       headers: { 'Content-Type': 'application/json', Origin: this.origin },
       body: JSON.stringify({ command, publicKey: identity.publicKey, signature: await this.sign(command) }) });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.error || `Room service rejected ${action} (${response.status}).`);
+    if (!response.ok) throw Object.assign(new Error(result.error || `Room service rejected ${action} (${response.status}).`), { status: response.status });
     return result;
   }
   messages(): Stored[] { return readJson(this.path('messages.json'), []); }
@@ -176,6 +179,12 @@ export class BrowserAgent {
   /** Verified reaction operations this device holds (only for messages it also holds). */
   reactionOps(): ReactionPacket[] { return readJson(this.path('reactions.json'), []); }
   reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
+  /** Where a plain `listen` continues from: the cursors the last `listen` returned. */
+  listenCursor(): ListenCursor | undefined {
+    const c = readJson<Partial<ListenCursor> | undefined>(this.path(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+    return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
+  }
+  saveListenCursor(cursor: ListenCursor) { writeJson(this.path(LISTEN_CURSOR), cursor); }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined { const a = readJson<unknown>(this.path('activity.json'), undefined); return validActivity(a) ? a : undefined; }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
@@ -497,7 +506,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
               : reviseDecision(author, current, item.action === 'option' ? { addOption: item.label } : item.action === 'close' ? { close: true } : { withdraw: true });
             if (body) await shareDecisionOp({ ...body, id: item.id });
           }
-        } catch (error) { log(`dropped decision change ${item.id}: ${error instanceof Error ? error.message : String(error)}`); }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          log(`dropped decision change ${item.id}: ${reason}`);
+          noteDropped(outbox, item.id, reason);
+        }
         unlinkSync(join(outbox, file)); continue;
       }
       if ('type' in item && item.type === 'task') {
@@ -602,7 +615,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
  * Wait until this agent is addressed in the browser room (same semantics as local `listen`). Calling it means the
  * agent is idle; returning what addressed it means it is working on that until it listens again.
  */
-export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number) {
+export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number, outcomesAfter?: number) {
   const deadline = Date.now() + seconds * 1000;
   let beat = 0;
   while (true) {
@@ -610,7 +623,10 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     const woke = evaluateWake(view, view.memberId, after, boardAfter);
     // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
     const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
-    const wakes = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : decisionWakes(ops.map(p => p.body), agent.members(), view.memberId, ops.filter(p => p.seq > decisionsAfter).map(p => p.body));
+    const since = (seq: number) => decisionWakes(ops.map(p => p.body), agent.members(), view.memberId!, ops.filter(p => p.seq > seq).map(p => p.body));
+    const asks = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : since(decisionsAfter);
+    // Asks wake from decisionsAfter, outcomes of the agent's own decisions only from outcomesAfter: older ones are old news.
+    const wakes = outcomesAfter === undefined || decisionsAfter === undefined || outcomesAfter <= decisionsAfter ? asks : { ...since(outcomesAfter), asked: asks.asked };
     const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
     const result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
     if (result.state !== 'waiting') {
@@ -624,11 +640,39 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     if (!beat || Date.now() - beat >= LISTEN_HEARTBEAT_MS) { if (beat) agent.touchActivity(); else agent.recordActivity('idle'); beat = Date.now(); }
     if (Date.now() >= deadline) {
       agent.touchActivity();
+      // Asks before outcomesAfter were checked and did not wake, so moving the cursor past them loses nothing.
       return { state: 'timeout', roomId: agent.roomId, participantId: view.memberId, floor: view.floor, messages: [], cursor: after,
-        boardCursor: boardAfter ?? view.boardRevision, decisionCursor: decisionsAfter ?? decisionCursor, observed: result.messages.filter(m => m.authorId !== view.memberId).length };
+        boardCursor: boardAfter ?? view.boardRevision, decisionCursor: decisionsAfter === undefined ? decisionCursor : Math.max(decisionsAfter, outcomesAfter ?? 0),
+        observed: result.messages.filter(m => m.authorId !== view.memberId).length };
     }
     await Bun.sleep(500);
   }
+}
+
+/**
+ * `listen` that remembers: cursors not given as flags continue from where the last `listen` returned, and the cursors it
+ * returns are saved before the agent sees them, like reading a mailbox. The bridge cannot tell whether the agent acted on
+ * what it read, so an agent that lost a result (it crashed) recovers with `fromStart`: history again, and a wake for every
+ * open assignment and every open decision still asking it. A timeout keeps the message and board cursors, so nothing it
+ * observed is lost.
+ *
+ * With nothing saved, the first listen returns history as before, plus open assignments and open asks from any time (they
+ * wake it once, then the cursors move past them). Outcomes of decisions the agent opened wake it only from now on, so an
+ * agent that starts over is not flooded with results it already had.
+ */
+export async function listenRemembering(agent: BrowserAgent, seconds: number, flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean } = {}) {
+  const saved = flags.fromStart ? undefined : agent.listenCursor();
+  // A cursor for a message this folder no longer holds (its messages were reset) starts over rather than failing every listen.
+  const known = saved?.after !== undefined && agent.messages().some(m => m.packet.body.id === saved.after);
+  const after = flags.after ?? (known ? saved!.after : undefined);
+  // Saved cursors ahead of what this folder holds (its tasks or decisions were reset) are stale: start those from 0.
+  const board = saved?.boardAfter !== undefined && saved.boardAfter <= agent.boardCursor() ? saved.boardAfter : undefined;
+  const decided = saved?.decisionsAfter !== undefined && saved.decisionsAfter <= agent.decisionCursor() ? saved.decisionsAfter : undefined;
+  const decisionsAfter = flags.decisionsAfter ?? decided;
+  const result = await listenBrowser(agent, after, seconds, flags.boardAfter ?? board ?? 0, decisionsAfter ?? 0, decisionsAfter ?? agent.decisionCursor());
+  agent.saveListenCursor({ ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor });
+  const resumed = !!saved && (flags.after === undefined || flags.boardAfter === undefined || flags.decisionsAfter === undefined);
+  return resumed ? { ...result, resumed } : result;
 }
 
 /** Queue a message for `run` to sign and deliver; waits until peers store it or the timeout passes. */
@@ -782,6 +826,16 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
     votes: d.votes.map(v => ({ by: name(v.memberId), counts: v.counts, option: label(v.optionId), ...(v.comment ? { comment: v.comment } : {}) })) };
 }
 
+/** Why `run` could not sign a queued decision change, kept next to the outbox for the command waiting on it. */
+export function noteDropped(outbox: string, id: string, reason: string) { writeFileSync(join(outbox, `${id}.dropped`), reason, { mode: 0o600 }); }
+/** The reason `run` noted for dropping a change, read once. */
+export function takeDropped(outbox: string, id: string) {
+  const note = join(outbox, `${id}.dropped`);
+  if (!existsSync(note)) return undefined;
+  const reason = readFileSync(note, 'utf8'); rmSync(note, { force: true });
+  return reason;
+}
+
 /** Queue a decision change for `run` to sign and share; returns the decision once this device holds the change. */
 export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveOmit<DecisionIntent, 'type'>, seconds = 10) {
   const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
@@ -810,7 +864,7 @@ export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveO
       return { status: 'shared', decision: decision ? describeDecision(agent, decision) : null, decisionCursor: agent.decisionCursor(ops) };
     }
     if (!pending && agent.compactedDecisionIds().has(intent.id)) return superseded(agent, intent.decisionId, view.memberId);
-    if (!pending) return { status: 'dropped', reason: 'The change no longer applied when it was signed (the decision closed or changed). Read it again.' };
+    if (!pending) return { status: 'dropped', reason: takeDropped(join(agent.dir, 'outbox'), intent.id) ?? 'The change no longer applied when it was signed (the decision closed or changed). Read it again.' };
     await Bun.sleep(300);
   }
   return { status: 'queued-for-bridge' };

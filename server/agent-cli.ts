@@ -2,7 +2,7 @@
  * meshrooms-agent: join a hosted Meshrooms room as an agent, from a connect link.
  *
  *   bun meshrooms-agent.js connect '<https://host/agent/<room>#<token>>'
- *   bun meshrooms-agent.js listen --room <room> [--after <message id>] [--wait-seconds 30]
+ *   bun meshrooms-agent.js listen --room <room> [--wait-seconds 30] [--from-start]   (continues where the last listen stopped)
  *   bun meshrooms-agent.js send --room <room> --request-id <uuid> [--text '<text>'] [--attach <file>]... [--reply-to <message id>]
  *   bun meshrooms-agent.js attachment --room <room> --id <attachment id> [--out <file or dir>] [--wait-seconds 30]
  *   bun meshrooms-agent.js tasks --room <room>
@@ -25,10 +25,10 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
-import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenBrowser, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
+import { BrowserAgent, PENDING_PROFILE, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import { mayAgentSpeak } from '../src/collab';
 
 export { parseConnectLink };
@@ -52,12 +52,71 @@ export function connectConflict(linkHash: string, previousLinkHash: string | und
     + `Each agent on a machine needs its own folder: set MESHROOMS_AGENT_HOME to a new one (for example ${join(folder, '..', 'agents-<name>')}) `
     + 'and run connect again with the same link.';
 }
+const BUSY = 'Another connect is running in this folder. Wait for it to finish, then try again.';
+/** Whether a process on this machine is still running; the folder is local, so the lock's owner is too. */
+function running(pid: number) {
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as { code?: string }).code === 'EPERM'; }
+}
+/**
+ * A lock is taken over only once the process it names has exited, however long a live one takes (a laptop asleep
+ * mid-connect keeps it). Locks are created already naming their process, so a live connect's lock never looks
+ * ownerless; a file that names no process is never taken over. Returns what the lock looked like when found stale,
+ * so a takeover can check it is replacing that same file.
+ */
+function staleLock(path: string) {
+  try {
+    const found = statSync(path), owner = readFileSync(path, 'utf8');
+    return /^\d{1,10}$/.test(owner) && !running(Number(owner)) ? `${found.ino}:${found.mtimeMs}:${owner}` : undefined;
+  } catch { return undefined; }
+}
+/** Creates a lock with its owner already in it: written to a private file, then hard-linked into place, which fails if one exists. */
+function takeLock(path: string) {
+  const draft = `${path}.${process.pid}.${randomUUID()}`;
+  writeFileSync(draft, String(process.pid), { flag: 'wx', mode: 0o600 });
+  try { linkSync(draft, path); }
+  catch (error) {
+    if ((error as { code?: string }).code === 'EEXIST') throw error;
+    // No hard links on this file system (FAT, some network shares): create it in place. A crash between creating
+    // and writing then leaves a lock that names no process, which is never taken over, only reported.
+    writeFileSync(path, String(process.pid), { flag: 'wx', mode: 0o600 });
+  } finally { unlinkSync(draft); }
+}
+const exists = (error: unknown) => (error as { code?: string }).code === 'EEXIST';
+/**
+ * One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. A connect
+ * that crashed leaves its lock behind; taking that over is exclusive too. Only the holder of `connect.lock.reclaim`
+ * may replace it, and only while it is still the same stale file, so two connects can never both take it.
+ */
+async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
+  const lock = join(folder, 'connect.lock'), reclaim = `${lock}.reclaim`;
+  try { takeLock(lock); }
+  catch (error) {
+    if (!exists(error)) throw error;
+    const seen = staleLock(lock);
+    if (!seen) {
+      let owner: string | undefined; try { owner = readFileSync(lock, 'utf8'); } catch { /* Released meanwhile. */ }
+      throw new Error(owner !== undefined && !/^\d{1,10}$/.test(owner) ? `${lock} doesn't name the connect that made it. If no connect is running, delete that file, then try again.` : BUSY);
+    }
+    // Reclaiming takes milliseconds; a marker whose process is gone was left by a crash in exactly that window.
+    try { takeLock(reclaim); }
+    catch (error) {
+      if (!exists(error)) throw error;
+      throw new Error(staleLock(reclaim) ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY);
+    }
+    try {
+      if (staleLock(lock) !== seen) throw new Error(BUSY);
+      unlinkSync(lock);
+      try { takeLock(lock); } catch (error) { throw exists(error) ? new Error(BUSY) : error; }
+    } finally { unlinkSync(reclaim); }
+  }
+  try { return await work(); } finally { try { unlinkSync(lock); } catch { /* Already gone. */ } }
+}
 const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/i.test(v);
 
 function args(argv: string[]) {
   const [command = 'help', ...rest] = argv; const values: Record<string, string> = {}; const positional: string[] = []; const attach: string[] = []; const options: string[] = [];
   for (let i = 0; i < rest.length; i++) {
-    if (['--clear', '--all', '--withdraw'].includes(rest[i])) values[rest[i]] = 'true';
+    if (['--clear', '--all', '--withdraw', '--from-start'].includes(rest[i])) values[rest[i]] = 'true';
     else if (rest[i] === '--attach') { if (rest[i + 1] === undefined) throw new Error('Give a file path for --attach.'); attach.push(rest[++i]); }
     else if (rest[i] === '--option' && command === 'ask') { if (rest[i + 1] === undefined) throw new Error('Give a label for --option.'); options.push(rest[++i]); }
     else if (rest[i].startsWith('--')) { if (rest[i + 1] === undefined) throw new Error(`Give a value for ${rest[i]}.`); values[rest[i]] = rest[++i]; }
@@ -102,7 +161,9 @@ function runnerAlive(roomId: string) {
 export async function agentCli(argv: string[]): Promise<unknown> {
   const { command, values, positional, attach, options } = args(argv);
   if (command === 'help') return { usage: [
-    "connect '<connect link>'", 'listen --room ROOM [--after MESSAGE_ID] [--board-after BOARD_CURSOR] [--decisions-after DECISION_CURSOR] [--wait-seconds 30]',
+    "connect '<connect link>'",
+    'listen --room ROOM [--wait-seconds 30] [--from-start]  (wakes on mentions, replies, assignments and decisions; continues from the cursors the last listen returned)',
+    '  --after MESSAGE_ID, --board-after BOARD_CURSOR, --decisions-after DECISION_CURSOR override a saved cursor; --from-start drops them and returns history again',
     "ask --room ROOM --request-id UUID --question Q (--option A --option B ... | --mode plan-review --plan-file FILE) [--context TEXT | --context-file FILE] [--ask-agents all|NAME,NAME] [--closes 30m|2h|ISO] [--reply-to MESSAGE_ID]",
     'decision-wait --room ROOM --decision ID [--wait-seconds 600]  (returns when people have decided; a draw is an outcome)',
     'decisions --room ROOM [--all]', "vote --room ROOM --request-id UUID --decision ID --option OPTION_ID|none [--comment 'why']  (agents advise; only people's votes count)",
@@ -121,16 +182,30 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     const agent = new BrowserAgent(home(), origin, roomId);
     const identity = await agent.ensureIdentity();
     const config = join(agent.dir, 'room.json'), link = createHash('sha256').update(token).digest('hex');
-    let previous: string | undefined;
-    try { previous = JSON.parse(readFileSync(config, 'utf8')).link; } catch { /* First connect in this folder. */ }
-    let status = await agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
-    const conflict = connectConflict(link, previous, status, home());
-    if (conflict) throw new Error(conflict);
-    writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
-    if (!status.memberId) {
-      await agent.command('agent-redeem', { token, label: `Agent on ${hostname().slice(0, 40) || 'this machine'}` });
-      status = await agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
-    }
+    let status: any = await withConnectLock(agent.dir, async () => {
+      let saved: string | undefined, previous: string | undefined;
+      try { saved = readFileSync(config, 'utf8'); previous = JSON.parse(saved).link; } catch { /* First connect in this folder. */ }
+      // Fail closed: if the room can't be checked, don't risk using this link on top of another agent's folder.
+      let current: any;
+      try {
+        current = await agent.command('status', { session: randomUUID() });
+        // A proxy or maintenance page can answer 200 with something else; only the room's own answer about this device counts.
+        if (current?.roomId !== roomId || current?.deviceId !== identity.id) throw new Error('the room service gave an unexpected answer');
+      } catch (error) { throw new Error(`Couldn't check the room before connecting, so this link was not used: ${error instanceof Error ? error.message : String(error)}`); }
+      const conflict = connectConflict(link, previous, current, home());
+      if (conflict) throw new Error(conflict);
+      writeFileSync(config, JSON.stringify({ origin, roomId, link }), { mode: 0o600 });
+      if (current.memberId) return current;
+      try { await agent.command('agent-redeem', { token, label: `Agent on ${hostname().slice(0, 40) || 'this machine'}` }); }
+      catch (error) {
+        // Roll back only when the room refused the link. After a timeout or a server error the redeem may have gone
+        // through, so the record stays and a retry with this same link carries on.
+        const refused = (error as { status?: number }).status;
+        if (refused !== undefined && refused >= 400 && refused < 500) { if (saved === undefined) unlinkSync(config); else writeFileSync(config, saved, { mode: 0o600 }); }
+        throw error;
+      }
+      return agent.command('status', { session: randomUUID() }).catch(() => ({} as any));
+    });
     // Everyone sees which harness and model an agent runs on; the agent reports it, the room cannot verify it.
     const runtime = { ...(values['--harness'] ? { harness: values['--harness'] } : {}), ...(values['--model'] ? { model: values['--model'] } : {}) };
     // Waiting for the host: the runner reports these once the agent is admitted, so they are not lost.
@@ -142,7 +217,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     return { state: status.memberId ? 'connected' : 'waiting-for-host', roomId, title: status.title, agentName: me?.name, deviceId: identity.id, runnerPid: pid, ...runtime, ...(runtimeState ? { runtimeState } : {}),
       next: [
         ...(Object.keys(runtime).length ? [] : [`Say what you run on: bun ${process.argv[1]} profile --room ${roomId} --harness '<your harness>' --model '<your model id>'`]),
-        `Wait for your turn: bun ${process.argv[1]} listen --room ${roomId} --wait-seconds 60 (repeat with --after <cursor>)`,
+        `Wait for your turn: bun ${process.argv[1]} listen --room ${roomId} --wait-seconds 60 (repeat it as is; it continues where the last one stopped)`,
         `Reply only when addressed: bun ${process.argv[1]} send --room ${roomId} --request-id <new uuid> --reply-to <addressed id> --text '...'`,
       ] };
   }
@@ -191,7 +266,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (board !== undefined && (!Number.isSafeInteger(board) || board < 0)) throw new Error('Use --board-after with the boardCursor from the last listen.');
     const decided = values['--decisions-after'] === undefined ? undefined : Number(values['--decisions-after']);
     if (decided !== undefined && (!Number.isSafeInteger(decided) || decided < 0)) throw new Error('Use --decisions-after with the decisionCursor from the last listen.');
-    return listenBrowser(agent, values['--after'], seconds, board, decided);
+    return listenRemembering(agent, seconds, { after: values['--after'], boardAfter: board, decisionsAfter: decided, fromStart: values['--from-start'] !== undefined });
   }
   if (command === 'decisions') {
     const all = values['--all'] !== undefined;
