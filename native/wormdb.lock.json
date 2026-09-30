@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "dependency": "wormdb",
+  "repository": "https://github.com/igorls/wormdb.git",
+  "baseCommit": "14af562e16fd8462f14776763c5ea4c00fc32116",
+  "candidateCommit": "f96b1aa794904585aaacd9a3c83ff688a031f743",
+  "meshguardCommit": "fdbfd51bdbc643bae0aff8cb7b11e9372f6a23a8",
+  "toolchain": {
+    "compiler": "zig",
+    "version": "0.16.0",
+    "target": "x86_64-windows",
+    "optimize": "ReleaseFast",
+    "command": "zig build ffi -Doptimize=ReleaseFast"
+  },
+  "artifact": {
+    "name": "wormdb_ffi.dll",
+    "platform": "win32",
+    "arch": "x64",
+    "size": 1952768,
+    "sha256": "f26d01ce9ea3395d5a68a8656f4c0923a2fafdd99221806de0946a08f7ac065b",
+    "requiredSymbols": [
+      "wormdb_open",
+      "wormdb_open_sync",
+      "wormdb_close",
+      "wormdb_set",
+      "wormdb_get",
+      "wormdb_free",
+      "wormdb_delete"
+    ]
+  },
+  "upstreamStatus": {
+    "visibility": "public",
+    "license": "MIT",
+    "syncBranchPublished": true,
+    "notes": "Integrated source includes the priority security fixes, exact-byte event reauthorization, persistent accepted replication sessions, wormdb_open_sync, fail-closed direct WAL sync errors and pre-commit live-state reservation. The native artifact is qualified separately from the standalone network server."
+  }
+}

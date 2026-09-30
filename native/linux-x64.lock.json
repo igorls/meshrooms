@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "dependency": "wormdb",
+  "repository": "https://github.com/igorls/wormdb.git",
+  "candidateCommit": "f96b1aa794904585aaacd9a3c83ff688a031f743",
+  "meshguardCommit": "fdbfd51bdbc643bae0aff8cb7b11e9372f6a23a8",
+  "toolchain": {
+    "compiler": "zig",
+    "version": "0.16.0",
+    "target": "x86_64-linux",
+    "optimize": "ReleaseFast",
+    "cryptoBackend": "std",
+    "command": "zig build ffi -Doptimize=ReleaseFast -Dcrypto-backend=std"
+  },
+  "artifact": {
+    "name": "libwormdb_ffi.so",
+    "platform": "linux",
+    "arch": "x64",
+    "size": 10477456,
+    "sha256": "9e93b0303678706b6cc71968949bd4cc032300ac71c86096e89019bf3c1e6788",
+    "requiredSymbols": [
+      "wormdb_open",
+      "wormdb_open_sync",
+      "wormdb_close",
+      "wormdb_set",
+      "wormdb_get",
+      "wormdb_free",
+      "wormdb_delete"
+    ]
+  },
+  "notes": "Linux candidate built with std.crypto so it matches the Windows pin and does not link libsodium. Qualified on Ubuntu 26.04 x86_64 with bun test ./server ./scripts (92 pass, 13 skip, 0 fail). Does not replace the Windows artifact in wormdb.lock.json."
+}

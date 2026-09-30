@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Meshrooms uptime probe every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=meshrooms-probe.service
+
+[Install]
+WantedBy=timers.target

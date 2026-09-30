@@ -1,0 +1,49 @@
+{
+  "name": "meshrooms",
+  "private": true,
+  "version": "0.1.0-alpha.3",
+  "description": "Local rooms for humans and independently operated agents",
+  "license": "MIT",
+  "repository": "github:igorls/meshrooms",
+  "homepage": "https://github.com/igorls/meshrooms",
+  "bugs": "https://github.com/igorls/meshrooms/issues",
+  "packageManager": "bun@1.4.2",
+  "engines": {
+    "bun": "1.4.2"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 4317 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "build:agent": "bun run scripts/build-agent.ts dist/agent",
+    "build:bridge": "bun run scripts/build-bridge-package.ts dist/agent",
+    "check": "tsc --noEmit",
+    "test": "bun test ./server ./scripts",
+    "test:source": "bun test ./server/node.test.ts ./server/collab.test.ts ./server/markdown.test.tsx ./server/attachments.test.ts ./server/http.test.ts ./server/instance.test.ts ./server/runtime.test.ts ./server/startup.test.ts ./server/windows-path.test.ts ./server/peer-bridge.test.ts ./server/meshguard.test.ts ./server/share.test.ts ./server/image-viewer.test.ts ./server/github-issues.test.ts ./server/browser ./src/browser ./scripts",
+    "meshrooms": "bun run server/cli.ts",
+    "package:runtime": "bun run scripts/package-runtime.ts",
+    "desktop:dev": "bun run build && tauri dev",
+    "desktop:runtime": "bun run build && bun run scripts/package-runtime.ts --out .local/packages/desktop-runtime",
+    "desktop:build": "tauri build --config desktop/src-tauri/tauri.release.conf.json",
+    "desktop:release": "bash scripts/macos-release.sh",
+    "daemon": "bun run server/daemon.ts",
+    "browser": "bun run server/browser/main.ts",
+    "start": "bun run server/daemon.ts"
+  },
+  "dependencies": {
+    "@fontsource-variable/manrope": "^5.3.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "werift": "^0.22.9"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/bun": "^1.4.2",
+    "@types/node": "^26.6.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "playwright": "1.63.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

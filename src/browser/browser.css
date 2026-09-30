@@ -1,0 +1,228 @@
+.browser-rooms{--room-gutter:clamp(20px,3vw,40px);--rail-secondary:#c4d1de;--rail-active:#304458;display:grid;grid-template-columns:216px minmax(0,1fr);min-height:100dvh;background:var(--paper);color:var(--ink);font-size:14px}
+.browser-rooms .proto-label{display:none}.browser-rooms button,.browser-rooms input,.browser-rooms summary{min-height:44px}.browser-rooms button,.browser-rooms summary{cursor:pointer}.browser-rooms button:disabled{cursor:default}.browser-rooms h1{font-size:26px;line-height:1.3;letter-spacing:-.025em;overflow-wrap:anywhere}.browser-rooms h2{font-size:17px;line-height:1.5}.browser-rooms h3{font-size:13px;margin:0;line-height:1.5}.browser-rooms p{line-height:1.75}.browser-rooms input,.browser-rooms textarea{font:inherit;caret-color:var(--blue)}.browser-rooms ::selection{background:#e9f3ee;color:var(--ink)}.browser-rooms summary{align-content:center}.browser-rooms summary:focus-visible{outline:3px solid #5b85f2;outline-offset:3px;border-radius:4px}.browser-main:focus{outline:none}
+/* Navigation is separate from the current room's people and devices. */
+.browser-rail{background:var(--rail);color:#f2f6f9;padding:28px 16px 20px;display:flex;flex-direction:column;gap:32px;min-width:0}.browser-brand{color:inherit;text-decoration:none;padding-inline:4px}.browser-brand .wordmark{font-size:20px;gap:8px}.browser-brand svg{width:24px}.browser-rail-intro{color:var(--rail-secondary);max-width:24ch}.browser-rail-footer{margin-top:auto;color:var(--rail-secondary);font-size:12px;padding:20px 4px 0}.browser-room-nav{min-height:0;overflow-y:auto}.browser-room-nav h2{color:var(--rail-secondary);font-size:12px;padding:0 12px 12px}.browser-room-nav a{display:flex;align-items:center;gap:12px;min-height:44px;padding:12px;text-decoration:none;border-radius:8px;font-size:13px;margin-block:4px}.browser-room-nav a span{min-width:0;overflow-wrap:anywhere}.browser-room-nav a[aria-current=page]{background:var(--rail-active);font-weight:700}.browser-room-nav a:hover{background:var(--rail-active)}.browser-room-nav .browser-all-rooms{color:var(--rail-secondary);margin-top:16px}.browser-self{margin-top:auto;display:flex;gap:12px;padding:20px 4px 0;border-top:1px solid var(--rail-active);align-items:center}.browser-self .avatar{color:#f2f6f9;background:var(--rail-active)}.browser-self>div{min-width:0}.browser-self strong{font-size:13px;overflow-wrap:anywhere}.browser-self div>span{display:block;font-size:12px;color:var(--rail-secondary);margin-top:4px}.browser-joined .browser-rail-footer{margin-top:0;padding-top:0}.browser-mobile-rooms{display:none}
+/* Arrival and waiting states retain the existing narrow form. */
+.browser-main{min-width:0;padding:40px var(--room-gutter);max-width:1200px;width:100%;margin-inline:auto}.browser-entry{max-width:480px;margin:48px auto}.browser-entry>p{color:var(--muted);margin:16px 0 28px}.browser-entry>h2{margin-top:32px}.browser-form{display:grid;gap:24px}.browser-form label,.browser-link-device label{display:grid;gap:8px;font-weight:650}.browser-form input{width:100%}.browser-form button{justify-self:start;padding-inline:24px}.browser-entry-note{font-size:12px}.browser-text-link{display:inline-flex;align-items:center;min-height:44px;margin-top:20px;color:var(--blue);background:transparent;border:0;padding:0;text-decoration:underline;text-underline-offset:4px}.browser-recent{border-top:1px solid var(--line);margin-top:40px;padding-top:24px}.browser-recent h2{margin-bottom:12px}.browser-recent a{display:block;padding:12px 0;color:var(--blue);text-underline-offset:4px;overflow-wrap:anywhere}.browser-entry-actions{display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-top:24px}.browser-entry-actions .browser-text-link{margin-top:0}.browser-link-code{display:block;font-size:22px;letter-spacing:.025em;overflow-wrap:anywhere;padding:20px 0;user-select:all}
+/* One viewport: header, independently scrolling conversation, anchored composer. */
+.browser-joined{height:100dvh;min-height:0;overflow:hidden}.browser-joined .browser-rail{min-height:0}.browser-joined .browser-main{padding:0;max-width:none;margin:0;display:flex;flex-direction:column;min-height:0}.browser-room-header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:24px var(--room-gutter);border-bottom:1px solid var(--line);flex-shrink:0}.browser-room-heading{min-width:0}.browser-room-header h1{font-size:22px}.browser-room-header p{font-size:12px;color:var(--muted);margin-top:4px}.browser-room-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}.browser-room-actions button{font-size:12px;white-space:nowrap}.browser-room-actions [aria-expanded=true]{background:var(--soft);border-color:var(--muted)}.browser-workspace{display:flex;flex:1;min-height:0;min-width:0}.browser-conversation{position:relative;display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}.browser-transcript{overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;flex:1;min-height:0;padding:0 var(--room-gutter)}.browser-transcript:focus-visible{outline:2px solid #5b85f2;outline-offset:-3px}.browser-message-list{max-width:880px;margin-inline:auto;padding:24px 0 32px}.browser-day{display:flex;align-items:center;gap:16px;color:var(--muted);font-size:12px;font-weight:650;margin:8px 0 28px}.browser-day::before,.browser-day::after{content:'';height:1px;background:var(--line);flex:1}.browser-day:not(:first-child){margin-top:32px}.browser-empty{padding-block:clamp(32px,8vh,80px);max-width:52ch}.browser-empty>svg{width:28px;height:28px;color:var(--muted);margin-bottom:20px}.browser-empty h2{font-size:22px;line-height:1.4}.browser-empty p{color:var(--muted);margin-top:12px}.browser-message{display:flex;gap:12px;padding-top:24px}.browser-day+.browser-message{padding-top:0}.browser-message>.avatar{flex-shrink:0;margin-top:2px}.browser-message>div{min-width:0;max-width:72ch}.browser-message header:not(.sr-only){display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}.browser-message header strong{font-size:14px;overflow-wrap:anywhere}.browser-message time,.browser-author-you{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}.browser-message .message-text{margin:4px 0;font-size:15px;line-height:1.7}.browser-rooms .message-text p{line-height:inherit}.browser-message-continuation{padding-top:4px}.browser-message-continuation>.avatar{visibility:hidden}.browser-receipt{font-size:12px;color:var(--muted);display:block;margin-top:4px}
+.browser-compose-area{position:relative;flex-shrink:0;padding:12px var(--room-gutter) max(16px,env(safe-area-inset-bottom))}.browser-composer{max-width:880px;margin-inline:auto;border:1px solid #b8c3d1;border-radius:12px;padding:12px 16px;transition:border-color 140ms ease-out}.browser-composer:focus-within{border-color:var(--blue)}.browser-composer textarea{display:block;width:100%;border:0;border-radius:4px;padding:4px 0;resize:none;min-height:48px;max-height:min(40dvh,calc(20.4em + 8px));line-height:1.7;background:transparent}.browser-composer textarea:focus-visible{outline-offset:4px}.browser-composer>div{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:8px}.browser-key-hint{font-size:12px;color:var(--muted)}.browser-composer button{min-width:88px}.browser-connection{display:flex;align-items:center;justify-content:center;gap:8px;font-size:12px;color:var(--muted);margin-top:8px}.browser-connection-dot{width:6px;height:6px;border:1px solid var(--muted);border-radius:50%;flex-shrink:0}.browser-connection-dot.is-connected{border-color:#358573;background:#358573}.browser-unread{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);z-index:1;white-space:nowrap;box-shadow:0 4px 16px #1826341a;font-size:12px}
+/* Admission is the only management task that interrupts the main column. */
+.browser-requests{padding:16px var(--room-gutter);border-bottom:1px solid var(--line);background:var(--soft);max-height:28dvh;overflow-y:auto;flex-shrink:0}.browser-requests h2{font-size:13px}.browser-requests h2>span{color:var(--muted);margin-left:8px}.browser-request{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-top:12px;max-width:760px}.browser-request>div:first-child{min-width:0}.browser-request strong{font-size:14px;overflow-wrap:anywhere}.browser-request span{display:block;color:var(--muted);font-size:12px;line-height:1.65;margin-top:4px}.browser-request-actions{display:flex;gap:8px;flex-shrink:0}.browser-request-actions button:not(.primary){padding-inline:12px}
+/* Secondary context is beside the conversation, or replaces it on small screens. */
+.browser-details{width:320px;flex-shrink:0;overflow-y:auto;overscroll-behavior:contain;border-left:1px solid var(--line);background:var(--soft);padding:20px 24px max(24px,env(safe-area-inset-bottom))}.browser-details[hidden]{display:none}.browser-details-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}.browser-details-heading h2{font-size:17px}.browser-details-heading h2:focus{outline:none}.browser-close{width:44px;border-radius:8px;margin-right:-12px}.browser-close:hover{background:var(--line)}.browser-details section+section{margin-top:24px;padding-top:24px;border-top:1px solid var(--line)}.browser-details h3>span{color:var(--muted);font-weight:500;margin-left:8px}.browser-details section>p{font-size:12px;color:var(--muted);margin-top:8px}.browser-person{display:flex;gap:12px;margin-top:20px;align-items:flex-start}.browser-person>div{min-width:0}.browser-person strong{font-size:13px;overflow-wrap:anywhere}.browser-person>div>span{display:block;font-size:12px;color:var(--muted);margin-top:4px}.browser-invite input{width:100%;font-size:12px;margin-top:12px}.browser-link-device,.browser-device-details{font-size:12px;margin-top:8px}.browser-link-device summary{font-weight:650}.browser-link-device p{color:var(--muted);margin:8px 0 16px}.browser-link-device form{display:grid;gap:12px;padding-bottom:16px}.browser-link-device input{width:100%;font-variant-numeric:tabular-nums}.browser-link-device button{justify-self:start}.browser-device-details>div{display:grid;gap:8px;padding:16px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}.browser-device-details>div>span{color:var(--muted)}.browser-remove{justify-self:start;color:#8d352b;text-decoration:underline;text-underline-offset:4px;padding:8px 0}.browser-storage-note{font-size:12px;color:var(--muted);margin-top:32px}
+.browser-error{background:#fcefeb;color:#8d352b;padding:12px 16px;border-radius:8px;font-size:13px;line-height:1.7;margin-bottom:20px;overflow-wrap:anywhere}.browser-error button{margin-left:12px}.browser-notice{font-size:13px;color:#294f40;margin-bottom:16px}.browser-joined .browser-error,.browser-joined .browser-notice{margin:0;padding:12px var(--room-gutter);border-radius:0;flex-shrink:0;max-height:20dvh;overflow-y:auto}.browser-joined .browser-notice{background:#e9f3ee}
+@media(max-width:1150px){.browser-details-open .browser-conversation{display:none}.browser-details{width:100%;border:0;padding-inline:var(--room-gutter)}.browser-details>section,.browser-details>.browser-storage-note{max-width:560px}}
+@media(max-width:760px){.browser-rooms{display:block}.browser-rail{padding:16px 20px;gap:16px}.browser-rail-intro,.browser-rail-footer{display:none}.browser-main{padding:24px 20px 32px}.browser-entry{margin:24px auto}.browser-joined{display:flex;flex-direction:column}.browser-joined .browser-rail{padding:8px 20px;flex-direction:row;align-items:center;justify-content:space-between;flex-shrink:0;gap:12px}.browser-joined .browser-brand{padding:0}.browser-brand .wordmark{font-size:17px}.browser-brand svg{width:20px}.browser-room-nav,.browser-self{display:none}.browser-mobile-rooms{display:flex;align-items:center;min-height:44px;font-size:12px}.browser-joined .browser-main{flex:1}.browser-room-header{align-items:flex-start;flex-wrap:wrap;gap:16px;padding:16px 20px}.browser-room-heading{width:100%}.browser-room-header h1{font-size:21px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}.browser-room-actions{flex-wrap:wrap;width:100%}.browser-room-actions button{flex:1;padding-inline:12px}.browser-requests{padding:12px 20px}.browser-request{align-items:flex-start;flex-wrap:wrap;gap:8px}.browser-request-actions{margin-left:auto}.browser-rooms input,.browser-rooms textarea{font-size:16px}.browser-message-list{padding-top:16px}.browser-message{gap:12px}.browser-message .message-text{font-size:14px}.browser-message header:not(.sr-only){gap:8px}.browser-message .avatar{width:28px;height:28px}.browser-day{margin-bottom:24px}.browser-compose-area{padding-top:8px}.browser-composer{padding:12px}.browser-key-hint{display:none}.browser-composer>div{justify-content:flex-end;margin-top:4px}.browser-connection{font-size:12px}.browser-empty{padding-block:24px}.browser-empty h2{font-size:20px}}
+@media(max-height:600px) and (max-width:760px){.browser-joined .browser-rail{display:none}.browser-room-header{padding-block:8px;gap:8px}.browser-room-header p{display:none}.browser-composer textarea{min-height:32px;height:40px}.browser-compose-area{padding-bottom:max(8px,env(safe-area-inset-bottom))}}
+/* Agents, mentions and replies */
+.browser-role{font-size:11px;font-weight:650;color:#435e69;background:#e6ecee;border-radius:5px;padding:1px 6px}
+.browser-operator{font-size:12px;color:var(--muted)}
+.browser-message-for-you{box-shadow:inset 3px 0 0 #9db6f3;margin-left:-14px;padding-left:14px}
+.browser-reply-button{margin-left:auto;font-size:12px;color:var(--muted);background:transparent;border:0;border-radius:6px;padding:2px 8px;min-height:28px}
+.browser-reply-button:hover,.browser-reply-button:focus-visible{color:var(--ink);background:var(--soft)}
+.browser-message .browser-reply-reference{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;color:var(--muted);border-left:2px solid var(--line);padding-left:8px;margin:4px 0 2px}
+.browser-reactions{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px}
+.browser-reaction{display:inline-flex;align-items:center;gap:4px;min-height:28px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;background:var(--paper);font-size:12px;color:var(--ink)}
+.browser-reaction.is-mine{border-color:#9db6f3;background:#eef3fc}
+.browser-reaction:hover,.browser-reaction:focus-visible{border-color:var(--muted)}
+.browser-reaction-add{position:relative}
+/* Add a reaction: a quiet icon. At the end of a message's reactions, or next to Reply when it has none, shown there on
+   hover or keyboard focus (and always, quietly, on touch screens), so a message without reactions has no extra row. */
+.browser-reaction-picker-toggle{display:inline-flex;align-items:center;justify-content:center;min-width:28px;min-height:28px;padding:0;border:1px dashed transparent;border-radius:999px;background:transparent;color:var(--muted);line-height:1}
+.browser-reaction-picker-toggle:hover,.browser-reaction-picker-toggle:focus-visible,.browser-reaction-picker-toggle[aria-expanded=true]{border-color:var(--line);color:var(--ink);background:var(--soft)}
+.browser-reaction-add-header{display:inline-flex;align-self:center}
+.browser-reaction-add-header .browser-reaction-picker{left:auto;right:0;bottom:auto;top:calc(100% + 4px)}
+@media(hover:hover){.browser-reaction-add-header{opacity:0;transition:opacity .12s}.browser-message:is(:hover,:focus-within) .browser-reaction-add-header,.browser-reaction-add-header:has([aria-expanded=true]){opacity:1}}
+.browser-message{position:relative}
+.browser-reaction-add-float{position:absolute;top:0;right:0;border-radius:999px;background:var(--paper)}
+@media(hover:none){.browser-reaction-add-header .browser-reaction-picker-toggle{border:0;min-width:32px}.browser-message-continuation:has(.browser-reaction-add-float)>div{padding-right:36px}}
+@media(prefers-reduced-motion:reduce){.browser-reaction-add-header{transition:none}}
+.browser-reaction-picker{position:absolute;left:0;bottom:calc(100% + 6px);z-index:2;display:flex;gap:4px;padding:6px;border:1px solid var(--line);border-radius:12px;background:var(--paper);box-shadow:0 8px 24px rgba(15,23,42,.08)}
+.browser-reaction-picker button{min-width:32px;min-height:32px;border:0;border-radius:8px;background:transparent;font-size:16px}
+.browser-reaction-picker button:hover,.browser-reaction-picker button:focus-visible{background:var(--soft)}
+.browser-reply-draft{max-width:880px;margin:0 auto 8px;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:var(--muted)}
+.browser-agents form,.browser-agent-link{display:grid;gap:12px;margin-top:12px}
+.browser-agents label{display:grid;gap:8px;font-weight:650}
+.browser-agents input{width:100%;font-size:12px}
+.browser-agent-link>p{font-size:12px;color:var(--muted)}
+.browser-agent-link>div{display:flex;align-items:center;gap:16px}
+.browser-agent-link .browser-text-link{margin-top:0}
+.browser-agent-waiting{font-size:12px;color:var(--muted);margin-top:8px}
+.browser-person .browser-remove{display:block;padding:4px 0 0;font-size:12px}
+@media(max-width:760px){.browser-message-for-you{margin-left:-10px;padding-left:10px}}
+.browser-confirm{margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--paper)}
+.browser-confirm>p{font-size:12px;line-height:1.6}
+.browser-confirm>div{display:flex;align-items:center;gap:16px;margin-top:8px}
+.browser-confirm .browser-text-link{margin-top:0}
+.browser-leave{display:block;margin-top:12px}
+/* Task board beside the conversation, at its dragged width (--board-width) within the bounds in panel.ts. */
+.browser-workspace{container-type:inline-size}
+.browser-workspace>.task-board{width:clamp(300px,var(--board-width,380px),min(70vw,100% - 360px));flex-shrink:0;border-left:1px solid var(--line);overflow-y:auto;overscroll-behavior:contain}
+.browser-rooms .task-card button,.browser-rooms .board-filters button,.browser-rooms .board-disclosure,.browser-rooms .board-more{min-height:32px}
+.board-handle{position:relative;z-index:2;flex:0 0 12px;margin-inline:-6px;cursor:col-resize;touch-action:none}
+.board-handle::before{content:"";position:absolute;inset:0 5px;transition:background-color .12s}
+.board-handle::after{content:"";position:absolute;top:50%;left:3px;width:6px;height:40px;margin-top:-20px;border-radius:3px;background:#c4cfdb;transition:background-color .12s}
+.board-handle:hover::before,.board-handle:hover::after,.board-resizing .board-handle::before,.board-resizing .board-handle::after{background:var(--blue)}
+.board-handle:focus-visible{outline:none}
+.board-handle:focus-visible::after{background:var(--blue);box-shadow:0 0 0 2px var(--paper),0 0 0 5px #5b85f2}
+.board-resizing,.board-resizing *{cursor:col-resize!important;user-select:none!important}
+.browser-count{display:inline-block;min-width:18px;margin-left:6px;padding:0 6px;border-radius:9px;background:var(--blue);color:#fff;font-size:11px;font-weight:700;text-align:center}
+/* A conversation narrowed by the board drops the composer key hint, as on phones. */
+.browser-conversation{container-type:inline-size}
+@container(max-width:560px){.browser-key-hint{display:none}}
+/* Without room for both, the board replaces the conversation, as on phones. */
+@container(max-width:659px){.browser-board-open .browser-conversation,.board-handle{display:none}.browser-workspace>.task-board{width:100%;border-left:0}}
+@media(max-width:760px){.board-handle{display:none}}
+/* Room settings */
+.browser-settings .floor-control{margin-top:12px;flex-wrap:wrap}
+.browser-setting{display:flex;gap:10px;align-items:flex-start;margin-top:16px;font-size:12px;line-height:1.6;cursor:pointer}
+.browser-setting input{margin-top:3px;width:16px;height:16px;flex-shrink:0}
+.browser-setting strong{display:block;font-size:13px}
+.browser-setting span{color:var(--muted)}
+.browser-setting strong{color:var(--ink)}
+.browser-settings-summary{margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.8}
+.browser-settings .floor-control{display:flex;align-items:center;gap:6px}
+.browser-settings .floor-control>span{width:100%;font-size:12px;font-weight:650;color:var(--ink)}
+.browser-settings .floor-control button{font-size:12px;padding:6px 12px;min-height:32px;border:1px solid #b8c3d1;border-radius:8px;background:#fff;color:var(--ink)}
+.browser-settings .floor-control button[aria-pressed=true]{background:#eaf0fd;border-color:var(--blue);color:#234c99;font-weight:650}
+/* Pictures */
+.avatar-picture{object-fit:cover;padding:0;background:var(--line)}
+.browser-picture>div{display:flex;align-items:center;gap:12px;margin-top:12px}
+.browser-picture .browser-remove{padding:0}
+.browser-repositories ul{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:4px}
+.browser-repositories li{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;min-width:0}
+.browser-repositories li a{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;color:#234c99}
+.browser-repositories li .browser-remove{padding:6px 0;font-size:12px;flex-shrink:0}
+.browser-repo-suggestions{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:12px}
+.browser-repo-suggestions>span{width:100%;font-size:12px;font-weight:650}
+.browser-chip{font-size:12px;font-weight:600;padding:6px 10px;min-height:32px;border:1px dashed #9fb0c6;border-radius:999px;background:#fff;color:var(--ink);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.browser-chip:not(:disabled):hover{border-style:solid;border-color:var(--blue)}
+.browser-repo-add{display:flex;gap:8px;margin-top:12px}
+.browser-repo-add input{flex:1;min-width:0;font-size:12px}
+.browser-person .browser-picture-link{display:block;min-height:0;margin-top:4px;font-size:12px}
+/* Attachments: files move between devices, so they can be on their way or no longer kept here. */
+.browser-composer .pending-files{padding:8px 0 0}.browser-compose-tools{display:flex;align-items:center;gap:12px;margin-right:auto}.browser-composer .browser-attach{min-width:0;display:inline-flex;align-items:center;gap:6px;padding-inline:12px}
+.browser-message .message-attachments{margin-top:6px}.attachment-waiting{cursor:default}.attachment-image.attachment-waiting{display:flex;align-items:center;justify-content:center;min-height:96px;max-height:340px;padding:16px;border-style:dashed;text-align:center}
+.attachment-waiting span{display:flex;flex-direction:column;gap:4px;min-width:0}.attachment-image.attachment-waiting strong{font-size:12px;overflow-wrap:anywhere}.attachment-waiting small{font-size:11px;color:var(--muted)}span.attachment-file.attachment-waiting{border-style:dashed}span.attachment-file.attachment-waiting:hover{background:none}
+/* Task changes between messages: quiet lines, never messages. The marker sits under the avatar column. */
+.browser-task-line{display:grid;min-height:28px;grid-template-columns:34px minmax(0,max-content) auto;justify-content:start;align-items:baseline;column-gap:12px;margin:0;padding-top:12px;font-size:12px;line-height:1.6;color:var(--muted)}
+.browser-task-line::before{content:'';justify-self:center;align-self:center;width:6px;height:6px;border-radius:2px;background:#b8c3d1}
+.browser-task-line+.browser-task-line{padding-top:0}
+.browser-day+.browser-task-line{padding-top:0}
+.browser-task-line button{display:inline;min-height:28px;padding:0;font-weight:500;text-align:left;color:inherit;border-radius:4px}
+.browser-task-line button:hover{color:var(--ink);text-decoration:underline;text-underline-offset:3px}
+.browser-task-line time{font-variant-numeric:tabular-nums;margin-left:-4px}
+@media(max-width:760px){.browser-task-line{grid-template-columns:28px minmax(0,max-content) auto}}
+/* Agent activity: the text says the state; the dot on the picture only repeats it. */
+.browser-person-avatar{position:relative;display:inline-flex;flex-shrink:0}
+.agent-dot{position:absolute;right:-3px;bottom:-3px;width:12px;height:12px;border-radius:50%;border:2px solid var(--soft);background:#a3adba}
+.agent-dot.is-online{background:var(--soft);box-shadow:inset 0 0 0 2px #3f8f6f}.agent-dot.is-idle{background:#3f8f6f}.agent-dot.is-working{background:#d49423}.agent-dot.is-quiet{opacity:.55}
+.browser-person>div>span.agent-activity{color:var(--ink);overflow-wrap:anywhere}
+.browser-person>div>span.agent-activity.is-offline,.agent-activity-age,.agent-activity-quiet{color:var(--muted)}
+.agent-activity-link{display:inline;padding:0;font-weight:600;color:var(--blue);text-decoration:underline;text-underline-offset:3px;text-align:left}
+.browser-person>div>span.agent-activity-note{font-style:italic;margin-top:2px;overflow-wrap:anywhere}
+.browser-message-highlight{background:#f1f5ff;box-shadow:inset 3px 0 0 var(--blue);margin-left:-14px;padding-left:14px}
+@media(max-width:760px){.browser-message-highlight{margin-left:-10px;padding-left:10px}}
+.task-working{display:inline-flex;align-items:center;gap:5px;font-weight:600;color:#7a5510}.task-working::before{content:'';width:6px;height:6px;border-radius:50%;background:#d49423}
+/* Collapsible rail (desktop): an icon rail with the room names as tooltips; phones keep their top bar. */
+.browser-rail-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.browser-rail-toggle{display:inline-flex;align-items:center;justify-content:center;width:36px;min-height:36px;padding:0;border-radius:8px;color:var(--rail-secondary);background:none;flex-shrink:0}
+.browser-rail-toggle:hover{background:var(--rail-active);color:#f2f6f9}
+.browser-rooms{transition:grid-template-columns .15s ease}
+@media(prefers-reduced-motion:reduce){.browser-rooms{transition:none}}
+@media(min-width:761px){
+.browser-rail-collapsed{grid-template-columns:64px minmax(0,1fr)}
+.browser-rail-collapsed .browser-rail{padding-inline:10px;align-items:center}
+.browser-rail-collapsed .browser-rail-top{flex-direction:column;gap:16px}
+.browser-rail-collapsed .browser-brand .wordmark{font-size:0;gap:0}
+.browser-rail-collapsed .browser-room-nav h2,.browser-rail-collapsed .browser-rail-footer{display:none}
+.browser-rail-collapsed .browser-room-nav a{justify-content:center;padding:12px 0;width:44px}
+.browser-rail-collapsed .browser-room-nav a span,.browser-rail-collapsed .browser-self>div{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.browser-rail-collapsed .browser-self{padding-inline:0;justify-content:center}
+}
+@media(max-width:760px){.browser-rail-toggle{display:none}.browser-rail-top{display:contents}}
+/* Scroll panes contain their visually hidden (absolute) labels, so they scroll with the pane instead of stretching the page. */
+.browser-joined,.browser-room-nav,.browser-requests,.browser-transcript,.browser-details{position:relative}
+.browser-person>div>span.agent-runtime{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+/* Decisions: a card in the conversation, the composer form, and the list panel. */
+.browser-decision{margin:20px 0 0 44px;padding:12px 16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--paper);max-width:72ch}
+.browser-decision.is-closed{background:var(--soft)}
+.browser-decision.browser-message-highlight{padding-left:16px;box-shadow:inset 3px 0 0 var(--blue);background:#f1f5ff}
+.browser-decision>header{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;font-size:12px;color:var(--muted)}
+.browser-decision-kind{font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.04em;font-size:11px}
+.browser-decision-state{margin-left:auto;font-variant-numeric:tabular-nums}
+.browser-decision-state.is-final{color:var(--ink);font-weight:650}
+.browser-decision h3{font-size:15px;line-height:1.45;margin:6px 0 2px;overflow-wrap:anywhere}
+.browser-decision-context{font-size:14px;color:var(--ink)}
+.browser-decision-options{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}
+.browser-decision-options li{display:flex;align-items:center;gap:10px}
+.browser-decision-options button{position:relative;flex:1;min-width:0;min-height:36px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--paper);text-align:left;overflow:hidden;cursor:pointer}
+.browser-decision-options button:disabled{cursor:default}
+.browser-decision-options button:not(:disabled):hover{border-color:var(--muted)}
+.browser-decision-options .is-chosen button{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}
+.browser-decision-options .is-winner button{border-color:#2f7d4f;box-shadow:inset 0 0 0 1px #2f7d4f}
+.browser-decision-label{position:relative;z-index:1;font-size:14px;overflow-wrap:anywhere}
+.browser-decision-count{position:relative;z-index:1;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.browser-decision-bar{position:absolute;inset:0;pointer-events:none}
+.browser-decision-bar>span{display:block;height:100%;background:#eef2fc;transition:width .2s ease}
+.is-winner .browser-decision-bar>span{background:#e3f1e8}
+.browser-decision-voters{display:flex;flex-shrink:0}
+.browser-decision-voters>span{margin-left:-6px}
+.browser-decision-voters .avatar{width:22px;height:22px;font-size:10px;border:2px solid var(--paper)}
+.browser-decision-advice,.browser-decision-reasons{margin-top:10px;font-size:13px}
+.browser-decision-advice h4{font-size:12px;color:var(--muted);font-weight:650}
+.browser-decision-advice h4 span{font-weight:500}
+.browser-decision-advice ul,.browser-decision-reasons ul{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:6px}
+.browser-decision-advice li{display:flex;gap:8px;align-items:flex-start}
+.browser-decision-advice li>span:last-child{overflow-wrap:anywhere}
+.browser-decision-advice .avatar{width:22px;height:22px;font-size:10px;flex-shrink:0}
+.browser-decision-reasons summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:650}
+.browser-decision-reasons li{overflow-wrap:anywhere}
+.browser-decision-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px 16px;margin-top:8px}
+.browser-decision-links{display:flex;flex-wrap:wrap;gap:4px 16px}
+.browser-decision-inline{display:flex;gap:8px;margin-top:6px}
+.browser-decision-inline input{flex:1;min-width:0;font-size:13px}
+.browser-decision-inline button{font-size:12px}
+.browser-rooms .browser-link-button{background:none;border:0;border-radius:4px;padding:4px 2px;min-height:28px;min-width:0;color:var(--blue);font-size:12px;font-weight:650;cursor:pointer}
+.browser-rooms .browser-link-button:hover{text-decoration:underline;text-underline-offset:3px}
+.browser-rooms .browser-link-button:disabled{color:var(--muted);cursor:default;text-decoration:none}
+.browser-rooms .browser-link-button.browser-danger{color:#8d352b}
+.browser-decision-note{font-size:12px;color:var(--muted)}
+.browser-decision>.browser-decision-note{margin-top:8px}
+.browser-decision-error{font-size:12px;color:#8d352b;margin-top:8px}
+/* The composer form sits exactly over the message box's width and stays compact. */
+.browser-decision-form{display:grid;gap:10px;max-width:880px;margin:0 auto 10px;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius);background:var(--soft);max-height:min(50vh,420px);overflow-y:auto}
+.browser-decision-form-top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px}
+.browser-segmented{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--paper)}
+.browser-segmented label{position:relative;display:flex;align-items:center;padding:5px 12px;font-size:12px;font-weight:650;color:var(--muted);cursor:pointer}
+.browser-segmented label+label{border-left:1px solid var(--line)}
+.browser-segmented input{position:absolute;opacity:0;pointer-events:none}
+.browser-segmented label:has(input:checked){background:var(--ink);color:#fff}
+.browser-segmented label:has(input:focus-visible){outline:2px solid #5b85f2;outline-offset:-2px}
+.browser-decision-question{width:100%;font-size:14px}
+.browser-decision-option-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;align-items:center}
+.browser-decision-option-input{display:flex;gap:4px;align-items:center}
+.browser-decision-option-input input{flex:1;min-width:0;font-size:14px}
+.browser-rooms .browser-decision-option-grid>.browser-link-button{justify-self:start}
+.browser-decision-context summary{cursor:pointer;font-size:12px;font-weight:650;color:var(--muted)}
+.browser-decision-context summary span{font-weight:500}
+.browser-decision-context textarea{display:block;width:100%;margin-top:6px;font-size:13px}
+.browser-decision-form-bottom{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;font-size:12px;position:sticky;bottom:-12px;margin:0 -14px -12px;padding:8px 14px 12px;background:var(--soft);border-top:1px solid var(--line)}
+.browser-decision-form-bottom label{display:flex;gap:6px;align-items:center}
+.browser-decision-form-bottom select{width:auto;font-size:12px}
+.browser-decision-form-actions{display:flex;gap:8px;margin-left:auto}
+.browser-decision-form-actions button{font-size:12px}
+/* The @mention list belongs to the message box, whatever opens above it. */
+.browser-composer{position:relative}
+.browser-composer>.mention-list{left:12px;bottom:calc(100% + 6px);max-width:calc(100% - 24px)}
+.browser-decisions-panel ul{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:4px}
+.browser-decisions-panel li button{display:grid;justify-items:start;justify-content:stretch;gap:2px;width:100%;padding:10px 12px;border-radius:8px;text-align:left;background:transparent;border:0;cursor:pointer}
+.browser-decisions-panel li button:hover{background:var(--line)}
+.browser-decisions-panel li strong{font-size:13px;overflow-wrap:anywhere}
+.browser-decisions-panel li span{font-size:12px;color:var(--muted)}
+.browser-decisions-panel h3 span{color:var(--muted);font-weight:500;margin-left:8px}
+.browser-decisions-panel section>p{font-size:12px;color:var(--muted);margin-top:8px}
+@media(max-width:760px){.browser-decision{margin-left:0;padding:12px 14px}.browser-decision-state{margin-left:0;width:100%}.browser-decision-form-top .browser-decision-note{display:none}.browser-decision-form-actions{margin-left:0;width:100%;justify-content:flex-end}}
+/* Host whose only device holds the room key (identity-loss stopgap until passkey recovery). */
+.browser-details .browser-only-device{color:#6b4f1d;background:#faf3e3;border-radius:8px;padding:10px 12px;margin-top:12px}.browser-only-device .browser-text-link{display:flex;margin-top:4px;min-height:32px}

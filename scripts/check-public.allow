@@ -1,0 +1,17 @@
+# Deliberate exceptions to the built-in patterns of scripts/check-public.ts.
+#
+# Format: <path> <literal>  # <reason>
+# A pattern hit is allowed only when it is in <path>, on a line that contains <literal>, and the
+# literal covers the hit. Every entry needs a reason, and an entry that stops matching is an error,
+# so this list stays as short as the tree allows. Private terms can never be allowed here.
+
+deploy/turnserver.conf.example denied-peer-ip=10.0.0.0-10.255.255.255  # documented coturn config: never relay into RFC 1918 space
+deploy/turnserver.conf.example denied-peer-ip=100.64.0.0-100.127.255.255  # documented coturn config: never relay into CGNAT/Tailscale space
+deploy/turnserver.conf.example denied-peer-ip=172.16.0.0-172.31.255.255  # documented coturn config: never relay into RFC 1918 space
+deploy/turnserver.conf.example denied-peer-ip=192.168.0.0-192.168.255.255  # documented coturn config: never relay into RFC 1918 space
+server/runtime.test.ts http://192.168.1.50:4318  # a LAN address is the realistic non-loopback URL the runtime probe must refuse
+server/share.test.ts 10.99.0.1  # MeshGuard mesh addresses are private IPv4; the share tests need one
+deploy/turnserver.conf.example denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff  # documented coturn config: never relay into unique-local IPv6 space
+scripts/browser-room-smoke.mjs r.local  # a property on ICE route stats (r.local === 'relay'), not a host name
+server/collab.test.ts igor@codex.dev  # an email-shaped string whose domain starts with an agent name; the test proves mentions ignore it
+server/markdown.test.tsx mailto:a@github.com  # a mailto link the test proves is never rendered as a repository reference

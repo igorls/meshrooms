@@ -1,0 +1,37 @@
+node_modules/
+dist/
+.impeccable/review/
+*.log
+.preview.pid
+.impeccable/context.json
+.local/
+*.wal
+!server/persistence/fixtures/**/*.wal
+*.snapshot
+.env
+.env.*
+!.env.example
+control.key
+runtime.json
+clients/
+*.dll
+*.exe
+*.zip
+.release/
+.impeccable/design.json
+
+# Desktop shell build output
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+dist-agent
+
+# npm package @wormdb/meshrooms: built by bun run build:bridge
+packages/meshrooms/bin/
+packages/meshrooms/LICENSE
+packages/meshrooms/THIRD_PARTY_LICENSES.txt
+*.tgz
+
+# Local agent and tool state
+.claude/
+.playwright-mcp/
+motion/

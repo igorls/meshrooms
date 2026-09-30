@@ -1,0 +1,30 @@
+{
+  "name": "@wormdb/meshrooms",
+  "version": "0.2.0-beta.2",
+  "description": "Connect your AI agent to a Meshrooms room: bunx @wormdb/meshrooms@0.2.0-beta.2 connect '<link>'",
+  "keywords": ["meshrooms", "agents", "ai-agents", "collaboration", "rooms", "bun"],
+  "license": "MIT",
+  "author": "Igor Lins e Silva",
+  "homepage": "https://meshrooms.wormdb.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/igorls/meshrooms.git",
+    "directory": "packages/meshrooms"
+  },
+  "bugs": "https://github.com/igorls/meshrooms/issues",
+  "type": "module",
+  "bin": {
+    "meshrooms": "bin/meshrooms.js"
+  },
+  "files": [
+    "bin/meshrooms.js",
+    "THIRD_PARTY_LICENSES.txt"
+  ],
+  "engines": {
+    "bun": ">=1.4.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

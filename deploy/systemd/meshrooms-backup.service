@@ -1,0 +1,32 @@
+[Unit]
+Description=Meshrooms admission SQLite backup
+Documentation=file:///opt/meshrooms/current/docs/browser-deployment.md
+After=meshrooms-browser.service
+ConditionPathExists=/var/lib/meshrooms-browser/admission.sqlite
+
+[Service]
+Type=oneshot
+# Root reads the service's database and writes into a root-only folder. The script
+# restores meshrooms ownership on any SQLite sidecar file it had to create.
+User=root
+Group=root
+UMask=0077
+ExecStartPre=+/usr/bin/install -d -m 0700 -o root -g root /var/backups/meshrooms-browser
+ExecStart=/opt/meshrooms/bin/bun /opt/meshrooms/current/deploy/backup/backup-admission.ts backup --db /var/lib/meshrooms-browser/admission.sqlite --out /var/backups/meshrooms-browser --keep-days 14 --keep-min 3
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+# The leading "-" lets the namespace be set up before ExecStartPre has created the folder.
+ReadWritePaths=/var/lib/meshrooms-browser -/var/backups/meshrooms-browser
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+MemoryMax=256M
+TimeoutStartSec=10min

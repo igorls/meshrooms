@@ -1,0 +1,31 @@
+[Unit]
+Description=Meshrooms off-site uptime probe
+Documentation=file:///opt/meshrooms-probe/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=meshrooms-probe
+StateDirectoryMode=0700
+# Read by systemd as root before dropping privileges; the file stays root-only (0600).
+EnvironmentFile=/etc/meshrooms-probe/telegram.env
+Environment=HOME=/var/lib/meshrooms-probe
+Environment=BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+ExecStart=/usr/local/bin/bun /opt/meshrooms-probe/meshrooms-probe.ts
+TimeoutStartSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=256M

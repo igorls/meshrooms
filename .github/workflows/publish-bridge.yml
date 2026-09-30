@@ -1,0 +1,103 @@
+name: Publish bridge
+
+# Publishes the agent bridge, npm package `@wormdb/meshrooms` (packages/meshrooms), through npm trusted publishing (GitHub
+# OIDC, no token) with provenance. Pushing a tag bridge-v<version> publishes that version under the `latest` dist-tag,
+# which is what `bunx @wormdb/meshrooms` runs. A manual run is a dry run unless dry-run is unchecked and it runs on such a tag.
+# The tagged commit must be on main, and the publish job waits for approval in the `npm` environment.
+on:
+  push:
+    tags: ['bridge-v*']
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build, test and pack without publishing
+        type: boolean
+        default: true
+      dist-tag:
+        description: npm dist-tag (bunx @wormdb/meshrooms runs latest)
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-bridge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Required reviewers approve every run; npm's trusted publisher accepts only this workflow in this environment.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+      DIST_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.dist-tag || 'latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # A tag can point at any commit, including one that never went through review; publish only what main contains.
+      - name: Check the commit is on main
+        run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then exit 0; fi
+          if [ "$GITHUB_REF_TYPE" != tag ] && [ "$DRY_RUN" = true ]; then
+            echo "::warning::$GITHUB_SHA is not on main; continuing only because this is a dry run."
+          else
+            echo "::error::$GITHUB_SHA is not on main. Tag a commit that is on main."; exit 1
+          fi
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install --global npm@11.20.0
+      - name: Check tag, version and dist-tag
+        run: |
+          version=$(jq -r .version packages/meshrooms/package.json)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "bridge-v$version" ]; then echo "::error::Tag $GITHUB_REF_NAME does not match packages/meshrooms version $version (expected bridge-v$version)."; exit 1; fi
+          elif [ "$DRY_RUN" != true ]; then
+            echo "::error::Publish from the tag bridge-v$version; other refs can only dry-run."; exit 1
+          fi
+          if ! [[ "$DIST_TAG" =~ ^[a-z][a-z0-9-]*$ ]]; then echo "::error::Invalid dist-tag."; exit 1; fi
+          echo "BRIDGE_VERSION=$version" >> "$GITHUB_ENV"
+      - run: bun install --frozen-lockfile
+      # The Windows source checks ran in verify; this runs the bridge's own tests on Linux too (runner detection uses ps here).
+      - run: bun test ./server/browser/bridge-install.test.ts ./server/browser/agent-connect.test.ts
+      - run: bun run build:bridge
+      - name: Check the package contents and bin
+        working-directory: packages/meshrooms
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          files=$(jq -r '.[0].files | map(.path) | sort | join(",")' "$RUNNER_TEMP/pack.json")
+          packed=$(jq -r '.[0].version' "$RUNNER_TEMP/pack.json")
+          name=$(jq -r '.[0].name' "$RUNNER_TEMP/pack.json")
+          # Scoped, so npm publish needs --access public (passed below); the bin stays `meshrooms`.
+          if [ "$name" != "@wormdb/meshrooms" ]; then echo "::error::Packed $name, expected @wormdb/meshrooms."; exit 1; fi
+          if [ "$(jq -r '.bin | keys | join(",")' package.json)" != meshrooms ]; then echo "::error::The package must have exactly one bin, meshrooms."; exit 1; fi
+          if [ "$files" != "LICENSE,README.md,THIRD_PARTY_LICENSES.txt,bin/meshrooms.js,package.json" ]; then echo "::error::Unexpected package contents: $files"; exit 1; fi
+          if [ "$packed" != "$BRIDGE_VERSION" ]; then echo "::error::Packed $packed, expected $BRIDGE_VERSION."; exit 1; fi
+          if [ "$(head -n 1 bin/meshrooms.js)" != '#!/usr/bin/env bun' ]; then echo "::error::bin/meshrooms.js has no Bun shebang."; exit 1; fi
+          reported=$(bun bin/meshrooms.js version | jq -r .version)
+          if [ "$reported" != "$BRIDGE_VERSION" ]; then echo "::error::The bundle reports $reported, expected $BRIDGE_VERSION."; exit 1; fi
+          echo "@wormdb/meshrooms@$packed: $files"
+      - name: Publish
+        working-directory: packages/meshrooms
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            npm publish --provenance --access public --tag "$DIST_TAG" --dry-run
+          else
+            npm publish --provenance --access public --tag "$DIST_TAG"
+          fi

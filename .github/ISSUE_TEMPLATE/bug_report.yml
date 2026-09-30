@@ -1,0 +1,21 @@
+name: Bug report
+description: Report a reproducible Meshrooms problem
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the expected and actual behavior. Do not include credentials or private room history.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version and environment
+      placeholder: Release tag or commit, Windows version, agent harness
