@@ -3,7 +3,7 @@ import { taskBody, type TaskPacket } from '../../src/browser/board';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BrowserAgent, PENDING_PROFILE, applyPendingProfile, boardTasks } from '../browser-agent';
+import { BrowserAgent, PENDING_PROFILE, applyPendingProfile, boardTasks, runBridge, taskBrowser } from '../browser-agent';
 
 const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), codex = crypto.randomUUID();
 const packet = (body: ReturnType<typeof taskBody>): TaskPacket => ({ body, signature: '' });
@@ -55,4 +55,34 @@ test("harness and model given before admission are reported once admitted", asyn
     expect(existsSync(join(agent.dir, PENDING_PROFILE))).toBe(false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('task-add and task-update through the bridge link a #42 title to the room’s one pinned repository', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-autolink-'));
+  try {
+    const agent = new BrowserAgent(dir, 'https://example.test', roomId) as any;
+    const members = [{ id: codex, name: 'Codex', role: 'agent' }, { id: alex, name: 'Alex', role: 'human' }];
+    writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: codex, members, devices: [] }));
+    // The room service's status carries the pinned repository; the bridge keeps it in settings.json.
+    let stop = false;
+    agent.command = async (action: string) => {
+      if (action !== 'status') return {};
+      if (stop) throw Object.assign(new Error('This room was closed by its host.'), { status: 410 });
+      return { memberId: codex, ownerId: alex, epoch: 'one', members, devices: [], settings: { floor: 'humans-first' }, repositories: ['example/app'] };
+    };
+    const bridge = runBridge(agent, () => {}).catch(error => error);
+    const added = await taskBrowser(agent, { requestId: crypto.randomUUID(), change: { title: '#42 Review the contract' } });
+    expect(added).toMatchObject({ status: 'shared', task: { title: '#42 Review the contract', issue: 'https://github.com/example/app/issues/42' } });
+    // --issue none keeps a new task unlinked, and after an unlink a retitle with the same reference stays unlinked.
+    const none = await taskBrowser(agent, { requestId: crypto.randomUUID(), change: { title: '#43 Draft the notes', issue: null } });
+    expect(none.task?.issue).toBeUndefined();
+    await taskBrowser(agent, { requestId: crypto.randomUUID(), taskId: added.taskId, change: { issue: null } });
+    const kept = await taskBrowser(agent, { requestId: crypto.randomUUID(), taskId: added.taskId, change: { title: '#42 Review the contract, v2' } });
+    expect(kept.task).toMatchObject({ title: '#42 Review the contract, v2' });
+    expect(kept.task?.issue).toBeUndefined();
+    const retitled = await taskBrowser(agent, { requestId: crypto.randomUUID(), taskId: none.taskId, change: { title: '#44 Draft the notes' } });
+    expect(retitled.task?.issue).toBe('https://github.com/example/app/issues/44');
+    stop = true;
+    expect(String(await bridge)).toContain('closed by its host');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
 

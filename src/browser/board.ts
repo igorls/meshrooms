@@ -1,4 +1,5 @@
 import { TASK_STATUSES, type Task, type TaskStatus } from '../collab';
+import { issueNumberAt } from '../markdown';
 import { validRepository } from './protocol';
 
 /**
@@ -55,6 +56,25 @@ export function mentionedRepositories(texts: string[], limit = 5): string[] {
     }
   }
   return found;
+}
+/** The room's pinned repository when it pins exactly one; with none or several, a bare `#42` is ambiguous. */
+export function soleRepository(repositories: readonly string[] | undefined): string | undefined {
+  return repositories?.length === 1 && validRepository(repositories[0]) ? repositories[0] : undefined;
+}
+/**
+ * The issue a task title refers to with a bare `#42`, in the room's one pinned repository. Undefined when the room pins
+ * no repository or several, or the title has no such reference (see issueNumberAt: `owner/name#42` and `#42abc` are not
+ * bare references, and a web link is ignored). With several references the first one counts.
+ */
+export function issueFromTitle(title: string, repositories: readonly string[] | undefined): string | undefined {
+  const repository = soleRepository(repositories);
+  if (!repository) return undefined;
+  const text = title.replace(/[a-z][a-z\d+.-]*:\/\/\S*/gi, ' ');
+  for (let at = text.indexOf('#'); at >= 0; at = text.indexOf('#', at + 1)) {
+    const number = issueNumberAt(text, at);
+    if (number) return `https://github.com/${repository}/issues/${number}`;
+  }
+  return undefined;
 }
 /** `owner/name#42` for a linked issue or pull request. */
 export function issueLabel(link: string) {
@@ -225,13 +245,23 @@ export function withinRevisionJump<T extends { body: TaskBody }>(held: TaskBody[
   return incoming.filter(op => accepted.has(op));
 }
 
-/** The unsigned body for creating (no current task) or changing a task; the caller signs and sends it. */
-export function taskBody(input: { roomId: string; deviceId: string; memberId: string; current?: Task; taskId?: string; change: TaskChange; removed?: boolean }): TaskBody {
+/**
+ * The unsigned body for creating (no current task) or changing a task; the caller signs and sends it.
+ *
+ * `repositories` are the room's pinned ones. A task created, or retitled, with a bare `#42` in its title links that
+ * issue when the room pins exactly one repository (issueFromTitle), unless the change sets `issue` itself or the task
+ * already links one. A retitle links only a reference its old title didn't have, so a link someone removed stays removed.
+ */
+export function taskBody(input: { roomId: string; deviceId: string; memberId: string; current?: Task; taskId?: string; change: TaskChange; removed?: boolean; repositories?: readonly string[] }): TaskBody {
   const { current, change } = input;
   const title = (change.title ?? current?.title ?? '').trim(), notes = (change.notes ?? current?.notes ?? '').trim();
   if (!title || title.length > 120) throw new Error('Give the task a title of up to 120 characters.');
   if (notes.length > 2000) throw new Error('Keep task notes to 2,000 characters.');
-  const issue = change.issue !== undefined ? change.issue : current?.issue ?? null;
+  let issue = change.issue !== undefined ? change.issue : current?.issue ?? null;
+  if (change.issue === undefined && !issue && change.title !== undefined && !input.removed) {
+    const found = issueFromTitle(title, input.repositories);
+    if (found && (!current || found !== issueFromTitle(current.title, input.repositories))) issue = found;
+  }
   if (issue !== null && !validIssueLink(issue)) throw new Error('Link a GitHub issue or pull request, like https://github.com/owner/name/issues/42.');
   return { kind: 'task', roomId: input.roomId, id: crypto.randomUUID(), deviceId: input.deviceId, memberId: input.memberId, at: Date.now(),
     taskId: current?.id ?? input.taskId ?? crypto.randomUUID(), revision: (current?.revision ?? 0) + 1, title, notes,

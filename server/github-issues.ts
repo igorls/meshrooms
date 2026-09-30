@@ -5,7 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import { issueLabel, issueLinkFrom } from '../src/browser/board';
+import { issueLabel, issueLinkFrom, validIssueLink } from '../src/browser/board';
 import { validRepository } from '../src/browser/protocol';
 
 /** Runs `gh` with arguments (never through a shell) and optional standard input; returns its output. */
@@ -93,9 +93,14 @@ export function openIssueOnce(dir: string, requestId: string, open: () => string
 }
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as { code?: string }).code === 'EPERM'; } };
+/**
+ * The claim's file for an issue link. Only a strict GitHub issue or pull request link is accepted, and the name keeps
+ * only safe characters, so no link can name a file outside the claims folder (`..`, or backslashes on Windows).
+ */
 const claimFile = (dir: string, link: string) => {
+  if (!validIssueLink(link)) throw new Error('Use a GitHub issue or pull request link, like https://github.com/owner/name/issues/42.');
   const [, owner, name, , number] = new URL(link).pathname.split('/');
-  return join(dir, `${owner}_${name}_${number}.txt`.toLowerCase());
+  return join(dir, `${owner}_${name}_${number}.txt`.toLowerCase().replace(/[^a-z0-9_.-]/g, '_').replace(/\.{2,}/g, '_'));
 };
 
 /**
@@ -113,4 +118,4 @@ export function claimIssueTask(dir: string, link: string, requestId: string): { 
   return holder === requestId ? undefined : { requestId: holder, running: alive(Number(pid)) };
 }
 /** Releases the claim: the task is on the board, or adding it failed before anything was queued. */
-export function releaseIssueTask(dir: string, link: string) { rmSync(claimFile(dir, link), { force: true }); }
+export function releaseIssueTask(dir: string, link: string) { if (validIssueLink(link)) rmSync(claimFile(dir, link), { force: true }); }

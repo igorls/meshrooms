@@ -175,3 +175,23 @@ test('hostile input stays fast and shallow', () => {
   for (const input of inputs) expect(html(input).length).toBeGreaterThan(0);
   expect(performance.now() - started).toBeLessThan(500);
 });
+
+test('a bare #42 links to the issue in the room’s one pinned repository, outside code, links and headings', () => {
+  const linked = (text: string, repositories?: string[]) => renderToStaticMarkup(<MentionText text={text} participants={people} repositories={repositories} />)
+    .replace(/<svg.*?<\/svg>/g, '<svg/>');
+  const one = ['example/app'], issue = (n: number) => `<a class="md-ref md-ref-issue" href="https://github.com/example/app/issues/${n}" title="https://github.com/example/app/issues/${n}" target="_blank" rel="noopener noreferrer"><svg/>#${n}</a>`;
+  expect(linked('Fixed in #42, see also (#7).', one)).toBe(`<p>Fixed in ${issue(42)}, see also (${issue(7)}).</p>`);
+  expect(linked('**#42** and @Grok on #8', one)).toBe(`<p><strong>${issue(42)}</strong> and <span class="mention ">@Grok</span> on ${issue(8)}</p>`);
+  // Only with exactly one pinned repository.
+  expect(linked('Fixed in #42')).toBe('<p>Fixed in #42</p>');
+  expect(linked('Fixed in #42', [])).toBe('<p>Fixed in #42</p>');
+  expect(linked('Fixed in #42', ['example/app', 'example/docs'])).toBe('<p>Fixed in #42</p>');
+  // Never inside code, an existing link, a URL or a heading, and never for other shapes.
+  expect(linked('`#42` and\n\n```\n#43\n```', one)).toBe('<p><code>#42</code> and</p><figure class="md-code"><pre><code>#43</code></pre></figure>');
+  expect(linked('[see #42](https://example.com/a) https://example.com/b#43', one)).toBe('<p><a href="https://example.com/a" target="_blank" rel="noopener noreferrer">see #42</a> <a href="https://example.com/b#43" target="_blank" rel="noopener noreferrer">https://example.com/b#43</a></p>');
+  expect(linked('# Title\n\n## Plan for #42', one)).toBe('<p class="md-heading"><strong>Title</strong></p><p class="md-heading"><strong>Plan for #42</strong></p>');
+  expect(linked('#42abc example/other#42 a#42 &#42; #0 #1234567890 \\#42', one)).toBe('<p>#42abc example/other#42 a#42 &amp;#42; #0 #1234567890 #42</p>');
+  // Lists, quotes and tables link too; a repository that isn't a real owner/name links nothing.
+  expect(linked('- #1\n\n> #2', one)).toBe(`<ul><li>${issue(1)}</li></ul><blockquote><p>${issue(2)}</p></blockquote>`);
+  expect(linked('#42', ['../x'])).toBe('<p>#42</p>');
+});

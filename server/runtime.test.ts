@@ -503,6 +503,7 @@ process.on('SIGTERM', () => { cleanup(); server.stop(true); process.exit(0); });
       const token = loadControlToken(dataDir);
       expect(result1.url).not.toContain(token);
       expect(JSON.stringify(result1)).not.toContain(token);
-    });
+      // Starting a real child Bun process can exceed the default 5 s on a busy CI runner.
+    }, 20_000);
   });
 });

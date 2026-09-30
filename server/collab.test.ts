@@ -93,6 +93,47 @@ test('a mention wakes only the agents it names, on either floor; an open floor w
   expect(mayAgentSpeak({ ...room, floor: 'open' }, 'codex', 'other')).toBe(true);
 });
 
+test('a reply addresses the author of the message it replies to, and only a message with no mention and no reply wakes every agent', () => {
+  // Two people and two agents; `me` is the agent listening.
+  const roster = [
+    { id: 'alex', name: 'Alex', role: 'human' as const }, { id: 'sam', name: 'Sam', role: 'human' as const },
+    { id: 'me', name: 'Wren', role: 'agent' as const }, { id: 'other', name: 'Echo', role: 'agent' as const },
+  ];
+  const say = (id: string, authorId: string, text: string, replyTo?: string): Message => {
+    const author = roster.find(p => p.id === authorId)!;
+    return { id, authorId, author: author.name, role: author.role, text, time: new Date().toISOString(), mentions: mentionedIds(text, roster), ...(replyTo ? { replyTo } : {}) };
+  };
+  const messages = [
+    say('from-other', 'other', 'Echo here, the build is green'), say('from-me', 'me', 'Wren here, reviewing now'), say('from-sam', 'sam', 'I will take the docs'),
+    say('reply-other', 'alex', 'Thanks, ship it', 'from-other'),
+    say('reply-me', 'alex', 'Good, go ahead', 'from-me'),
+    say('reply-human', 'alex', 'Sounds good', 'from-sam'),
+    say('reply-mention', 'alex', 'Thanks, and @Wren please double-check', 'from-other'),
+    say('reply-gone', 'alex', 'Still true?', randomUUID()),
+    say('mention-other', 'alex', '@Echo can you look?'),
+    say('all', 'alex', '@agents stand by'),
+    say('nobody', 'alex', 'Lunch in five'),
+  ];
+  const addressed = (floor: 'open' | 'humans-first', agent = 'me') =>
+    evaluateWake({ floor, participants: roster, messages, tasks: [], boardRevision: 0 }, agent, 'from-sam', 0).addressed;
+  // Open floor: a reply to another agent, to a person, or to a message no longer held is not a broadcast.
+  expect(addressed('open')).toEqual(['reply-me', 'reply-mention', 'all', 'nobody']);
+  expect(addressed('open', 'other')).toEqual(['reply-other', 'reply-mention', 'mention-other', 'all', 'nobody']);
+  // Humans-first is unchanged: only what addresses the agent; a message naming nobody wakes nobody.
+  expect(addressed('humans-first')).toEqual(['reply-me', 'reply-mention', 'all']);
+  expect(addressed('humans-first', 'other')).toEqual(['reply-other', 'reply-mention', 'mention-other', 'all']);
+  // An agent's reply or @mention wakes another agent on an open floor only: the humans-first guard comes before the
+  // mention and reply checks, so two agents can't keep each other talking there.
+  const agents = [...messages, say('agent-reply', 'other', 'Over to you', 'from-me'), say('agent-mention', 'other', '@Wren your turn'),
+    say('agent-all', 'other', '@agents stand by')];
+  const agentWake = (floor: 'open' | 'humans-first') => evaluateWake({ floor, participants: roster, messages: agents, tasks: [], boardRevision: 0 }, 'me', 'nobody', 0).addressed;
+  expect(agentWake('open')).toEqual(['agent-reply', 'agent-mention', 'agent-all']);
+  expect(agentWake('humans-first')).toEqual([]);
+  // A third agent is never woken by a reply between two others.
+  expect(evaluateWake({ floor: 'open', participants: [...roster, { id: 'third', name: 'Kite', role: 'agent' as const }], messages: agents, tasks: [], boardRevision: 0 }, 'third', 'nobody', 0).addressed)
+    .not.toContain('agent-reply');
+});
+
 function memoryNode(records = new Map<string, string>()) {
   return { records, node: new LocalNode({ read: key => records.get(key) ?? null, write: (key, value) => { records.set(key, value); }, close() {} }) };
 }
@@ -296,6 +337,30 @@ test("Copilot's review: an open floor does not let an operator-only agent speak 
   expect(mayAgentSpeak(room, 'codex', undefined)).toBe(false);
   expect(mayAgentSpeak(room, 'codex', 'm2')).toBe(true);
   expect(mayAgentSpeak({ ...room, participants: participants.map(p => ({ ...p, wake: 'anyone' as const })) }, 'codex', 'm1')).toBe(true);
+});
+
+test('an operator-only agent follows the reply rule too: its operator replying to someone else is talking to them', () => {
+  const participants = [
+    { id: 'alex', name: 'Alex', role: 'human' as const }, { id: 'sam', name: 'Sam', role: 'human' as const },
+    { id: 'wren', name: 'Wren', role: 'agent' as const, operatorId: 'alex', wake: 'operator' as const },
+    { id: 'echo', name: 'Echo', role: 'agent' as const, operatorId: 'sam' },
+  ];
+  const at = new Date().toISOString();
+  const say = (id: string, authorId: string, text: string, replyTo?: string): Message => {
+    const author = participants.find(p => p.id === authorId)!;
+    return { id, authorId, author: author.name, role: author.role, text, time: at, mentions: mentionedIds(text, participants), ...(replyTo ? { replyTo } : {}) };
+  };
+  const messages = [
+    say('from-sam', 'sam', 'The draft is up'), say('from-echo', 'echo', 'Tests pass'), say('from-wren', 'wren', 'Reviewing'),
+    say('to-sam', 'alex', 'Looks good', 'from-sam'), say('to-echo', 'alex', 'Thanks', 'from-echo'),
+    say('to-wren', 'alex', 'Go ahead', 'from-wren'), say('to-sam-named', 'alex', 'Agreed, @Wren take a look', 'from-sam'),
+    say('plain', 'alex', 'Anyone around?'), say('sam-plain', 'sam', 'Lunch?'),
+  ];
+  const room = { floor: 'open' as const, participants, messages, tasks: [], boardRevision: 0 };
+  // Its operator's replies to another person or another agent are not for it; name it to bring it in.
+  expect(evaluateWake(room, 'wren', 'from-wren', 0).addressed).toEqual(['to-wren', 'to-sam-named', 'plain']);
+  expect(mayAgentSpeak(room, 'wren', 'to-sam')).toBe(false);
+  expect(mayAgentSpeak(room, 'wren', 'to-sam-named')).toBe(true);
 });
 
 test("nobody on a local node may be named agents", () => {

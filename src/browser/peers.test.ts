@@ -4,7 +4,7 @@ import { BrowserPeers } from './peers';
 import { MAX_STORED_MESSAGES } from './history';
 import { MAX_PENDING_INCOMING, PACE_HIGH_WATER, Resync, SYNC_REQUEST } from './pacer';
 import { syncChunks, taskBody } from './board';
-import { identity } from './storage';
+import { FenceError, claimFence, identity } from './storage';
 import { QUOTA_BURST, QuotaDrops } from './quota';
 
 /**
@@ -35,9 +35,11 @@ type Fake = { readyState: string; bufferedAmount: number; sent: string[]; send(t
 function fakeChannel(): Fake {
   return { readyState: 'open', bufferedAmount: 0, sent: [], send(text) { this.sent.push(text); }, bufferedAmountLowThreshold: 0, addEventListener() {} };
 }
+/** An engine that has claimed the room, as the app's engines do before writing; a later room() takes it over. */
 async function room() {
   const errors: string[] = [];
   const engine = new BrowserPeers({} as never, roomId, local.id, 'session', () => {}, message => errors.push(message)) as any;
+  engine.fenced(await claimFence(`owner:${local.id}:${roomId}`));
   await engine.load();
   engine.status = status;
   const channel = fakeChannel(), peer = { pc: { close() {} }, session: 's', started: Date.now(), sent: new Map(), resync: new Resync() };
@@ -98,7 +100,8 @@ describe('browser history window (SYNC-2)', () => {
     const incoming = await messageFrom('and receives');
     full.deliver(incoming); await full.settle();
     expect(receipts(full.channel)).toEqual([incoming.body.id]);
-  });
+    // 1,001 signed sends plus a full history window: about 4 s on a desktop, past the default 5 s on a busy CI runner.
+  }, 20_000);
 
   test('receipts are written together rather than rewriting the history for each one (SYNC-7)', async () => {
     const { engine, deliver, settle } = await room();
@@ -209,5 +212,113 @@ describe('browser sync pacing (SYNC-3)', () => {
     // A request naming another room is ignored.
     deliver({ kind: SYNC_REQUEST, roomId: crypto.randomUUID() }); await settle();
     expect(channel.sent).toHaveLength(1);
+  });
+});
+
+describe('a stale owner after a takeover (fencing)', () => {
+  const ownerKey = `owner:${local.id}:${roomId}`;
+  const storedTexts = () => (records.get(`messages:${local.id}:${roomId}`) as { packet: { body: { text: string } } }[]).map(m => m.packet.body.text);
+  /** The room held by one owner, then claimed by a second (a tab taking it over) while the first is frozen, not stopped. */
+  async function takeover() {
+    const stale = await room();
+    const fresh = await room();
+    return { stale, fresh };
+  }
+
+  test('a stale owner waking up writes nothing, loses nothing and confirms nothing', async () => {
+    const stale = await room();
+    const first = await messageFrom('before the takeover');
+    stale.deliver(first); await stale.settle();
+    expect(storedTexts()).toEqual(['before the takeover']);
+    // The new owner claims the room and loads what the old one had written.
+    const fresh = await room();
+    const second = await messageFrom('stored by the new owner');
+    fresh.deliver(second); await fresh.settle();
+    expect(storedTexts()).toEqual(['before the takeover', 'stored by the new owner']);
+    // The frozen owner wakes with its older copy and receives a message: its write of [first, third] must not land.
+    const writes = fakeStorage.writes;
+    const third = await messageFrom('sent while the old owner was frozen');
+    stale.deliver(third); await stale.settle();
+    expect(fakeStorage.writes).toBe(writes);
+    expect(storedTexts()).toEqual(['before the takeover', 'stored by the new owner']);
+    // No receipt, so the sender keeps it for the new owner; no banner; the stale engine stops.
+    expect(receipts(stale.channel)).toEqual([first.body.id]);
+    expect(stale.errors).toEqual([]);
+    expect(stale.engine.isStopped()).toBe(true);
+    // Its pending receipt writes and board changes are fenced too.
+    await stale.engine.close();
+    expect(storedTexts()).toEqual(['before the takeover', 'stored by the new owner']);
+    // The new owner goes on as before, and gets the message when the sender retries.
+    fresh.deliver(third); await fresh.settle();
+    expect(storedTexts()).toEqual(['before the takeover', 'stored by the new owner', 'sent while the old owner was frozen']);
+  });
+
+  test('a message the new owner evicted is not brought back by the stale owner', async () => {
+    const stored = Array.from({ length: MAX_STORED_MESSAGES }, (_, i) => ({
+      packet: { body: { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: remote.id, memberId: them, text: `old ${i}`, at: i + 1 }, signature: 'x' }, targets: [], receipts: [] }));
+    records.set(`messages:${local.id}:${roomId}`, stored);
+    const { stale, fresh } = await takeover();
+    fresh.deliver(await messageFrom('newer')); await fresh.settle();
+    fresh.deliver(await messageFrom('newest')); await fresh.settle();
+    expect(storedTexts()[0]).toBe('old 2'); // 'old 0' and 'old 1' made room.
+    // The stale owner still holds 'old 1'; its window with one more message would write it back.
+    stale.deliver(await messageFrom('late')); await stale.settle();
+    const after = storedTexts();
+    expect(after).toHaveLength(MAX_STORED_MESSAGES);
+    expect(after[0]).toBe('old 2');
+    expect(after).not.toContain('old 1');
+    expect(after.slice(-2)).toEqual(['newer', 'newest']);
+    expect(after).not.toContain('late');
+  });
+
+  test('every kind of write by a stale owner is fenced, and the first one stops it', async () => {
+    const own = { packet: { body: { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: remote.id, memberId: them, text: 'held', at: 1 }, signature: 'x' }, targets: [], receipts: [] };
+    const attempts: [string, (engine: any) => Promise<unknown>, string[]][] = [
+      ['send', engine => engine.send('a draft that must come back'), [`messages:${local.id}:${roomId}`]],
+      ['board', engine => engine.changeTask({ title: 'A task' }), [`board:${local.id}:${roomId}`]],
+      ['decision', engine => engine.openDecision({ question: 'Which one?', options: ['A', 'B'] }), [`decisions:${local.id}:${roomId}`]],
+      ['reaction', engine => engine.react(own.packet.body.id, '👍'), [`reactions:${local.id}:${roomId}`]],
+      ['file', engine => engine.storeFile('a'.repeat(64), new Uint8Array([1, 2, 3]), 'image/png'), [`files:${local.id}:${roomId}`, `file:${local.id}:${roomId}:${'a'.repeat(64)}`]],
+    ];
+    for (const [kind, attempt, keys] of attempts) {
+      records.clear();
+      records.set(`messages:${local.id}:${roomId}`, [own]);
+      const { stale } = await takeover();
+      const before = keys.map(key => records.get(key));
+      await expect(attempt(stale.engine), kind).rejects.toBeInstanceOf(FenceError);
+      expect(keys.map(key => records.get(key)), kind).toEqual(before);
+      expect(stale.engine.isStopped(), kind).toBe(true);
+      expect(stale.engine.lostRoom(), kind).toBe(true);
+      expect(stale.errors, kind).toEqual([]);
+    }
+  });
+
+  test('a stale owner evicting files deletes nothing', async () => {
+    const sha = 'b'.repeat(64), fileKey = `file:${local.id}:${roomId}:${sha}`, indexKey = `files:${local.id}:${roomId}`;
+    const { stale } = await takeover();
+    // The new owner holds a file that the stale owner, going by its older history, would evict.
+    records.set(indexKey, { [sha]: { size: 3, type: 'image/png' } });
+    records.set(fileKey, new Blob([new Uint8Array([1, 2, 3])]));
+    stale.engine.index = { [sha]: { size: 3, type: 'image/png' } };
+    stale.engine.syncFiles(); await stale.engine.fileSerial;
+    expect(records.has(fileKey)).toBe(true);
+    expect(records.get(indexKey)).toEqual({ [sha]: { size: 3, type: 'image/png' } });
+    expect(stale.engine.isStopped()).toBe(true);
+  });
+
+  test('each claim moves the epoch on, even when two are made at once', async () => {
+    const one = await claimFence(ownerKey), two = await claimFence(ownerKey);
+    expect(two.epoch).toBe(one.epoch + 1);
+    // Concurrent claims each read and write the epoch in one transaction: neither can take the other's number.
+    const [three, four] = await Promise.all([claimFence(ownerKey), claimFence(ownerKey)]);
+    expect([three.epoch, four.epoch]).toEqual([two.epoch + 1, two.epoch + 2]);
+  });
+
+  test('an engine without a claim writes nothing', async () => {
+    const engine = new BrowserPeers({} as never, roomId, local.id, 'session', () => {}, () => {}) as any;
+    await engine.load();
+    engine.status = status;
+    await expect(engine.send('never stored')).rejects.toThrow('Claim the room');
+    expect(records.has(`messages:${local.id}:${roomId}`)).toBe(false);
   });
 });

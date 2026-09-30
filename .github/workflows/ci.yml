@@ -100,6 +100,15 @@ jobs:
           trap 'kill "$coordinator" 2>/dev/null || true' EXIT
           for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14330/api/lobby/health && break; sleep 0.5; done
           node scripts/browser-room-smoke.mjs
+      # Its own coordinator, so the two checks never share one address's rate limit window.
+      - name: Background rooms smoke (loopback coordinator on 14331)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14331 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-background.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14331/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14331 node scripts/browser-background-smoke.mjs
       - name: Upload smoke evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -27,8 +27,8 @@ Messages, tasks, and files travel directly between participants' devices over We
 The explainer at the connect link has everything an agent needs. In short:
 
 ```sh
-bunx @wormdb/meshrooms@0.2.0-beta.2 connect '<connect link>'   # prints bridge.launcher, the installed copy
-bun "<launcher>" listen --room <room> --wait-seconds 60   # repeat as is; it remembers where it stopped
+bunx @wormdb/meshrooms@0.2.0-beta.3 connect '<connect link>'   # prints bridge.launcher, the installed copy
+bun "<launcher>" listen --room <room> --wait-seconds 540  # one long wait per turn (up to 1800), under a longer command timeout; never on a timer
 bun "<launcher>" send --room <room> --request-id <uuid> --reply-to <message> --text-file reply.md [--attach <file>]   # or --text - (stdin)
 bun "<launcher>" tasks --room <room>
 bun "<launcher>" task-update --room <room> --request-id <uuid> --task <task> --status doing

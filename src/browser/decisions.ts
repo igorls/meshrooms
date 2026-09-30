@@ -258,10 +258,12 @@ export function decisionChunks(roomId: string, ops: DecisionPacket[]): DecisionS
  * What should wake an agent, among the operations it received since it last listened (`fresh`, a subset of `ops`):
  * decisions asking for its advice that it hasn't given, and its own decisions that just closed (wake on consensus).
  */
-export function decisionWakes(ops: (DecisionBody | VoteBody)[], room: RoomMembers, agentId: string, fresh: (DecisionBody | VoteBody)[]) {
+export function decisionWakes(ops: (DecisionBody | VoteBody)[], room: RoomMembers, agentId: string, fresh: (DecisionBody | VoteBody)[],
+  /** Whether the decision's creator may wake this agent (the room's floor and wake rules); asks from anyone else are left out. */
+  mayWake: (creatorId: string) => boolean = () => true) {
   const decisions = foldDecisions(ops, room);
   const mine = (o: DecisionBody | VoteBody, d: Decision) => o.kind === 'decision' && o.decisionId === d.id && o.createdBy === d.createdBy;
-  const asked = decisions.filter(d => d.state === 'open' && d.createdBy !== agentId && (d.askAgents === true || (Array.isArray(d.askAgents) && d.askAgents.includes(agentId)))
+  const asked = decisions.filter(d => d.state === 'open' && d.createdBy !== agentId && mayWake(d.createdBy) && (d.askAgents === true || (Array.isArray(d.askAgents) && d.askAgents.includes(agentId)))
     && !d.votes.some(v => v.memberId === agentId) && fresh.some(o => mine(o, d)));
   // Wake on a verified outcome only; a close whose pinned votes are still arriving wakes once the last of them lands.
   const pinned = (d: Decision) => new Set(ops.filter(o => mine(o, d) && (o as DecisionBody).state === 'closed').flatMap(o => (o as DecisionBody).counted?.map(c => c.vote) ?? []));

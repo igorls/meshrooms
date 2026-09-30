@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, setSystemTime, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -114,6 +114,32 @@ test('listen records idle while waiting and working on what woke the agent, unti
   agent.noteActivity('Back at 3pm'); agent.noteActivity('');
   expect(agent.activity()).not.toHaveProperty('note');
 });
+
+test('a half-hour listen keeps its heartbeat fresh, so the roster never shows it without a check-in', async () => {
+  const agent = room();
+  const hello = say(agent, 'Morning, everyone');
+  let now = Date.now();
+  setSystemTime(new Date(now));
+  try {
+    writeFileSync(join(agent.dir, 'runner-alive.json'), JSON.stringify({ pid: process.pid, at: now }));
+    const waiting = listenBrowser(agent, hello, 1800);
+    const started = now, beats: number[] = [];
+    // The clock jumps 90 s per 600 ms of real time, more than a heartbeat period each time, so the test takes seconds.
+    while (now - started < 1800_000) {
+      await Bun.sleep(600);
+      beats.push(agent.activity()!.heartbeat);
+      // A browser receiving the announced heartbeat now: still idle and waiting, never "no check-in".
+      expect(deriveActivity([{ ...agent.activity()!, receivedAt: now }], true, now)).toMatchObject({ state: 'idle' });
+      expect(deriveActivity([{ ...agent.activity()!, receivedAt: now }], true, now)).not.toHaveProperty('quiet');
+      // Its runner is alive throughout, as `run` proves every second.
+      now += 90_000; setSystemTime(new Date(now)); writeFileSync(join(agent.dir, 'runner-alive.json'), JSON.stringify({ pid: process.pid, at: now }));
+    }
+    expect(await waiting).toMatchObject({ state: 'timeout' });
+    const gaps = beats.slice(1).map((beat, i) => beat - beats[i]);
+    expect(beats.at(-1)! - started).toBeGreaterThan(1700_000); // Still beating near the end of the half hour.
+    expect(Math.max(...gaps)).toBeLessThan(IDLE_STALE_MS);
+  } finally { setSystemTime(); }
+}, 120_000);
 
 test('run announces changes at once, repeats every 30 seconds, and greets channels as they open', () => {
   const agent = room();

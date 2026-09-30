@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { compactBoard, foldBoard, issueLabel, issueLinkFrom, mentionedRepositories, newIssueUrl, repositoryFrom, syncChunks, taskBody, taskTimeline, validIssueLink, validTaskBody, type TaskBody } from '../../src/browser/board';
+import { compactBoard, foldBoard, issueFromTitle, issueLabel, issueLinkFrom, mentionedRepositories, newIssueUrl, repositoryFrom, syncChunks, taskBody, taskTimeline, validIssueLink, validTaskBody, type TaskBody } from '../../src/browser/board';
 
 const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), sam = crypto.randomUUID(), codex = crypto.randomUUID();
 const device = 'a'.repeat(64);
@@ -179,4 +179,55 @@ test('repositories mentioned in the conversation are suggested for pinning, most
     'not https://github.com.evil.dev/x/y or http://github.com/a/b',
   ])).toEqual(['igorls/meshrooms', 'igorls/wormdb']);
   expect(mentionedRepositories(Array.from({ length: 9 }, (_, i) => `https://github.com/org/r${i}`), 3)).toEqual(['org/r8', 'org/r7', 'org/r6']);
+});
+
+test('a bare #42 in a title names an issue only when the room pins exactly one repository', () => {
+  const one = ['example/app'];
+  expect(issueFromTitle('#42 Review the contract', one)).toBe('https://github.com/example/app/issues/42');
+  expect(issueFromTitle('Review the contract (#42)', one)).toBe('https://github.com/example/app/issues/42');
+  // No pinned repository, or several: ambiguous, so nothing.
+  expect(issueFromTitle('#42 Review', [])).toBeUndefined();
+  expect(issueFromTitle('#42 Review', undefined)).toBeUndefined();
+  expect(issueFromTitle('#42 Review', ['example/app', 'example/docs'])).toBeUndefined();
+  // Not a bare reference: inside a web link, another repository's, glued to letters, zero, or over 9 digits.
+  expect(issueFromTitle('See https://example.com/page#42', one)).toBeUndefined();
+  expect(issueFromTitle('See https://example.com/#42 again', one)).toBeUndefined();
+  expect(issueFromTitle('Port example/other#42', one)).toBeUndefined();
+  expect(issueFromTitle('Rename #42abc', one)).toBeUndefined();
+  expect(issueFromTitle('Item#42 and &#42;', one)).toBeUndefined();
+  expect(issueFromTitle('#0 and #1234567890', one)).toBeUndefined();
+  expect(issueFromTitle('No reference here', one)).toBeUndefined();
+  // Several references: the first one counts.
+  expect(issueFromTitle('Merge #12 into #34', one)).toBe('https://github.com/example/app/issues/12');
+  expect(issueFromTitle('Port example/other#5, then #6', one)).toBe('https://github.com/example/app/issues/6');
+});
+
+test('a task created or retitled with #42 links that issue, and an unlink stays unlinked', () => {
+  const repositories = ['example/app'], link = 'https://github.com/example/app/issues/42';
+  const auto = (memberId: string, change: Parameters<typeof taskBody>[0]['change'], current?: ReturnType<typeof foldBoard>[number]) =>
+    taskBody({ roomId, deviceId: device, memberId, current, change, repositories });
+  // Created with a reference: linked. Without exactly one pinned repository: not.
+  const created = auto(alex, { title: '#42 Review the contract' });
+  expect(created.issue).toBe(link);
+  expect(taskBody({ roomId, deviceId: device, memberId: alex, change: { title: '#42 Review' }, repositories: ['example/app', 'example/docs'] }).issue).toBeUndefined();
+  expect(taskBody({ roomId, deviceId: device, memberId: alex, change: { title: '#42 Review' } }).issue).toBeUndefined();
+  // An explicit link, or an explicit none, wins over the title.
+  expect(auto(alex, { title: '#42 Review', issue: 'https://github.com/example/app/pull/7' }).issue).toBe('https://github.com/example/app/pull/7');
+  expect(auto(alex, { title: '#42 Review', issue: null }).issue).toBeUndefined();
+  // Retitling a task without a link links the new reference.
+  const plain = auto(alex, { title: 'Review the contract' });
+  expect(auto(sam, { title: 'Review the contract (#43)' }, foldBoard([plain])[0]).issue).toBe('https://github.com/example/app/issues/43');
+  // A change that doesn't touch the title links nothing, so existing tasks aren't migrated.
+  const older = op(alex, { title: '#44 Older task' });
+  expect(auto(sam, { status: 'doing' }, foldBoard([older])[0]).issue).toBeUndefined();
+  // Someone unlinks: a later retitle keeping the same reference doesn't bring the link back; a new reference does.
+  const unlinked = auto(sam, { issue: null }, foldBoard([created])[0]);
+  expect(unlinked.issue).toBeUndefined();
+  const kept = auto(alex, { title: '#42 Review the contract, v2' }, foldBoard([created, unlinked])[0]);
+  expect(kept.issue).toBeUndefined();
+  expect(auto(alex, { title: '#45 Review the contract' }, foldBoard([created, unlinked, kept])[0]).issue).toBe('https://github.com/example/app/issues/45');
+  // A task that links an issue keeps it when retitled with another reference.
+  expect(auto(alex, { title: '#46 Review' }, foldBoard([created])[0]).issue).toBe(link);
+  // A derived link passes validation, so peers accept the operation.
+  expect(validTaskBody(created, roomId)).toBe(true);
 });

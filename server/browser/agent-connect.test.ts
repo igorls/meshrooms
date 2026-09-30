@@ -27,8 +27,8 @@ test('connect never reuses another agent that already lives in this folder', () 
 });
 
 test('connect fails closed when the room cannot be checked: the link is not used and nothing is recorded', async () => {
-  const folder = mkdtempSync(join(tmpdir(), 'agent-connect-')), before = process.env.MESHROOMS_AGENT_HOME;
-  process.env.MESHROOMS_AGENT_HOME = folder;
+  const folder = mkdtempSync(join(tmpdir(), 'agent-connect-')), before = process.env.MESHROOMS_AGENT_HOME, registry = process.env.MESHROOMS_AGENT_REGISTRY;
+  process.env.MESHROOMS_AGENT_HOME = folder; process.env.MESHROOMS_AGENT_REGISTRY = join(folder, 'agent-homes.json');
   try {
     const room = crypto.randomUUID();
     await expect(agentCli(['connect', `http://127.0.0.1:9/agent/${room}#${'z'.repeat(43)}`])).rejects.toThrow('this link was not used');
@@ -36,6 +36,7 @@ test('connect fails closed when the room cannot be checked: the link is not used
     expect(existsSync(join(folder, 'browser-agents', room, 'connect.lock'))).toBe(false);
   } finally {
     if (before === undefined) delete process.env.MESHROOMS_AGENT_HOME; else process.env.MESHROOMS_AGENT_HOME = before;
+    if (registry === undefined) delete process.env.MESHROOMS_AGENT_REGISTRY; else process.env.MESHROOMS_AGENT_REGISTRY = registry;
     rmSync(folder, { recursive: true, force: true });
   }
 });
@@ -52,10 +53,12 @@ function fakeRoom(mode: { status: 'room' | 'maintenance'; redeem: number }) {
   } });
 }
 async function inFreshHome(work: (folder: string) => Promise<void>) {
-  const folder = mkdtempSync(join(tmpdir(), 'agent-connect-')), before = process.env.MESHROOMS_AGENT_HOME;
-  process.env.MESHROOMS_AGENT_HOME = folder;
+  const folder = mkdtempSync(join(tmpdir(), 'agent-connect-')), before = process.env.MESHROOMS_AGENT_HOME, registry = process.env.MESHROOMS_AGENT_REGISTRY;
+  // The agent-folder registry too, so a test's folders never land in the real one.
+  process.env.MESHROOMS_AGENT_HOME = folder; process.env.MESHROOMS_AGENT_REGISTRY = join(folder, 'agent-homes.json');
   try { await work(folder); } finally {
     if (before === undefined) delete process.env.MESHROOMS_AGENT_HOME; else process.env.MESHROOMS_AGENT_HOME = before;
+    if (registry === undefined) delete process.env.MESHROOMS_AGENT_REGISTRY; else process.env.MESHROOMS_AGENT_REGISTRY = registry;
     rmSync(folder, { recursive: true, force: true });
   }
 }

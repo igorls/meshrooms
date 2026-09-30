@@ -13,7 +13,7 @@
  * record its activity (activity.json), which `run` announces to connected devices.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { browserProtocol, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
@@ -31,7 +31,7 @@ import {
   foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody, withinReactionKeyCap,
   type ReactionBody, type ReactionEmoji, type ReactionPacket,
 } from '../src/browser/reactions';
-import { evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
+import { authorWakes, evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
 import { releaseIssueTask } from './github-issues';
 import { whileBusy } from './agent-install';
@@ -51,8 +51,8 @@ type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange
 type ReactionIntent = { type: 'reaction'; id: string; messageId: string; emoji: ReactionEmoji; blocked?: 'log-full' };
 /** A queued decision change; like tasks, `run` builds it against the decision as it stands when signing. */
 type DecisionIntent = { type: 'decision'; id: string; decisionId: string } & (
-  | { action: 'open'; question: string; context: string; mode: DecisionMode; options: string[]; askAgents: boolean | string[]; closesAt: number | null }
-  | { action: 'vote'; optionId: string | null; comment: string }
+  | { action: 'open'; question: string; context: string; mode: DecisionMode; options: string[]; askAgents: boolean | string[]; closesAt: number | null; replyTo?: string }
+  | { action: 'vote'; optionId: string | null; comment: string; replyTo?: string }
   | { action: 'option'; label: string } | { action: 'close' } | { action: 'withdraw' });
 type StoredDecisionOp = DecisionPacket & { seq: number };
 /** A stored task operation and the board cursor at which it arrived. */
@@ -65,6 +65,8 @@ type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; 
 /** Message, board and decision cursors `listen` continues from; saved in the agent's room folder. */
 export type ListenCursor = { after?: string; boardAfter: number; decisionsAfter: number };
 const LISTEN_CURSOR = 'listen-cursor.json';
+/** The room folder's subfolder for what the agent's own commands write (see BrowserAgent.live). */
+export const LIVE = 'live';
 
 const b64 = (bytes: ArrayBuffer | Uint8Array) => Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString('base64');
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
@@ -103,6 +105,9 @@ export function parseConnectLink(link: string) {
   return { origin: url.origin, roomId: match[1], token };
 }
 
+/** settings.json. `checkedAt`: when the runner last had them from the room service (this machine's clock). */
+export type RoomRules = { floor: Floor; agentAssignmentsWake?: boolean; repositories?: string[]; checkedAt?: number };
+
 /** One agent's membership in one browser room. */
 export class BrowserAgent {
   readonly dir: string;
@@ -110,13 +115,20 @@ export class BrowserAgent {
   private key?: CryptoKey;
   constructor(dataDir: string, readonly origin: string, readonly roomId: string) {
     this.dir = resolve(dataDir, 'browser-agents', roomId);
-    for (const sub of ['outbox', 'files', 'wants']) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
+    for (const sub of ['outbox', 'files', 'wants', LIVE]) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
   }
   private path(name: string) { return join(this.dir, name); }
+  /**
+   * State the agent's own commands write (its listen cursor and activity) lives in live/, apart from the files the runner
+   * and the watcher trust, so a harness sandbox can be given live/, outbox/, files/ and wants/ without the rest.
+   * Folders from before live/ existed are still read.
+   */
+  private live(name: string) { const path = join(this.dir, LIVE, name); return existsSync(path) || !existsSync(this.path(name)) ? path : this.path(name); }
   /** Content-addressed files: <dir>/files/<sha256>. Every read re-hashes, so a damaged file is never served or returned. */
   readonly files: FileStore & { path: (sha: string) => string; add: (bytes: Uint8Array) => string } = {
     path: sha => this.path(join('files', sha)),
-    has: sha => isSha256(sha) && existsSync(this.files.path(sha)),
+    // A regular file only: a link planted in files/ is never followed (the hash check would catch its content anyway).
+    has: sha => { try { return isSha256(sha) && lstatSync(this.files.path(sha)).isFile(); } catch { return false; } },
     get: async sha => {
       if (!this.files.has(sha)) return undefined;
       const bytes = new Uint8Array(readFileSync(this.files.path(sha)));
@@ -174,7 +186,7 @@ export class BrowserAgent {
   messages(): Stored[] { return readJson(this.path('messages.json'), []); }
   members(): Members { return readJson(this.path('members.json'), { members: [], devices: [] }); }
   /** The room's rules as the host set them, copied from the room service by `run`. */
-  settings(): { floor: Floor; agentAssignmentsWake?: boolean; repositories?: string[] } { return readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
+  settings(): RoomRules { return readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
   /** Verified task operations in arrival order, each with the board cursor at which it arrived. */
   taskOps(): StoredOp[] { return readJson<StoredOp[]>(this.path('tasks.json'), []).map((p, i) => ({ ...p, seq: p.seq ?? i + 1 })); }
   /** Arrivals so far. Compaction drops operations but never moves the cursor back, so later assignments still wake. */
@@ -197,29 +209,29 @@ export class BrowserAgent {
   reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
   /** Where a plain `listen` continues from: the cursors the last `listen` returned. */
   listenCursor(): ListenCursor | undefined {
-    const c = readJson<Partial<ListenCursor> | undefined>(this.path(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+    const c = readJson<Partial<ListenCursor> | undefined>(this.live(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
     return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
   }
-  saveListenCursor(cursor: ListenCursor) { writeJson(this.path(LISTEN_CURSOR), cursor); }
+  saveListenCursor(cursor: ListenCursor) { writeJson(join(this.dir, LIVE, LISTEN_CURSOR), cursor); }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
-  activity(): Activity | undefined { const a = readJson<unknown>(this.path('activity.json'), undefined); return validActivity(a) ? a : undefined; }
+  activity(): Activity | undefined { const a = readJson<unknown>(this.live('activity.json'), undefined); return validActivity(a) ? a : undefined; }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
   recordActivity(state: Activity['state'], on?: ActivityOn, now = Date.now()) {
     const current = this.activity(), same = current?.state === state;
     const messages = on?.messages?.length ? { messages: on.messages } : {}, tasks = on?.tasks?.length ? { tasks: on.tasks } : {};
     const next: Activity = { state, since: same ? current!.since : now, heartbeat: now,
       ...(state === 'working' && (messages.messages || tasks.tasks) ? { on: { ...messages, ...tasks } } : {}), ...(same && current!.note ? { note: current!.note } : {}) };
-    writeJson(this.path('activity.json'), next); return next;
+    writeJson(join(this.dir, LIVE, 'activity.json'), next); return next;
   }
   /** The agent is still at it: refresh the heartbeat without changing what it is doing. */
-  touchActivity(now = Date.now()) { const current = this.activity(); if (current) writeJson(this.path('activity.json'), { ...current, heartbeat: now }); }
+  touchActivity(now = Date.now()) { const current = this.activity(); if (current) writeJson(join(this.dir, LIVE, 'activity.json'), { ...current, heartbeat: now }); }
   /** Set (or clear, with an empty note) the agent's note. Before any `listen`, a note means it is working. */
   noteActivity(note: string, now = Date.now()) {
     const text = note.trim();
     if (text && !validNote(text)) throw new Error('Keep the note to one line of up to 140 characters.');
     const { note: _, ...current } = this.activity() ?? { state: 'working' as const, since: now, heartbeat: now };
     const next: Activity = { ...current, heartbeat: now, ...(text ? { note: text } : {}) };
-    writeJson(this.path('activity.json'), next); return next;
+    writeJson(join(this.dir, LIVE, 'activity.json'), next); return next;
   }
 
   /** The room as local-room shapes, so collab.ts rules apply unchanged. */
@@ -276,6 +288,82 @@ export function activityAnnouncer(agent: BrowserAgent, channels: () => (Channel 
   };
 }
 
+/** Whether the runner may sign a queued message: the room's floor rules, as `send` checks them, for its reply target. */
+export function queuedMaySpeak(agent: BrowserAgent, memberId: string, replyTo: string | undefined) {
+  return mayAgentSpeak(agent.view(), memberId, replyTo);
+}
+const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+/**
+ * Why the runner must not sign a queued item, if it mustn't. The commands check the same before they queue, but
+ * anything that can write the outbox (a harness sandbox can) skips them, so the runner checks again: well-formed ids,
+ * the room's floor for messages and for opening a decision, advice only when asked or addressed, only stewards close a
+ * decision, and message text within the room's limit. Task, decision and reaction bodies are also checked as peers
+ * check them, once built.
+ */
+export function outboxProblem(agent: BrowserAgent, memberId: string, item: unknown): string | undefined {
+  const id = (value: unknown) => typeof value === 'string' && UUID.test(value);
+  const it = item as Record<string, any>;
+  if (!it || typeof it !== 'object' || !id(it.id)) return 'its id is not a UUID';
+  if (it.replyTo !== undefined && !id(it.replyTo)) return 'its reply target is not a UUID';
+  const view = agent.view();
+  if (it.type === 'decision') {
+    if (!id(it.decisionId)) return 'its decision id is not a UUID';
+    if (it.action === 'open') return mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'the room is humans-first and nothing addressed the agent';
+    const current = pickDecision(agent.decisions(), it.decisionId, memberId);
+    if (!current) return undefined; // Nothing to change: the runner makes no change for it.
+    if (it.action === 'vote') {
+      const asked = current.askAgents === true || (Array.isArray(current.askAgents) && current.askAgents.includes(memberId));
+      return asked || mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'the decision did not ask the agent and nothing addressed it';
+    }
+    if (it.action === 'close' || it.action === 'withdraw') {
+      const { ownerId, members } = agent.members();
+      const steward = current.createdBy === memberId || memberId === ownerId || members.some(m => m.id === current.createdBy && m.operatorId === memberId);
+      return steward ? undefined : 'only who opened a decision, its operator, or the host can close it';
+    }
+    if (it.action === 'option') return current.mode === 'plan-review' ? 'plan reviews keep their options' : undefined;
+    return 'it is not a known decision change';
+  }
+  if (it.type === 'task') return id(it.taskId) ? undefined : 'its task id is not a UUID';
+  if (it.type === 'reaction') return id(it.messageId) ? undefined : 'its message id is not a UUID';
+  if (it.type !== undefined) return 'it is not a known kind';
+  if (typeof it.text !== 'string' || it.text.length > 4000 || (!it.text.trim() && !(Array.isArray(it.attachments) && it.attachments.length)))
+    return 'its text is empty or longer than 4,000 characters';
+  return mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'nothing in this room addressed the agent';
+}
+
+/** The runner rewrites this every second with its pid, so a command that can't inspect processes can still tell it runs. */
+export const RUNNER_ALIVE = 'runner-alive.json';
+/** Written by the runner when the room service answers 410 (the host closed the room, or the service removed it). */
+export const ROOM_CLOSED_FILE = 'room-closed.json';
+/**
+ * No proof of life from the runner for this long means it stopped or hangs. One pass can legitimately take a status
+ * request that times out (10 s) plus some signalling, so this is well above that.
+ */
+export const RUNNER_STALE_MS = 30_000;
+/** After this long without a new proof of life, a proof naming a process that no longer exists is not worth waiting out. */
+const RUNNER_GONE_MS = 5_000;
+const processGone = (pid: unknown) => {
+  if (!Number.isSafeInteger(pid) || (pid as number) <= 1) return false;
+  try { process.kill(pid as number, 0); return false; } catch (error) { return (error as { code?: string }).code === 'ESRCH'; }
+};
+/**
+ * Whether the runner stopped while a command waited on it since `since`: its proof of life is older than RUNNER_STALE_MS,
+ * or names a process that is gone. Before its first proof, a runner started just now gets RUNNER_STALE_MS from `since`.
+ */
+export function runnerStopped(agent: BrowserAgent, since: number, now = Date.now()) {
+  const proof = readJson<{ pid?: unknown; at?: unknown } | undefined>(join(agent.dir, RUNNER_ALIVE), undefined);
+  const at = typeof proof?.at === 'number' ? proof.at : 0, last = Math.max(at, since);
+  if (now - last > RUNNER_STALE_MS) return true;
+  // Only a proof from since onwards names the runner to check: an older one is the runner this one replaced, whose
+  // process is gone by design while the new one starts up (bun, the version check) before its first proof.
+  return at >= since && now - last > RUNNER_GONE_MS && processGone(proof?.pid);
+}
+/** Why the room is gone, once the runner has heard it from the room service. */
+export function roomClosed(agent: BrowserAgent): { at: number; reason: string } | undefined {
+  const closed = readJson<{ at?: unknown; reason?: unknown } | undefined>(join(agent.dir, ROOM_CLOSED_FILE), undefined);
+  return closed && typeof closed.reason === 'string' && typeof closed.at === 'number' ? { at: closed.at, reason: closed.reason } : undefined;
+}
+
 /** Harness and model given to `connect` before the host admitted the agent; the runner reports them once admitted. */
 export const PENDING_PROFILE = 'profile-pending.json';
 export async function applyPendingProfile(agent: BrowserAgent, log: (line: string) => void) {
@@ -330,6 +418,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     return kept.at(-1) === added;
   };
   let evictedSinceLog = 0, evictionLogged = 0;
+  /** When a channel to another device first opened: the room's history and state arrive right after. */
+  let syncedAt: number | undefined;
   /** Append verified operations at the next cursors; a large board is compacted like a browser's, without moving the cursor. */
   const storeOps = (ops: StoredOp[], added: TaskPacket[]) => {
     let seq = agent.boardCursor(ops);
@@ -514,6 +604,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     channel.stateChanged.subscribe(state => {
       if (state === 'closed') { if (peers.get(id) === peer) transfers.closed(id); return; }
       if (state !== 'open') return;
+      syncedAt ??= Date.now();
       log(`channel open to ${id.slice(0, 8)}`);
       // Exchange boards, decisions, and reactions so either side catches up while apart.
       opened();
@@ -592,8 +683,16 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     const outbox = join(agent.dir, 'outbox');
     for (const file of readdirSync(outbox).filter(f => f.endsWith('.json')).sort()) {
       try {
+        // A harness sandbox can write the outbox: only regular files are read, and a planted link is removed, not followed.
+        if (!lstatSync(join(outbox, file)).isFile()) { log(`outbox ${file}: not a regular file, removed`); unlinkSync(join(outbox, file)); continue; }
         const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | null>(join(outbox, file), null);
         if (!item || !status?.memberId) continue;
+        const problem = outboxProblem(agent, status.memberId, item);
+        if (problem) {
+          log(`dropped ${file}: ${problem}`);
+          if ((item as DecisionIntent).type === 'decision' && UUID.test(String(item.id))) noteDropped(outbox, item.id, `This change was not made: ${problem}.`);
+          unlinkSync(join(outbox, file)); continue;
+        }
         if ('type' in item && item.type === 'decision') {
           const ops = agent.decisionOps(), author = { roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId };
           const current = pickDecision(agent.decisions(ops), item.decisionId, status.memberId);
@@ -604,7 +703,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
                 : !current ? undefined
                 : item.action === 'vote' ? castVote(author, current, item.optionId, item.comment, nextVoteRevision(ops.map(p => p.body), current, status.memberId))
                 : reviseDecision(author, current, item.action === 'option' ? { addOption: item.label } : item.action === 'close' ? { close: true } : { withdraw: true });
-              if (body) await shareDecisionOp({ ...body, id: item.id });
+              const signed = body && { ...body, id: item.id };
+              if (signed && !validDecisionBody(signed, agent.roomId) && !validVoteBody(signed, agent.roomId)) throw new Error('the change is not within the room\'s limits');
+              if (signed) await shareDecisionOp(signed);
             }
           } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
@@ -619,7 +720,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             const current = foldBoard(ops.map(p => p.body)).find(t => t.id === item.taskId);
             const creating = !ops.some(p => p.body.taskId === item.taskId);
             if (creating || current) { // A task someone removed meanwhile is not recreated by an update.
-              const body = { ...taskBody({ roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId, current, taskId: item.taskId, change: item.change, removed: item.removed }), id: item.id };
+              const body = { ...taskBody({ roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId, current, taskId: item.taskId, change: item.change, removed: item.removed, repositories: agent.settings().repositories }), id: item.id };
+              if (!validTaskBody(body, agent.roomId)) { log(`dropped ${file}: the task change is not within the room's limits`); unlinkSync(join(outbox, file)); continue; }
               const packet = { body, signature: await agent.sign(body) };
               storeOps(ops, [packet]);
               broadcast(packet);
@@ -627,7 +729,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           }
           unlinkSync(join(outbox, file));
           // issue-task holds a claim while this outbox item is pending; release once run is done with it.
-          if (typeof item.change.issue === 'string') releaseIssueTask(join(agent.dir, 'issue-tasks'), item.change.issue);
+          if (validIssueLink(item.change.issue)) releaseIssueTask(join(agent.dir, 'issue-tasks'), item.change.issue);
           continue;
         }
         if ('type' in item && item.type === 'reaction') {
@@ -646,6 +748,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             revision: currentRevision(bodies, item.messageId, status.memberId, item.emoji) + 1,
             at: Date.now(), ...(remove ? { removed: true as const } : {}),
           };
+          if (!validReactionBody(body, agent.roomId)) { log(`dropped ${file}: not a valid reaction`); unlinkSync(join(outbox, file)); continue; }
           const packet = { body, signature: await agent.sign(body) };
           if (!storeReactionOps(ops, [packet])) {
             // Log full: leave queued and mark so reactBrowser can report log-full distinctly.
@@ -673,18 +776,42 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     flush();
   });
 
+  /**
+   * Save one of the files the commands read (listen, status, the watch peek). A failure is logged, at most once a minute
+   * per file, and the rest of the pass carries on; the commands keep reading the last good copy.
+   */
+  const failing = new Map<string, number>();
+  /** The room's rules as the room service last gave them, kept in memory so each status rewrites them. */
+  let rules: RoomRules | undefined;
+  const keep = (file: string, value: unknown) => {
+    try { writeJson(join(agent.dir, file), value); failing.delete(file); }
+    catch (error) {
+      if (Date.now() - (failing.get(file) ?? 0) < 60_000) return;
+      failing.set(file, Date.now());
+      log(`${file}: ${error instanceof Error ? error.message : String(error)} (keeping the last saved copy)`);
+    }
+  };
   let pruned = 0;
   log(`bridge running as device ${identity.id.slice(0, 12)} in ${agent.roomId}`);
   while (true) {
+    // Proof of life for commands that can't inspect processes (a harness sandbox denies it), so they don't start a second runner.
+    try { writeJson(join(agent.dir, RUNNER_ALIVE), { pid: process.pid, at: Date.now(), ...(syncedAt ? { syncedAt } : {}) }); } catch { /* Written again next second. */ }
     try {
       const next: RoomStatus = await agent.command('status', { session, epoch, cursor });
       if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await Bun.sleep(3000); continue; }
+      // The room's rules first, and on their own: listen, status and the watch peek read the floor from this file, so
+      // nothing else in the pass (closing peers, a members.json busy on Windows) may leave it behind the room.
+      // Every admitted status from the room service carries them; one that doesn't (a service from before room settings)
+      // keeps the last ones heard, which are still written, so a lost or damaged copy never falls back to the default.
+      if (next.settings) rules = { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, repositories: next.repositories ?? [], checkedAt: Date.now() };
+      rules ??= agent.settings();
+      keep('settings.json', rules);
       if (epoch && next.epoch !== epoch) { for (const p of peers.values()) await p.pc.close(); peers.clear(); cursor = 0; }
       epoch = next.epoch; status = next;
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
-      writeJson(join(agent.dir, 'members.json'), { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
-      if (next.settings) writeJson(join(agent.dir, 'settings.json'), { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, repositories: next.repositories ?? [] });
+      // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
+      keep('members.json', { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
       await applyPendingProfile(agent, log);
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
       const available = (next.devices || []).filter(d => d.id !== identity.id && d.session);
@@ -716,7 +843,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (Date.now() - pruned > 60_000) { prune(); pruned = Date.now(); }
     } catch (error) {
       // 410: the host closed the room or the service removed it. Nothing will change, so stop instead of retrying.
-      if ((error as { status?: number }).status === 410) { clearInterval(ticking); for (const p of peers.values()) await p.pc.close(); throw error; }
+      // A waiting listen reads the marker and returns at once instead of waiting out its timer.
+      if ((error as { status?: number }).status === 410) {
+        clearInterval(ticking);
+        try { writeJson(join(agent.dir, ROOM_CLOSED_FILE), { at: Date.now(), reason: error instanceof Error ? error.message : String(error) }); } catch { /* The next runner hears it again. */ }
+        for (const p of peers.values()) await p.pc.close();
+        throw error;
+      }
       log(`status: ${error instanceof Error ? error.message : String(error)}`);
     }
     await Bun.sleep(1000);
@@ -729,6 +862,73 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
  */
 export const FIRST_LISTEN_GRACE_MS = 3_000;
 
+/** The cursors one `listen` works from; `history` marks a first listen, which answers with the conversation so far. */
+export type ListenPlan = { after?: string; boardAfter?: number; decisionsAfter?: number; outcomesAfter?: number; history: boolean };
+
+/**
+ * One look at the room for this agent under listen's rules: what would wake it, and which cursors that answer carries.
+ * `historyDue` says whether a first listen has given the sync its moment, so it answers with history even when
+ * nothing addresses the agent. Reads only: `listen` records activity and saves cursors, `peekWork` does neither.
+ * Undefined while the agent is not admitted.
+ */
+export function listenSnapshot(agent: BrowserAgent, plan: ListenPlan, historyDue: boolean) {
+  const { after, boardAfter, decisionsAfter, outcomesAfter, history } = plan;
+  const view = agent.view(); if (!view.memberId) return undefined;
+  const woke = evaluateWake(view, view.memberId, after, boardAfter);
+  // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
+  const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
+  // An ask wakes the agent under the same author rules as a message: in humans-first rooms, only a person's.
+  const since = (seq: number) => decisionWakes(ops.map(p => p.body), agent.members(), view.memberId!, ops.filter(p => p.seq > seq).map(p => p.body), creator => authorWakes(view, view.memberId!, creator));
+  const asks = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : since(decisionsAfter);
+  // Asks wake from decisionsAfter, outcomes of the agent's own decisions only from outcomesAfter: older ones are old news.
+  const wakes = outcomesAfter === undefined || decisionsAfter === undefined || outcomesAfter <= decisionsAfter ? asks : { ...since(outcomesAfter), asked: asks.asked };
+  const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
+  let result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
+  if (history && after === undefined) {
+    // A first listen answers with history even when the room has no messages yet (once the sync had its moment):
+    // what it finds for this agent is part of that history, not a separate wake.
+    if (result.state === 'addressed') result = { ...result, state: 'history' };
+    else if (result.state === 'waiting' && historyDue) result = { ...result, state: 'history', boardCursor: view.boardRevision ?? boardAfter };
+  }
+  return { view, result, wakes, decided, decisionCursor };
+}
+
+/**
+ * The cursors a plain `listen` continues from, resolved the way `listenRemembering` does: flags first, then what the
+ * last listen saved, as long as this folder still holds what it names.
+ */
+export function listenPlan(agent: BrowserAgent, flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean } = {}) {
+  const saved = flags.fromStart ? undefined : agent.listenCursor();
+  // A cursor for a message this folder no longer holds (its messages were reset) starts over rather than failing every listen.
+  const known = saved?.after !== undefined && agent.messages().some(m => m.packet.body.id === saved.after);
+  const after = flags.after ?? (known ? saved!.after : undefined);
+  // Saved cursors ahead of what this folder holds (its tasks or decisions were reset) are stale: start those from 0.
+  const board = saved?.boardAfter !== undefined && saved.boardAfter <= agent.boardCursor() ? saved.boardAfter : undefined;
+  const decided = saved?.decisionsAfter !== undefined && saved.decisionsAfter <= agent.decisionCursor() ? saved.decisionsAfter : undefined;
+  const decisionsAfter = flags.decisionsAfter ?? decided;
+  // With nothing saved (or --from-start) and no message cursor given, this is a first listen: it answers with history.
+  const plan: ListenPlan = { after, boardAfter: flags.boardAfter ?? board ?? 0, decisionsAfter: decisionsAfter ?? 0,
+    outcomesAfter: decisionsAfter ?? agent.decisionCursor(), history: !saved && after === undefined };
+  return { plan, saved };
+}
+
+/** What a plain `listen` would hand the agent right now. */
+export type PeekResult = { admitted: boolean; work: boolean; state: 'history' | 'addressed' | 'waiting'; addressed: string[]; tasks: string[]; decisions: string[] };
+/**
+ * Whether a plain `listen` would return work for this agent now, under exactly listen's rules and saved cursors, without
+ * consuming it: no cursor is saved and no activity recorded, so the listen that follows still returns the same work.
+ * Work means messages that address the agent, assignments, or decisions; a first listen's history counts only when it
+ * holds some of those. The watcher calls this to decide whether to wake the agent's harness.
+ */
+export function peekWork(agent: BrowserAgent): PeekResult {
+  const snapshot = listenSnapshot(agent, listenPlan(agent).plan, false);
+  if (!snapshot) return { admitted: false, work: false, state: 'waiting', addressed: [], tasks: [], decisions: [] };
+  const { result, wakes } = snapshot;
+  const decisions = [...wakes.asked, ...wakes.resolved, ...wakes.withdrawn].map(d => d.id);
+  const work = result.state !== 'waiting' && (result.addressed.length > 0 || result.tasks.length > 0 || decisions.length > 0);
+  return { admitted: true, work, state: result.state, addressed: result.addressed, tasks: result.tasks.map(t => t.id), decisions };
+}
+
 /**
  * Wait until this agent is addressed in the browser room (same semantics as local `listen`). Calling it means the
  * agent is idle; returning what addressed it means it is working on that until it listens again.
@@ -737,26 +937,25 @@ export const FIRST_LISTEN_GRACE_MS = 3_000;
  * conversation so far, which may be empty, instead of waiting for someone to speak. Open assignments and asks it finds
  * are part of that history too.
  */
-export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number, outcomesAfter?: number, history = false) {
+export async function listenBrowser(agent: BrowserAgent, after: string | undefined, seconds: number, boardAfter?: number, decisionsAfter?: number, outcomesAfter?: number, history = false,
+  restartRunner?: () => Promise<void>) {
   const started = Date.now(), deadline = started + seconds * 1000, historyBy = started + Math.min(seconds * 1000, FIRST_LISTEN_GRACE_MS);
-  let beat = 0;
+  let beat = 0, runnerSince = started, restarted = false;
   while (true) {
-    const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
-    const woke = evaluateWake(view, view.memberId, after, boardAfter);
-    // Decisions asking for this agent's advice, and its own decisions that resolved (wake on consensus).
-    const ops = agent.decisionOps(), decisionCursor = agent.decisionCursor(ops);
-    const since = (seq: number) => decisionWakes(ops.map(p => p.body), agent.members(), view.memberId!, ops.filter(p => p.seq > seq).map(p => p.body));
-    const asks = decisionsAfter === undefined ? { asked: [], resolved: [], withdrawn: [] } : since(decisionsAfter);
-    // Asks wake from decisionsAfter, outcomes of the agent's own decisions only from outcomesAfter: older ones are old news.
-    const wakes = outcomesAfter === undefined || decisionsAfter === undefined || outcomesAfter <= decisionsAfter ? asks : { ...since(outcomesAfter), asked: asks.asked };
-    const decided = wakes.asked.length || wakes.resolved.length || wakes.withdrawn.length;
-    let result = woke.state === 'waiting' && decided ? { ...woke, state: 'addressed' as const } : woke;
-    if (history && after === undefined) {
-      // A first listen answers with history even when the room has no messages yet (once the sync had its moment):
-      // what it finds for this agent is part of that history, not a separate wake.
-      if (result.state === 'addressed') result = { ...result, state: 'history' };
-      else if (result.state === 'waiting' && Date.now() >= historyBy) result = { ...result, state: 'history', boardCursor: view.boardRevision ?? boardAfter };
-    }
+    const closed = roomClosed(agent);
+    const snapshot = listenSnapshot(agent, { after, boardAfter, decisionsAfter, outcomesAfter, history }, Date.now() >= historyBy);
+    if (!snapshot && !closed) throw new Error('This agent is not admitted to the browser room yet.');
+    /** A return that consumes nothing: the cursors stay where they were, and what it observed is only counted. */
+    const unchanged = (state: 'timeout' | 'closed' | 'runner-stopped', extra: Record<string, unknown> = {}) => {
+      const view = snapshot?.view, result = snapshot?.result;
+      // Asks before outcomesAfter were checked and did not wake, so moving the cursor past them loses nothing.
+      return { state, roomId: agent.roomId, participantId: view?.memberId, floor: view?.floor, messages: [], cursor: after,
+        boardCursor: boardAfter ?? view?.boardRevision, decisionCursor: decisionsAfter === undefined ? snapshot?.decisionCursor ?? 0 : Math.max(decisionsAfter, outcomesAfter ?? 0),
+        observed: result?.messages.filter(m => m.authorId !== view?.memberId).length ?? 0, ...extra };
+    };
+    // Nothing more will arrive, and nothing can be answered: say so now rather than at the end of the wait.
+    if (closed) return unchanged('closed', { error: `${closed.reason} Stop listening to this room.` });
+    const { view, result, wakes, decided, decisionCursor } = snapshot!;
     if (result.state !== 'waiting') {
       // History without anything for this agent is catching up, not work.
       if (result.addressed.length || result.tasks.length || decided) agent.recordActivity('working', { messages: result.addressed.slice(-8), tasks: result.tasks.map(t => t.id).slice(-8) });
@@ -766,12 +965,12 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
           ...(wakes.withdrawn.length ? { withdrawn: wakes.withdrawn.map(d => describeDecision(agent, d)) } : {}) } } : {}) };
     }
     if (!beat || Date.now() - beat >= LISTEN_HEARTBEAT_MS) { if (beat) agent.touchActivity(); else agent.recordActivity('idle'); beat = Date.now(); }
-    if (Date.now() >= deadline) {
-      agent.touchActivity();
-      // Asks before outcomesAfter were checked and did not wake, so moving the cursor past them loses nothing.
-      return { state: 'timeout', roomId: agent.roomId, participantId: view.memberId, floor: view.floor, messages: [], cursor: after,
-        boardCursor: boardAfter ?? view.boardRevision, decisionCursor: decisionsAfter === undefined ? decisionCursor : Math.max(decisionsAfter, outcomesAfter ?? 0),
-        observed: result.messages.filter(m => m.authorId !== view.memberId).length };
+    if (Date.now() >= deadline) { agent.touchActivity(); return unchanged('timeout'); }
+    // The files only change while the runner runs: a long wait on a stopped one would never hear anything. Start it
+    // again once; if that one stops too, hand the question back to the agent instead of waiting on frozen files.
+    if (runnerStopped(agent, runnerSince)) {
+      if (!restartRunner || restarted) return unchanged('runner-stopped', { error: 'The background process stopped. Run listen again; it starts the process again.' });
+      restarted = true; await restartRunner(); runnerSince = Date.now();
     }
     await Bun.sleep(500);
   }
@@ -789,18 +988,10 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
  * wake it once, then the cursors move past them). Outcomes of decisions the agent opened wake it only from now on, so an
  * agent that starts over is not flooded with results it already had.
  */
-export async function listenRemembering(agent: BrowserAgent, seconds: number, flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean } = {}) {
-  const saved = flags.fromStart ? undefined : agent.listenCursor();
-  // A cursor for a message this folder no longer holds (its messages were reset) starts over rather than failing every listen.
-  const known = saved?.after !== undefined && agent.messages().some(m => m.packet.body.id === saved.after);
-  const after = flags.after ?? (known ? saved!.after : undefined);
-  // Saved cursors ahead of what this folder holds (its tasks or decisions were reset) are stale: start those from 0.
-  const board = saved?.boardAfter !== undefined && saved.boardAfter <= agent.boardCursor() ? saved.boardAfter : undefined;
-  const decided = saved?.decisionsAfter !== undefined && saved.decisionsAfter <= agent.decisionCursor() ? saved.decisionsAfter : undefined;
-  const decisionsAfter = flags.decisionsAfter ?? decided;
-  // With nothing saved (or --from-start) and no message cursor given, this is a first listen: it answers with history.
-  const first = !saved && after === undefined;
-  const result = await listenBrowser(agent, after, seconds, flags.boardAfter ?? board ?? 0, decisionsAfter ?? 0, decisionsAfter ?? agent.decisionCursor(), first);
+export async function listenRemembering(agent: BrowserAgent, seconds: number,
+  flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean; restartRunner?: () => Promise<void> } = {}) {
+  const { plan, saved } = listenPlan(agent, flags);
+  const result = await listenBrowser(agent, plan.after, seconds, plan.boardAfter, plan.decisionsAfter, plan.outcomesAfter, plan.history, flags.restartRunner);
   agent.saveListenCursor({ ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor });
   const resumed = !!saved && (flags.after === undefined || flags.boardAfter === undefined || flags.decisionsAfter === undefined);
   return resumed ? { ...result, resumed } : result;
@@ -846,7 +1037,8 @@ export async function attachmentBrowser(agent: BrowserAgent, key: string, out: s
   if (!ref) throw new Error('No message in this room has that attachment. Use an attachment id from listen.');
   const want = join(agent.dir, 'wants', ref.sha256);
   let bytes = await agent.files.get(ref.sha256);
-  if (!bytes) writeFileSync(want, '', { mode: 0o600 });
+  // By rename: a link planted at the name in wants/ is replaced, never written through.
+  if (!bytes) replaceFile(want, '');
   const deadline = Date.now() + seconds * 1000;
   try {
     while (!bytes && Date.now() < deadline) { await Bun.sleep(300); bytes = await agent.files.get(ref.sha256); }
@@ -959,11 +1151,17 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
 }
 
 /** Why `run` could not sign a queued decision change, kept next to the outbox for the command waiting on it. */
-export function noteDropped(outbox: string, id: string, reason: string) { writeFileSync(join(outbox, `${id}.dropped`), reason, { mode: 0o600 }); }
+export function noteDropped(outbox: string, id: string, reason: string) {
+  // The id names the file, so it must be a UUID; written by rename, so a link planted at the name is replaced, not followed.
+  if (!UUID.test(id)) return;
+  replaceFile(join(outbox, `${id}.dropped`), reason);
+}
 /** The reason `run` noted for dropping a change, read once. */
 export function takeDropped(outbox: string, id: string) {
   const note = join(outbox, `${id}.dropped`);
-  if (!existsSync(note)) return undefined;
+  // The outbox is writable by a sandboxed wake: only a small regular file is read, never a link to something else.
+  let found; try { found = lstatSync(note); } catch { return undefined; }
+  if (!found.isFile() || found.size > 4096) { rmSync(note, { force: true }); return undefined; }
   const reason = readFileSync(note, 'utf8'); rmSync(note, { force: true });
   return reason;
 }

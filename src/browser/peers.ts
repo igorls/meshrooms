@@ -12,7 +12,7 @@ import {
   foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody, withinReactionKeyCap,
   type ReactionChip, type ReactionEmoji, type ReactionPacket,
 } from './reactions';
-import { StorageError, read, sign, update, write } from './storage';
+import { FenceError, StorageError, read, sign, update, type Fence } from './storage';
 import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRecord } from './activity';
 import { awaitingDelivery, windowHistory } from './history';
 import { IncomingGate, PACE_LOW_WATER, Resync, SYNC_REQUEST, SendQueue, isSyncRequest, type SyncRequest } from './pacer';
@@ -69,6 +69,10 @@ export class BrowserPeers {
   private files: FileTransfers;
   /** Latest activity per agent device with an open channel; memory only, dropped when the channel closes. */
   private activity = new Map<string, ActivityRecord>();
+  /** This engine's claim on the room's records in this browser (see claimFence). Nothing is written without one. */
+  private fence?: Fence;
+  /** A fenced write found that another tab claimed the room: this engine stopped for good. */
+  private fencedOut = false;
   constructor(private api: BrowserApi, private roomId: string, private deviceId: string, private session: string,
     private changed: (messages: SavedMessage[], connected: string[], added?: SavedMessage) => void, private error: (message: string) => void,
     private boardChanged: (tasks: Task[], ops: TaskBody[]) => void = () => {}, private filesChanged: (files: Record<string, FileView>) => void = () => {},
@@ -84,6 +88,25 @@ export class BrowserPeers {
       store: { has: sha => sha in this.index, get: sha => this.readFile(sha), put: (sha, bytes, type) => this.storeFile(sha, bytes, type) },
       channel: id => this.peers.get(id)?.channel,
       peers: () => [...this.peers].filter(([id, p]) => p.channel?.readyState === 'open' && this.status?.devices?.some(d => d.id === id)).map(([id]) => id) });
+  }
+  /** Write only while this claim on the room is current: once another tab claims it, every write aborts unwritten. */
+  fenced(fence: Fence) { this.fence = fence; }
+  /** Stopped, by its owner or because another tab claimed the room. */
+  isStopped() { return this.stopped; }
+  /** Stopped because another tab of this browser claimed the room (its writes are fenced out); a reload takes it back. */
+  lostRoom() { return this.fencedOut; }
+  /**
+   * Every write of this room's records goes through here, fenced by the engine's claim. An engine without a claim
+   * writes nothing: an unfenced writer could overwrite the room's current owner. Losing the room stops this engine at
+   * once, whichever write found out (a message, a receipt, the board, a file), then the error goes on to the caller.
+   */
+  private async put(puts: [string, unknown][], deletes: string[] = []) {
+    if (!this.fence) throw new Error('Claim the room (claimRoom) before writing its records.');
+    try { await update(puts, deletes, this.fence); }
+    catch (error) {
+      if (error instanceof FenceError && !this.fencedOut) { this.fencedOut = true; this.stop(); }
+      throw error;
+    }
   }
   async load() {
     this.messages = await read<SavedMessage[]>(this.key) || []; this.ops = await read<TaskPacket[]>(this.boardKey) || [];
@@ -104,8 +127,10 @@ export class BrowserPeers {
   /** Stored as a Blob, which browsers keep on disk; only verified raster images carry an image type. */
   private storeFile(sha: string, bytes: Uint8Array, type: string) {
     return this.fileChain(async () => {
+      // A stopped engine has handed the room to another owner, which keeps the file index from now on.
+      if (this.stopped) return;
       const next = { ...this.index, [sha]: { size: bytes.length, type } };
-      await update([[this.fileKey(sha), new Blob([bytes as BlobPart], { type: IMAGE_TYPES.includes(type) ? type : 'application/octet-stream' })], [this.filesKey, next]]);
+      await this.put([[this.fileKey(sha), new Blob([bytes as BlobPart], { type: IMAGE_TYPES.includes(type) ? type : 'application/octet-stream' })], [this.filesKey, next]]);
       this.index = next; await this.fileUrl(sha); this.notifyFiles();
     });
   }
@@ -124,7 +149,7 @@ export class BrowserPeers {
     if (Object.keys(this.index).some(sha => !this.retained.has(sha))) void this.fileChain(async () => {
       const evicted = Object.keys(this.index).filter(sha => !this.retained.has(sha));
       const next = Object.fromEntries(Object.entries(this.index).filter(([sha]) => this.retained.has(sha)));
-      await update([[this.filesKey, next]], evicted.map(sha => this.fileKey(sha)));
+      await this.put([[this.filesKey, next]], evicted.map(sha => this.fileKey(sha)));
       this.index = next;
       for (const sha of evicted) { const url = this.urls.get(sha); if (url) URL.revokeObjectURL(url); this.urls.delete(sha); }
       this.notifyFiles();
@@ -149,13 +174,13 @@ export class BrowserPeers {
     // Compaction keeps the same board with fewer operations; only a large board needs it.
     if (next.length > COMPACT_AT) next = compactBoard(next);
     if (next.length > MAX_TASK_OPS) throw new Error('This room’s task board is full in this preview.');
-    await write(this.boardKey, next); this.ops = next; this.notifyBoard();
+    await this.put([[this.boardKey, next]]); this.ops = next; this.notifyBoard();
   }
   /** Create a task (no current), change one, or remove it. Signed here and sent to every connected device. */
   async changeTask(change: TaskChange, current?: Task, removed = false) {
     return this.transaction(async () => {
       if (!this.status?.memberId || this.stopped) throw new Error('Join the room before changing tasks.');
-      const body = taskBody({ roomId: this.roomId, deviceId: this.deviceId, memberId: this.status.memberId, current, change, removed });
+      const body = taskBody({ roomId: this.roomId, deviceId: this.deviceId, memberId: this.status.memberId, current, change, removed, repositories: this.status.repositories });
       const packet: TaskPacket = { body, signature: await sign(body) };
       await this.addOps([packet]);
       for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* The board is exchanged again on reconnect. */ } }
@@ -175,7 +200,7 @@ export class BrowserPeers {
     let next = [...this.reactionOps, ...ready];
     if (next.length > COMPACT_REACTIONS_AT) next = compactReactions(next);
     if (next.length > MAX_REACTION_OPS) throw new Error('This room’s reactions log is full in this preview.');
-    await write(this.reactionKey, next); this.reactionOps = next; this.notifyReactions();
+    await this.put([[this.reactionKey, next]]); this.reactionOps = next; this.notifyReactions();
   }
   private async flushPendingReactions(messageId: string) {
     const due = this.pendingReactions.filter(op => op.body.messageId === messageId);
@@ -259,7 +284,7 @@ export class BrowserPeers {
     // Compaction keeps the same decisions with fewer votes; only a busy log needs it.
     if (next.length > COMPACT_DECISIONS_AT) next = compactDecisions(next);
     if (next.length > MAX_DECISION_OPS) throw new Error('This room’s decisions log is full in this preview.');
-    await write(this.decisionKey, next); this.decisionOps = next; this.notifyDecisions();
+    await this.put([[this.decisionKey, next]]); this.decisionOps = next; this.notifyDecisions();
   }
   private async publishDecision(body: DecisionBody | VoteBody) {
     // The same per-member limit applies to this device's own operations as to those it receives.
@@ -325,8 +350,14 @@ export class BrowserPeers {
     if (!device || this.status?.members?.find(m => m.id === device.memberId)?.role !== 'agent' || !validActivityPacket(packet, this.roomId)) return;
     this.activity.set(id, receiveActivity(packet)); this.notifyActivity();
   }
-  /** Network and peer problems go to the transient banner; failed saves are shown by the storage banner instead. */
-  private fail(error: Error) { if (!(error instanceof StorageError)) this.error(error.message); }
+  /**
+   * Network and peer problems go to the transient banner; failed saves are shown by the storage banner instead. A
+   * fenced-out write means another tab owns the room now: this engine stops, and the new owner keeps the records.
+   */
+  private fail(error: Error) {
+    if (error instanceof FenceError) return; // Already stopped by put().
+    if (!(error instanceof StorageError)) this.error(error.message);
+  }
   private notify(added?: SavedMessage) { if (!this.stopped) this.changed([...this.messages], [...this.peers].filter(([, p]) => p.channel?.readyState === 'open').map(([id]) => id), added); }
   private transaction<T>(work: () => Promise<T>): Promise<T> {
     const next = this.serial.then(work); this.serial = next.catch(() => {}); return next;
@@ -338,7 +369,7 @@ export class BrowserPeers {
   /** Store `added` at the end of the history, evicting the oldest messages past the rolling window. */
   private async save(added: SavedMessage) {
     const { kept, evicted } = windowHistory([...this.messages, added], m => this.awaiting(m));
-    await write(this.key, kept); this.messages = kept; this.receiptsDirty = false;
+    await this.put([[this.key, kept]]); this.messages = kept; this.receiptsDirty = false;
     const stored = kept.at(-1) === added;
     this.notify(stored ? added : undefined);
     if (added.packet.body.attachments || evicted.some(m => m.packet.body.attachments)) this.syncFiles();
@@ -353,7 +384,7 @@ export class BrowserPeers {
       void this.transaction(() => this.writeReceipts()).catch(e => this.fail(e));
     }, 1000);
   }
-  private async writeReceipts() { if (this.receiptsDirty) { this.receiptsDirty = false; await write(this.key, this.messages); } }
+  private async writeReceipts() { if (this.receiptsDirty) { this.receiptsDirty = false; await this.put([[this.key, this.messages]]); } }
   /** Files are stored here before the message that names them, so this browser can serve them as soon as peers ask. */
   async send(text: string, replyTo?: string, files: { ref: AttachmentRef; bytes: Uint8Array }[] = []) {
     return this.transaction(async () => {
@@ -517,7 +548,20 @@ export class BrowserPeers {
   }
   stop() {
     this.stopped = true; this.disconnect();
+    // No file is fetched for a stopped engine: another owner, if any, fetches what the room needs.
+    this.files.keep(() => false);
     if (this.receiptTimer) { clearTimeout(this.receiptTimer); this.receiptTimer = undefined; void this.transaction(() => this.writeReceipts()).catch(() => {}); }
     for (const url of this.urls.values()) URL.revokeObjectURL(url); this.urls.clear();
+  }
+  /**
+   * Stop, then wait for every write this engine had started (history, receipts, board, files), so another owner of
+   * the room in this browser (a tab taking it into the foreground) loads everything and never races a late write.
+   */
+  async close() {
+    this.stop();
+    for (let serial = this.serial, files = this.fileSerial; ; serial = this.serial, files = this.fileSerial) {
+      await serial; await files;
+      if (serial === this.serial && files === this.fileSerial) return;
+    }
   }
 }

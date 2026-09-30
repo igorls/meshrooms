@@ -35,8 +35,7 @@
 .browser-reaction-add-header .browser-reaction-picker{left:auto;right:0;bottom:auto;top:calc(100% + 4px)}
 @media(hover:hover){.browser-reaction-add-header{opacity:0;transition:opacity .12s}.browser-message:is(:hover,:focus-within) .browser-reaction-add-header,.browser-reaction-add-header:has([aria-expanded=true]){opacity:1}}
 .browser-message{position:relative}
-.browser-reaction-add-float{position:absolute;top:0;right:0;border-radius:999px;background:var(--paper)}
-@media(hover:none){.browser-reaction-add-header .browser-reaction-picker-toggle{border:0;min-width:32px}.browser-message-continuation:has(.browser-reaction-add-float)>div{padding-right:36px}}
+@media(hover:none){.browser-reaction-add-header .browser-reaction-picker-toggle{border:0;min-width:32px}}
 @media(prefers-reduced-motion:reduce){.browser-reaction-add-header{transition:none}}
 .browser-reaction-picker{position:absolute;left:0;bottom:calc(100% + 6px);z-index:2;display:flex;gap:4px;padding:6px;border:1px solid var(--line);border-radius:12px;background:var(--paper);box-shadow:0 8px 24px rgba(15,23,42,.08)}
 .browser-reaction-picker button{min-width:32px;min-height:32px;border:0;border-radius:8px;background:transparent;font-size:16px}
@@ -46,8 +45,11 @@
 .browser-agents label{display:grid;gap:8px;font-weight:650}
 .browser-agents input{width:100%;font-size:12px}
 .browser-agent-link>p{font-size:12px;color:var(--muted)}
-.browser-agent-link>div{display:flex;align-items:center;gap:16px}
+.browser-agent-link>div{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px}
 .browser-agent-link .browser-text-link{margin-top:0}
+.browser-agent-harness{display:grid;gap:4px;font-size:12px;color:var(--muted)}
+.browser-agent-harness select{font:inherit;font-size:13px;color:var(--ink);padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--paper)}
+.browser-agent-link textarea.browser-agent-prompt{width:100%;box-sizing:border-box;resize:vertical;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink);background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:8px;white-space:pre-wrap;overflow-wrap:anywhere}
 .browser-agent-waiting{font-size:12px;color:var(--muted);margin-top:8px}
 .browser-person .browser-remove{display:block;padding:4px 0 0;font-size:12px}
 @media(max-width:760px){.browser-message-for-you{margin-left:-10px;padding-left:10px}}
@@ -138,8 +140,11 @@
 .browser-rail-collapsed .browser-brand .wordmark{font-size:0;gap:0}
 .browser-rail-collapsed .browser-room-nav h2,.browser-rail-collapsed .browser-rail-footer{display:none}
 .browser-rail-collapsed .browser-room-nav a{justify-content:center;padding:12px 0;width:44px}
-.browser-rail-collapsed .browser-room-nav a span,.browser-rail-collapsed .browser-self>div{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.browser-rail-collapsed .browser-room-nav a span:not(.browser-room-badges):not(.browser-room-badge):not(.browser-room-waiting),.browser-rail-collapsed .browser-self>div{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .browser-rail-collapsed .browser-self{padding-inline:0;justify-content:center}
+/* Collapsed, a room's badge sits on its icon's corner. */
+.browser-rail-collapsed .browser-room-nav a{position:relative}.browser-rail-collapsed .browser-room-badges{display:contents}.browser-rail-collapsed .browser-room-badge{position:absolute;top:2px;right:-4px;box-shadow:0 0 0 2px var(--rail);min-width:16px;padding:0 4px;font-size:10px;line-height:16px}
+.browser-rail-collapsed .browser-room-waiting{position:absolute;bottom:2px;right:-4px;box-shadow:0 0 0 2px var(--rail);padding:0 4px;font-size:10px;line-height:16px;gap:1px}.browser-rail-collapsed .browser-room-waiting svg{width:9px;height:9px}
 }
 @media(max-width:760px){.browser-rail-toggle{display:none}.browser-rail-top{display:contents}}
 /* Scroll panes contain their visually hidden (absolute) labels, so they scroll with the pane instead of stretching the page. */
@@ -226,3 +231,27 @@
 @media(max-width:760px){.browser-decision{margin-left:0;padding:12px 14px}.browser-decision-state{margin-left:0;width:100%}.browser-decision-form-top .browser-decision-note{display:none}.browser-decision-form-actions{margin-left:0;width:100%;justify-content:flex-end}}
 /* Host whose only device holds the room key (identity-loss stopgap until passkey recovery). */
 .browser-details .browser-only-device{color:#6b4f1d;background:#faf3e3;border-radius:8px;padding:10px 12px;margin-top:12px}.browser-only-device .browser-text-link{display:flex;margin-top:4px;min-height:32px}
+
+.browser-agent-cta{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:8px 24px 0;padding:12px 16px;border:1px solid #9db6f3;border-radius:12px;background:#eef3fc;color:var(--ink)}
+.browser-agent-cta p{margin:2px 0 0;font-size:13px;color:var(--muted)}
+.browser-agent-cta-actions{display:flex;align-items:center;gap:12px;flex-shrink:0}
+.browser-agent-cta-actions .browser-text-link{margin-top:0}
+@media (max-width:640px){.browser-agent-cta{flex-direction:column;align-items:stretch;margin:8px 12px 0}.browser-agent-cta-actions{justify-content:space-between}}
+.browser-message-continuation{position:relative}
+.browser-message-continuation .browser-continuation-header{position:absolute;top:0;right:0;z-index:1;gap:8px;padding:2px 6px;border-radius:8px;background:var(--paper);box-shadow:0 1px 6px #1826341a;opacity:0;transition:opacity 120ms ease-out}
+.browser-message-continuation:hover .browser-continuation-header,.browser-message-continuation:focus-within .browser-continuation-header{opacity:1}
+.browser-continuation-header>strong,.browser-continuation-header>.browser-role,.browser-continuation-header>.browser-operator,.browser-continuation-header>.browser-author-you{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media(hover:none){.browser-message-continuation .browser-continuation-header{opacity:1;box-shadow:none;background:transparent}.browser-message-continuation>div{padding-right:120px}}
+@media(prefers-reduced-motion:reduce){.browser-message-continuation .browser-continuation-header{transition:none}}
+/* Unread counts of the person's other rooms, kept live by background connections. A mention of you takes the accent and an @. */
+.browser-room-badge{flex-shrink:0;min-width:20px;padding:0 6px;border-radius:10px;background:#3b526a;color:#f2f6f9;font-size:11px;font-weight:700;line-height:20px;text-align:center;font-variant-numeric:tabular-nums}
+.browser-room-badge.is-mention{background:var(--blue);color:#fff}.browser-room-badge.is-mention::before{content:'@'}
+/* A room's badges sit at the end of its row, stacked when there are two, so the name keeps its width. */
+.browser-room-badges{display:inline-flex;flex-direction:column;align-items:flex-end;gap:4px;margin-left:auto;flex-shrink:0}
+.browser-room-nav a.has-unread>span:not(.browser-room-badges){color:#fff;font-weight:700}
+.browser-mobile-rooms .browser-room-badges,.browser-recent .browser-room-badges{flex-direction:row;align-items:center;margin-left:8px;vertical-align:middle}
+.browser-recent a .browser-room-badge{display:inline-block;background:var(--line);color:var(--ink)}.browser-recent a .browser-room-badge.is-mention{background:var(--blue);color:#fff}
+/* Someone waiting to join a room you host: a person and a count, in amber, since it asks for an action. */
+.browser-room-waiting{display:inline-flex;align-items:center;gap:3px;flex-shrink:0;padding:0 6px;border-radius:10px;background:#f0c36a;color:#182634;font-size:11px;font-weight:700;line-height:20px;font-variant-numeric:tabular-nums}
+.browser-join-notice{display:flex;flex-wrap:wrap;align-items:center;gap:4px 16px;background:var(--soft);color:var(--ink);padding:8px 16px;border-radius:8px;overflow-wrap:anywhere}
+.browser-join-notice a{color:var(--blue);font-weight:700;text-underline-offset:4px}.browser-join-notice .browser-text-link{margin-top:0}

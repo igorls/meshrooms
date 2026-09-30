@@ -60,9 +60,29 @@ export function repoRef(href: string): RepoRef | undefined {
   return undefined;
 }
 
-export function parseMarkdown(text: string): Block[] {
+/**
+ * The issue number of a bare `#123` reference at text[at]. The `#` must not follow a letter, digit, `_`, `/`, `&`, `#`,
+ * `.` or `-`, so `owner/name#12`, `&#123;`, `page#12` and URL fragments are not references; the number has 1 to 9
+ * digits, doesn't start with 0, and isn't followed by a letter, digit or `_`, so `#123abc` and longer numbers aren't.
+ */
+export function issueNumberAt(text: string, at: number): string | undefined {
+  if (text[at] !== '#') return undefined;
+  const before = text[at - 1];
+  if (before && (/[\p{L}\p{N}_]/u.test(before) || '/&#.-'.includes(before))) return undefined;
+  return /^#([1-9]\d{0,8})(?![\p{L}\p{N}_])/u.exec(text.slice(at, at + 11))?.[1];
+}
+
+/**
+ * `issueRepository`: the one GitHub repository a room pins. A bare `#123` in text then links to its issue 123, except
+ * inside code, links and headings. Without it `#123` stays text.
+ */
+export type MarkdownOptions = { issueRepository?: string };
+
+export function parseMarkdown(text: string, options: MarkdownOptions = {}): Block[] {
   const lines = text.replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/^\t+/, tabs => '    '.repeat(tabs.length)));
-  return parseBlocks(lines, 0);
+  // Only a real GitHub owner/name qualifies, so every such link renders as an issue reference.
+  const repository = options.issueRepository;
+  return parseBlocks(lines, 0, repository && repoRef(`https://github.com/${repository}/issues/1`)?.kind === 'issue' ? repository : undefined);
 }
 
 const indentOf = (line: string) => line.length - line.trimStart().length;
@@ -117,7 +137,7 @@ function tableAt(lines: string[], i: number) {
   return header && align && header.length === align.length && header.length <= MAX_COLUMNS ? { header, align } : undefined;
 }
 
-function parseBlocks(lines: string[], depth: number): Block[] {
+function parseBlocks(lines: string[], depth: number, issues?: string): Block[] {
   const blocks: Block[] = [];
   let i = 0;
   while (i < lines.length) {
@@ -145,12 +165,12 @@ function parseBlocks(lines: string[], depth: number): Block[] {
     if (depth < MAX_DEPTH && quoteLine(line)) {
       const inner: string[] = [];
       for (; i < lines.length && quoteLine(lines[i]); i++) inner.push(lines[i].replace(/^ {0,3}> ?/, ''));
-      blocks.push({ type: 'quote', children: parseBlocks(inner, depth + 1) });
+      blocks.push({ type: 'quote', children: parseBlocks(inner, depth + 1, issues) });
       continue;
     }
     if (isRule(line)) { blocks.push({ type: 'rule' }); i++; continue; }
     const item = depth < MAX_DEPTH ? listItem(line) : null;
-    if (item) { i = parseList(lines, i, depth, blocks); continue; }
+    if (item) { i = parseList(lines, i, depth, blocks, issues); continue; }
     const table = tableAt(lines, i);
     if (table) {
       // Body rows run to a blank line, another block, a line without a pipe, or the caps. Like GFM, a long row is cut to
@@ -159,19 +179,19 @@ function parseBlocks(lines: string[], depth: number): Block[] {
       const maxRows = Math.min(MAX_TABLE_ROWS, Math.floor(MAX_TABLE_CELLS / width) - 1);
       let cells: string[] | undefined;
       for (i += 2; i < lines.length && rows.length < maxRows && !blank(lines[i]) && !startsBlock(lines[i]) && (cells = tableCells(lines[i])); i++)
-        rows.push(cells!.slice(0, width).map(cell => parseInline(cell)));
-      blocks.push({ type: 'table', align: table.align, header: table.header.map(cell => parseInline(cell)), rows });
+        rows.push(cells!.slice(0, width).map(cell => parseInline(cell, false, issues)));
+      blocks.push({ type: 'table', align: table.align, header: table.header.map(cell => parseInline(cell, false, issues)), rows });
       continue;
     }
     const paragraph = [line.trim()];
     for (i++; i < lines.length && !blank(lines[i]) && (depth >= MAX_DEPTH || !startsBlock(lines[i])) && !tableAt(lines, i); i++) paragraph.push(lines[i].trim());
-    blocks.push({ type: 'paragraph', children: parseInline(paragraph.join('\n')) });
+    blocks.push({ type: 'paragraph', children: parseInline(paragraph.join('\n'), false, issues) });
   }
   return blocks;
 }
 
 /** Parses the list starting at lines[start] into blocks and returns the index after it. */
-function parseList(lines: string[], start: number, depth: number, blocks: Block[]): number {
+function parseList(lines: string[], start: number, depth: number, blocks: Block[], issues?: string): number {
   const first = listItem(lines[start])!;
   const base = first[1].length; const ordered = first[3] !== undefined;
   const bullet = ordered ? first[2].slice(-1) : first[2];
@@ -197,7 +217,7 @@ function parseList(lines: string[], start: number, depth: number, blocks: Block[
       else break;
       previousBlank = false;
     }
-    items.push(parseBlocks(content, depth + 1));
+    items.push(parseBlocks(content, depth + 1, issues));
     let next = i;
     while (next < lines.length && blank(lines[next])) next++;
     if (next < lines.length && sameKind(listItem(lines[next]))) i = next; else break;
@@ -218,8 +238,11 @@ function push(children: Inline[], node: Inline) {
   else if (node.type !== 'text' || node.text) children.push(node);
 }
 
-/** Emphasis frames on a stack; an unmatched opener falls back to literal text when it is popped. */
-function parseInline(text: string, inLink = false): Inline[] {
+/**
+ * Emphasis frames on a stack; an unmatched opener falls back to literal text when it is popped. With `issues` (an
+ * owner/name), a bare `#123` outside a link label links to that repository's issue.
+ */
+function parseInline(text: string, inLink = false, issues?: string): Inline[] {
   const root: Frame = { char: '', count: 0, children: [] };
   const stack = [root];
   const open: Record<string, number> = { '*': 0, _: 0 };
@@ -260,6 +283,8 @@ function parseInline(text: string, inLink = false): Inline[] {
       const url = bareUrl(text, i);
       if (url) { const href = safeHref(url); if (href) { emit({ type: 'link', href, children: [{ type: 'text', text: url }] }); i += url.length; continue; } }
     }
+    const issue = c === '#' && issues && !inLink ? issueNumberAt(text, i) : undefined;
+    if (issue) { emit({ type: 'link', href: `https://github.com/${issues}/issues/${issue}`, children: [{ type: 'text', text: `#${issue}` }] }); i += issue.length + 1; continue; }
     if (c === '*' || c === '_') {
       let run = 1; while (text[i + run] === c) run++;
       const before = text[i - 1] ?? ' '; const after = text[i + run] ?? ' ';
@@ -282,7 +307,7 @@ function parseInline(text: string, inLink = false): Inline[] {
       i += run; continue;
     }
     let end = i + 1;
-    while (end < text.length && !'\\\n`[*_hH'.includes(text[end])) end++;
+    while (end < text.length && !'\\\n`[*_hH#'.includes(text[end])) end++;
     emit({ type: 'text', text: text.slice(i, end) }); i = end;
   }
   while (stack.length > 1) collapse();

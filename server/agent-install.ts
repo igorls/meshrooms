@@ -199,6 +199,8 @@ function withInstallLock<T>(dir: string, work: () => T): T {
  */
 export function installBridge(source: string, version = BRIDGE_VERSION, dir = binDir()) {
   if (!isVersion(version)) throw new Error(`Not a version: ${version}`);
+  const intact = intactInstall(source, version, dir);
+  if (intact) return intact;
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     assertPrivateDir(dir);
@@ -223,6 +225,26 @@ export function installBridge(source: string, version = BRIDGE_VERSION, dir = bi
     throw new Error(`Couldn't install the Meshrooms bridge into ${dir}: ${error instanceof Error ? error.message : String(error)}. `
       + 'Set MESHROOMS_BIN_DIR to a private folder you can write to (outside your project), then run the command again.');
   }
+}
+
+/**
+ * The install as it stands, when it needs no change: this version is recorded with this bundle's hash, every recorded
+ * version still has its hash, and the launcher is byte for byte the one the newest of them needs. Then nothing is
+ * written (no lock, no manifest), so a command run from the installed launcher never needs the bin folder writable,
+ * and the launcher is checked before a runner or watcher starts from it. Anything else takes the full install.
+ */
+function intactInstall(source: string, version: string, dir: string) {
+  try {
+    const hash = sha256(readFileSync(source)), file = `meshrooms-${version}.js`, manifest = readManifest(dir);
+    if (manifest.versions[version]?.sha256 !== hash || manifest.versions[version]?.file !== file) return undefined;
+    const entries = Object.entries(manifest.versions);
+    if (!entries.every(([v, entry]) => isVersion(v) && entry.file === `meshrooms-${v}.js` && sha256(readFileSync(join(dir, entry.file))) === entry.sha256)) return undefined;
+    const [newest, entry] = entries.reduce((best, next) => compareVersions(next[0], best[0]) > 0 ? next : best);
+    const launcher = join(dir, LAUNCHER);
+    if (readFileSync(launcher, 'utf8') !== launcherSource(newest, entry.sha256)) return undefined;
+    assertPrivateDir(dir);
+    return { dir, launcher, version: newest, installed: join(dir, file) };
+  } catch { return undefined; }
 }
 
 /** The bundle this process runs from, or undefined when running from source (bun run server/agent-cli.ts). */

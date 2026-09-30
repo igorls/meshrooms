@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import { AGENTS_MENTION, TASK_STATUSES, groupTasks, matchesTaskFilter, mentionSegments, type Floor, type Task, type TaskFilter, type TaskStatus } from '../collab';
 import { parseMarkdown, repoRef, safeHref, type Block, type Inline, type RepoRef, type TableAlign } from '../markdown';
 import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
-import { issueLabel, issueLinkFrom, newIssueUrl } from '../browser/board';
+import { issueFromTitle, issueLabel, issueLinkFrom, newIssueUrl, soleRepository } from '../browser/board';
 
 const statusLabels: Record<TaskStatus, string> = { todo: 'To do', doing: 'In progress', done: 'Done' };
 
@@ -15,9 +15,13 @@ function RefIcon({ kind }: { kind: RepoRef['kind'] }) {
   return <svg className="md-ref-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{refGlyphs[kind]}</svg>;
 }
 
-/** Message markdown with @mentions marked; mentions of the viewer are stronger. Code stays literal. */
-export function MentionText({ text, participants, viewerId }: { text: string; participants: Participant[]; viewerId?: string }) {
-  const blocks = useMemo(() => parseMarkdown(text), [text]);
+/**
+ * Message markdown with @mentions marked; mentions of the viewer are stronger. Code stays literal. With `repositories`,
+ * the room's pinned ones, a bare `#42` links to that issue when the room pins exactly one.
+ */
+export function MentionText({ text, participants, viewerId, repositories }: { text: string; participants: Participant[]; viewerId?: string; repositories?: readonly string[] }) {
+  const issueRepository = soleRepository(repositories);
+  const blocks = useMemo(() => parseMarkdown(text, { issueRepository }), [text, issueRepository]);
   const viewer = participants.find(p => p.id === viewerId)?.name.toLowerCase();
   const mentions = (value: string) => mentionSegments(value, participants).map((segment, index) => segment.mention
     ? <span key={index} className={`mention ${segment.text.slice(1).toLowerCase() === viewer ? 'you' : ''}`}>{segment.text}</span>
@@ -151,13 +155,15 @@ export function useMentions(participants: Participant[], viewerId: string | unde
 export function useStickToBottom(threshold = 80) {
   const element = useRef<HTMLElement | null>(null), pinned = useRef(true), lastTop = useRef(0);
   const [unread, setUnread] = useState(0);
+  /** Whether the view follows the newest message, so everything in it has been on screen. */
+  const [following, setFollowing] = useState(true);
   // Programmatic scrolls record where they left the view. Scroll events come at most once a frame, so if the reader
   // scrolled up in the same frame as a follow, the only event would already show the upper position; compared with a
   // stale lastTop it wouldn't look like an upward scroll, the view would stay pinned, and new messages would pull the
   // reader back down instead of counting as unread.
   const scrollToEnd = (node: HTMLElement) => { node.scrollTop = node.scrollHeight; lastTop.current = node.scrollTop; };
   const toBottom = useCallback(() => {
-    pinned.current = true; setUnread(0);
+    pinned.current = true; setUnread(0); setFollowing(true);
     if (element.current) scrollToEnd(element.current);
   }, []);
   const ref = useCallback((node: HTMLElement | null) => {
@@ -178,10 +184,11 @@ export function useStickToBottom(threshold = 80) {
     if (up && distance > 1) pinned.current = false;
     else if (distance < threshold) pinned.current = true;
     if (pinned.current) setUnread(0);
+    setFollowing(pinned.current);
   }, [threshold]);
   /** Your own message always shows; others' are counted while the reader is scrolled up. */
   const arrived = useCallback((own: boolean) => { if (own) toBottom(); else if (!pinned.current) setUnread(count => count + 1); }, [toBottom]);
-  return { ref, onScroll, toBottom, arrived, unread };
+  return { ref, onScroll, toBottom, arrived, unread, following };
 }
 
 /** Sizes a textarea to its content; its CSS max-height caps the growth, after which it scrolls. */
@@ -255,6 +262,8 @@ export function TaskBoard({ room, viewerId, disabled, onClose, actions, highligh
   }
   // A pasted issue or pull request link becomes a task linked to it; its title can be edited after.
   const pastedIssue = repositories ? issueLinkFrom(title) : undefined, tooLong = !pastedIssue && title.trim().length > 120;
+  // A bare `#42` in the title links that issue when the room pins one repository (taskBody does the linking).
+  const titleIssue = pastedIssue || tooLong ? undefined : issueFromTitle(title, repositories);
   async function submit(event: React.FormEvent) {
     event.preventDefault(); if (!title.trim() || busy || tooLong) return; setBusy(true);
     const draft = pastedIssue ? { title: issueLabel(pastedIssue), issue: pastedIssue } : { title: title.trim() };
@@ -267,11 +276,11 @@ export function TaskBoard({ room, viewerId, disabled, onClose, actions, highligh
       <button className="icon-button" aria-label="Close tasks" onClick={onClose}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6" /></svg></button></div>
     <form className="task-add" onSubmit={submit}>
       <label className="sr-only" htmlFor="task-title">New task</label>
-      <input id="task-title" value={title} onChange={e => setTitle(e.target.value)} placeholder={repositories ? 'Add a task, or paste an issue link…' : 'Add a task…'} maxLength={repositories ? 200 : 120} aria-describedby={pastedIssue || tooLong ? 'task-title-hint' : undefined} />
+      <input id="task-title" value={title} onChange={e => setTitle(e.target.value)} placeholder={repositories ? 'Add a task, or paste an issue link…' : 'Add a task…'} maxLength={repositories ? 200 : 120} aria-describedby={pastedIssue || titleIssue || tooLong ? 'task-title-hint' : undefined} />
       <div><label className="sr-only" htmlFor="task-assignee">Assign to</label>
         <select id="task-assignee" value={assignee} onChange={e => setAssignee(e.target.value)}><option value="">Unassigned</option>{local.map(p => <option key={p.id} value={p.id}>{p.id === viewerId ? `${p.name} (you)` : p.name}{p.role === 'agent' ? ' · agent' : ''}</option>)}</select>
         <button className="primary" type="submit" disabled={disabled || busy || !title.trim() || tooLong}>{busy ? 'Adding…' : 'Add'}</button></div>
-      {(pastedIssue || tooLong) && <p className="task-add-hint" id="task-title-hint">{pastedIssue ? `Adds a task linked to ${issueLabel(pastedIssue)}.` : 'Keep task titles to 120 characters.'}</p>}
+      {(pastedIssue || titleIssue || tooLong) && <p className="task-add-hint" id="task-title-hint">{pastedIssue || titleIssue ? `Adds a task linked to ${issueLabel((pastedIssue || titleIssue)!)}.` : 'Keep task titles to 120 characters.'}</p>}
     </form>
     {tasks.length > 0 && <div className="board-filters" role="group" aria-label="Show tasks">{filters.map(f =>
       <button key={f.key} aria-pressed={active === f.key} onClick={() => setFilter(f.key)}>{f.label}<span>{openMatching(f.key)}<span className="sr-only"> open</span></span></button>)}</div>}

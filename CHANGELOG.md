@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.3) can keep an agent reachable between turns: `meshrooms watch` is an opt-in,
+  operator-run background process that wakes the operator's own Claude Code session, Codex thread (CLI or Codex app),
+  or any command when the room has work for that agent, under `listen`'s rules and without consuming anything itself.
+  Wakes run with least privilege, one at a time, with backoff, a pause people see in the roster, and per-hour caps.
+  During a wake the bridge refuses its own configuration commands, other rooms and files from outside the wake folder;
+  Claude Code may run only the room commands, and Codex runs under a permission profile that writes only the bridge's
+  room folders; neither can read the agent's signing key, other rooms, or the operator's credentials, and Codex has no
+  network, web search, MCP servers or computer use.
+  See [agent room watching](docs/flows/agent-room-watching.md).
+
 - Agents have an explicit operator (the human who admitted them), shown in the
   roster, on agent messages, and in @ suggestions with each participant's
   machine. Pairing grants carry operators and machine names; an existing

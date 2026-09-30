@@ -74,7 +74,7 @@ export function mentionSegments(text: string, participants: Pick<Participant, 'i
 /** `agentAssignmentsWake`: a host setting in browser rooms that lets an agent's assignment wake another agent. */
 type RoomView = { floor?: Floor; messages: Message[]; participants: Pick<Participant, 'id' | 'role' | 'operatorId' | 'wake'>[]; tasks?: Task[]; agentAssignmentsWake?: boolean };
 
-/** A message addresses a participant by mentioning them or by replying to one of their messages. */
+/** A message addresses a participant by mentioning them or by replying to one of their messages, on either floor. */
 export function addresses(message: Message, participantId: string, messages: Message[]): boolean {
   if (message.authorId === participantId) return false;
   if (message.mentions?.includes(participantId)) return true;
@@ -82,22 +82,37 @@ export function addresses(message: Message, participantId: string, messages: Mes
 }
 
 const roleOf = (room: RoomView, id: string | undefined) => room.participants.find(p => p.id === id)?.role;
-/** An agent set to operator-only wakes solely for its operator; otherwise any person may wake it. */
+/**
+ * An agent set to operator-only wakes solely for its operator; otherwise any person may wake it. The operator's
+ * messages still follow `wakes`: a reply to someone else is for them, so it wakes the agent only if it names it.
+ */
 function mayWake(room: RoomView, agentId: string, authorId: string | undefined): boolean {
   const agent = room.participants.find(p => p.id === agentId);
   return agent?.wake !== 'operator' || (!!agent.operatorId && agent.operatorId === authorId);
 }
 
 /**
- * Whether a message should wake an agent under the room's floor policy. Agents never wake themselves. A message that
- * mentions someone addresses only the agents it mentions (`@agents` mentions them all) and the author of the message it
- * replies to, on either floor. On an open floor, a person's message that mentions nobody addresses every agent.
+ * Whether a message should wake an agent under the room's floor policy. Agents never wake themselves. A message addresses
+ * the agents it mentions (`@agents` mentions them all) and the author of the message it replies to, on either floor.
+ * On an open floor, a person's message that neither mentions anyone nor replies to anything addresses every agent. A
+ * reply is never that broadcast, not even when the message it replies to is gone from this snapshot: it was for that
+ * message's author, so it wakes nobody else.
  */
 export function wakes(room: RoomView, message: Message, agentId: string): boolean {
   if (message.authorId === agentId || !mayWake(room, agentId, message.authorId)) return false;
-  if ((room.floor ?? DEFAULT_FLOOR) === 'open' && message.role === 'human' && !message.mentions?.length) return true;
+  if ((room.floor ?? DEFAULT_FLOOR) === 'open' && message.role === 'human' && !message.mentions?.length && !message.replyTo) return true;
   if ((room.floor ?? DEFAULT_FLOOR) === 'humans-first' && message.role !== 'human') return false;
   return addresses(message, agentId, room.messages);
+}
+
+/**
+ * Whether something another member started, other than a message (a decision that asks agents), may wake this agent:
+ * the same author rules as a message. Never itself, only its operator when it is operator-only, and in humans-first
+ * rooms only a person.
+ */
+export function authorWakes(room: RoomView, agentId: string, authorId: string): boolean {
+  if (authorId === agentId || !mayWake(room, agentId, authorId)) return false;
+  return (room.floor ?? DEFAULT_FLOOR) === 'open' || roleOf(room, authorId) === 'human';
 }
 
 /**

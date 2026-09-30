@@ -53,23 +53,58 @@ export async function read<T>(key: string): Promise<T | undefined> {
   const store = (await transaction('readonly')).objectStore('records');
   return new Promise((resolve, reject) => { const r = store.get(key); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
 }
+/**
+ * Ownership of a room's records in this browser. Whoever takes a room's connection increments the room's epoch
+ * (claimFence) and writes with it; a fenced write checks the stored epoch in its own transaction and aborts, writing
+ * nothing, once someone else has claimed the room since. So an owner that lost the room (a frozen tab whose lock was
+ * taken) can never write an older copy over the new owner's.
+ */
+export type Fence = { key: string; epoch: number };
+/** A fenced write found that another owner holds the room now; nothing was written. */
+export class FenceError extends Error { override name = 'FenceError'; }
 /** Several puts and deletes in one transaction; a failure is reported to onStorageProblem and rejects with StorageError. */
-async function save(puts: [string, unknown][], deletes: string[] = []) {
+async function save(puts: [string, unknown][], deletes: string[] = [], fence?: Fence) {
   let tx: IDBTransaction;
   try { tx = await transaction('readwrite'); } catch { const error = failure(undefined); report(error.message); throw error; }
+  let fenced = false;
   return new Promise<void>((resolve, reject) => {
     tx.oncomplete = () => { report(undefined); resolve(); };
-    tx.onabort = tx.onerror = () => { const error = failure(tx.error); report(error.message); reject(error); };
+    tx.onabort = tx.onerror = () => {
+      // Losing the room is not a storage problem: the new owner saves.
+      if (fenced) { reject(new FenceError('This room was opened in another tab of this browser.')); return; }
+      const error = failure(tx.error); report(error.message); reject(error);
+    };
     try {
       const store = tx.objectStore('records');
-      for (const [key, value] of puts) store.put(value, key);
-      for (const key of deletes) store.delete(key);
+      const apply = () => {
+        for (const [key, value] of puts) store.put(value, key);
+        for (const key of deletes) store.delete(key);
+      };
+      if (!fence) { apply(); return; }
+      // Read and write in one transaction: no other write can commit between the check and these puts.
+      const check = store.get(fence.key);
+      check.onsuccess = () => {
+        if (check.result === fence.epoch) { try { apply(); } catch { tx.abort(); } return; }
+        fenced = true; tx.abort();
+      };
     } catch { try { tx.abort(); } catch { /* Already finished; onabort or onerror reports it. */ } }
   });
 }
-export function write(key: string, value: unknown) { return save([[key, value]]); }
+export function write(key: string, value: unknown, fence?: Fence) { return save([[key, value]], [], fence); }
 /** Several puts and deletes in one transaction, so a file and its index entry change together. */
-export function update(puts: [string, unknown][], deletes: string[] = []) { return save(puts, deletes); }
+export function update(puts: [string, unknown][], deletes: string[] = [], fence?: Fence) { return save(puts, deletes, fence); }
+/** Take ownership of a room's records: the next epoch, which every earlier owner's fenced writes now fail against. */
+export async function claimFence(key: string): Promise<Fence> {
+  const tx = await transaction('readwrite');
+  return new Promise<Fence>((resolve, reject) => {
+    let epoch = 0;
+    tx.oncomplete = () => resolve({ key, epoch });
+    tx.onabort = tx.onerror = () => reject(failure(tx.error));
+    const store = tx.objectStore('records');
+    const current = store.get(key);
+    current.onsuccess = () => { epoch = (typeof current.result === 'number' ? current.result : 0) + 1; store.put(epoch, key); };
+  });
+}
 /**
  * Ask the browser to keep this site's storage (identity keys, history, outbox) under storage pressure. Called once the
  * person has joined a room; a browser that declines (or has no such API) is left alone, with nothing shown.

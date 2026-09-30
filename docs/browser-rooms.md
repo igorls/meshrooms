@@ -70,6 +70,103 @@ served by this runtime; private admission data must never be in the web root.
   propagation requires coordination connectivity; this is not an offline revocation
   protocol. A removed device can deliberately request fresh admission.
 
+## Background rooms and unread counts
+
+While any Meshrooms tab is open, the browser also stays connected to the person's
+other rooms, so their messages arrive peer to peer as usual and the room list shows
+real unread counts. The room service sees the same status polls it always does,
+less often, and nothing about messages: there are no server-side unread hints.
+
+- **One leader per browser profile.** Every tab queues for the `meshrooms-background`
+  Web Lock; the holder connects to the joined rooms no tab shows. When it closes, the
+  next tab in the queue takes over. A leader hidden for two minutes hands over to a
+  visible tab, since hidden tabs' timers are throttled first.
+- **One connection per room.** A profile is one device, and the service keeps one
+  session per device and room. `meshrooms-room:<id>` is still the one-tab-per-room
+  lock; `meshrooms-connection:<id>` is held by whoever runs the room's connection. A
+  tab opening a room takes the room lock, tells the leader over a BroadcastChannel,
+  and waits for the connection lock. The leader stops that room, waits for its
+  IndexedDB writes to finish and releases it; the tab loads the stored history and
+  connects with its own session. Peers retry unconfirmed messages, so a message sent
+  during the switch arrives once the tab is connected. The leader also checks the held
+  locks every 2 s, so a tab that closes gives its room back to the background within
+  a few seconds. A leader that doesn't answer within 10 s (a frozen tab) has the
+  connection lock taken from it.
+- **Fenced writes.** Each room's records carry an ownership epoch in IndexedDB
+  (`owner:<device>:<room>`). Whoever takes the connection lock increments it, and every
+  write of that room's records (history, receipts, board, decisions, reactions, files,
+  read position) checks the epoch in the same transaction and aborts, writing nothing,
+  if another owner has claimed the room since. So a frozen leader that wakes after its
+  lock was taken can't write an older copy of the history over the new owner's: its
+  writes fail, it sends no storage receipt, and the sender delivers the message to the
+  new owner instead. (Merging by message id was the alternative, but a merge can bring
+  back messages the new owner evicted from the rolling window and can't undo a board or
+  reaction compaction; fencing makes the stale write not happen at all.)
+  - Claims are made only while holding the connection lock, so a tab taking a room
+    over always claims after the owner it replaces. An engine without a claim writes
+    nothing.
+  - The first fenced-out write stops the engine, whatever it was writing, and it
+    downloads no more files. A foreground tab stops polling and shows "This room is
+    open in another tab. Reload to use it here." with a **Reload** button.
+  - A background room that ends this way, or whose storage fails, is started again
+    after 5 s, doubling up to two minutes while it keeps failing.
+  - One edge remains: a leader frozen between being granted the lock and claiming,
+    whose lock is then taken, claims when it wakes and fences out the tab that took
+    over. Nothing is lost: that tab stops with the Reload notice, and reloading claims
+    the room again.
+- **Stored like any other message.** Background rooms run the same engine: history,
+  receipts, the board, decisions, reactions and files are stored in IndexedDB, so
+  opening the room shows them at once, without downloading them again.
+- **Limits.** Background rooms poll every 6 s instead of 1.5 s. It can't be much
+  slower: the service reports a device online only within 10 s of its last poll, and
+  peers drop the connection of a device that isn't online. Polls are spaced from start
+  to start, so a slow connection setup doesn't stretch the gap. At most 10 rooms are
+  held in the background, the most recently opened in this browser; rooms past that
+  show no count until they are among the 10 again. A 429 answer backs off 30 s, then
+  up to a minute.
+- **Hidden tabs.** When every Meshrooms tab has been hidden for five minutes, the
+  background rooms disconnect until one is visible again. Their counts stay as they
+  were, and messages sent meanwhile arrive when they reconnect. Five minutes also
+  matches Chrome's intensive throttling of hidden pages. The foreground room keeps
+  polling as before.
+- **Rate budget.** Per browser profile: a foreground room is 40 polls a minute and a
+  full background 10 × 10 = 100, so 140 a minute, 58 % of the 240 per address on
+  loopback and 12 % of the 1,200 behind the proxy. Each further tab showing a room adds
+  40 and takes one room out of the background (−10). Connection setup adds one `signal`
+  request per side per connection. Everyone behind one IPv4 address shares its budget:
+  behind the proxy that is about 8 people with a full background each (1,200 ÷ 140),
+  against about 30 with a foreground tab only (1,200 ÷ 40).
+- **Idle expiry.** A background poll counts as opening the room, so a room held in the
+  background doesn't idle-expire while any Meshrooms tab of a member is open.
+- **Unread counts** are per device and room. A room's read position is the last
+  message read, kept in IndexedDB; a message counts as read when its room is open in
+  a visible tab and the conversation is scrolled to the end. Unread is the messages by
+  others after that position; mentions are the ones that @mention you or reply to one
+  of your messages. On the first run the position starts at the newest stored message,
+  so older history isn't counted; if the rolling window evicted the read message,
+  everything stored counts. The tab holding a room's connection publishes its count
+  through localStorage for the other tabs.
+- **What people see.** The room list shows a count per room, in the accent with an @
+  when some are for you, read out as "3 unread, 1 mention"; the open room shows none.
+  The tab title is `(N) <room> · Meshrooms`, N being everything unread in the other
+  rooms. On phones the "Your rooms" link carries the total, and the room list on the
+  start page shows each room's count.
+- **Waiting to join.** Background polls count as the host being online, so a guest
+  sees "Waiting for approval". The host's browser therefore shows it too: room status
+  lists pending requests (people, companion devices, guests' agents) to the host, and
+  a room they host shows an amber badge with a person and the number waiting, read out
+  as "1 waiting to join". The tab title spells it out, `(3 · 1 waiting)`, rather than
+  adding it to N: admitting is a different action from reading, and requests expire
+  after ten minutes. Each tab announces a new request once ("Casey asked to join
+  Design review", with **Open room**), and several at once queue behind each other;
+  the requester's name is shown as plain text. A waiting list is live information:
+  its owner rewrites it at least every 5 s while anyone waits, readers ignore one older
+  than 15 s, and a tab that stops holding a room clears it, so a new tab never
+  announces a request from a closed tab or an earlier session. Counts are read only for
+  room ids shaped like room links.
+
+Agents are unaffected: bridges keep their own connections.
+
 ## Room lifecycle and invite codes
 
 - **Creating rooms** needs an invite code when the service requires one (the hosted
@@ -129,7 +226,7 @@ their previous behavior (off) until the host changes it.
 
 The service logs one JSON line per lobby command (action, status, duration in ms and a
 request id; status polls answered 200 or 410 are not logged, since open tabs poll
-every 1.5 s and tabs left on a closed room keep polling until reloaded) and one per server error with its
+every 1.5 s, background rooms every 6 s, and tabs left on a closed room keep polling until reloaded) and one per server error with its
 message and stack. Lines never contain payloads, SDP, keys, invite codes, room ids
 or client addresses. A 500 response carries the same `requestId`.
 
@@ -171,6 +268,16 @@ bunx playwright install chromium   # add --with-deps on a fresh Linux machine
 MESHROOMS_BROWSER_PORT=14330 MESHROOMS_BROWSER_DATA="$(mktemp -d)" bun run server/browser/main.ts &
 node scripts/browser-room-smoke.mjs
 ```
+
+`scripts/browser-background-smoke.mjs` checks background rooms and unread counts with
+two profiles in two shared rooms: a badge for the other room, the mention style and
+tab title, stored history on opening it, one leader and one session per room across
+two tabs, leader handover on close, a foreground takeover with no lost message, and,
+with a third profile asking to join, the waiting badge, title and notice for a room
+its host holds in the background.
+CI runs it against its own coordinator on port 14331 (set
+MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14331), so the two checks don't share a
+rate limit window.
 
 MESHROOMS_PLAYWRIGHT_MODULE can point to an already installed Playwright package.
 MESHROOMS_BROWSER_TEST_ORIGIN selects a different loopback test origin. With a

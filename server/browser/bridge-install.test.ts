@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { agentCli, isRunnerCommand } from '../agent-cli';
 import { BRIDGE_VERSION, BridgeTooOld, MANIFEST, assertPrivateDir, binDir, bunTooOld, busyOnWindows, checkBridgeVersion, compareVersions, installBridge, launcherSource, runningBundle } from '../agent-install';
@@ -57,6 +57,27 @@ test('the bridge installs under the home folder on every OS, never the current f
   // From source, runners run the source; a built bundle installs itself first.
   expect(runningBundle('/repo/server/agent-install.ts')).toBeUndefined();
   expect(runningBundle('/home/jane/.bun/install/cache/meshrooms/bin/meshrooms.js')).toBe('/home/jane/.bun/install/cache/meshrooms/bin/meshrooms.js');
+});
+
+test('an intact install writes nothing, so the bin folder need not be writable, and a changed launcher is put back', () => {
+  const dir = testDirectory('bridge-install-intact');
+  try {
+    const bin = join(dir.path, 'bin'), bundle = join(dir.path, 'bundle.js');
+    writeFileSync(bundle, 'export async function main() {}\n');
+    const first = installBridge(bundle, '0.2.0-beta.3', bin);
+    const manifest = statSync(join(bin, MANIFEST)).mtimeMs, launcher = statSync(first.launcher).mtimeMs;
+    // The install lock can't be taken now: an install that wrote anything would have to wait for it.
+    mkdirSync(join(bin, 'install.lock'));
+    expect(installBridge(bundle, '0.2.0-beta.3', bin)).toEqual(first);
+    expect(statSync(join(bin, MANIFEST)).mtimeMs).toBe(manifest);
+    expect(statSync(first.launcher).mtimeMs).toBe(launcher);
+    expect(readdirSync(bin).filter(f => f.endsWith('.tmp'))).toEqual([]);
+    // A launcher that no longer matches is not trusted: the next install writes it again before anything starts from it.
+    rmSync(join(bin, 'install.lock'), { recursive: true });
+    writeFileSync(first.launcher, 'console.log("changed");\n');
+    installBridge(bundle, '0.2.0-beta.3', bin);
+    expect(readFileSync(first.launcher, 'utf8')).toBe(launcherSource('0.2.0-beta.3', createHash('sha256').update(readFileSync(bundle)).digest('hex')));
+  } finally { dir.cleanup(); }
 });
 
 test('installing keeps a versioned copy and a launcher that never moves back to an older version', async () => {
@@ -252,7 +273,7 @@ test('the built bridge connects without writing into the current folder, and its
   const dir = testDirectory('bridge-connect'), server = fakeRoom(MIN_AGENT_VERSION, CURRENT_AGENT_VERSION), room = crypto.randomUUID();
   const project = join(dir.path, 'project'), cache = join(dir.path, 'bunx-cache'), bin = join(dir.path, 'bin');
   mkdirSync(project);
-  const env = { ...process.env, MESHROOMS_AGENT_HOME: join(dir.path, 'agents'), MESHROOMS_BIN_DIR: bin };
+  const env = { ...process.env, MESHROOMS_AGENT_HOME: join(dir.path, 'agents'), MESHROOMS_BIN_DIR: bin, MESHROOMS_AGENT_REGISTRY: join(dir.path, 'agent-homes.json') };
   const run = async (script: string, args: string[]) => {
     const child = Bun.spawn([process.execPath, script, ...args], { cwd: project, env, stdout: 'pipe', stderr: 'pipe' });
     const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);

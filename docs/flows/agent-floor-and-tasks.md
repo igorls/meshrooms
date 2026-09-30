@@ -19,7 +19,7 @@ Each room has a `floor`, which only the local human can change (Agents reply →
 
 | | `humans-first` (default) | `open` |
 | --- | --- | --- |
-| Wakes an agent | A person's `@Name`, a person's `@agents`, a person's reply to the agent's message, or a person assigning the agent a task | A person's message that mentions nobody; otherwise, like another agent's message, only one that mentions this agent (`@Name`, `@agents`) or replies to it; any assignment |
+| Wakes an agent | A person's `@Name`, a person's `@agents`, a person's reply to the agent's message, or a person assigning the agent a task | A person's message that mentions nobody and replies to nothing; otherwise, like another agent's message, only one that mentions this agent (`@Name`, `@agents`) or replies to it; any assignment |
 | Agent may send | A reply (`replyTo`) to a message that woke it, or anything while it holds an open task a person assigned | Anything |
 
 An agent's own messages never wake it. Another agent's message never wakes it
@@ -32,6 +32,21 @@ still names every agent, and a reply still addresses the author of the message
 it replies to. Mentioning only a person wakes no agent. Bridges older than
 0.2.0-beta.2 keep the old rule; the rule lives in `wakes` (`src/collab.ts`),
 which the bridge's `listen` and the local node share.
+
+A reply is addressed the same way: a person's reply to an agent's message wakes
+that agent and anyone the reply mentions, not every agent, even on an open
+floor. A reply to a person's message wakes no agent unless it mentions one.
+Only a person's message that mentions nobody and replies to nothing is the open
+floor's broadcast. (An agent's reply to another agent's message wakes that agent
+only on an open floor, as any agent message does.) This rule came in 0.2.0-beta.3.
+Earlier bridges woke every agent for a person's reply that named nobody, so the
+other agents each spent a turn on a message meant for one of them; the join
+guide and the skill tell agents on those bridges to check `mentions` and
+`replyTo` before answering.
+
+Thread follow-ups change with it: a person replying to someone else's
+"@Wren do X" without naming Wren no longer wakes Wren on an open floor, as on a
+humans-first one. Mention the agent to include it.
 
 Enforcement lives in the node (`LocalNode.send`), not only in the skill: a
 harness that ignores its instructions still cannot post unprompted. The
@@ -66,6 +81,12 @@ The operator chooses who can wake each of their agents, per room:
 | Anyone (default) | Any person under the room's floor rules |
 | Only me | Only the operator's own mentions, replies, and task assignments |
 
+"Replies" means the operator's replies to the agent's own messages. An
+operator's reply to another person or another agent is talking to them and does
+not wake an operator-only agent, on either floor, so the agent may not answer
+it either; the operator names the agent to bring it in. On an open floor the
+operator's messages that mention nobody and reply to nothing still wake it.
+
 The setting is enforced where the agent runs: an operator-only agent's node
 rejects its replies to anyone else, just as it rejects unprompted messages. Each
 node controls only its own agents, so the setting of a remote agent is not
@@ -89,8 +110,9 @@ assignments do not wake the agent (compatible with older callers).
 
 ### Hosted rooms: listen remembers
 
-In hosted browser rooms, `bun "<launcher>" listen --room R --wait-seconds 60` is
-the whole loop. Agents that had to carry three cursors (`--after`,
+In hosted browser rooms, `bun "<launcher>" listen --room R --wait-seconds 540` is
+the whole loop, run under a harness command timeout longer than the wait (600 s
+for 540 s) so the harness doesn't kill it mid-wait. Agents that had to carry three cursors (`--after`,
 `--board-after`, `--decisions-after`) missed assignments and decisions when a
 loop dropped one, so the bridge keeps them in the agent's room folder
 (`listen-cursor.json`, written atomically) and wakes on everything by default.
@@ -137,6 +159,45 @@ remove tasks.
   assigned it and at which board revision; that is what wakes the assignee.
 - Assignees must be participants on this machine. In paired rooms the board is
   local to each node and is not replicated; the UI says so.
+
+### Issue links (hosted rooms)
+
+A task in a hosted browser room can link one GitHub issue or pull request:
+`task-add`/`task-update --issue <link>|owner/name#42` (`--issue none` unlinks),
+`task-issue`, `issue-task`, or pasting a link into the board. People pin the
+room's repositories in Room details.
+
+**Auto-linking.** When the room pins exactly one repository, a task created
+with a bare `#42` in its title, or retitled to one, links
+`https://github.com/<owner>/<name>/issues/42` (GitHub forwards it when 42 is a
+pull request). So `task-add --title '#42 Review the contract'` in a room that
+pins `example/app` links `example/app#42`, and the board shows it like any other
+link. The rules (`issueFromTitle` and `taskBody` in `src/browser/board.ts`):
+
+- With no pinned repository, or several, `#42` is ambiguous and nothing is linked.
+- The first reference in the title counts. `owner/name#42` (use `--issue` for
+  another repository), `#42abc`, `a#42`, a `#` inside a web link, `#0` and
+  numbers over 9 digits are not references.
+- It never overrides a person or agent: a change that sets `--issue` itself,
+  including `--issue none`, wins, and a task that already links something keeps
+  it.
+- A retitle links only a reference its old title did not have. After someone
+  unlinks a task, renaming it with the same `#42` keeps it unlinked; a
+  different reference links that one.
+- Only new changes are linked; existing tasks are not migrated, and a change
+  that does not touch the title (status, assignee, notes) links nothing.
+
+The link is decided where the change is signed (the browser, or the agent's
+bridge, from the room's pinned repositories), so it is part of the signed
+operation and every device folds the same board. The browser's add form says
+"Adds a task linked to …" before it happens.
+
+**In the conversation.** In a room that pins exactly one repository, a bare
+`#42` in a message renders as a link to that issue (`parseMarkdown`'s
+`issueRepository` in `src/markdown.ts`), with the same safe-link rules as any
+other link. Code spans, code blocks, existing links, URLs and headings are left
+alone, and `\#42` stays text. Only the rendering changes: stored messages are
+untouched, so pinning a second repository turns these links off again.
 
 ## Not yet
 

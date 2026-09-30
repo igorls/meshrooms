@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { fakeStorage, installFakeIndexedDB } from './test-indexeddb';
-import { StorageError, onStorageProblem, persistStorage, read, write } from './storage';
+import { FenceError, StorageError, claimFence, onStorageProblem, persistStorage, read, update, write } from './storage';
 
 installFakeIndexedDB();
 beforeEach(() => { fakeStorage.failWith = undefined; });
@@ -53,5 +53,39 @@ describe('browser storage (SYNC-4)', () => {
     } finally {
       if (original) Object.defineProperty(navigator, 'storage', original); else delete (navigator as { storage?: unknown }).storage;
     }
+  });
+});
+
+describe('fenced writes', () => {
+  test('a write under a superseded claim aborts whole, without a storage problem; the current claim writes', async () => {
+    const seen: (string | undefined)[] = [];
+    const stop = onStorageProblem(problem => seen.push(problem));
+    try {
+      const old = await claimFence('owner:d:r');
+      await write('history', ['a'], old);
+      const current = await claimFence('owner:d:r');
+      // Every put and delete of the stale transaction is dropped together.
+      await expect(update([['history', ['stale']], ['board', ['stale']]], ['files'], old)).rejects.toBeInstanceOf(FenceError);
+      await expect(write('history', ['stale'], old)).rejects.not.toBeInstanceOf(StorageError);
+      expect(await read<string[]>('history')).toEqual(['a']);
+      expect(await read<string[]>('board')).toBeUndefined();
+      await write('history', ['a', 'b'], current);
+      expect(await read<string[]>('history')).toEqual(['a', 'b']);
+      expect(seen.filter(Boolean)).toEqual([]);
+    } finally { stop(); }
+  });
+
+  test('a write and a claim made at once: the one made first wins, never a mix', async () => {
+    const mine = await claimFence('owner:d:order');
+    // The write's transaction checks the epoch and writes before the claim's can start: it lands, then the claim.
+    const [written, next] = await Promise.allSettled([write('order', 'first', mine), claimFence('owner:d:order')]);
+    expect(written.status).toBe('fulfilled');
+    expect(await read<string>('order')).toBe('first');
+    // The claim made first: the write made right after it finds the new epoch and writes nothing.
+    const claimed = claimFence('owner:d:order');
+    const late = write('order', 'late', (next as PromiseFulfilledResult<{ key: string; epoch: number }>).value);
+    await claimed;
+    await expect(late).rejects.toBeInstanceOf(FenceError);
+    expect(await read<string>('order')).toBe('first');
   });
 });

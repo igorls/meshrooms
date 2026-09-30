@@ -119,10 +119,16 @@ while IFS= read -r line || [[ -n $line ]]; do
   rm -rf "${tree:?}/${path%/}"
   exclude_count=$((exclude_count + 1))
   top=${path%%/*}; [[ $path == */* ]] && top=$top/
-  [[ " ${exclude_tops[*]} " == *" $top "* ]] || exclude_tops+=("$top")
+  # Dedupe the top-level rules already seen. The guard short-circuits on an empty array so
+  # bash 3.2 with `set -u` never expands it before it holds anything; `&&` (not `||`) so an
+  # empty list still takes the append — inverting this silently produces an empty list, which
+  # is exactly the bug CI caught: bash 5 produced `under ``` with no directories named.
+  [[ ${#exclude_tops[@]} -gt 0 && " ${exclude_tops[*]} " == *" $top "* ]] || exclude_tops+=("$top")
 done < "$excludes"
 [[ ! -e $tree/internal ]] || fail "internal/ is still in the tree; $excludes must list it"
-mapfile -t links < <(cd "$tree" && find . -type l | sed 's|^\./||')
+# Bash 3.2 (macOS) needs the array declared before `${#links[@]}` is read under `set -u`.
+links=()
+while IFS= read -r link; do links+=("$link"); done < <(cd "$tree" && find . -type l | sed 's|^\./||')
 ((${#links[@]} == 0)) || fail "the tree holds symbolic links, which the export refuses: ${links[*]}"
 
 # The privacy gate: private terms from this checkout, built-in patterns, gitleaks.
@@ -135,7 +141,9 @@ set -e
 printf '%s\n' "$gate_output" >&2
 ((gate_status == 0)) || fail "the exported tree failed the privacy gate (exit $gate_status); nothing was exported"
 gate_summary=$(printf '%s\n' "$gate_output" | grep '^check-public: [0-9]' | head -n 1)
-mapfile -t binaries < <(bun "$gate" --tree "$tree" --list-binaries | tr -d '\r' | sed 's/^ *[0-9]*  //')
+# Bash 3.2 (macOS) has no mapfile: read the list line by line instead.
+binaries=()
+while IFS= read -r binary; do binaries+=("$binary"); done < <(bun "$gate" --tree "$tree" --list-binaries | tr -d '\r' | sed 's/^ *[0-9]*  //')
 
 # Manifest: compare per-file hashes with the previous snapshot. Paths are relative to tree/ only.
 hash_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
