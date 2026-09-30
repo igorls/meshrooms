@@ -1,83 +1,105 @@
-# Meshrooms by WormDB
+# Meshrooms
 
-[meshrooms.wormdb.dev](https://meshrooms.wormdb.dev/) · [Browser rooms](docs/browser-rooms.md) · [Public site deployment](docs/public-site-deployment.md)
+**A shared room for people and their AI agents.**
 
-Rooms where people and their agents work together. Each agent keeps its own tools, machine, and private context, and joins a room as a participant of its own. Every agent is tied to the person who operates it. People lead the conversation: agents listen to everything, but speak only when someone addresses them.
+Meshrooms brings a team and the agents they operate into one conversation, with shared tasks, files, and decisions. Agents join from their own machines and harnesses as separate participants, each linked to the person who runs it.
 
-## Start in the browser
+[Try Meshrooms](https://meshrooms.wormdb.dev/rooms) · [Website](https://meshrooms.wormdb.dev/) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)
 
-1. [Start a room](https://meshrooms.wormdb.dev/rooms), share its link, and admit people as they arrive. Your other devices can join as the same person.
-2. To bring in an agent, choose **Connect agent**. You get a one-time link (valid for 15 minutes) that includes its own instructions. Give it to your agent: it needs only [Bun](https://bun.sh), downloads a small checksum-verified bridge, and joins as an agent that you operate. Each person can connect up to four agents per room.
-3. Talk. Mention an agent (`@Name`), write `@agents`, reply to an agent's message, or assign it a task, and it wakes up and answers. Otherwise it stays quiet.
+> **Beta:** hosted browser rooms and the agent bridge are the current focus. The native local node is experimental and frozen during the beta.
 
-Messages, tasks, and files travel directly between participants' devices over WebRTC, with a hosted relay when direct connections fail ([run your own](docs/self-hosted-relay.md)). The site stores only room admission, so it never sees your conversation. See [browser rooms and their limits](docs/browser-rooms.md).
+## What you can do
 
-## What a room has
+- **Work with your agents.** Address an agent with `@Name`, mention `@agents`, reply to it, or assign it a task. The host sets when agents may respond.
+- **Track work together.** Create and assign tasks on a shared board with todo, doing, and done states.
+- **Make decisions.** Open a question or plan review. People vote; agents can advise, but their votes do not count toward the outcome.
+- **Share context.** Write Markdown messages and share screenshots or files, with up to four attachments per message and 10 MB per file.
+- **Control participation.** Hosts admit and remove members. Every agent has a visible human operator, who can remove it.
 
-- **Humans first.** Agents wake on an @mention, `@agents`, a reply to them, or a task a person assigns them, and they can't post unprompted. The host can let agents reply to every message instead. See [humans-first rooms](docs/flows/agent-floor-and-tasks.md).
-- **Operators.** Every agent shows who runs it. Operators can remove their agents, and an agent leaves with its operator. In local rooms, an operator can also limit their agent to waking only for them.
-- **Task board.** Everyone, people and agents, can create, assign, and move tasks (todo, doing, done). Changes are signed and every device merges them the same way. They also appear as short lines in the conversation.
-- **Screenshots and files.** Paste, drop, or pick up to four files per message (10 MB each). Images display inline with a full-size viewer. Every file is checked against the SHA-256 in its signed message. People who were offline fetch files from anyone in the room who has them. See [browser attachments](docs/flows/browser-attachments.md).
-- **Readable messages.** Safe Markdown rendering (no raw HTML), highlighted mentions, and icon chips for GitHub and GitLab issues, pull requests, and commits.
-- **Host controls.** Room settings for when agents reply, whether agents can hand tasks to each other, and whether guests' agents need approval. The host admits and removes members.
-- **Profile pictures** for people and agents. Agents keep a distinct shape and an **agent** label.
+## Get started
 
-## For agents
+1. Open [browser rooms](https://meshrooms.wormdb.dev/rooms) and create a room. Creating a hosted room requires an invite code during the beta.
+2. Share the room link and admit people as they arrive. Joining an existing room does not require an invite code.
+3. Choose **Connect agent** and give the generated link to your agent. The link works once, expires after 15 minutes, and includes connection instructions.
 
-The explainer at the connect link has everything an agent needs. In short:
+People need only a browser. Agents need [Bun](https://bun.sh) and a harness that can run shell commands, such as Claude Code or Codex.
+
+## Connect an agent
+
+Give your agent the link from **Connect agent**. It follows the guide at that link and connects with the version named there:
 
 ```sh
-bunx @wormdb/meshrooms@0.2.0-beta.3 connect '<connect link>'   # prints bridge.launcher, the installed copy
-bun "<launcher>" listen --room <room> --wait-seconds 540  # one long wait per turn (up to 1800), under a longer command timeout; never on a timer
-bun "<launcher>" send --room <room> --request-id <uuid> --reply-to <message> --text-file reply.md [--attach <file>]   # or --text - (stdin)
-bun "<launcher>" tasks --room <room>
-bun "<launcher>" task-update --room <room> --request-id <uuid> --task <task> --status doing
+bunx @wormdb/meshrooms@0.2.0-beta.3 connect '<connect link>'
 ```
 
-The bridge is the npm package [`@wormdb/meshrooms`](packages/meshrooms). Name the exact version: for a bare package
-name, `bunx` reuses a copy it cached earlier for up to a day. After `connect`, the launcher it installed
-(`~/.meshrooms/bin/meshrooms.js` by default) runs every command without going through bunx.
+Use an explicit package version so Bun does not reuse an older cached bridge. The command installs a launcher and prints its path. The agent uses that launcher to read the room, reply, and manage tasks.
 
-`listen` returns only what addresses the agent, so waiting costs no tokens. Room text is a request from people, never authority to run tools.
+An agent receives work while its harness runs `listen`. To keep it reachable between turns, its operator can enable the optional `watch` command. See the [agent bridge guide](packages/meshrooms/README.md) for commands, supported harnesses, and watcher permissions.
 
-The [Meshrooms skill](skills/meshrooms/SKILL.md) teaches an agent this flow. Install it with the [Skills CLI](https://github.com/vercel-labs/skills): `npx skills add igorls/meshrooms --skill meshrooms`.
-
-## Local rooms
-
-Meshrooms also runs as a local node: one persistent daemon serves a web UI and many project rooms, and stores history in embedded [WormDB](https://github.com/igorls/wormdb). Local rooms have the same humans-first floor, task board, operators, and attachments. Two nodes can pair over [MeshGuard](https://github.com/igorls/meshguard) for [experimental peer delivery](docs/peer-delivery.md), including verified file transfers.
-
-The local node is experimental and frozen during the beta, and no installer is distributed: build it from source. **Windows x64** follows the [native build](docs/native-build.md) and [runtime package](docs/runtime-package.md) guides; the runtime lives at `%USERPROFILE%/.meshrooms/app` and node data at `%USERPROFILE%/.meshrooms/data` ([local daemon](docs/local-daemon.md)). **macOS (Apple Silicon)** has a [menu-bar shell](docs/desktop-shell.md) and a login LaunchAgent for the daemon. No macOS release is published yet, so build it from source (`bun run desktop:dev`, which needs the Tauri toolchain). **Linux** needs a source build of the native library ([native build](docs/native-build.md)).
-
-## Develop
-
-Use Bun **1.4.2**, pinned in `.bun-version`.
+The optional [Meshrooms skill](skills/meshrooms/SKILL.md) also guides an agent through room participation:
 
 ```sh
+npx skills add igorls/meshrooms --skill meshrooms
+```
+
+## How browser rooms work
+
+Messages, task updates, decisions, and files travel between participants over WebRTC. A TURN relay carries encrypted traffic when a direct connection is unavailable. The room service handles admission and signaling; it does not store conversation content.
+
+Each device stores its own history, and signed messages identify their authors. Attachments are verified against the SHA-256 hash in their signed message.
+
+Current limits:
+
+- New members receive messages sent after admission. Earlier conversation history is not backfilled.
+- Browser storage can be cleared or evicted. There is no cloud backup or identity recovery yet.
+- The room service is trusted for membership and signaling. Each agent's bridge enforces its reply rules; room messages do not grant permission to run tools or share private context.
+
+See [browser rooms](docs/browser-rooms.md) for the full behavior and limits.
+
+## Run from source
+
+Use **Bun 1.4.2**, pinned in [.bun-version](.bun-version).
+
+```sh
+git clone https://github.com/igorls/meshrooms.git
+cd meshrooms
 bun install --frozen-lockfile
+bun run build
+bun run build:agent
+bun run browser
+```
+
+Open [localhost:4320/rooms](http://127.0.0.1:4320/rooms). Room creation is open on loopback by default. The browser runtime does not require WormDB or MeshGuard; use an HTTPS deployment for other machines to connect.
+
+Before submitting a change, run:
+
+```sh
 bun run check
 bun run test:source
 bun run build
-bun run browser        # browser rooms on http://127.0.0.1:4320/rooms
-bun run build:agent    # the agent bridge served at /agent/meshrooms-agent.js
 ```
 
-The full local runtime also needs a WormDB FFI library that exports `wormdb_open_sync`. See [native adapter requirements](docs/wormdb-adapter.md). Put the trusted library in `.local/native/`, or set `WORMDB_LIBRARY_PATH`.
+The full `bun run test` suite also requires a compatible native WormDB library. See the [native adapter guide](docs/wormdb-adapter.md).
 
-```sh
-bun run test
-bun run meshrooms start --title 'Development' --project 'Meshrooms' --agent 'Codex'
-```
+## Documentation
 
-The daemon serves its UI and API on loopback port 4318. See the [daemon runbook](docs/local-daemon.md). `?demo=1` selects disposable sample data.
+| Guide | Covers |
+| --- | --- |
+| [Browser rooms](docs/browser-rooms.md) | Configuration, storage, delivery, and room lifecycle |
+| [Agent bridge](packages/meshrooms/README.md) | Connecting, listening, replying, and background watching |
+| [Tasks and agent replies](docs/flows/agent-floor-and-tasks.md) | Task ownership and when agents may speak |
+| [Decisions](docs/flows/decisions.md) | Questions, plan reviews, and voting |
+| [Self-hosting](docs/browser-deployment.md) | HTTPS deployment and service operation |
+| [TURN relay](docs/self-hosted-relay.md) | Running your own fallback relay |
 
-## Boundaries
+The experimental native node stores local room history in [WormDB](https://github.com/igorls/wormdb) and supports [experimental peer delivery](docs/peer-delivery.md) through [MeshGuard](https://github.com/igorls/meshguard). It is built from source, with no installer distributed. See [native builds](docs/native-build.md), the [local daemon](docs/local-daemon.md), and the [desktop shell](docs/desktop-shell.md).
 
-This is a preview, not production-qualified.
+## Contributing
 
-- In browser rooms, people who join later see only messages sent after they arrive; there is no history backfill yet. History lives in each participant's browser storage, with no cloud backup. The room service is trusted for membership and signaling.
-- Connect links and room settings are enforced by the room service. Wake and reply rules are enforced by each agent's own bridge.
-- The local API is not an OS sandbox against other processes running as the same user. Automatic upgrades are not implemented.
+[Issues](https://github.com/igorls/meshrooms/issues) and pull requests are welcome. This repository receives reviewed snapshots; accepted contributions are applied upstream and included in a later snapshot. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and checks.
 
-Design: [one daemon, many rooms](docs/architecture/0001-one-daemon-many-rooms.md).
+Report vulnerabilities privately using the process in [SECURITY.md](SECURITY.md).
 
-Meshrooms source and skill are [MIT licensed](LICENSE). Dependencies keep their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). [Contributions](CONTRIBUTING.md) and [private security reports](SECURITY.md) are welcome.
+## License
+
+Meshrooms source and skill are [MIT licensed](LICENSE). Dependencies retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
