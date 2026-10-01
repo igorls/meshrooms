@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -15,20 +15,25 @@ export type RuntimeRecord = {
 export function loadControlToken(dataDir: string): string {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const keyPath = join(dataDir, 'control.key');
-  if (existsSync(keyPath)) {
-    const existing = readFileSync(keyPath, 'utf8').trim();
-    if (existing.length >= 32) return existing;
-  }
+  const read = () => { try { const t = readFileSync(keyPath, 'utf8').trim(); return t.length >= 32 ? t : undefined; } catch { return undefined; } };
+  const existing = read();
+  if (existing) return existing;
+  // The key appears whole or not at all: it's written to a private temporary file and then hard-linked into place, which
+  // fails if another process got there first. Creating it in place ('wx' then write) left a moment where a second
+  // process starting at the same time read an empty key, failed to create its own and gave up.
   const token = randomBytes(32).toString('base64url');
+  const temporary = `${keyPath}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, token + '\n', { mode: 0o600, flag: 'wx' });
   try {
-    writeFileSync(keyPath, token + '\n', { mode: 0o600, flag: 'wx' });
+    linkSync(temporary, keyPath);
     return token;
   } catch (error: any) {
-    if (error?.code === 'EEXIST') {
-      const raced = readFileSync(keyPath, 'utf8').trim();
-      if (raced.length >= 32) return raced;
-    }
-    throw error;
+    if (error?.code !== 'EEXIST') throw error;
+    const raced = read();
+    if (raced) return raced;
+    throw new Error(`The control key at ${keyPath} is empty or damaged; remove it and start again.`);
+  } finally {
+    try { unlinkSync(temporary); } catch { /* Already gone. */ }
   }
 }
 
@@ -173,6 +178,10 @@ export async function ensureRunning(options: {
   port: number;
   daemonPath?: string;
   devOrigin?: string;
+  /** How long to wait for the started daemon to answer; a cold start on a busy machine can take seconds. */
+  readyTimeoutMs?: number;
+  /** Where the started process's output goes; by default it is discarded. Tests keep it to explain a start that failed. */
+  logFile?: string;
 }): Promise<RuntimeRecord> {
   const existing = await probeRuntime(options.dataDir);
   if (existing) {
@@ -192,17 +201,19 @@ export async function ensureRunning(options: {
     args.push('--dev-origin', options.devOrigin);
   }
 
+  const log = options.logFile ? openSync(options.logFile, 'a') : undefined;
   const child = spawn(process.execPath, args, {
     detached: true,
-    stdio: 'ignore',
+    stdio: log === undefined ? 'ignore' : ['ignore', log, log],
     windowsHide: true,
   });
+  if (log !== undefined) closeSync(log);
   let spawnError: Error | undefined;
   child.on('error', error => { spawnError = error; });
   child.unref();
 
   const startTime = Date.now();
-  const timeoutMs = 10000;
+  const timeoutMs = options.readyTimeoutMs ?? 10_000;
   const pollIntervalMs = 100;
 
   while (Date.now() - startTime < timeoutMs) {
@@ -214,5 +225,6 @@ export async function ensureRunning(options: {
     if (spawnError) throw new Error(`Could not start the Meshrooms runtime: ${spawnError.message}`);
   }
 
-  throw new Error(`Timed out waiting for Meshrooms daemon to become ready in ${options.dataDir} after 10 seconds.`);
+  const said = options.logFile ? (() => { try { return readFileSync(options.logFile!, 'utf8').trim().slice(-2_000); } catch { return ''; } })() : '';
+  throw new Error(`Timed out waiting for Meshrooms daemon to become ready in ${options.dataDir} after ${Math.round(timeoutMs / 1000)} seconds.${said ? `\nIts output:\n${said}` : ''}`);
 }

@@ -331,8 +331,45 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
   return mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'nothing in this room addressed the agent';
 }
 
-/** The runner rewrites this every second with its pid, so a command that can't inspect processes can still tell it runs. */
+/**
+ * The runner rewrites this every second with its pid, so a command that can't inspect processes can still tell it runs:
+ * `{ pid, at, startedAt, loopAt, polledAt?, failingSince?, failure?, syncedAt? }`.
+ * - `at`: the process is alive (its ticker runs).
+ * - `loopAt`: its loop last came round (reached the top of a pass, or had any outcome from its status poll). A pass is
+ *   bounded, so a loop that stops coming round is stuck, and only that counts against the runner.
+ * - `polledAt`: the room service last answered its status poll. `failingSince` and `failure`: the service has not
+ *   answered since then, and why. That is an outage or a rejection that replacing the runner can't fix (and killing it
+ *   would drop data channels that still work), so it is reported, never repaired.
+ * - `syncedAt`: a channel to another device first opened, or the room service said no other device is online, so
+ *   there is no history to wait for (set once; see startFromNow).
+ */
 export const RUNNER_ALIVE = 'runner-alive.json';
+/**
+ * A runner whose loop has not come round for this long is stuck, however fresh its proof of life: a pass takes at most
+ * about 24 s (an 11 s poll, a 12 s budget, a second's pause), so this is well past any pass. Whoever owns the runner then
+ * stops it and starts a fresh one.
+ */
+export const RUNNER_STUCK_MS = 60_000;
+/**
+ * How long the runner's loop has not come round, by its proof of life, never counted from before `since` (a command that
+ * just started or replaced it gives it its full time). Undefined when the proof doesn't say (a runner from before this
+ * was recorded), which is never taken for a stuck runner.
+ */
+export function stuckFor(proof: unknown, now = Date.now(), since = 0): number | undefined {
+  const loopAt = (proof as { loopAt?: unknown } | undefined)?.loopAt;
+  return typeof loopAt === 'number' ? now - Math.max(loopAt, since) : undefined;
+}
+export const runnerStuck = (proof: unknown, now = Date.now(), since = 0) => (stuckFor(proof, now, since) ?? 0) > RUNNER_STUCK_MS;
+/**
+ * Since when, and why, the room service has not answered the runner, by its proof; undefined while it answers. `status`:
+ * the HTTP status of the latest failure when the service did answer (a rejection, a rate limit, a server error); absent
+ * when the request itself failed or timed out.
+ */
+export function serviceSilence(proof: unknown): { since: number; failure?: string; status?: number } | undefined {
+  const p = proof as { failingSince?: unknown; failure?: unknown; failureStatus?: unknown } | undefined;
+  return typeof p?.failingSince === 'number' ? { since: p.failingSince, ...(typeof p.failure === 'string' ? { failure: p.failure } : {}),
+    ...(typeof p.failureStatus === 'number' ? { status: p.failureStatus } : {}) } : undefined;
+}
 /** Written by the runner when the room service answers 410 (the host closed the room, or the service removed it). */
 export const ROOM_CLOSED_FILE = 'room-closed.json';
 /**
@@ -347,17 +384,22 @@ const processGone = (pid: unknown) => {
   try { process.kill(pid as number, 0); return false; } catch (error) { return (error as { code?: string }).code === 'ESRCH'; }
 };
 /**
- * Whether the runner stopped while a command waited on it since `since`: its proof of life is older than RUNNER_STALE_MS,
- * or names a process that is gone. Before its first proof, a runner started just now gets RUNNER_STALE_MS from `since`.
+ * What is wrong with the runner a command waited on since `since`, if anything. 'stopped': its proof of life is older
+ * than RUNNER_STALE_MS, or names a process that is gone. 'stuck': it lives, but its loop has not come round for
+ * RUNNER_STUCK_MS. A room service that doesn't answer is neither (see serviceSilence). Before its first proof, a runner
+ * started just now gets RUNNER_STALE_MS from `since`.
  */
-export function runnerStopped(agent: BrowserAgent, since: number, now = Date.now()) {
+export function runnerTrouble(agent: BrowserAgent, since: number, now = Date.now()): 'stopped' | 'stuck' | undefined {
   const proof = readJson<{ pid?: unknown; at?: unknown } | undefined>(join(agent.dir, RUNNER_ALIVE), undefined);
   const at = typeof proof?.at === 'number' ? proof.at : 0, last = Math.max(at, since);
-  if (now - last > RUNNER_STALE_MS) return true;
+  if (now - last > RUNNER_STALE_MS) return 'stopped';
   // Only a proof from since onwards names the runner to check: an older one is the runner this one replaced, whose
   // process is gone by design while the new one starts up (bun, the version check) before its first proof.
-  return at >= since && now - last > RUNNER_GONE_MS && processGone(proof?.pid);
+  if (at >= since && now - last > RUNNER_GONE_MS && processGone(proof?.pid)) return 'stopped';
+  return runnerStuck(proof, now, since) ? 'stuck' : undefined;
 }
+/** Whether the runner a command waited on since `since` stopped, or its loop is stuck (see runnerTrouble). */
+export const runnerStopped = (agent: BrowserAgent, since: number, now = Date.now()) => runnerTrouble(agent, since, now) !== undefined;
 /** Why the room is gone, once the runner has heard it from the room service. */
 export function roomClosed(agent: BrowserAgent): { at: number; reason: string } | undefined {
   const closed = readJson<{ at?: unknown; reason?: unknown } | undefined>(join(agent.dir, ROOM_CLOSED_FILE), undefined);
@@ -396,8 +438,45 @@ export function flushOutbox(messages: Stored[], self: string, peers: Map<string,
   }
 }
 
-/** Long-running peer loop: presence, signaling, data channels, storage, and outbox delivery. */
-export async function runBridge(agent: BrowserAgent, log: (line: string) => void = console.error) {
+/** Whether `work` settled within `ms`. It is not cancelled either way: a promise can't be. */
+export async function within(work: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, ms)); });
+  try { return await Promise.race([work.then(() => true, () => true), late]); } finally { clearTimeout(timer); }
+}
+/** Each promise's outcome if it settled within `ms`, undefined for one still pending then. Late rejections stay handled. */
+export async function settleWithin<T>(work: Promise<T>[], ms: number): Promise<(PromiseSettledResult<T> | undefined)[]> {
+  const results: (PromiseSettledResult<T> | undefined)[] = work.map(() => undefined);
+  await within(Promise.all(work.map((p, i) => p.then(value => { results[i] = { status: 'fulfilled', value }; }, reason => { results[i] = { status: 'rejected', reason }; }))), ms);
+  return [...results];
+}
+/**
+ * How long one pass of the runner waits on each step. The room service keeps a device present for 25 s after it
+ * handled its last poll (PRESENCE_MS). Between one poll being handled and the next: the rest of that poll's round trip
+ * (the request gives up after 10 s, and `poll` backs that up), everything after it (which shares `budget`), the second's
+ * pause, and the next request's way to the service. That keeps polls inside the window in the usual case; only a slow
+ * answer followed by a slow next request can pass it, and the next poll restores presence. A step that runs past its time is
+ * left running, never started twice, and the pass moves on; one still unfinished after `wedged` means the runner can no
+ * longer do its work, and it stops so a fresh one takes over (see runBridge).
+ */
+export const PASS_DEADLINES = { poll: 11_000, budget: 12_000, profile: 5_000, signals: 10_000, outbox: 5_000, decisions: 3_000, close: 5_000, wedged: 60_000 };
+export type PassDeadlines = typeof PASS_DEADLINES;
+/** Thrown by runBridge when a step never finished: the process should exit, so whatever still hangs goes with it. */
+export class RunnerWedged extends Error { readonly wedged = true; }
+/** `work`'s value, or a rejection saying `what` didn't answer within `ms`. */
+async function answerWithin<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms / 1000} s`)), ms); });
+  try { return await Promise.race([work, late]); } finally { clearTimeout(timer); }
+}
+
+/**
+ * Long-running peer loop: presence, signaling, data channels, storage, and outbox delivery. `pause` is how it waits
+ * between passes (tests shorten it; the deadlines are what bound a pass).
+ */
+export async function runBridge(agent: BrowserAgent, log: (line: string) => void = console.error,
+  options: { deadlines?: Partial<PassDeadlines>; pause?: (ms: number) => Promise<unknown> } = {}) {
+  const deadlines: PassDeadlines = { ...PASS_DEADLINES, ...options.deadlines }, pause = options.pause ?? ((ms: number) => Bun.sleep(ms));
   const identity = await agent.ensureIdentity();
   const session = randomUUID(); const peers = new Map<string, Peer>();
   let status: RoomStatus | undefined; let epoch = ''; let cursor = 0;
@@ -552,7 +631,25 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
 
   const activity = activityAnnouncer(agent, () => [...peers.values()].map(p => p.channel));
-  const ticking = setInterval(activity.tick, 1000);
+  /**
+   * `loopAt`: when the loop last came round, which is what says the runner still works. `polledAt`: when the room service
+   * last answered. `failingSince`/`failure`: it hasn't since then, and why (see RUNNER_ALIVE).
+   */
+  const startedAt = Date.now();
+  let loopAt = startedAt, polledAt: number | undefined, failingSince: number | undefined, failure: string | undefined, failureStatus: number | undefined;
+  /**
+   * Proof of life for commands that can't inspect processes (a harness sandbox denies it), so they don't start a second
+   * runner. Written every second by the ticker rather than once per pass, so a long pass never makes the process look
+   * gone; whether its loop still comes round is `loopAt`.
+   */
+  const prove = () => {
+    try {
+      writeJson(join(agent.dir, RUNNER_ALIVE), { pid: process.pid, at: Date.now(), startedAt, loopAt, ...(polledAt ? { polledAt } : {}),
+        ...(failingSince ? { failingSince, failure, ...(failureStatus !== undefined ? { failureStatus } : {}) } : {}), ...(syncedAt ? { syncedAt } : {}) });
+    } catch { /* Written again next second. */ }
+  };
+  prove();
+  const ticking = setInterval(() => { prove(); activity.tick(); }, 1000);
 
   const flush = () => flushOutbox(agent.messages(), identity.id, peers, log);
   /** Send one signed operation to every open channel; a failing channel gets it again in the next exchange. */
@@ -603,7 +700,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     channel.bufferedAmountLow.subscribe(() => queue.pump());
     channel.stateChanged.subscribe(state => {
       if (state === 'closed') { if (peers.get(id) === peer) transfers.closed(id); return; }
-      if (state !== 'open') return;
+      // A peer that was retired (replaced, or its close still pending) has nothing more to exchange.
+      if (state !== 'open' || peers.get(id) !== peer) return;
       syncedAt ??= Date.now();
       log(`channel open to ${id.slice(0, 8)}`);
       // Exchange boards, decisions, and reactions so either side catches up while apart.
@@ -673,6 +771,39 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     pc.onDataChannel.subscribe(channel => connectChannel(peer, device.id, channel));
     return peer;
   };
+  /**
+   * Takes a peer out at once, then closes its connection in the background. A close that never finishes (seen with
+   * werift) can then neither hold up the pass nor leave the peer half there: it is already gone from `peers`, which every
+   * handler checks, and the next pass may connect to that device afresh.
+   */
+  const closeConnection = (id: string, peer: Peer) => {
+    const closing = Promise.resolve().then(() => peer.pc.close());
+    void within(closing, deadlines.close).then(done => { if (!done) log(`closing the connection to ${id.slice(0, 8)} did not finish within ${deadlines.close / 1000} s; left behind`); });
+    return closing;
+  };
+  const retire = (id: string, peer: Peer) => {
+    if (peers.get(id) === peer) { peers.delete(id); transfers.closed(id); }
+    return closeConnection(id, peer);
+  };
+  /** Every peer, as the room's epoch changes or the room closes; waits for the closes at most `deadlines.close`. */
+  const retireAll = () => within(Promise.allSettled([...peers].map(([id, peer]) => retire(id, peer))), deadlines.close);
+  /**
+   * One step of the pass, waited on for at most `ms`. A step still running from an earlier pass is neither started again
+   * nor waited on again: the outbox and closing decisions then never run twice at once, so nothing is signed or sent
+   * twice, and what was not delivered stays in the outbox for the run that finishes.
+   */
+  const inFlight = new Map<string, { since: number; done: Promise<void> }>();
+  const step = async (name: string, work: () => Promise<unknown>, ms: number) => {
+    if (inFlight.has(name)) return;
+    const entry = { since: Date.now(), done: Promise.resolve().then(work)
+      .then(() => {}, error => log(`${name}: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { if (inFlight.get(name) === entry) inFlight.delete(name); }) };
+    inFlight.set(name, entry);
+    if (await within(entry.done, ms)) return;
+    log(`pass: ${name} did not finish within ${Math.round(ms / 100) / 10} s; moving on (it keeps running and is not started again until it ends)`);
+  };
+  /** The longest-running step, if one has run past `deadlines.wedged`. */
+  const wedged = () => [...inFlight].find(([, entry]) => Date.now() - entry.since > deadlines.wedged)?.[0];
   const describe = async (id: string, peer: Peer, offer: boolean) => {
     await peer.pc.setLocalDescription(offer ? await peer.pc.createOffer() : await peer.pc.createAnswer());
     await new Promise(r => setTimeout(r, 1500)); // werift gathers host/srflx candidates quickly; descriptions are not trickled.
@@ -794,11 +925,35 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   let pruned = 0;
   log(`bridge running as device ${identity.id.slice(0, 12)} in ${agent.roomId}`);
   while (true) {
-    // Proof of life for commands that can't inspect processes (a harness sandbox denies it), so they don't start a second runner.
-    try { writeJson(join(agent.dir, RUNNER_ALIVE), { pid: process.pid, at: Date.now(), ...(syncedAt ? { syncedAt } : {}) }); } catch { /* Written again next second. */ }
+    loopAt = Date.now();
+    // A step that never finishes holds the serialized work (incoming packets, the outbox) behind it: the runner would
+    // stay present but deaf. It stops instead, so whoever owns the runner starts a fresh one.
+    const stuck = wedged();
+    if (stuck) {
+      clearInterval(ticking);
+      log(`pass: ${stuck} has not finished in ${Math.round(deadlines.wedged / 1000)} s; stopping so a fresh runner takes over`);
+      await retireAll();
+      throw new RunnerWedged(`The runner's ${stuck} step never finished; start the runner again.`);
+    }
     try {
-      const next: RoomStatus = await agent.command('status', { session, epoch, cursor });
-      if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await Bun.sleep(3000); continue; }
+      let next: RoomStatus;
+      try { next = await answerWithin(agent.command('status', { session, epoch, cursor }), deadlines.poll, 'the room service'); }
+      catch (error) {
+        // An outage, a machine that woke before its network, a rejection: reported through the proof, never a reason to
+        // replace this runner, which carries on and polls again (a 410 is handled below).
+        const status = (error as { status?: unknown }).status;
+        if (status !== 410) {
+          failingSince ??= Date.now(); failure = error instanceof Error ? error.message : String(error);
+          // An HTTP answer (a rejection, a rate limit, a server error) means the service was reached: only a failure without
+          // one (the request failed or timed out) can mean this runner's own networking broke. See repairRunner.
+          failureStatus = typeof status === 'number' ? status : undefined;
+        }
+        throw error;
+      } finally { loopAt = Date.now(); }
+      polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined;
+      // Everything after the poll shares one budget, so the next poll comes inside the service's presence window.
+      const passEnds = Date.now() + deadlines.budget, left = (cap: number) => Math.max(0, Math.min(cap, passEnds - Date.now()));
+      if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await pause(3000); continue; }
       // The room's rules first, and on their own: listen, status and the watch peek read the floor from this file, so
       // nothing else in the pass (closing peers, a members.json busy on Windows) may leave it behind the room.
       // Every admitted status from the room service carries them; one that doesn't (a service from before room settings)
@@ -806,37 +961,55 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (next.settings) rules = { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, repositories: next.repositories ?? [], checkedAt: Date.now() };
       rules ??= agent.settings();
       keep('settings.json', rules);
-      if (epoch && next.epoch !== epoch) { for (const p of peers.values()) await p.pc.close(); peers.clear(); cursor = 0; }
+      if (epoch && next.epoch !== epoch) { void retireAll(); cursor = 0; }
       epoch = next.epoch; status = next;
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
       keep('members.json', { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
-      await applyPendingProfile(agent, log);
+      await step('profile', () => applyPendingProfile(agent, log), left(deadlines.profile));
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
       const available = (next.devices || []).filter(d => d.id !== identity.id && d.session);
+      // Alone in the room: no device can send history, so there is nothing to wait for before a watcher starts from now.
+      // Without this, a watcher whose operator closed the browser waited for a channel that would never open.
+      if (available.length === 0) syncedAt ??= Date.now();
       for (const [id, peer] of peers) {
         if (!available.some(d => d.id === id && d.session === peer.session) || ['failed', 'closed'].includes(peer.pc.connectionState)
-          || (peer.pc.connectionState !== 'connected' && Date.now() - peer.started > 20_000)) { await peer.pc.close(); peers.delete(id); transfers.closed(id); }
+          || (peer.pc.connectionState !== 'connected' && Date.now() - peer.started > 20_000)) retire(id, peer);
       }
+      // Offers and answers are prepared side by side, as the browser does: each waits for its candidates, and one after
+      // another a busy room's pass outlasted the service's presence window, so peers took this agent for gone. A peer is
+      // replaced before its work starts, so each piece of work belongs to one peer; one not done in time is dropped, and
+      // its late steps find it gone (describe checks) instead of signalling for it.
+      const work: { id: string; peer: Peer; done: Promise<unknown> }[] = [];
       for (const signal of next.signals || []) {
         const device = available.find(d => d.id === signal.from && d.session === signal.session); if (!device) continue;
-        let peer = peers.get(device.id);
         if (signal.description.type === 'offer') {
           if (device.id > identity.id) continue;
-          if (peer) { await peer.pc.close(); transfers.closed(device.id); } peer = makePeer(device);
-          await peer.pc.setRemoteDescription(signal.description as any);
-          await describe(device.id, peer, false);
-        } else if (peer?.pc.signalingState === 'have-local-offer') await peer.pc.setRemoteDescription(signal.description as any);
+          const previous = peers.get(device.id); if (previous) retire(device.id, previous);
+          const peer = makePeer(device);
+          work.push({ id: device.id, peer, done: (async () => { await peer.pc.setRemoteDescription(signal.description as any); await describe(device.id, peer, false); })() });
+        } else {
+          const peer = peers.get(device.id);
+          if (peer?.pc.signalingState === 'have-local-offer') work.push({ id: device.id, peer, done: (async () => { await peer.pc.setRemoteDescription(signal.description as any); })() });
+        }
       }
       for (const device of available) {
         if (identity.id < device.id && !peers.has(device.id)) {
           const peer = makePeer(device); connectChannel(peer, device.id, peer.pc.createDataChannel('meshrooms-browser-v1'));
-          await describe(device.id, peer, true);
+          work.push({ id: device.id, peer, done: describe(device.id, peer, true) });
         }
       }
-      await deliverOutbox();
-      await closeDueDecisions();
+      const signalMs = left(deadlines.signals), settled = await settleWithin(work.map(w => w.done), signalMs);
+      settled.forEach((result, i) => {
+        const { id, peer } = work[i];
+        if (result?.status === 'rejected') log(`signal: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+        if (result) return;
+        log(`pass: connecting to ${id.slice(0, 8)} did not finish within ${Math.round(signalMs / 100) / 10} s; dropping that connection to try again`);
+        if (peers.get(id) === peer) retire(id, peer);
+      });
+      await step('outbox', deliverOutbox, left(deadlines.outbox));
+      await step('decisions', closeDueDecisions, left(deadlines.decisions));
       for (const peer of peers.values()) { peer.queue?.pump(); resyncDue(peer); }
       for (const id of quotaDrops.due()) requestSync(id);
       transfers.tick(); fetchWanted();
@@ -847,12 +1020,12 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if ((error as { status?: number }).status === 410) {
         clearInterval(ticking);
         try { writeJson(join(agent.dir, ROOM_CLOSED_FILE), { at: Date.now(), reason: error instanceof Error ? error.message : String(error) }); } catch { /* The next runner hears it again. */ }
-        for (const p of peers.values()) await p.pc.close();
+        await retireAll();
         throw error;
       }
       log(`status: ${error instanceof Error ? error.message : String(error)}`);
     }
-    await Bun.sleep(1000);
+    await pause(1000);
   }
 }
 

@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { base64, type RoomStatus } from '../../src/browser/protocol';
-import { BrowserLobby } from './lobby';
+import { BrowserLobby, PRESENCE_MS } from './lobby';
 import { browserHandler } from './http';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import { testDirectory } from '../test-directory';
@@ -189,6 +189,24 @@ test('signaling is scoped to admitted devices, current sessions and the coordina
   } finally { lobby.close(); }
 });
 
+test('a device stays reachable for the presence window after its last poll, so a slow bridge pass does not drop it', async () => {
+  let now = Date.now(); const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam', () => now);
+    const s = await sam.status(room);
+    const offer = { to: s.deviceId, session: host.session, targetSession: sam.session, description: { type: 'offer', sdp: 'test offer' } };
+    // A bridge that polled 12 s ago, in the middle of a long pass, is still there: it is listed and can be offered to.
+    now += 12_000;
+    expect((await host.status(room)).devices!.find(d => d.id === s.deviceId)?.session).toBe(sam.session);
+    await host.send('signal', room, offer);
+    // Past the window it is gone: not listed, and an offer to it asks the sender to reconnect.
+    now += PRESENCE_MS;
+    expect((await host.status(room)).devices!.find(d => d.id === s.deviceId)?.session).toBeUndefined();
+    await expect(host.send('signal', room, offer)).rejects.toThrow('connection changed');
+  } finally { lobby.close(); }
+});
 
 test('a person connects an agent with a one-time link; it joins as its own member they operate', async () => {
   let now = Date.now(); const lobby = new BrowserLobby(':memory:', { origin, now: () => now });

@@ -526,6 +526,10 @@ export function BrowserRooms() {
   };
   const activities = new Map(agents.map(agent => [agent.id, activityOf(agent)]));
   const working = [...activities.values()].filter(a => a.state === 'working').length;
+  /** Agents reachable right now for the strip under the header, busiest first; the rest are only counted. */
+  const STRIP_ORDER = { working: 0, idle: 1, online: 2, offline: 3 } as const;
+  const present = agents.filter(agent => activities.get(agent.id)!.state !== 'offline')
+    .sort((a, b) => STRIP_ORDER[activities.get(a.id)!.state] - STRIP_ORDER[activities.get(b.id)!.state]);
   /** Task id → names of agents working on it right now, for markers on the board. */
   const workingOn: Record<string, string[]> = {};
   for (const agent of agents) {
@@ -547,6 +551,7 @@ export function BrowserRooms() {
     return <span className="agent-activity is-working">Replying to <button className="agent-activity-link" title="Show the message" onClick={() => showMessage(latest.id)}>{authors.length > 1 ? `${authors.slice(0, -1).join(', ')} and ${authors.at(-1)}` : authors[0]}</button>{age}</span>;
   }
   function closeDetails() { setDetailsOpen(false); detailsButton.current?.focus(); }
+  function openDetails() { setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false); }
 
   async function act(work: () => Promise<void>) {
     if (busy) return;
@@ -800,8 +805,17 @@ export function BrowserRooms() {
         </section> : <>
           <header className="browser-room-header">
             <div className="browser-room-heading"><h1>{title}</h1><p>{people} {people === 1 ? 'person' : 'people'}{agents.length ? ` and ${agents.length} agent${agents.length === 1 ? '' : 's'}` : ''} in this room{working ? ` · ${working} working` : ''}</p></div>
-            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else { setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false); } }}><RoomIcon kind="people" />Room details</button><button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
+            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); }}><RoomIcon kind="people" />Room details</button><button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
           </header>
+          {admitted && agents.length > 0 && <section className="browser-agent-strip" aria-label="Agents in this room">
+            {present.map(agent => {
+              const a = activities.get(agent.id)!;
+              return <div className={`browser-agent-chip is-${a.state}`} key={agent.id} title={`${agent.name} · ${runtimeOf(agent) || 'agent'} · operated by ${operatorOf(agent)}`}>
+                <span className="browser-person-avatar"><MemberAvatar member={agent} roomId={urlRoom} fallback={agent.name} /><span className={`agent-dot is-${a.state}${a.state !== 'offline' && a.state !== 'online' && a.quiet !== undefined ? ' is-quiet' : ''}`} aria-hidden="true" /></span>
+                <span className="browser-agent-chip-text"><strong>{agent.name}</strong>{activityLine(a)}</span></div>;
+            })}
+            {agents.length > present.length && <button className="browser-text-link browser-agent-strip-more" onClick={openDetails}>{present.length ? `${agents.length - present.length} offline` : `${agents.length} agent${agents.length === 1 ? '' : 's'} offline`}</button>}
+          </section>}
           {status.expiresAt !== undefined && status.expiresAt - Date.now() < EXPIRY_WARNING && <p role="status" className="browser-notice">This room will be removed on {new Date(status.expiresAt).toLocaleDateString(undefined, { dateStyle: 'long' })} if nobody opens it.</p>}
           {admitted && self && !isAgent(self) && !agentCtaDismissed && !agentLink && !status.agentInvites?.length && !status.members?.some(m => isAgent(m) && m.operatorId === self.id) &&
             <section className="browser-agent-cta" aria-label="Connect an agent"><div><strong>Bring your agent into this room</strong><p>Connect Claude Code, Codex or another agent. It joins as your agent, answers when someone addresses it, and you decide what it does.</p></div>

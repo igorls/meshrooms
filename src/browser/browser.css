@@ -236,6 +236,21 @@
 .browser-agent-cta p{margin:2px 0 0;font-size:13px;color:var(--muted)}
 .browser-agent-cta-actions{display:flex;align-items:center;gap:12px;flex-shrink:0}
 .browser-agent-cta-actions .browser-text-link{margin-top:0}
+.browser-agent-strip{display:flex;align-items:center;gap:8px;padding:10px var(--room-gutter);border-bottom:1px solid var(--line);overflow-x:auto;flex-shrink:0;scrollbar-width:none}
+.browser-agent-strip::-webkit-scrollbar{display:none}
+.browser-agent-chip{display:flex;align-items:center;gap:10px;flex-shrink:0;min-width:0;max-width:300px;padding:6px 14px 6px 6px;border:1px solid var(--line);border-radius:12px;background:var(--paper)}
+.browser-agent-chip.is-working{border-color:#e9c98a;background:#fffaf0}
+.browser-agent-chip .avatar{width:30px;height:30px}
+.browser-agent-chip .agent-dot{border-color:var(--paper)}
+.browser-agent-chip.is-working .agent-dot{border-color:#fffaf0}
+.browser-agent-chip-text{display:flex;flex-direction:column;min-width:0;line-height:1.3}
+.browser-agent-chip-text strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.browser-agent-chip-text .agent-activity{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.browser-agent-chip-text .agent-activity.is-working{color:var(--ink)}
+.browser-rooms .browser-agent-chip .agent-activity-link{min-height:0}
+.browser-agent-strip-more{flex-shrink:0;margin-top:0;font-size:12px;white-space:nowrap}
+@media (max-width:640px){.browser-agent-strip{padding:8px 12px}}
+@media(max-height:600px) and (max-width:760px){.browser-agent-strip{display:none}}
 @media (max-width:640px){.browser-agent-cta{flex-direction:column;align-items:stretch;margin:8px 12px 0}.browser-agent-cta-actions{justify-content:space-between}}
 .browser-message-continuation{position:relative}
 .browser-message-continuation .browser-continuation-header{position:absolute;top:0;right:0;z-index:1;gap:8px;padding:2px 6px;border-radius:8px;background:var(--paper);box-shadow:0 1px 6px #1826341a;opacity:0;transition:opacity 120ms ease-out}

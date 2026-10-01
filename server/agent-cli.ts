@@ -33,7 +33,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
-import { BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, replaceFile, roomClosed, runnerStopped, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, peekWork, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
+import { BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, replaceFile, roomClosed, runnerStuck, runnerTrouble, serviceSilence, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, peekWork, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import {
   DEFAULT_MAX_AGENT_WAKES_PER_HOUR, DEFAULT_MAX_WAKES_PER_HOUR, DEFAULT_RUN_TIMEOUT_MINUTES, HARNESSES, WAKE_COMMANDS, WAKE_WRITABLE, WATCH_TIMING, CODEX_DISABLED, INSPECT_TIMEOUT_MS, codexEnvDenies, envProjectProblem, killDeps, recordAgentHome, CODEX_PROFILE, HOME_SECRETS, clearDir, codexBase, codexConfig, heredocMarker, killTree, processInfo, runFingerprint, sameRun,
   wakeReadDenies, type WakeContext,
@@ -68,9 +68,18 @@ export function connectConflict(linkHash: string, previousLinkHash: string | und
     + 'and run connect again with the same link.';
 }
 const BUSY = 'Another connect is running in this folder. Wait for it to finish, then try again.';
-/** Whether a process on this machine is still running; the folder is local, so the lock's owner is too. */
+/**
+ * Whether a process on this machine is still running; the folder is local, so the lock's owner is too. On Linux a process
+ * that exited but isn't reaped yet (a zombie) still answers signal 0, though it runs nothing: it doesn't count.
+ */
 function running(pid: number) {
-  try { process.kill(pid, 0); return true; } catch (error) { return (error as { code?: string }).code === 'EPERM'; }
+  try { process.kill(pid, 0); } catch (error) { if ((error as { code?: string }).code !== 'EPERM') return false; }
+  return !zombie(pid);
+}
+/** Whether the process has exited and waits to be reaped (Linux only; elsewhere this is never seen). */
+function zombie(pid: number) {
+  if (process.platform !== 'linux') return false;
+  try { return /\)\s+Z\s/.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; }
 }
 /**
  * A lock is taken over only once the process it names has exited, however long a live one takes (a laptop asleep
@@ -98,32 +107,51 @@ function takeLock(path: string) {
 }
 const exists = (error: unknown) => (error as { code?: string }).code === 'EEXIST';
 /**
- * One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. A connect
- * that crashed leaves its lock behind; taking that over is exclusive too. Only the holder of `connect.lock.reclaim`
- * may replace it, and only while it is still the same stale file, so two connects can never both take it.
+ * Takes `lock` for this process, or false while another live process holds it. A holder that crashed leaves its lock
+ * behind; taking that over is exclusive too. Only the holder of `<lock>.reclaim` may replace it, and only while it is
+ * still the same stale file, so two processes can never both take it. `what` names the holder in errors.
  */
-async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
-  const lock = join(folder, 'connect.lock'), reclaim = `${lock}.reclaim`;
-  try { takeLock(lock); }
+function tryLock(lock: string, what: string): boolean {
+  const reclaim = `${lock}.reclaim`;
+  try { takeLock(lock); return true; }
   catch (error) {
     if (!exists(error)) throw error;
     const seen = staleLock(lock);
     if (!seen) {
       let owner: string | undefined; try { owner = readFileSync(lock, 'utf8'); } catch { /* Released meanwhile. */ }
-      throw new Error(owner !== undefined && !/^\d{1,10}$/.test(owner) ? `${lock} doesn't name the connect that made it. If no connect is running, delete that file, then try again.` : BUSY);
+      if (owner !== undefined && !/^\d{1,10}$/.test(owner)) throw new Error(`${lock} doesn't name the ${what} that made it. If no ${what} is running, delete that file, then try again.`);
+      return false;
     }
     // Reclaiming takes milliseconds; a marker whose process is gone was left by a crash in exactly that window.
     try { takeLock(reclaim); }
     catch (error) {
       if (!exists(error)) throw error;
-      throw new Error(staleLock(reclaim) ? `A crashed connect left ${reclaim}. Delete that file, then try again.` : BUSY);
+      if (staleLock(reclaim)) throw new Error(`A crashed ${what} left ${reclaim}. Delete that file, then try again.`);
+      return false;
     }
     try {
-      if (staleLock(lock) !== seen) throw new Error(BUSY);
+      if (staleLock(lock) !== seen) return false;
       unlinkSync(lock);
-      try { takeLock(lock); } catch (error) { throw exists(error) ? new Error(BUSY) : error; }
+      try { takeLock(lock); return true; } catch (error) { if (exists(error)) return false; throw error; }
     } finally { unlinkSync(reclaim); }
   }
+}
+/** One connect at a time per folder, so two can't both see an empty room and overwrite each other's link. */
+async function withConnectLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
+  const lock = join(folder, 'connect.lock');
+  if (!tryLock(lock, 'connect')) throw new Error(BUSY);
+  try { return await work(); } finally { try { unlinkSync(lock); } catch { /* Already gone. */ } }
+}
+/** Held while the room's runner is looked at, stopped and started (see repairRunner). */
+export const RUNNER_LOCK = 'runner.lock';
+/**
+ * One start or stop of a room's runner at a time, across commands, the watcher and connect: without it, two commands
+ * could both stop a stuck runner and both start one, leaving two runners polling for one device. Waits up to `waitMs`
+ * for another holder to finish, then gives up ('busy'): that holder is doing the work.
+ */
+export async function withRunnerLock<T>(dir: string, work: () => Promise<T>, waitMs = 20_000, sleep: (ms: number) => Promise<unknown> = ms => Bun.sleep(ms)): Promise<T | 'busy'> {
+  const lock = join(dir, RUNNER_LOCK);
+  for (const by = Date.now() + waitMs; !tryLock(lock, 'runner start');) { if (Date.now() >= by) return 'busy'; await sleep(100); }
   try { return await work(); } finally { try { unlinkSync(lock); } catch { /* Already gone. */ } }
 }
 const uuid = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/i.test(v);
@@ -199,32 +227,69 @@ function runnerTarget(): RunnerTarget {
   const installed = installBridge(bundle);
   return { script: installed.launcher, version: installed.version };
 }
-/** runner.json records which version each runner was started with, so a newer install can replace an older runner. */
+/**
+ * runner.json records which version each runner was started with, so a newer install can replace an older runner, and
+ * when it started, so a stop can tell it from a process that later got its pid.
+ */
 const runnerRecord = (roomId: string) => join(home(), 'browser-agents', roomId, 'runner.json');
+type RunnerRecord = { pid?: number; version?: string | null; started?: string };
+const readRunnerRecord = (roomId: string): RunnerRecord => { try { return JSON.parse(readFileSync(runnerRecord(roomId), 'utf8')); } catch { return {}; } };
 function startRunner(roomId: string, target = runnerTarget()) {
   const child = spawn(process.execPath, [target.script, 'run', '--room', roomId], { detached: true, stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
   child.unref();
   replaceFile(join(home(), 'browser-agents', roomId, 'runner.pid'), String(child.pid));
-  replaceFile(runnerRecord(roomId), JSON.stringify({ pid: child.pid, version: target.version ?? null }));
+  const started = child.pid ? processInfo(child.pid)?.started : undefined;
+  replaceFile(runnerRecord(roomId), JSON.stringify({ pid: child.pid, version: target.version ?? null, ...(started ? { started } : {}) }));
   return child.pid;
 }
 /**
- * The live runner, if it runs the version the launcher starts now. A runner of another version (or from a downloaded
- * meshrooms-agent.js, which recorded none) is stopped, so the caller starts the installed one and the version
- * handshake runs again. From source there is no installed version to compare, and a live runner is kept.
+ * Whether a process (its command line and start time, as the system reports them) still is this room's runner: its
+ * command line is exactly the runner's, and, when runner.json recorded that pid's start, it started then (sameRun, which
+ * fails closed on a start time it can't read). A runner started before start times were recorded is known by its
+ * command line alone, as before.
  */
-async function currentRunner(roomId: string, target: RunnerTarget): Promise<{ pid?: number; replaced?: string }> {
-  const found = runnerProcess(roomId), pid = found?.pid;
-  // Known only from its proof of life (this command can't see processes): leave it be, never kill on that word.
-  if (!pid || !target.version || !found.verified) return { pid };
-  let recorded: { pid?: number; version?: string | null } = {};
-  try { recorded = JSON.parse(readFileSync(runnerRecord(roomId), 'utf8')); } catch { /* A runner from before the npm package. */ }
-  if (recorded.pid === pid && recorded.version === target.version) return { pid };
-  try { process.kill(pid); } catch { /* Already gone. */ }
-  for (let i = 0; i < 40 && runnerGone(pid) === false; i++) await Bun.sleep(50);
-  return { replaced: recorded.pid === pid && recorded.version ? recorded.version : 'unknown' };
+export function sameRunner(roomId: string, pid: number, record: RunnerRecord, info: { command: string; started?: string } | undefined) {
+  if (!info || !isRunnerCommand(info.command, roomId)) return false;
+  return record.pid === pid && record.started ? sameRun({ fingerprint: roomId.toLowerCase(), started: record.started }, info) : true;
 }
-function runnerGone(pid: number) { try { process.kill(pid, 0); return false; } catch { return true; } }
+/**
+ * Stops the room's runner before another starts, only while `pid` still is it (sameRunner), with killTree (taskkill /T
+ * /F on Windows, its own process group elsewhere), and waits until it is gone. False when it couldn't be confirmed as the
+ * runner or didn't go: the caller then starts nothing, so two runners never share the device.
+ */
+export async function stopRunner(roomId: string, pid: number, deps: { info: (pid: number) => { command: string; started?: string } | undefined; record: () => RunnerRecord;
+  kill: (pid: number, stillSame: () => boolean) => boolean; gone: (pid: number) => boolean; sleep: (ms: number) => Promise<unknown> } = {
+  info: processInfo, record: () => readRunnerRecord(roomId), kill: (target, stillSame) => killTree(target, 5_000, killDeps, stillSame), gone: runnerGone, sleep: ms => Bun.sleep(ms) }) {
+  const record = deps.record(), same = () => sameRunner(roomId, pid, record, deps.info(pid));
+  if (!same() || !deps.kill(pid, same)) return false;
+  for (let i = 0; i < 100; i++) { if (deps.gone(pid)) return true; await deps.sleep(50); }
+  return deps.gone(pid);
+}
+/**
+ * The live runner, and whether it runs a version other than the one the launcher starts now (`outdated`: the version it
+ * recorded, or 'unknown' for a downloaded meshrooms-agent.js, which recorded none), so repairRunner replaces it and the
+ * version handshake runs again. From source there is no installed version to compare. One known only from its proof of
+ * life (this command can't see processes) is never judged outdated: nothing is killed on that word.
+ */
+function lookRunner(roomId: string, target: RunnerTarget): FoundRunner | undefined {
+  const found = runnerProcess(roomId);
+  if (!found || !target.version || !found.verified) return found;
+  const recorded = readRunnerRecord(roomId);
+  if (recorded.pid === found.pid && recorded.version === target.version) return found;
+  return { ...found, outdated: recorded.pid === found.pid && recorded.version ? recorded.version : 'unknown' };
+}
+/** Whether the process is gone. On Linux one killed but not yet reaped by its parent (a zombie) is gone too: it runs nothing. */
+function runnerGone(pid: number) {
+  try { process.kill(pid, 0); } catch { return true; }
+  if (process.platform !== 'linux') return false;
+  try { return /\)\s+Z\s/.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return true; }
+}
+/**
+ * Whether a look after a stop found a runner other than the one just stopped. The stopped one can still seem there for a
+ * moment: its proof of life stays fresh for ALIVE_WITHIN_MS, and on Linux it may not be reaped yet, so a lookup that
+ * can't read its command line would take it for a live runner and no new one would start.
+ */
+export const anotherRunner = (after: FoundRunner | undefined, stopped: number) => !!after && after.pid !== stopped;
 /**
  * Whether a process's command line is our runner for this room: exactly <bun> <script> run --room <roomId>, where the
  * script is the installed launcher (meshrooms.js), a bridge downloaded before the npm package (meshrooms-agent.js), or
@@ -261,11 +326,47 @@ const commandLine = (pid: number) => process.platform === 'win32'
   : execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: INSPECT_TIMEOUT_MS });
 const readPid = (path: string) => { try { return Number(readFileSync(path, 'utf8')); } catch { return NaN; } };
 const readProof = (path: string) => () => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return undefined; } };
+/**
+ * The saved runner as a command finds it: its pid, whether its command line proved it ours (`verified`, else only its
+ * proof of life did), and, by its own proof: `stuck` (its loop has not come round for RUNNER_STUCK_MS), `polledAt` (the
+ * room service last answered it) and `silence` (the service hasn't answered since then; reported, never repaired).
+ * `outdated`: it runs another version than the launcher starts now (see lookRunner).
+ */
+export type FoundRunner = { pid: number; verified: boolean; stuck: boolean; polledAt?: number; silence?: { since: number; failure?: string; status?: number }; outdated?: string };
+/**
+ * Health by the proof of life, only when the proof is that runner's own (a runner just started hasn't written one yet).
+ * Identity is ourProcess's business; this only says whether an identified runner is doing its job.
+ */
+export function runnerHealth(pid: number, proof: unknown, now = Date.now()): Pick<FoundRunner, 'stuck' | 'polledAt' | 'silence'> {
+  const p = proof as { pid?: unknown; polledAt?: unknown } | undefined;
+  if (p?.pid !== pid) return { stuck: false };
+  const silence = serviceSilence(proof);
+  return { stuck: runnerStuck(proof, now), ...(typeof p.polledAt === 'number' ? { polledAt: p.polledAt } : {}), ...(silence ? { silence } : {}) };
+}
+/** The room service not answering the runner, as status and listen report it; undefined while it answers. */
+export function roomServiceReport(silence: FoundRunner['silence']) {
+  return silence ? { answering: false, since: new Date(silence.since).toISOString(), ...(silence.failure ? { failure: silence.failure } : {}), ...(silence.status ? { status: silence.status } : {}),
+    note: 'The runner keeps trying. If the room service answers this machine, the runner is replaced (at most once every 5 minutes); '
+      + 'otherwise it is an outage, and people see this agent offline until the service answers again.' } : undefined;
+}
+/**
+ * How `status` reports the runner: its pid and how long ago the room service last answered it (null before a first
+ * answer, or from a runner that doesn't record it). One whose loop is stuck is not reported as a runner: `runner` is null
+ * and `runnerProblem` says why. A room service that doesn't answer is its own state, `roomService`.
+ */
+export function runnerReport(found: FoundRunner | undefined, now = Date.now()) {
+  if (!found) return { runner: null };
+  const syncedAgoSeconds = found.polledAt === undefined ? null : Math.max(0, Math.round((now - found.polledAt) / 1000));
+  const service = roomServiceReport(found.silence), roomService = service ? { roomService: service } : {};
+  if (!found.stuck) return { runner: { pid: found.pid, syncedAgoSeconds }, ...roomService };
+  return { runner: null, runnerProblem: { pid: found.pid, syncedAgoSeconds, reason: `The runner's loop has not come round for over ${RUNNER_STUCK_MS / 1000} s, `
+    + 'so people see this agent offline. The next listen or other room command replaces it (the watcher does, if one runs).' }, ...roomService };
+}
 /** The saved runner, only if that PID still is our bridge for this room (PIDs get reused), and whether its command line said so. */
-function runnerProcess(roomId: string) {
-  const dir = join(home(), 'browser-agents', roomId), pid = readPid(join(dir, 'runner.pid'));
-  const how = ourProcess(pid, command => isRunnerCommand(command, roomId), { alive: running, commandLine, proof: readProof(join(dir, RUNNER_ALIVE)) });
-  return how ? { pid, verified: how === 'command' } : undefined;
+function runnerProcess(roomId: string): FoundRunner | undefined {
+  const dir = join(home(), 'browser-agents', roomId), pid = readPid(join(dir, 'runner.pid')), proof = readProof(join(dir, RUNNER_ALIVE));
+  const how = ourProcess(pid, command => isRunnerCommand(command, roomId), { alive: running, commandLine, proof });
+  return how ? { pid, verified: how === 'command', ...runnerHealth(pid, proof()) } : undefined;
 }
 function runnerAlive(roomId: string) { return runnerProcess(roomId)?.pid; }
 /** The room's watcher, only if that PID still is our watcher for this room. */
@@ -399,6 +500,161 @@ function ownActions(agent: BrowserAgent) {
 export function runnerOwner(inWake: boolean, watcherRuns: () => boolean): 'watcher' | 'command' {
   return inWake || watcherRuns() ? 'watcher' : 'command';
 }
+/** At most one automatic replacement of a room's stuck runner in this long, so a runner that keeps failing isn't churned. */
+export const REPAIR_BACKOFF_MS = 5 * 60_000;
+/** Records the last automatic replacement of a room's runner, for REPAIR_BACKOFF_MS. */
+export const RUNNER_REPAIR = 'runner-repair.json';
+/**
+ * A runner whose polls have failed for this long is checked from outside: the checking process asks the room service
+ * itself (probeRoomService). If the service answers, the runner's own networking is what's broken, and a fresh process
+ * fixes it; if not, it is an outage, which no replacement fixes.
+ */
+export const RUNNER_ISOLATED_MS = 60_000;
+/** How long that check waits for the room service. */
+export const PROBE_TIMEOUT_MS = 5_000;
+/** Whether the room service answers this process: its health endpoint, from the same origin the runner uses. */
+export async function probeRoomService(origin: string, fetcher: typeof fetch = fetch, timeoutMs = PROBE_TIMEOUT_MS) {
+  try {
+    const response = await fetcher(`${origin}/api/lobby/health`, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+    return response.ok && (await response.json() as { ok?: unknown })?.ok === true;
+  } catch { return false; }
+}
+/** What repairRunner uses; runnerRepairs gives the real ones, tests pass fakes. */
+export type RepairDeps = {
+  inWake: boolean; watcherRuns: () => boolean;
+  /** The caller judged the runner it found broken (listen or the watcher, by runnerTrouble since they started it). */
+  broken?: boolean;
+  /** Whether the room service answers this process (see RUNNER_ISOLATED_MS); asked only about a runner whose polls fail. */
+  probe: () => Promise<boolean>;
+  lock: <T>(work: () => Promise<T>) => Promise<T | 'busy'>;
+  runner: () => Promise<FoundRunner | undefined> | FoundRunner | undefined;
+  stop: (pid: number) => Promise<boolean>; start: () => Promise<number | undefined>;
+  lastRepair: () => number | undefined; recordRepair: (at: number) => void; now: () => number; log: (line: string) => void;
+};
+export type Repair = { outcome: 'wake' | 'kept' | 'watcher' | 'started' | 'restarted' | 'replaced' | 'unverified' | 'not-stopped' | 'backoff' | 'busy'; pid?: number; replaced?: string };
+/**
+ * What a command, the watcher or connect does about the room's runner before it works. A wake never touches it, and
+ * while a watcher runs the watcher owns it (runnerOwner). Otherwise a missing runner is started, and one that is stuck,
+ * that the caller found broken, or that runs another version is replaced. So is one whose polls have failed for
+ * RUNNER_ISOLATED_MS while the room service answers this process (`probe`): its own networking is broken, and a fresh
+ * process fixes that. If the service doesn't answer this process either, it is an outage: reported
+ * (roomServiceReport), never repaired, since no replacement would help.
+ *
+ * Replacing is exclusive: under the runner lock the runner is looked at again (another process may have repaired it
+ * meanwhile), stopped, and a new one started only if no live runner appeared since. Only a runner whose command line
+ * proves it ours is stopped (a sandboxed command that knows it only by its proof of life leaves it be), and one that
+ * can't be confirmed and stopped keeps the device, so two runners never poll for one device. A stuck or broken runner is
+ * replaced at most once per REPAIR_BACKOFF_MS. Every repair that couldn't be done is logged.
+ */
+export async function repairRunner(deps: RepairDeps): Promise<Repair> {
+  if (deps.inWake) return { outcome: 'wake' };
+  // Whether the room service answers this process: asked once per repair, and only about a runner whose polls have
+  // failed for RUNNER_ISOLATED_MS, only by the runner's owner (never in a wake, never while a watcher runs). Only a
+  // transport failure (no HTTP answer: the request failed or timed out) counts: a service that answers the runner with a
+  // rejection, a rate limit or a server error was reached, and the health endpoint (answered before the rate limiter)
+  // would pass while a fresh runner fared no better.
+  let probed: Promise<boolean> | undefined;
+  const isolated = (runner: FoundRunner) => !!runner.silence && runner.silence.status === undefined && deps.now() - runner.silence.since > RUNNER_ISOLATED_MS
+    && runnerOwner(false, deps.watcherRuns) === 'command' && (probed ??= deps.probe());
+  const needs = async (runner: FoundRunner | undefined) => !runner ? 'missing' : runner.outdated ? 'outdated' : runner.stuck ? 'stuck' : deps.broken ? 'broken'
+    : await isolated(runner) ? 'isolated' : undefined;
+  const first = await deps.runner();
+  if (!await needs(first)) return { outcome: 'kept', pid: first!.pid };
+  if (runnerOwner(false, deps.watcherRuns) === 'watcher') return { outcome: 'watcher', ...(first ? { pid: first.pid } : {}) };
+  const result = await deps.lock(async (): Promise<Repair> => {
+    const runner = await deps.runner();
+    // A runner other than the one found broken was started meanwhile: it gets its own time.
+    const why = runner && deps.broken && runner.pid !== first?.pid && !runner.stuck && !runner.outdated ? undefined : await needs(runner);
+    if (!why) return { outcome: 'kept', pid: runner!.pid };
+    if (!runner) return { outcome: 'started', pid: await deps.start() };
+    const failing = runner.silence ? new Date(runner.silence.since).toISOString() : '';
+    const what = why === 'stuck' ? 'is stuck (its loop has not come round for over a minute)' : why === 'broken' ? 'stopped answering'
+      : why === 'isolated' ? `has had its polls fail since ${failing}, though the room service answers` : `runs another version (${runner.outdated})`;
+    if (!runner.verified) { deps.log(`the runner (pid ${runner.pid}) ${what}, but its process can't be inspected from here to confirm it; leaving it`); return { outcome: 'unverified', pid: runner.pid }; }
+    if (why !== 'outdated') {
+      const last = deps.lastRepair();
+      if (last !== undefined && deps.now() - last < REPAIR_BACKOFF_MS) {
+        deps.log(`the runner (pid ${runner.pid}) ${what}, but it was already replaced at ${new Date(last).toISOString()}; the next replacement may come ${REPAIR_BACKOFF_MS / 60_000} minutes after that`);
+        return { outcome: 'backoff', pid: runner.pid };
+      }
+      if (why === 'isolated') deps.log(`room service answers but the runner's polls fail since ${failing}: replacing (pid ${runner.pid})`);
+    }
+    if (!await deps.stop(runner.pid)) { deps.log(`the runner (pid ${runner.pid}) ${what}, but it couldn't be confirmed and stopped; not starting a second one`); return { outcome: 'not-stopped', pid: runner.pid }; }
+    // Recorded once the old runner is gone: a stop that failed replaced nothing, so it doesn't hold back the next try.
+    if (why !== 'outdated') deps.recordRepair(deps.now());
+    // Every start takes this lock, but a bridge from before it doesn't: never add a runner beside one that appeared.
+    const after = await deps.runner();
+    if (anotherRunner(after, runner.pid)) return { outcome: 'kept', pid: after!.pid };
+    const pid = await deps.start();
+    if (why === 'outdated') return { outcome: 'replaced', pid, replaced: runner.outdated };
+    deps.log(why === 'isolated' ? `the runner (pid ${runner.pid}) was replaced with pid ${pid}`
+      : `the runner (pid ${runner.pid}) ${what}; replaced it with pid ${pid}`);
+    return { outcome: 'restarted', pid };
+  });
+  if (result === 'busy') { deps.log('another process is starting or stopping the runner; leaving it to that one'); return { outcome: 'busy' }; }
+  return result;
+}
+/**
+ * What listen adds about the runner, only when something is wrong: the room service not answering the live runner
+ * (`roomService`, by a fresh proof of life), or a runner that needed replacing and couldn't be (`runnerProblem`, with
+ * what to do). Otherwise nothing, so a normal listen's answer is unchanged.
+ */
+export function listenNotes(proof: unknown, repair: Repair, now = Date.now()) {
+  const at = (proof as { at?: unknown } | undefined)?.at;
+  const service = typeof at === 'number' && now - at < ALIVE_WITHIN_MS ? roomServiceReport(serviceSilence(proof)) : undefined;
+  const hints: Partial<Record<Repair['outcome'], string>> = {
+    unverified: "The runner needs replacing, but this command can't inspect processes to confirm which one it is. Run stop, then listen, outside the sandbox.",
+    'not-stopped': "The runner needs replacing, but it couldn't be confirmed and stopped. Run stop, then listen again.",
+    backoff: `The runner needs replacing, but it was replaced less than ${REPAIR_BACKOFF_MS / 60_000} minutes ago; a later listen replaces it again.`,
+    busy: 'Another process is replacing the runner right now; listen again.',
+  };
+  const hint = hints[repair.outcome];
+  return { ...(service ? { roomService: service } : {}), ...(hint ? { runnerProblem: { outcome: repair.outcome, pid: repair.pid ?? null, hint } } : {}) };
+}
+/**
+ * The real RepairDeps for a room. `purpose` names the command for the version check before a start (`check: false` skips
+ * it, as connect has just made it). The launcher target is worked out only when needed: never in a wake.
+ */
+function runnerRepairs(agent: BrowserAgent, options: { purpose: string; inWake: boolean; watcherRuns: () => boolean; broken?: boolean; check?: boolean;
+  log?: (line: string) => void; target?: RunnerTarget }): RepairDeps {
+  let target = options.target;
+  const which = () => target ??= runnerTarget(), repairs = join(agent.dir, RUNNER_REPAIR);
+  return { inWake: options.inWake, watcherRuns: options.watcherRuns, broken: options.broken,
+    probe: () => probeRoomService(agent.origin),
+    lock: work => withRunnerLock(agent.dir, work),
+    runner: () => lookRunner(agent.roomId, which()),
+    stop: pid => stopRunner(agent.roomId, pid),
+    start: async () => { if (options.check !== false) await checkBridgeVersion(agent.origin, options.purpose); return startRunner(agent.roomId, which()); },
+    lastRepair: () => { const at = readProof(repairs)()?.at; return typeof at === 'number' ? at : undefined; },
+    recordRepair: at => replaceFile(repairs, JSON.stringify({ at })),
+    now: Date.now, log: options.log ?? (line => console.error(`meshrooms: ${line}`)) };
+}
+/**
+ * The watcher's check on the runner, run between wakes, at each heartbeat of a wake and right after it: it starts one that
+ * isn't running and replaces one that stopped answering or is stuck (repairRunner, as the owner), and leaves a closed
+ * room alone. `overrides` are for tests.
+ */
+export function watcherRunnerCheck(agent: BrowserAgent, log: (line: string) => void, overrides: Partial<RepairDeps> = {}) {
+  let since = Date.now(), closedLogged = false;
+  return async (): Promise<Repair | undefined> => {
+    if (roomClosed(agent)) { if (!closedLogged) { log('the room is closed; the runner is not started again'); closedLogged = true; } return undefined; }
+    const repair = await repairRunner({ ...runnerRepairs(agent, { purpose: 'watch', inWake: false, watcherRuns: () => false, broken: runnerTrouble(agent, since) !== undefined, log }), ...overrides });
+    if (['started', 'restarted', 'replaced'].includes(repair.outcome)) { since = Date.now(); log(`started the bridge runner (pid ${repair.pid})`); }
+    return repair;
+  };
+}
+/**
+ * `run`: the runner itself. A step that never finished may still hold sockets or timers, so a wedged runner exits, and
+ * nothing of it lingers beside the next one. `deps` are for tests.
+ */
+export async function runRunner(agent: BrowserAgent, deps: { check: (origin: string, purpose: string) => Promise<unknown>; bridge: (agent: BrowserAgent) => Promise<unknown>;
+  exit: (code: number) => void; log: (line: string) => void } = { check: checkBridgeVersion, bridge: runBridge, exit: code => process.exit(code), log: console.error }) {
+  await deps.check(agent.origin, 'run');
+  try { await deps.bridge(agent); } catch (error) {
+    if (error instanceof RunnerWedged) { deps.log(error.message); deps.exit(1); return; }
+    throw error;
+  }
+}
 
 /** The paths under a folder that a wake must not see: the agent and bridge folders, and the operator's credentials and transcripts. */
 export function cwdExposes(cwd: string, paths = [home(), binDir(), process.env.CODEX_HOME || join(homedir(), '.codex'), ...HOME_SECRETS.map(secret => join(homedir(), secret))]) {
@@ -450,7 +706,8 @@ async function runWatch(agent: BrowserAgent) {
   for (const sub of WAKE_WRITABLE) mkdirSync(join(agent.dir, sub), { recursive: true, mode: 0o700 });
   writeWatchState(roomId, { ...readWatchState(roomId), pid: process.pid, version: BRIDGE_VERSION, startedAt: Date.now(), stoppedAt: undefined });
   log(`watcher ${BRIDGE_VERSION} started (pid ${process.pid}): harness ${config.harness} in ${config.cwd}, at most ${config.maxWakesPerHour} wakes per hour here and ${config.maxAgentWakesPerHour} in all rooms`);
-  let ready = false, waitingLogged = false, closedLogged = false, envLogged = false, runnerSince = Date.now();
+  let ready = false, waitingLogged = false, envLogged = false;
+  const checkRunner = watcherRunnerCheck(agent, log);
   const env = { ...process.env, MESHROOMS_AGENT_HOME: config.agentHome, MESHROOMS_WAKE_ROOM: roomId, MESHROOMS_WAKE_DIR: wake, MESHROOMS_ROOM: roomId, MESHROOMS_PROMPT_FILE: promptFile };
   const runTimeoutMs = config.runTimeoutMinutes * 60_000;
   const claim = sessionClaim(join(homedir(), '.meshrooms', 'locks'), sessionKey(config), running);
@@ -484,21 +741,9 @@ async function runWatch(agent: BrowserAgent) {
       if (result.exitCode !== 0 || read.error || result.error) log(`harness output (end):\n${`${result.stderr}\n${result.stdout}`.trim().slice(-2_000)}`);
       return { exitCode: result.exitCode, timedOut: result.timedOut, ...read, ...(result.error ? { error: result.error } : {}) };
     },
-    // While it runs, the watcher owns the runner: it starts one that stopped and replaces one that stopped answering
-    // (the same test listen uses), and leaves a closed room alone. A wake's listen never restarts it.
-    ensureRunner: async () => {
-      if (roomClosed(agent)) { if (!closedLogged) { log('the room is closed; the runner is not started again'); closedLogged = true; } return; }
-      const target = runnerTarget(), live = (await currentRunner(roomId, target)).pid;
-      if (live && !runnerStopped(agent, runnerSince)) return;
-      if (live) {
-        const runner = runnerProcess(roomId);
-        if (!runner?.verified) return;
-        log('the bridge runner stopped answering; starting it again');
-        await stopProcess(runner.pid);
-      }
-      await checkBridgeVersion(agent.origin, 'watch');
-      startRunner(roomId, target); runnerSince = Date.now(); log('started the bridge runner');
-    },
+    // While it runs, the watcher owns the runner: it starts one that stopped and replaces one that stopped answering or
+    // is stuck (the same test listen uses), and leaves a closed room alone. A wake's listen never restarts it.
+    ensureRunner: async () => { await checkRunner(); },
     // A pid is only that run while its command line still carries this room's mark and it started when the run did (pids get reused).
     runAlive: run => running(run.pid) && sameRun(run, processInfo(run.pid)),
     // SIGKILL follows SIGTERM only if the pid is still that run a few seconds later.
@@ -631,15 +876,18 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     let runtimeState: 'reported' | 'after-admission' | undefined;
     if (Object.keys(runtime).length && status.memberId) { await agent.command('profile' as never, runtime); runtimeState = 'reported'; }
     else if (Object.keys(runtime).length) { writeFileSync(join(agent.dir, PENDING_PROFILE), JSON.stringify(runtime), { mode: 0o600 }); runtimeState = 'after-admission'; }
-    const live = await currentRunner(roomId, target);
-    const pid = live.pid ?? startRunner(roomId, target);
+    // Connect makes sure a current runner runs, under the same lock and ownership as every other start: while a watcher
+    // runs, the watcher starts or replaces it.
+    const live = await repairRunner(runnerRepairs(agent, { purpose: 'connect', inWake: false, watcherRuns: () => !!watcherAlive(roomId), check: false, target }));
+    const pid = live.pid;
     const me = (status.members || []).find((m: any) => m.id === status.memberId);
     // The installed launcher never goes through bunx, so no cached older copy can answer instead; bunx with the exact
     // version the service wants (or this one) is the fallback.
     const cli = runningBundle() ? `bun "${target.script}"` : `bun ${process.argv[1]}`;
     const bunx = bunxCommand(service?.current ?? BRIDGE_VERSION);
     return { state: status.memberId ? 'connected' : 'waiting-for-host', roomId, title: status.title, agentName: me?.name, deviceId: identity.id, runnerPid: pid, ...runtime, ...(runtimeState ? { runtimeState } : {}),
-      bridge: { version: target.version ?? BRIDGE_VERSION, launcher: target.script, ...(live.replaced ? { replacedRunner: live.replaced } : {}) },
+      // What happened to the runner (started, kept, left to the watcher, busy, ...): runnerPid can be missing.
+      bridge: { version: target.version ?? BRIDGE_VERSION, launcher: target.script, runner: live.outcome, ...(live.replaced ? { replacedRunner: live.replaced } : {}) },
       next: [
         ...(Object.keys(runtime).length ? [] : [`Say what you run on: ${cli} profile --room ${roomId} --harness '<your harness>' --model '<your model id>'`]),
         `Wait for your turn: ${cli} listen --room ${roomId} --wait-seconds 540 (each return costs you a model turn, so wait as long as your harness lets one command run, up to 1800, and set its command timeout above the wait, e.g. 600 s for 540; repeat it as is, it continues where the last one stopped; never poll it on a timer)`,
@@ -653,14 +901,14 @@ export async function agentCli(argv: string[]): Promise<unknown> {
   }
   const agent = knownRoom(values['--room']);
   await readTextOptions(values);
-  if (command === 'run') { await checkBridgeVersion(agent.origin, 'run'); await runBridge(agent); return; }
+  if (command === 'run') { await runRunner(agent); return; }
   if (command === 'status') {
     // People see whether this agent is idle (in listen) or working on what woke it; the note says more until it listens again.
     if (values['--note'] !== undefined) agent.noteActivity(values['--note']);
     // The runner rewrites the floor from every status the room answers (each second), so while it runs this is the
     // room's live floor; otherwise the last one heard, and floorLive says which.
-    const view = agent.view(), runner = runnerAlive(agent.roomId) ?? null, checkedAt = agent.settings().checkedAt;
-    return { roomId: agent.roomId, runner, admitted: !!view.memberId, floor: view.floor,
+    const view = agent.view(), { runner, ...problems } = runnerReport(runnerProcess(agent.roomId)), checkedAt = agent.settings().checkedAt;
+    return { roomId: agent.roomId, runner, ...problems, admitted: !!view.memberId, floor: view.floor,
       floorCheckedAt: iso(checkedAt), floorLive: !!runner && !!checkedAt && Date.now() - checkedAt < 2 * ALIVE_WITHIN_MS,
       members: agent.members().members.map(({ id, name, role, operatorId, harness, model }) => ({ id, name, role, operatorId, ...(harness ? { harness } : {}), ...(model ? { model } : {}) })), messages: view.messages.length, activity: agent.activity() ?? null };
   }
@@ -697,18 +945,24 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     if (watcher) { await stopProcess(watcher); writeWatchState(agent.roomId, { ...readWatchState(agent.roomId), stoppedAt: Date.now() }); }
     const run = readWatchState(agent.roomId).activeRun, busy = run && running(run.pid) ? { activeRun: { pid: run.pid, note: 'The harness run in progress finishes on its own.' } } : {};
     if (command === 'watch-stop') return { stopped: !!watcher, ...busy };
-    const runner = runnerProcess(agent.roomId), pid = runner?.verified ? runner.pid : undefined; if (pid) process.kill(pid);
-    return { stopped: !!pid, ...(watcher ? { watcherStopped: true } : {}), ...busy };
+    // Under the runner lock, so no command starts one meanwhile; only a runner its command line proves is stopped. When it
+    // isn't stopped, `reason` says why: another process holds the lock ('busy'), this command can't inspect processes to
+    // confirm it ('unverified'), or it couldn't be confirmed and stopped ('not-stopped').
+    const outcome = await withRunnerLock(agent.dir, async () => {
+      const runner = runnerProcess(agent.roomId);
+      return !runner ? 'none' : !runner.verified ? 'unverified' : await stopRunner(agent.roomId, runner.pid) ? 'stopped' : 'not-stopped';
+    });
+    if (outcome === 'busy') console.error('meshrooms: another process is starting or stopping the runner, so stop left it; run stop again in a moment');
+    return { stopped: outcome === 'stopped', ...(outcome !== 'stopped' && outcome !== 'none' ? { reason: outcome } : {}), ...(watcher ? { watcherStopped: true } : {}), ...busy };
   }
   // listen/send need the peer loop. A runner that stopped because the service needs a newer bridge must not be
   // restarted from the same version: say how to update instead.
   // A runner of an older version than the installed one is replaced the same way.
   // During a wake the watcher looks after the runner: a harness never installs, replaces or starts one. Outside a wake,
   // a command leaves a missing runner to a live watcher too (it starts one within seconds), so two never start at once.
-  if (wake === undefined) {
-    const target = runnerTarget();
-    if (!(await currentRunner(agent.roomId, target)).pid && runnerOwner(false, () => !!watcherAlive(agent.roomId)) === 'command') { await checkBridgeVersion(agent.origin, command); startRunner(agent.roomId, target); }
-  }
+  // A runner whose loop is stuck is replaced the same way, stopped before the new one starts; see repairRunner.
+  const repairs = (broken: boolean) => runnerRepairs(agent, { purpose: command, inWake: wake !== undefined, watcherRuns: () => !!watcherAlive(agent.roomId), broken });
+  let repair = await repairRunner(repairs(false));
   if (command === 'listen') {
     // Every return costs the agent a model turn, so one call may wait up to half an hour; the heartbeat keeps it shown as idle.
     const seconds = Number(values['--wait-seconds'] || 30);
@@ -720,15 +974,10 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     // A runner that stops (or hangs) during a long wait is replaced once; see listenBrowser. While a watcher runs (in a
     // wake or not) the watcher owns the runner instead: listen then reports `runner-stopped`, which consumes nothing,
     // and leaves the restart to it. Only a runner its command line proves is ever stopped; one known only by its proof
-    // of life is left alone.
-    const restartRunner = wake !== undefined ? undefined : async () => {
-      if (runnerOwner(false, () => !!watcherAlive(agent.roomId)) === 'watcher') return;
-      const runner = runnerProcess(agent.roomId);
-      if (runner && !runner.verified) return;
-      if (runner) await stopProcess(runner.pid);
-      startRunner(agent.roomId, runnerTarget());
-    };
-    return listenRemembering(agent, seconds, { after: values['--after'], boardAfter: board, decisionsAfter: decided, fromStart: values['--from-start'] !== undefined, restartRunner });
+    // of life is left alone, under the same lock and backoff as every repair.
+    const restartRunner = wake !== undefined ? undefined : async () => { repair = await repairRunner(repairs(true)); };
+    const result = await listenRemembering(agent, seconds, { after: values['--after'], boardAfter: board, decisionsAfter: decided, fromStart: values['--from-start'] !== undefined, restartRunner });
+    return { ...result as object, ...listenNotes(readProof(join(agent.dir, RUNNER_ALIVE))(), repair) };
   }
   if (command === 'decisions') {
     const all = values['--all'] !== undefined;

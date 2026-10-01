@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 import { createHmac, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   ensureRunning,
@@ -73,6 +73,19 @@ describe('Runtime Discovery & Daemon Lifecycle', () => {
       expect(token.length).toBeGreaterThanOrEqual(32);
       expect(existsSync(join(subDir, 'control.key'))).toBe(true);
     });
+
+    it('gives every process the same key when several create it at once, and leaves no temporary files', async () => {
+      const dataDir = makeDir('token-race');
+      const modulePath = join(import.meta.dir, 'runtime.ts').replaceAll('\\', '/');
+      const script = `import { loadControlToken } from '${modulePath}'; console.log(loadControlToken(process.env.TOKEN_DIR!));`;
+      // Separate processes, started together, as when two daemons start at the same moment.
+      const runs = Array.from({ length: 8 }, () => Bun.spawn([process.execPath, '-e', script], { env: { ...process.env, TOKEN_DIR: dataDir }, stdout: 'pipe', stderr: 'pipe' }));
+      const outputs = await Promise.all(runs.map(async run => ({ code: await run.exited, out: (await new Response(run.stdout).text()).trim(), err: await new Response(run.stderr).text() })));
+      for (const output of outputs) expect(output).toMatchObject({ code: 0, err: '' });
+      expect(new Set(outputs.map(o => o.out)).size).toBe(1);
+      expect(readFileSync(join(dataDir, 'control.key'), 'utf8').trim()).toBe(outputs[0].out);
+      expect(readdirSync(dataDir).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    }, 60_000);
   });
 
   describe('runtimeProof', () => {
@@ -423,7 +436,9 @@ describe('Runtime Discovery & Daemon Lifecycle', () => {
 
     it('starts stopped daemon using child fixture and converges concurrent callers', async () => {
       const dataDir = makeDir('start-and-converge');
-      const fixturePort = 44888;
+      // A free port, not a fixed one another process on the runner may hold.
+      const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() });
+      const fixturePort = probe.port!; probe.stop(true);
       const runtimeModulePath = join(import.meta.dir, 'runtime.ts').replaceAll('\\', '/');
 
       // Create a purpose-built child daemon fixture in a test directory
@@ -483,12 +498,18 @@ process.on('SIGTERM', () => { cleanup(); server.stop(true); process.exit(0); });
           libraryPath: 'dummy.dll',
           port: fixturePort,
           daemonPath: fixtureScriptPath,
+          readyTimeoutMs: 40_000,
+          // Kept so a start that fails says why, instead of only timing out.
+          logFile: join(dataDir, 'daemon.log'),
         }),
         ensureRunning({
           dataDir,
           libraryPath: 'dummy.dll',
           port: fixturePort,
           daemonPath: fixtureScriptPath,
+          readyTimeoutMs: 40_000,
+          // Kept so a start that fails says why, instead of only timing out.
+          logFile: join(dataDir, 'daemon.log'),
         }),
       ]);
 
@@ -503,7 +524,8 @@ process.on('SIGTERM', () => { cleanup(); server.stop(true); process.exit(0); });
       const token = loadControlToken(dataDir);
       expect(result1.url).not.toContain(token);
       expect(JSON.stringify(result1)).not.toContain(token);
-      // Starting a real child Bun process can exceed the default 5 s on a busy CI runner.
-    }, 20_000);
+      // A real child Bun process compiles the runtime module on its first start, which took over 10 s on a busy CI
+      // runner: the start waits up to 40 s for it, and the test allows for that.
+    }, 60_000);
   });
 });

@@ -1,7 +1,7 @@
 {
   "name": "@wormdb/meshrooms",
-  "version": "0.2.0-beta.3",
-  "description": "Connect your AI agent to a Meshrooms room: bunx @wormdb/meshrooms@0.2.0-beta.3 connect '<link>'",
+  "version": "0.2.0-beta.4",
+  "description": "Connect your AI agent to a Meshrooms room: bunx @wormdb/meshrooms@0.2.0-beta.4 connect '<link>'",
   "keywords": ["meshrooms", "agents", "ai-agents", "collaboration", "rooms", "bun"],
   "license": "MIT",
   "author": "Igor Lins e Silva",

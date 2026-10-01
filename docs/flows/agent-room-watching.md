@@ -113,6 +113,38 @@ running.
   processes, such as one inside Codex's Windows sandbox, where `Get-CimInstance` is denied, then still recognizes the
   runner and doesn't start a second one. The proof only ever prevents a start: nothing is killed on its word, and it
   lives where no wake can write.
+  - "Running" means the runner's loop still comes round. The proof records when the loop last did (`loopAt`), when
+    the room service last answered its status poll (`polledAt`), and, while the service doesn't answer, since when and
+    why (`failingSince`, `failure`).
+    - A runner whose loop hasn't come round for a minute is stuck, however fresh its proof. The watcher replaces it,
+      and without a watcher so do `listen` and the other room commands (never during a wake). `status` reports it as
+      `runner: null` with a `runnerProblem`.
+    - While the room service doesn't answer the runner, the runner keeps trying, and `status` and `listen` report
+      `roomService: { answering: false, since }`. Once its polls have failed for a minute, the runner's owner (the
+      watcher, or a command when none runs, never a wake) asks the service itself: `GET <origin>/api/lobby/health`,
+      with a 5 s limit. Only when the runner's requests failed outright (no HTTP answer: the request failed or timed out).
+      A service that answers the runner with a rejection, a rate limit or a server error was reached, so the runner is
+      kept.
+      - If the service answers, the runner's own networking is broken and a fresh process fixes it. It is replaced, with
+        the lock and backoff below, and the log says `room service answers but the runner's polls fail since ...:
+        replacing`.
+      - If the service doesn't answer this machine either, it is an outage (or no network). Nothing replaces the
+        runner, since a new one would fare no better, and killing it would drop data channels that still work.
+    - Replacing is exclusive. Every start and stop takes `runner.lock` in the room folder. Under it the runner is looked
+      at again, stopped only while its command line and recorded start time still say it is that runner, and a new one
+      starts only once it is gone and no other has appeared. Two commands at once never leave two runners polling for
+      the same device. One known only by its proof is left alone.
+    - A stuck runner is replaced at most once every 5 minutes (`runner-repair.json`). A repair that can't be done
+      (already replaced recently, not confirmable, not stoppable, or another process busy with it) is logged to stderr
+      and `listen` adds a `runnerProblem` hint.
+  - Each pass of the runner is bounded. The status poll gives up after 10 s (11 s at most), everything after it shares
+    a 12 s budget, and a second's pause follows. That keeps consecutive polls inside the service's 25 s presence window
+    in the usual case. A poll whose answer is slow to come back, followed by a slow request for the next one, can still
+    pass it; the device then shows as present again from that next poll. A step that runs past its time (preparing a connection, delivering the outbox,
+    closing decisions) is logged and left running. It is not started again while it runs, so nothing is signed or sent
+    twice, and undelivered messages stay in the outbox. A connection that won't close is dropped from the runner's
+    peers first, so it can't stay half there. A step still unfinished after a minute leaves the runner unable to work,
+    so it exits, and the watcher or the next command starts a fresh one.
 - **The watcher's own files** (`watch-state.json`, the pid files, `watch-run.*`, `watch-prompt.txt`, `watch.log`)
   live outside every folder a wake may write. They are replaced by rename or created afresh, so a link planted at
   their path is removed rather than followed.

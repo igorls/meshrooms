@@ -56,6 +56,12 @@ const ACTIVITY_WRITE_INTERVAL = 3_600_000;
 const fingerprint = (c: SignedCommand['command']) => createHash('sha256').update(JSON.stringify({ ...c, at: 0 })).digest('hex');
 /** TURN credentials last at least an hour; the expiry is rounded up to ten minutes so a room keeps one username meanwhile. */
 const TURN_LIFETIME = 3600, TURN_STEP = 600;
+/**
+ * How long a device counts as present after its last status poll. Bridges up to 0.2.0-beta.3 poll only after a whole
+ * pass that makes their connection offers one peer at a time, so in a busy room a pass outlasted a 10 s window: the
+ * agent dropped out between polls, offers to it failed, and every peer kept reconnecting. Kept under the 30 s pruning.
+ */
+export const PRESENCE_MS = 25_000;
 
 /** SQLite stores admission only. Signaling/presence expire in memory; no chat passes through this service. */
 export class BrowserLobby {
@@ -369,7 +375,7 @@ export class BrowserLobby {
             if (!actor) fail(403, 'Room admission is required.');
             const target = room.devices.find(d => d.id === c.payload.to) || fail(403, 'The recipient is not admitted.');
             const local = this.presence.get(`${room.id}:${id}`), remote = this.presence.get(`${room.id}:${target.id}`);
-            if (!local || local.session !== c.payload.session || !remote || remote.session !== c.payload.targetSession || remote.at < this.now() - 10_000) fail(409, 'The connection changed. Reconnecting.');
+            if (!local || local.session !== c.payload.session || !remote || remote.session !== c.payload.targetSession || remote.at < this.now() - PRESENCE_MS) fail(409, 'The connection changed. Reconnecting.');
             const description = c.payload.description as RTCSessionDescriptionInit;
             if (!description || !['offer', 'answer'].includes(description.type) || typeof description.sdp !== 'string' || description.sdp.length > 16_000) fail(400, 'Invalid connection offer.');
             const key = `${room.id}:${target.id}`;
@@ -405,7 +411,7 @@ export class BrowserLobby {
     }
     const online = (d: BrowserDevice) => {
       const p = this.presence.get(`${room.id}:${d.id}`);
-      return p && p.at > this.now() - 10_000 ? p.session : undefined;
+      return p && p.at > this.now() - PRESENCE_MS ? p.session : undefined;
     };
     const result: RoomStatus = { roomId: room.id, title: room.title, epoch: this.epoch, deviceId: id, hostOnline: room.devices.some(d => d.memberId === room.ownerId && !!online(d)) };
     const actor = room.devices.find(d => d.id === id);

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.4) keeps agents reachable in busy rooms and replaces a runner that stops syncing:
+  - It prepares its connection offers to every peer at once instead of one after another, so in a room of seven or
+    eight devices it no longer drops out between polls and leaves everyone seeing everyone offline. The room service
+    also keeps a device present for 25 s after its last poll.
+  - A runner whose loop stops, or whose polls keep failing while the room service answers this machine, is replaced
+    automatically: one at a time under a lock, at most every five minutes, and never by a wake or while a watcher owns
+    the runner. An outage of the room service is reported in `status` and `listen` instead of causing restarts.
+  - `status` says when the runner is stuck or the room service isn't answering, and `stop` says why it stopped nothing.
+
 - The agent bridge (0.2.0-beta.3) can keep an agent reachable between turns: `meshrooms watch` is an opt-in,
   operator-run background process that wakes the operator's own Claude Code session, Codex thread (CLI or Codex app),
   or any command when the room has work for that agent, under `listen`'s rules and without consuming anything itself.

@@ -9,6 +9,7 @@ import { deviceId } from '../../src/browser/protocol';
 import { testDirectory } from '../test-directory';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import packageJson from '../../packages/meshrooms/package.json';
+import { fakeRunner, processRuns, type FakeKind } from './fake-runner';
 
 test('versions order like semver, prereleases before their release', () => {
   const sorted = ['0.1.0-alpha.3', '0.2.0-alpha.9', '0.2.0-beta.1', '0.2.0-beta.2', '0.2.0-beta.10', '0.2.0-rc.1', '0.2.0', '0.2.1', '0.10.0', '1.0.0'];
@@ -241,10 +242,14 @@ test('connect fails closed when it cannot ask the service, after retrying; other
  * A room service stand-in: /api/lobby/health reports `minimum`; `status` answers for this device, and after the link is
  * redeemed the agent waits for the host (so the runner keeps polling rather than exiting).
  */
-function fakeRoom(minimum: string, current?: string) {
+/** `health.down` makes the health endpoint fail, as in an outage. */
+function fakeRoom(minimum: string, current?: string, health = { down: false }) {
   let redeemed = false;
   return Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
-    if (new URL(request.url).pathname === '/api/lobby/health') return Response.json({ ok: true, revision: 'test', minAgentVersion: minimum, currentAgentVersion: current });
+    if (new URL(request.url).pathname === '/api/lobby/health') {
+      if (health.down) return new Response('Service Unavailable', { status: 503 });
+      return Response.json({ ok: true, revision: 'test', minAgentVersion: minimum, currentAgentVersion: current });
+    }
     const { command, publicKey } = await request.json() as any;
     if (command.action === 'agent-redeem') { redeemed = true; return Response.json({ ok: true }); }
     if (command.action === 'status') return Response.json({ roomId: command.roomId, deviceId: await deviceId(publicKey), title: 'Room', epoch: 'e', hostOnline: true,
@@ -281,6 +286,7 @@ test('the built bridge connects without writing into the current folder, and its
   };
   let runner: number | undefined;
   const runners: number[] = [];
+  const track = () => { try { const pid = Number(readFileSync(join(dir.path, 'agents', 'browser-agents', room, 'runner.pid'), 'utf8')); if (pid > 1 && !runners.includes(pid)) runners.push(pid); } catch { /* None yet. */ } };
   try {
     const { file } = await buildAgent(cache);
     const connected = await run(file, ['connect', `http://127.0.0.1:${server.port}/agent/${room}#${token}`, '--harness', 'Test', '--model', 'test-model']);
@@ -288,7 +294,7 @@ test('the built bridge connects without writing into the current folder, and its
     const result = JSON.parse(connected.out);
     runner = result.runnerPid;
     runners.push(runner!);
-    expect(result).toMatchObject({ state: 'waiting-for-host', roomId: room, bridge: { version: BRIDGE_VERSION, launcher: join(bin, 'meshrooms.js') } });
+    expect(result).toMatchObject({ state: 'waiting-for-host', roomId: room, bridge: { version: BRIDGE_VERSION, launcher: join(bin, 'meshrooms.js'), runner: 'started' } });
     // Next steps run the installed launcher, which never goes through bunx's cache; bunx comes only with an exact version.
     const next = result.next.join('\n');
     expect(next).toContain(`bun "${join(bin, 'meshrooms.js')}" listen --room ${room}`);
@@ -303,36 +309,137 @@ test('the built bridge connects without writing into the current folder, and its
     const launcher = join(bin, 'meshrooms.js');
     const status = await run(launcher, ['status', '--room', room]);
     expect(status.err).toBe('');
-    expect(JSON.parse(status.out)).toMatchObject({ roomId: room, runner: runner });
+    // status names the runner and how long ago the room service answered it (null until its first answer).
+    expect(JSON.parse(status.out)).toMatchObject({ roomId: room, runner: { pid: runner } });
 
     // A runner of another version (here: recorded as older), or one from a downloaded meshrooms-agent.js that recorded
     // no version, is replaced by the installed version on the next command that needs it.
-    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const alive = processRuns;
     const record = join(dir.path, 'agents', 'browser-agents', room, 'runner.json');
-    expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: runner, version: BRIDGE_VERSION });
+    // With its start time, so a stop can tell it from a process that later gets its pid.
+    expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: runner, version: BRIDGE_VERSION, started: expect.any(String) });
     for (const older of [() => writeFileSync(record, JSON.stringify({ pid: runner, version: '0.1.0' })), () => rmSync(record)]) {
       older();
       const before = runner!;
-      expect((await run(launcher, ['decisions', '--room', room])).err).toBe('');
-      runner = JSON.parse((await run(launcher, ['status', '--room', room])).out).runner;
-      runners.push(runner!);
+      // runner.pid is written by the command itself before it returns: every runner it started is tracked at once.
+      const replaced = await run(launcher, ['decisions', '--room', room]);
+      track();
+      expect(replaced.err).toBe('');
+      runner = JSON.parse((await run(launcher, ['status', '--room', room])).out).runner?.pid;
       expect(runner).toBeNumber();
       expect(runner).not.toBe(before);
       expect(alive(before)).toBe(false);
-      expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: runner, version: BRIDGE_VERSION });
+      expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: runner, version: BRIDGE_VERSION, started: expect.any(String) });
     }
     // A runner of the installed version is kept.
     expect((await run(launcher, ['decisions', '--room', room])).err).toBe('');
-    expect(JSON.parse((await run(launcher, ['status', '--room', room])).out).runner).toBe(runner);
+    expect(JSON.parse((await run(launcher, ['status', '--room', room])).out).runner?.pid).toBe(runner);
 
     expect(JSON.parse((await run(launcher, ['stop', '--room', room])).out)).toEqual({ stopped: true });
     expect(readdirSync(project)).toEqual([]);
   } finally {
+    track();
     for (const pid of runners) try { process.kill(pid); } catch { /* Already gone. */ }
     server.stop(true);
     dir.cleanup();
   }
 }, 60_000);
+
+test('the built bridge replaces a stuck or cut-off runner from a command: never for an outage, never while a watcher runs or in a wake, and not twice in the backoff', async () => {
+  const health = { down: false };
+  const dir = testDirectory('bridge-repair'), server = fakeRoom(MIN_AGENT_VERSION, CURRENT_AGENT_VERSION, health), room = crypto.randomUUID();
+  const project = join(dir.path, 'project'), cache = join(dir.path, 'bunx-cache'), bin = join(dir.path, 'bin');
+  mkdirSync(project);
+  const env = { ...process.env, MESHROOMS_AGENT_HOME: join(dir.path, 'agents'), MESHROOMS_BIN_DIR: bin, MESHROOMS_AGENT_REGISTRY: join(dir.path, 'agent-homes.json') };
+  const run = async (script: string, args: string[], extra: Record<string, string> = {}) => {
+    const child = Bun.spawn([process.execPath, script, ...args], { cwd: project, env: { ...env, ...extra }, stdout: 'pipe', stderr: 'pipe' });
+    const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { out, err };
+  };
+  const alive = processRuns;
+  const launcher = join(bin, 'meshrooms.js'), roomDir = join(dir.path, 'agents', 'browser-agents', room);
+  // Every runner a command may have started is tracked as soon as that command returns, before any assertion can fail,
+  // so a failing test never leaves a real runner behind.
+  const runners: number[] = [], fakes: { kill: () => void }[] = [];
+  const track = () => { try { const pid = Number(readFileSync(join(roomDir, 'runner.pid'), 'utf8')); if (pid > 1 && !runners.includes(pid)) runners.push(pid); } catch { /* None yet. */ } };
+  const bridge = async (args: string[], extra: Record<string, string> = {}) => { try { return await run(launcher, args, extra); } finally { track(); } };
+  try {
+    const { file } = await buildAgent(cache);
+    await run(file, ['connect', `http://127.0.0.1:${server.port}/agent/${room}#${token}`]);
+    track();
+    expect(JSON.parse((await bridge(['stop', '--room', room])).out)).toEqual({ stopped: true });
+    // Stand-ins whose command lines are a runner's (or a watcher's) for this room, writing the proof of life they're told to.
+    const plant = async (kind: FakeKind, verb: 'run' | 'watch-run' = 'run') => {
+      const fake = await fakeRunner(join(dir.path, 'fake'), room, { kind, verb, ...(verb === 'run' ? { proofFile: join(roomDir, 'runner-alive.json') } : {}) });
+      fakes.push(fake);
+      if (verb === 'watch-run') writeFileSync(join(roomDir, 'watch.pid'), String(fake.pid));
+      else {
+        writeFileSync(join(roomDir, 'runner.pid'), String(fake.pid));
+        writeFileSync(join(roomDir, 'runner.json'), JSON.stringify({ pid: fake.pid, version: BRIDGE_VERSION, started: fake.started }));
+      }
+      return fake;
+    };
+    const runnerPid = () => Number(readFileSync(join(roomDir, 'runner.pid'), 'utf8'));
+    const status = async () => JSON.parse((await bridge(['status', '--room', room])).out);
+
+    // The runner's polls have failed for ten minutes while its loop comes round, and the room service doesn't answer this
+    // machine either: an outage, reported and left alone.
+    health.down = true;
+    const silent = await plant('silent');
+    expect((await bridge(['decisions', '--room', room])).err).toBe('');
+    expect(silent.alive()).toBe(true);
+    expect(runnerPid()).toBe(silent.pid);
+    expect(await status()).toMatchObject({ runner: { pid: silent.pid }, roomService: { answering: false, failure: 'fetch failed' } });
+    // The service answers this machine, but the runner's polls still fail: its own networking is broken, so it's replaced.
+    health.down = false;
+    const cutOff = await bridge(['decisions', '--room', room]);
+    expect(cutOff.err).toContain("room service answers but the runner's polls fail since");
+    expect(silent.alive()).toBe(false);
+    const replaced = runnerPid();
+    expect(replaced).not.toBe(silent.pid);
+    expect(alive(replaced)).toBe(true);
+    expect(JSON.parse((await bridge(['stop', '--room', room])).out)).toEqual({ stopped: true });
+    // A fresh backoff for what follows.
+    rmSync(join(roomDir, 'runner-repair.json'));
+
+    // Stuck for ten minutes: status says so. While a watcher runs, the command leaves it to the watcher.
+    const stuck = await plant('stuck');
+    expect(await status()).toMatchObject({ runner: null, runnerProblem: { pid: stuck.pid } });
+    const watcher = await plant('none', 'watch-run');
+    expect((await bridge(['decisions', '--room', room])).err).toBe('');
+    expect(stuck.alive()).toBe(true);
+    watcher.kill();
+    // In a wake, never.
+    const wake = join(roomDir, 'wake'); mkdirSync(wake, { recursive: true });
+    expect((await bridge(['decisions', '--room', room], { MESHROOMS_WAKE_ROOM: room, MESHROOMS_WAKE_DIR: wake })).err).toBe('');
+    expect(stuck.alive()).toBe(true);
+    expect(runnerPid()).toBe(stuck.pid);
+    // Otherwise the command stops it and starts one fresh runner in its place, and says so.
+    const repaired = await bridge(['decisions', '--room', room]);
+    expect(repaired.err).toContain('is stuck');
+    expect(stuck.alive()).toBe(false);
+    const fresh = runnerPid();
+    expect(fresh).not.toBe(stuck.pid);
+    expect(alive(fresh)).toBe(true);
+    expect(existsSync(join(roomDir, 'runner.lock'))).toBe(false);
+
+    // Stuck again within the backoff: left alone, and said so.
+    expect(JSON.parse((await bridge(['stop', '--room', room])).out)).toEqual({ stopped: true });
+    const again = await plant('stuck');
+    const backoff = await bridge(['decisions', '--room', room]);
+    expect(backoff.err).toContain('already replaced');
+    expect(again.alive()).toBe(true);
+    expect(runnerPid()).toBe(again.pid);
+  } finally {
+    for (const fake of fakes) fake.kill();
+    // The launcher's own stop first (it knows its runner), then every runner seen, whatever an assertion interrupted.
+    if (existsSync(launcher) && existsSync(roomDir)) await run(launcher, ['stop', '--room', room]).catch(() => {});
+    track();
+    for (const pid of runners) try { process.kill(pid); } catch { /* Already gone. */ }
+    server.stop(true);
+    dir.cleanup();
+  }
+}, 180_000);
 
 test('the bridge replaces its state files through Windows sharing errors instead of crashing', async () => {
   const { replaceFile } = await import('../browser-agent');
