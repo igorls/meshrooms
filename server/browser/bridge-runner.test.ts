@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  REPAIR_BACKOFF_MS, RUNNER_LOCK, RUNNER_REPAIR, agentCli, listenNotes, probeRoomService, repairRunner, roomServiceReport, runRunner, runnerHealth, runnerReport, sameRunner, stopRunner,
+  REPAIR_BACKOFF_MS, RUNNER_LOCK, RUNNER_REPAIR, agentCli, listenNotes, probeRoomService, repairRunner, roomServiceReport, runRunner, runnerHealth, runnerReport, runnerStarted, sameRunner, stopRunner,
   watcherRunnerCheck, withRunnerLock, type FoundRunner, type RepairDeps,
 } from '../agent-cli';
 import {
@@ -386,6 +386,20 @@ test('the runner lock waits for its holder, gives up after its wait, and takes o
   // A file that names no process is never taken over.
   writeFileSync(lock, 'junk');
   await expect(withRunnerLock(dir, async () => 'done', 300)).rejects.toThrow("doesn't name the runner start that made it");
+});
+
+test('recording a runner start asks until the system reports when the process started', () => {
+  let looks = 0;
+  const started = runnerStarted(70, () => ++looks < 3 ? undefined : { started: '2026-01-01T00:00:00.0000000Z' }, () => {}, 1_000);
+  expect(started).toBe('2026-01-01T00:00:00.0000000Z');
+  expect(looks).toBe(3);
+});
+
+test('recording a runner start stops asking once its budget has passed', () => {
+  let now = 0, slept = 0;
+  const started = runnerStarted(70, () => undefined, ms => { slept += ms; now += ms; }, 250, () => now);
+  expect(started).toBeUndefined();
+  expect(slept).toBe(250);
 });
 
 test('a runner is stopped only while it still is this room\'s runner, and nothing new starts until it is gone', async () => {

@@ -234,11 +234,27 @@ function runnerTarget(): RunnerTarget {
 const runnerRecord = (roomId: string) => join(home(), 'browser-agents', roomId, 'runner.json');
 type RunnerRecord = { pid?: number; version?: string | null; started?: string };
 const readRunnerRecord = (roomId: string): RunnerRecord => { try { return JSON.parse(readFileSync(runnerRecord(roomId), 'utf8')); } catch { return {}; } };
+/**
+ * When the process started, as the system reports it. A lookup right after spawn often sees nothing, and on Windows
+ * the first PowerShell can spend the whole inspect budget just starting, so one look would leave `started` out of
+ * runner.json and a stop could not tell this process from one that later got its pid. Asks until the time is there.
+ * Past the budget the runner is recorded without one, like a runner from before start times were recorded.
+ */
+export function runnerStarted(pid: number, info: (pid: number) => { started?: string } | undefined = processInfo, sleep: (ms: number) => void = ms => Bun.sleepSync(ms), budgetMs = 15_000, now: () => number = Date.now): string | undefined {
+  const deadline = now() + budgetMs;
+  for (;;) {
+    const started = info(pid)?.started;
+    if (started) return started;
+    const remaining = deadline - now();
+    if (remaining <= 0) return undefined;
+    sleep(Math.min(100, remaining));
+  }
+}
 function startRunner(roomId: string, target = runnerTarget()) {
   const child = spawn(process.execPath, [target.script, 'run', '--room', roomId], { detached: true, stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
   child.unref();
   replaceFile(join(home(), 'browser-agents', roomId, 'runner.pid'), String(child.pid));
-  const started = child.pid ? processInfo(child.pid)?.started : undefined;
+  const started = child.pid ? runnerStarted(child.pid) : undefined;
   replaceFile(runnerRecord(roomId), JSON.stringify({ pid: child.pid, version: target.version ?? null, ...(started ? { started } : {}) }));
   return child.pid;
 }
