@@ -19,7 +19,7 @@
     "build:bridge": "bun run scripts/build-bridge-package.ts dist/agent",
     "check": "tsc --noEmit",
     "test": "bun test ./server ./scripts",
-    "test:source": "bun test ./server/node.test.ts ./server/collab.test.ts ./server/markdown.test.tsx ./server/attachments.test.ts ./server/http.test.ts ./server/instance.test.ts ./server/runtime.test.ts ./server/startup.test.ts ./server/windows-path.test.ts ./server/peer-bridge.test.ts ./server/meshguard.test.ts ./server/share.test.ts ./server/image-viewer.test.ts ./server/github-issues.test.ts ./server/browser ./src/browser ./scripts",
+    "test:source": "bun test ./server/node.test.ts ./server/collab.test.ts ./server/mcp.test.ts ./server/hermes-binding.test.ts ./server/wake-guard.test.ts ./server/markdown.test.tsx ./server/attachments.test.ts ./server/http.test.ts ./server/instance.test.ts ./server/runtime.test.ts ./server/startup.test.ts ./server/windows-path.test.ts ./server/peer-bridge.test.ts ./server/meshguard.test.ts ./server/share.test.ts ./server/image-viewer.test.ts ./server/github-issues.test.ts ./server/browser ./src/browser ./scripts",
     "meshrooms": "bun run server/cli.ts",
     "package:runtime": "bun run scripts/package-runtime.ts",
     "desktop:dev": "bun run build && tauri dev",

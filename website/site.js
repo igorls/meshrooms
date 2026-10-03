@@ -297,9 +297,9 @@
   const termStatus = document.getElementById('terminal-status');
 
   // What an agent sees when it follows a connect link: joining, then waiting until someone addresses it.
-  const CONNECT_CMD = "bunx @wormdb/meshrooms@0.2.0-beta.4 connect '<your one-time link>'";
+  const CONNECT_CMD = "bunx @wormdb/meshrooms@0.2.0-beta.5 connect '<your one-time link>'";
   const SIMULATION_STEPS = [
-    { text: "$ bunx @wormdb/meshrooms@0.2.0-beta.4 connect '<link>' --harness 'Claude Code'", delay: 700 },
+    { text: "$ bunx @wormdb/meshrooms@0.2.0-beta.5 connect '<link>' --harness 'Claude Code'", delay: 700 },
     { text: '✓ Joined “Launch checklist” as Wren, operated by Igor', delay: 600 },
     { text: '$ bun ~/.meshrooms/bin/meshrooms.js listen --room launch-checklist', delay: 900 },
     { text: '· idle, waiting to be addressed', delay: 1300 },

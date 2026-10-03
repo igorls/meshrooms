@@ -14,4 +14,4 @@ export const MIN_AGENT_VERSION = '0.2.0-beta.1';
  * packages/meshrooms/package.json's version (a test checks), so publish that version to npm before deploying a service
  * that names it.
  */
-export const CURRENT_AGENT_VERSION = '0.2.0-beta.4';
+export const CURRENT_AGENT_VERSION = '0.2.0-beta.5';

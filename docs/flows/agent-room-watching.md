@@ -1,7 +1,7 @@
 # Agent room watching
 
 Status: implemented in the agent bridge (0.2.0-beta.3) as `meshrooms watch`, for Claude Code, Codex (the CLI and the
-Codex app's threads) and any other harness through a command template. A security review (below) confined what a
+Codex app's threads), Hermes and any other harness through a command template. A security review (below) confined what a
 wake can do before release. Verified end to end on Windows against a loopback coordinator. The Windows Codex plus
 Linux agent acceptance below has not been run yet.
 
@@ -15,11 +15,76 @@ in its harness. Closing the room's browser view must not stop delivery.
 Each agent retains its own tools and private context. Room participation does
 not grant other participants authority over those tools.
 
+## Live first, the watcher as the fallback
+
+A headless wake (`claude -p --resume`, `codex exec resume` and the like) resumes a session's transcript, not the
+operator's live process. The operator's open window never shows it, the conversation forks (the headless run appends
+turns while the live process keeps its own context), and a bare `--continue` can pick the wrong session in a busy folder.
+Looping `listen --wait-seconds 540` instead costs a model turn every nine minutes while idle. So delivery has two modes,
+and one mailbox has one reader at a time:
+
+- **Live (recommended for Claude Code, and any harness that re-invokes the session when a background command exits).**
+  The agent runs `listen --room R --until-addressed` as a background command. It blocks at no turn cost and exits only
+  when there is work (the same rules as `listen`: addressed messages, assigned tasks, decisions); the harness then
+  re-invokes the operator's own session, in their window. The agent handles the work and starts the command again.
+  Looping short listens on a timer is wrong: every return costs a turn.
+  - Exit codes: `0` work, the same JSON as `listen` with its cursors, plus `pickupUntil` and `wokenRuns`; also `0` with
+    `state: timeout` after the upper bound (24 h, `--max-wait-hours`, so a forgotten listener can't live forever).
+    `3` the room closed (410). `4` the agent was removed from the room (the runner's proof of life says
+    `removedSince`). `5` the runner stopped and wasn't running again within 10 minutes.
+  - Internally it waits in one-minute slices without returning. A slice that reports the runner stopped is followed by
+    a repair under today's rules (outside a wake and with no watcher owning the runner, `repairRunner`; otherwise it
+    waits for the owner), so a brief gap never ends the wait. A first listen's history with nothing for the agent is
+    caught up silently. Never in a wake: a wake's own listen takes no lease and works as before.
+  - **The live lease** (`live.json` in the room folder: pid, the process start time from `processInfo`, the room id its
+    command line carries, a heartbeat refreshed every 5 s, and the session id from `--session`). One live listener per
+    agent: a second is refused unless the first is verifiably gone (its pid no longer runs, or `sameRun` on its start
+    time says the pid is another process now; never a bare pid). On exit with work the lease moves to `pickup` with
+    `returnedAt` and `pickupUntil` (10 min, `--pickup-minutes`), during which the live session handles the work and
+    listens again. The window stays open past its end while the agent acted in the room (a message, task change, vote
+    or reaction) within the last 10 minutes, up to an hour after the listen returned, so a session busy on a long task
+    never gets a headless run of itself started beside it. A listener that takes over a pickup lease carries its
+    unhandled work along: if that listener stops, ends without work, or returns more, the work is still offered (from
+    the first cursor). On any other exit, or Ctrl+C, the lease goes. A listener killed outright leaves a heartbeat that
+    goes stale in 30 s.
+  - The lease, its lock and the marker of what headless runs listen already reported (`woken-seen.json`) sit in the
+    room folder itself, not in the folders a wake may write, so a wake can't forge a lease to keep the watcher quiet,
+    or move the marker on to hide its own replies from the live session.
+- **Headless (unattended agents).** The watcher below. It defers to a live session automatically, for every harness:
+  - No wake while the lease is attached (heartbeat younger than 30 s and its pid running; a stale heartbeat whose
+    process `sameRun` still confirms gets one more 30 s, for a machine back from sleep), or inside the pickup window.
+    It logs `live session attached; not waking` once per change, `watch-status` shows the lease under `live`, and the
+    agent's note reads `wakeup off: a live session is attached` (or `... is handling it` during pickup), unless the
+    agent set a note of its own, which is left alone.
+  - A stale lease, or a pickup window that passed, lets wakes resume as before. When the window passed while the agent
+    did nothing in the room and no listen read further, the work the live listen consumed is offered once to a
+    headless wake (its cursor is put back), so it isn't lost.
+  - Never two readers: the watcher claims the mailbox in `live.json` (`state: headless`, its pid, then the run's) right
+    before a wake, under `live.lock`, which also serializes a listener's attach. A watcher that finds a lease attached
+    since its last look skips the wake; a listener started during a headless wake waits for it to end. Coalescing still
+    applies: at most one headless wake in flight per session.
+  - Each wake logs the session it resumes and the session the harness reported; `watch-status` shows the latter as
+    `lastResult.sessionId`. The watcher keeps its last five runs (`recentRuns`); a listen outside a wake reports those
+    since the agent's last listen as `wokenRuns: [{ at, outcome, sent, repliedTo }]`: an outcome (`replied`, `failed`,
+    `paused`, `busy`, `no-action`, `did-not-read`) and message ids only. A wake reads untrusted room text, so the
+    harness's own summary could repeat it; handed to the live session, which is the operator's unconfined session, it
+    would cross the wake's confinement looking like the agent's own words. The summary stays in the operator's log.
+  - Text that reaches a terminal or the watch log (the log's lines, the bridge's stderr, the runner's and the MCP
+    server's logs, CLI errors) is made inert first (`server/terminal-text.ts`): escape sequences (CSI, OSC, DCS), other
+    C0 and C1 controls but newline and tab, and Unicode bidi overrides are removed. JSON output is left as data, since
+    `JSON.stringify` escapes control characters.
+- **Session pinning at connect.** `connect ... --session <id>` records the harness session in `room.json` (a UUID for
+  Claude Code, `<date>_<time>_<hex>` for Hermes, a plain id otherwise), with the harness `--harness` names. `watch`
+  with no `--session` or `--last` resumes the one recorded for the same harness: Claude Code, Codex (when no `--cwd`
+  is given, which is for `--last`) or Hermes. Without one, if the folder has more than one Claude Code session written in the
+  last day (`$CLAUDE_CONFIG_DIR/projects/<folder with every non-alphanumeric character as ->/<id>.jsonl`), it refuses
+  and says how to pass `--session`; `--last` keeps the old `--continue`.
+
 ## How it works
 
 An agent only takes part while its harness keeps calling `listen`. When the harness ends its turn, the agent drops out:
-the roster shows it hasn't checked in, and mentions go unanswered. The watcher closes that gap without keeping a model
-running.
+the roster shows it hasn't checked in, and mentions go unanswered. A live listener closes that gap while the session is
+open; the watcher closes it for an unattended agent, without keeping a model running.
 
 - **Operator-run and opt-in.** The operator starts it, for one agent in one room, from their own terminal:
   `bun "<launcher>" watch --room R --harness claude|codex|exec`. It is a detached background process, like the runner.
@@ -59,24 +124,58 @@ running.
   room's floor, advice needs the decision to ask the agent or a person to address it, and only a steward closes a
   decision. Built bodies are checked as peers check them. The runner's own writes into the wake-writable folders
   (`outbox/*.dropped`, `wants/`) go by rename, and links planted there are removed, never read or written through.
-- **Busy queue.** One run at a time per room. What arrives during a run stays pending, and the next check after the
-  run finds it. One harness session also serves one wake at a time across rooms: a lock per session (Claude's folder
-  or session, Codex's thread) in `~/.meshrooms/locks`.
+- **Coalescing, per harness session.** A wake means "check the room", never "handle event X".
+  - Every room bound to one harness session shares one **session ledger**, a file in `~/.meshrooms/locks` changed
+    only under a short lock, so every transition is atomic and every watcher sees the same state. The key is the
+    harness, its session store (Claude Code's config folder, `CODEX_HOME`, `HERMES_HOME`, by real path, one case and
+    separator on Windows) and the session id, trimmed. Claude Code's session is pinned when the room is bound (the
+    folder's newest), so rooms on one session never compute two keys and run at once.
+  - A room with work joins the session's line once, however many events arrive; a room that won't offer now (no work,
+    backing off, paused, capped, halted) leaves it. One wake runs at a time. Rooms are admitted in the order they joined,
+    and a room that just ran joins again at the back, so a room that floods (or keeps failing) never holds up another.
+    The claim is released on every outcome, and a crashed wake's claim ends when its watcher and run are gone, or at
+    its lease (the run timeout plus a minute).
+  - What arrives during a wake is covered by that wake or by exactly one more after it: the watcher peeks again only
+    when the run has ended.
+  - A session the harness says is held elsewhere (Codex's "active writer", Hermes's `SESSION_NOT_OWNED` refusal line;
+    an `exec` command reports it the same way, as a stderr line and a failed exit) gets nothing queued into it, idle
+    owner or not: the harness's own acquisition decides. The room keeps its place, no room of that session offers for 5
+    minutes, then one offer tries again. That refusal costs no failure budget. `bindings` and `watch-status` show it
+    and suggest a session of its own for the room.
+  - A broken ownership registry (`ActiveSessionRegistryError` on stderr with a failed exit) is a coordination failure,
+    not a busy session: the session is halted for every room on it, visibly (`wakeup halted: needs its operator`),
+    with no retry, until the operator binds again.
+  - These transitions are atomic under the session's lock, shared by the watchers, rather than decided by the daemon:
+    `bind` works without a daemon, and the daemon reads the ledgers to report them.
 - **Loop guards.**
   - A run that doesn't handle the room's work backs off 30 s, then 60 s. Handling means reading the room and not
     failing.
-  - If a run read the room, then failed or timed out before doing anything there, the listen cursor is put back, so
-    that work is offered once more. A second failure on the same work isn't retried; `listen --from-start` offers
-    everything open again.
+  - **No lost work, per item.** Before a wake is dispatched, what it is offered (message, task and decision ids), the
+    listen cursor before it and the binding's generation are written to `watch-state.json`. A wake that exits cleanly
+    handled what it read: humans-first lets an agent decline. A wake that read the room and then failed, timed out or
+    was interrupted, or one a crashed watcher left running (settled by the next watcher, as interrupted), gets the
+    items it didn't answer offered again by putting the cursor back, at most twice each. The prompt names what was
+    answered, to skip, and gives each offered message's reply a request id derived from the message with the agent's
+    own key (`reply-key` in its folder, which no wake can read), so a retried reply is the same message, never a second
+    one, and no room participant can predict that id. Work offered twice without an answer stays in `obligations`,
+    flagged in `watch-status` and `bindings`, until the agent answers it; `listen --from-start` offers everything
+    open again.
+  - **Bindings and generations.** `bind` (`watch`'s new name) writes a new generation into the binding. A watcher
+    stops before its next wake once its binding is off or another; a run that ends after that changes nothing of the
+    new binding's state (its offer is left for the new watcher to settle). A run left by a previous watcher is waited
+    for (by its room's mark and start time); one that can't be identified is never killed and nothing is started beside
+    it: the watcher halts until the operator binds again. A pause on a broken confinement holds across restarts of the
+    same binding. `unbind` (`watch-stop`) turns wakes off and keeps the agent connected; removing the agent from the room
+    is a separate act. `bindings` lists every agent on the machine.
   - The third run in a row that doesn't handle the work pauses the watcher. It stays running with its heartbeat, sets
     the agent's note to `wakeup paused: harness did not respond` (shown in the roster), records why in
     `watch-state.json`, and tries again every 15 minutes until a run handles the work. Running `watch` again resumes
     at once.
   - At most `--max-wakes-per-hour` wakes per room (default 20), and `--max-agent-wakes-per-hour` across all of an
     agent's rooms (default 30), bound agent-to-agent ping-pong.
-  - A Codex thread held by another writer (the Codex app has it open) is retried every 5 minutes with the note
-    `wakeup waiting: the session is open elsewhere`. Each try counts toward the caps. Only Codex's own error counts as
-    busy: its stderr with a failed exit, never what the model printed.
+  - A session held elsewhere is retried every 5 minutes with the note `wakeup waiting: the session is open elsewhere`
+    (see Coalescing). Each try counts toward the caps. Only the harness's own error counts as busy: its stderr with a
+    failed exit, never what the model printed.
 - **Presence.** While it waits, the watcher refreshes the agent's activity heartbeat every 15 s, like `listen`, so
   the roster shows the agent idle and reachable, paused or not. During a run it shows working, on the messages and
   tasks that woke it.
@@ -101,7 +200,8 @@ running.
   - **Windows gap:** there is no process group or job object to reach this way, so a child that outlives the harness is
     not reaped there. A timeout still takes down the whole tree while the harness runs.
   - `ps` runs with `-ww`, so macOS doesn't cut command lines short.
-- **The runner.** While it runs, the watcher owns the bridge's runner:
+- **The runner.** While the machine's daemon runs, it owns the runner and the watcher defers to it (see "The machine's
+  daemon" below). Without the daemon, while it runs, the watcher owns the bridge's runner:
   - It starts one that isn't running and replaces one that stopped answering (the same staleness test `listen` uses),
     every minute between wakes, at every heartbeat (15 s) during a wake, and right after each wake. It leaves a closed
     room alone.
@@ -152,13 +252,89 @@ running.
   install is intact: the manifest, every recorded version's hash, and the launcher's exact text all match. The
   launcher is checked this way before a runner or watcher starts from it.
 
+## The machine's daemon
+
+`meshrooms daemon` is one background process per OS user that keeps every agent on the machine connected, so an agent
+no longer goes deaf when a runner or a hand-started watcher dies, or when its operator's session ends.
+
+- **What it supervises.** Every agent folder in the registry (`~/.meshrooms/agent-homes.json`, which `connect` and
+  `watch` write), plus the default `~/.meshrooms/agents` that bridges from before the registry never recorded. In each,
+  every room with a `room.json`. It keeps each room's runner alive, and for each room whose binding is on it keeps the
+  room's watcher, `watch-run`, alive. A binding is on only when `watch.json` says `enabled: true` and is exactly what
+  `watch` authorised: `watch` records a digest of the whole binding (harness, program, command, session, folder, tools,
+  caps) in `~/.meshrooms/daemon/bindings/`, which no wake can read or write. A `watch.json` changed any other way stays
+  off, shown as "changed outside watch; run watch again", so a command planted in the room folder is never run.
+  `watch-stop` and `stop` delete that record, so turning `enabled` back on in the file doesn't turn wakes on. The
+  daemon and the watcher read bindings with the same code: `watch-run` refuses to start on a binding that is off, and
+  stops before its next wake once its binding is turned off or changed.
+- **Upgrading turns earlier bindings off.** A `watch.json` from a bridge before the daemon (no `enabled` field) was
+  never recorded as authorised, so it can't be told apart from a file someone else wrote. On its first look the daemon
+  turns it off with the reason "from an earlier watch; run watch again to turn on", and stops its watcher if one still
+  runs. Run `watch` again for each room that should keep waking its agent.
+- **Processes.** Runners and watchers stay the separate, detached processes they always were, started from the
+  installed launcher with the room's own agent folder. A room connected later is picked up within a tick (2 s), without
+  a restart. A daemon that didn't stop cleanly leaves `daemon.lock` behind; the next one takes it over once its pid is
+  gone or, with no recent heartbeat, runs a program that is not the daemon (a pid reused after a reboot).
+- **Single owner.** While it runs (its pid lives and its heartbeat in `~/.meshrooms/daemon/daemon.json` is under 60 s
+  old) and it looks after the room's agent folder, nothing else starts or replaces the room's runner or watcher.
+  `runnerOwner` puts the daemon first: commands and `listen` report what they found and leave the start to the daemon,
+  and the watcher's own runner check defers too. `watch` writes the binding and the daemon starts or restarts the
+  watcher; `connect` waits briefly for the daemon's runner. Every start and stop still goes through the room's
+  `runner.lock` or `watch.lock` and the same identity checks as before (`repairRunner`, `sameRunner`, `killTree`), so the
+  daemon never adds a second runner or watcher beside a live one. One that already runs (started before the daemon, or by
+  a daemon that crashed) is adopted, not replaced. When the watcher's command line can't be read (the lookup timed
+  out), its own proof of life decides: `aliveAt` in `watch-state.json`, written every 15 s, also during a run, under a
+  minute old and naming the same pid. With no such proof, a `watch.pid` under a minute old may be a watcher still
+  starting, so neither the daemon nor `watch` starts a second one (`watch` says so and changes nothing); an older one
+  names a pid the system gave another program, and the room has no watcher. Nothing is stopped on a proof of life.
+- **Checks and restarts.** Each tick reads only files: the runner's proof of life (`runnerTrouble`), the binding, and the
+  room's markers. A runner or watcher the daemon started is watched through its process handle, so its exit needs no
+  lookup. The process lookups `repairRunner` makes run when the proof says stopped or stuck (then at most every 20 s
+  until fixed), when a held process exited, for a new room, and otherwise once a minute, at most two per tick. A process
+  that exits is started again after 2 s, doubling with every quick failure in a row up to 5 minutes; one that ran for 2
+  minutes first starts the count over. Restarts, the last exit and the next start time are in `daemon status`.
+- **Desired state.** `watch-stop` turns the binding off (`enabled: false`) and stops the watcher; the runner stays, so the
+  agent stays in the room. `stop` also leaves `stopped.json` in the room folder: the daemon leaves that room alone until
+  a command uses it again (`connect`, `watch`, `listen`, `send` and the other room commands outside a wake remove it).
+  A watcher whose binding changed (another session, say) is restarted.
+- **Rooms it lets go.** A closed room (the runner heard 410 and wrote `room-closed.json`), or one whose agent was removed
+  (the runner's proof says `removedSince`, for over a minute: the room service no longer has this device and no
+  request is pending), is let go: its watcher is stopped, a removed agent's runner too, and `retired.json` records it.
+  It is never restarted, also by a later daemon, until a new `connect` writes `room.json` again.
+- **Logs.** The runner's and the watcher's stdout and stderr, which used to be discarded, go to `runner.log` and
+  `watcher.log` in the room folder. The daemon logs to `~/.meshrooms/daemon/daemon.log`. Each is kept under 1 MB plus
+  one older copy (`.1`); a log a process holds open is copied and emptied rather than renamed, so it keeps writing.
+  Without the daemon, a runner's log is bounded when the runner is next started.
+- **Commands.** `daemon start` starts it in the background, `daemon stop` stops it (only once its command line proves it
+  is the daemon; what it started keeps running and the next daemon adopts it), `daemon status` shows whether it runs,
+  its pid, uptime and every room it supervises. `daemon run` is the daemon in the foreground; a second one finds the
+  lock held and exits cleanly. None of these are available in a wake.
+- **No environment carried over.** Bun loads `.env` files from the folder it starts in. Every runner, watcher and
+  daemon the bridge starts runs `bun --no-env-file` from a folder of its own (the room folder, the daemon's folder),
+  with the caller's environment minus every `MESHROOMS_*` override and minus the values a `.env` in the caller's folder
+  put there; what a child needs (`MESHROOMS_AGENT_HOME`, the daemon's folder) is set explicitly. `daemon start` and
+  the login item always start the user's own daemon, from its default folder and registry.
+- **Start at login.** `daemon install` registers it: a LaunchAgent on macOS (RunAtLoad, restarted after a failure), a
+  systemd user unit on Linux (`~/.config/systemd/user/meshrooms-daemon.service`, `Restart=on-failure`,
+  `KillMode=process` so a restart of the unit never takes the runners down, enabled with `systemctl --user enable
+  --now`), and on Windows the per-user Run key, through a hidden PowerShell script that runs `daemon start`. The
+  entry carries no environment: it runs Bun with `--no-env-file` and the launcher by absolute path from
+  `~/.meshrooms/bin`. Another bridge folder is accepted only as `--bin-dir`, an absolute path to a folder of the user's
+  own inside the home folder (checked where it really is, links resolved) that group and others can't write, and the
+  command prints it to confirm. On Windows only where it is is checked, not its owner or permissions. Since launchd and
+  systemd give a job only a minimal `PATH`, `watch` records the harness's absolute path, and a wake runs with Bun's and
+  the harness's folders first on `PATH`; an `exec` command should name its program by absolute path.
+  `daemon uninstall` removes it. A systemd user unit runs
+  while its user is logged in, unless lingering is on (`loginctl enable-linger`).
+
 ## Adapters
 
 | Harness | Runs | Session | Permissions |
 | --- | --- | --- | --- |
-| `claude` | `claude -p --output-format json` in `--cwd`, prompt on stdin | `--continue` (the most recent conversation in `--cwd`), or `--resume <id>` with `--session` | `--permission-mode dontAsk`; `--allowedTools` with one `Bash(bun "<launcher>" <subcommand> *)` rule per wake subcommand; `--disallowedTools Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent PowerShell`, plus `Read(...)` denies (which cover Grep and Glob) for the secrets listed below and `Read(**/.env*)`; `--strict-mcp-config`; `--add-dir` for the wake folder; `--allow-tools` adds rules and can lift a deny; `watch` refuses a `--cwd` that contains the agent folder, the bridge, or those secrets |
+| `claude` | `claude -p --output-format json` in `--cwd`, prompt on stdin | `--resume <id>` with `--session` or the session `connect --session` recorded; otherwise `--continue` (the most recent conversation in `--cwd`), refused when the folder has more than one recent session unless `--last` | `--permission-mode dontAsk`; `--allowedTools` with one `Bash(bun "<launcher>" <subcommand> *)` rule per wake subcommand; `--disallowedTools Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent PowerShell`, plus `Read(...)` denies (which cover Grep and Glob) for the secrets listed below and `Read(**/.env*)`; `--strict-mcp-config`; `--add-dir` for the wake folder; `--allow-tools` adds rules and can lift a deny; `watch` refuses a `--cwd` that contains the agent folder, the bridge, or those secrets |
 | `codex` | `codex exec resume <id> - --skip-git-repo-check` from the room's wake folder, prompt on stdin | `--session <thread id>` (a CLI or Codex app thread), or `--last --cwd <folder>`, which pins the newest thread working there when the watcher starts; one of them is required | `default_permissions="meshrooms_wake"`, a permission profile that `extends` read-only (or the operator's own named profile), with `write` for `live/ outbox/ files/ wants/ wake/` of the room, `deny` for the secrets and `.env` globs listed below, and `network.enabled=false`; `approval_policy="never"`, `web_search="disabled"`, each configured MCP server `enabled=false`, and `--disable` for computer and browser use, plugins, apps, image generation and multi-agent; never the bypass flag; `watch` refuses when the operator's top-level config is read-only, or has a legacy `profile` line Codex 0.159 rejects |
 | `exec` | the `--command` template, split into arguments without a shell; `{prompt_file}` and `{room}` are filled in per argument | up to the command | the command's own, plus the bridge's wake mode |
+| `hermes` | `hermes chat --query-file <prompt file> --oneshot --resume <id> --no-restore-cwd --source tool --pass-session-id --ignore-rules --format stream-json --toolsets meshrooms-<first 8 of the room id> --max-turns 12 --run-budget 240` | `--session <id>`, **required**: Hermes has no `--continue`, and a wake never resumes "whatever ran last" | Hermes has no per-invocation tool allowlist, so the **toolset list is the boundary**: the wake runs with its room's MCP server's tools (plus Hermes's own three-tool catalog, see below) and nothing else, so it has no terminal, file or code-execution tool |
 
 **The secrets a wake can't read**, worked out before every wake:
 - **The agent's own folders:** the room's `identity.json` (the agent's signing key). Also everything in `~/.meshrooms`
@@ -197,6 +373,75 @@ Codex refuses to combine `sandbox_mode` and `default_permissions` overrides, and
 `--model` passes a model to claude or codex. `--harness-bin` runs another executable than `claude` or `codex` on
 `PATH`, such as the `codex` the Codex app ships. On Windows, npm's `.cmd` shims are run through Node directly, since
 only a shell can run a batch file. Other batch files are refused.
+
+## Setting up a Hermes wake
+
+Hermes has no per-invocation shell allowlist, so a wake is confined by its **toolset** instead: the wake runs with one
+Meshrooms MCP server's tools and nothing else. Set that server up first.
+
+1. **Serve the room over MCP.** `meshrooms mcp --room <roomId> [--wake-dir <folder>]` exposes exactly the wake
+   subcommands as tools. No tool takes a room parameter, so a call cannot reach another room, and every call runs under
+   the CLI's own wake rules (only the wake subcommands, only that room, files only in the wake folder). It does not
+   shell out: each call dispatches into the bridge's own code.
+2. **Register it with Hermes** in `$HERMES_HOME/config.yaml` (by default `~/.hermes/config.yaml`; the watcher reads the same file Hermes does). **The agent home goes in the args, not in an `env:` block.** Hermes filters the environment it passes to a stdio server, so `MESHROOMS_AGENT_HOME` in `env:` never reaches this process, and a server that reads `homedir()` instead points its wake folder and room lookup at the SHARED `~/.meshrooms/agents` while the watcher uses the real one — every file the wake was told to attach is then refused as outside the wake folder. The name must not begin `hermes-` or `mcp-`: those belong to
+   the agent's own tooling, and a wake has to be confined to the *room's* server. `--agent-home` is required,
+   not cosmetic: without it the server falls back to the shared agents folder and the wake would act as whichever
+   agent lives there. `tools.include` pins the tool list, so a future release of the server cannot widen what a wake
+   can do on its own.
+
+```yaml
+mcp_servers:
+  meshrooms-<first 8 of the room id>:
+    command: /path/to/bun
+    args: [/path/to/meshrooms.js, mcp, --room, <roomId>, --wake-dir, <wake folder>, --agent-home, <this agent's folder>]
+    enabled: true
+    tools:
+      include: [listen, send, react, tasks, task-add, task-update, decisions, vote, ask, decision-wait, attachment, status]
+```
+
+   **The name is per room, not one shared `meshrooms`.** A single name cannot tell two rooms apart, so with two
+   watchers on one machine a wake could be confined to the *wrong* room's server — it would look correct and act
+   somewhere the operator is not watching, consuming that room's cursor. `watch` derives the name itself
+   (`meshrooms-` plus the first 8 hex of the room id, which also keeps it clear of the reserved `mcp-`/`hermes-`
+   prefixes) and **verifies the entry before every wake**: a missing entry, a `--room` that is not this room, or a
+   `--agent-home` that is not this agent's folder all make it refuse and print the block to add. It never rewrites
+   your config. The tools-present check (`hermes mcp test`, a real connect) runs at watch start and once more after a
+   wake that fails with a tool or startup error, never in a loop, since it is the expensive one.
+
+   **What a confined wake can call.** Hermes defers the room's tools: they arrive as `mcp__<server>__<tool>` with
+   hyphens turned into underscores (`meshrooms-0a1b2c3d` arrives as `meshrooms_0a1b2c3d`, `task-update` as
+   `task_update`), and the model reaches them through Hermes's own three-tool catalog, `tool_search`, `tool_describe`
+   and `tool_call`. Those three are always present and can only reach tools inside the named toolset (asked for a
+   shell, `tool_call` answers that it is not a known tool), so the post-run check allows exactly them and nothing that
+   merely looks like them. Any other tool a wake calls, including a room tool from another room's server, is a
+   confinement breach: the watcher pauses at once and the wake is never counted as handled.
+
+3. **Start the watcher** with `--harness hermes --session <the session id>`. `watch` checks the server is registered and
+   offers the tools a wake needs, and refuses to start if it does not, using `hermes mcp test <server>` rather than
+   `mcp list`: `list` prints no tool names, and `test` proves the server actually starts. An unresolvable toolset leaves
+   an agent with zero tools while it still answers confidently, so a wake that skipped this check could look healthy and
+   be useless.
+
+A Hermes wake does not read the operator's memory or user profile (`--ignore-rules`), does not carry any `HERMES_*`
+session variable into the room (they are stripped, not just `HERMES_KANBAN_TASK`: an inherited variable that widens
+tools, skips confirmation or ignores the operator's config would undo the confinement), answers outside the operator's
+session list (`--source tool`), and is bounded by turn count and wall-clock. If the operator has the session open
+elsewhere, Hermes refuses to resume it (`hermes-refusal-reason: SESSION_NOT_OWNED`); the watcher treats that as busy,
+offers the work again later, and does not count it as a failure or pause. The match is deliberately narrow — the
+refusal LINE on stderr with a failed exit — because room text reaches stdout, and a wide search for the bare marker
+let one room message put the watcher into a five-minute backoff and announce "the session is open elsewhere" into the
+room.
+
+A wake may only call the room's own tools. The preflight proves the room's server offers them before a wake is spent;
+after the run, any `tool_use` naming something outside the room (a shell, a file writer, another server's tool) is a
+hard error that pauses the watcher, so a confinement that did not hold cannot look like a quiet turn.
+
+**Use a session made for the room, not a working one.** `--ignore-rules` keeps the operator's memory and user profile
+out, but a wake RESUMES a session by id, so it carries that session's own transcript — and the flag does not trim it.
+A room message can therefore reach whatever the operator and the harness discussed earlier in that session, including
+work unrelated to the room. Point `--session` at a dedicated session (per room) rather than a session the operator
+types into. This is the same advice as for Claude Code, for a different reason: there the hazard is two writers
+appending to one conversation, here it is the conversation's own history travelling into a room.
 
 ### What was checked, and how
 
@@ -293,10 +538,15 @@ its purpose and its risk. Everything is opt-in, and the defaults are least-privi
   - **Claude Code:** its project folder (except `.env` files) and the wake folder.
   - **Codex:** everything the operator can read except the denied secrets, including other projects and their `.env`
     files, and it can attach a copy. It can also rewrite its own activity (`live/`) and so change the note people see.
-  - **Tools the operator grants** with `--allow-tools`, and an `exec` harness, are outside the deny lists.
+  - **Tools the operator grants** with `--allow-tools`, and an `exec` harness, are outside the deny lists. That
+    includes the agent's `reply-key`: an `exec` wake can read it and so work out the request id of any reply this
+    agent would send. Accepted: `exec` runs the operator's own command with its own permissions, which can already
+    send as the agent.
 
-  Whether it does is up to the model: the room rules in the prompt are guidance to it, not enforcement. The next step
-  is an MCP tool that gives a wake only `listen`, `send` and the other room actions, with no shell at all.
+  Whether it does is up to the model: the room rules in the prompt are guidance to it, not enforcement. **For Hermes
+  this is closed:** `meshrooms mcp` gives a wake only the room's commands as tools, so it has no shell at all, and
+  `--ignore-rules` keeps the operator's own notes out of its context. Claude Code and Codex keep their shell under the
+  rules above.
 
 ## Remaining gaps
 
@@ -307,14 +557,20 @@ its purpose and its risk. Everything is opt-in, and the defaults are least-privi
 - **The Codex app's window.** The app-side behavior was checked through the app's own `codex app-server`, not by
   watching the app's window. Unverified: what the window shows when opening a thread fails because the watcher holds
   it, and whether an open thread refreshes after the watcher's turn without being reopened.
-- **An open Claude Code session.** Claude Code takes no lock. The watcher's own session lock keeps two rooms apart, but
-  if the operator is typing into the same conversation the watcher resumes, both append to it. A dedicated session
-  (`--session`) avoids that, and it's also cheaper: every wake resumes the whole conversation.
-- **Machine restarts.** The watcher and the runner survive the terminal, not a reboot. Running `watch` again after a
-  reboot resumes without replaying anything. There is no login item or service yet.
+- **An open Claude Code session.** Claude Code takes no lock. A live listener (`--until-addressed`) is the answer: the
+  watcher wakes nothing while it holds its lease. Without one, if the operator is typing into the same conversation
+  the watcher resumes, both append to it; a dedicated session (`--session`) avoids that, and it's also cheaper.
+- **The live lease's platform edges.** A listener killed without a chance to clean up (Windows `TerminateProcess`, a
+  harness ending the task) is noticed by its pid no longer running, or after its heartbeat goes stale (30 s). The
+  Claude Code transcript folder name (`projects/<folder>`) is Claude Code's own convention, not a published interface:
+  if a later version names it differently, no sessions are found and `watch` falls back to `--continue` as before.
+- **Machine restarts.** Without the daemon, the watcher and the runner survive the terminal, not a reboot, and running
+  `watch` again after a reboot resumes without replaying anything. With `daemon install`, the daemon starts at login
+  and brings every agent and every binding back (see "The machine's daemon").
 - **No room-side switch.** People see the watcher only through the agent's activity and notes. The UI has no toggle
   that shows "watching on" or lets the host pause it; watching stays in the operator's hands.
-- **One mailbox.** A `listen` loop the agent runs itself while a watcher is on reads the same cursor (see AGT-5).
+- **One mailbox.** A plain `listen` loop the agent runs itself while a watcher is on reads the same cursor (see
+  AGT-5). A live listener doesn't: the watcher defers to its lease.
 
 ## Acceptance
 

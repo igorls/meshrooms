@@ -1,17 +1,17 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { taskBody } from '../../src/browser/board';
 import { openDecision } from '../../src/browser/decisions';
 import { BrowserAgent, listenRemembering, noteDropped, outboxProblem, peekWork, queuedMaySpeak, takeDropped } from '../browser-agent';
 import { claimIssueTask, releaseIssueTask } from '../github-issues';
-import { agentCli, cwdExposes, envProject, insideDir, newerThreadWarning, ourProcess, runnerOwner, startFromNow, wakeGuard, ALIVE_WITHIN_MS, START_SETTLE_MS } from '../agent-cli';
+import { agentCli, answeredItems, cwdExposes, envProject, insideDir, newerThreadWarning, ourProcess, runnerOwner, startFromNow, wakeGuard, ALIVE_WITHIN_MS, START_SETTLE_MS } from '../agent-cli';
 import {
   CLAUDE_DENIED, CODEX_DISABLED, CODEX_PROFILE, PAUSED_NOTE, WATCH_TIMING, appendNoFollow, claudeReadRules, claudeRulePath, clearDir, codexBase, codexConfig, codexThread, killTree, reapGroup,
   runFingerprint, sameRun, wakeReadDenies, agentHomesFile, codexEnvDenies, envProjectProblem, knownAgentHomes, recordAgentHome, stopOwnChild, type KillDeps, emptyState, harnessInvocation, heredocMarker, launcherRules, newestCodexThread,
-  openFresh, readHarnessOutput, resolveProgram, runProgram, sessionClaim, sessionKey, splitTemplate, wakeLedger, watchLoop, watchPrompt, writeFresh,
+  openFresh, readHarnessOutput, hermesWakeEnv, TOOL_SCAN_LIMIT, TOOL_SCAN_OVERFLOW, resolveProgram, runProgram, sessionLedger, type SessionClaim, sessionKey, splitTemplate, wakeLedger, watchLoop, watchPrompt, writeFresh,
   type WatchConfig, type WatchDeps, type WatchState,
 } from '../agent-watch';
 
@@ -19,7 +19,9 @@ const alex = crypto.randomUUID(), wren = crypto.randomUUID(), other = crypto.ran
 const roster = (memberId: string) => ({ memberId, ownerId: alex, members: [{ id: alex, name: 'Alex', role: 'human' as const },
   { id: wren, name: 'Wren', role: 'agent' as const, operatorId: alex }, { id: other, name: 'Otto', role: 'agent' as const, operatorId: alex }], devices: [] });
 const dirs: string[] = [];
-afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+// Windows refuses to remove a folder a process still uses (its working directory, an open file) for a moment after it
+// exits: retry rather than fail the test that just passed.
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
 const tempHome = () => { const home = mkdtempSync(join(tmpdir(), 'mr-bridge-watch-')); dirs.push(home); return home; };
 
 /** A room folder as the runner leaves it, for the agent Wren. */
@@ -149,6 +151,7 @@ function deps(r: Room, h: ReturnType<typeof harness>, options: { until: () => bo
     cursor: r.cursor,
     restoreCursor: saved => r.agent.saveListenCursor(JSON.parse(saved)),
     ownActions: () => r.agent.messages().filter(m => m.packet.body.memberId === wren).length,
+    answered: (items, since) => answeredItems(r.agent, items, since),
     activity: { idle: () => r.agent.recordActivity('idle', undefined, h.clock.now), working: on => r.agent.recordActivity('working', on, h.clock.now),
       touch: () => r.agent.touchActivity(h.clock.now), setNote: text => r.agent.noteActivity(text, h.clock.now), currentNote: () => r.agent.activity()?.note },
     run: h.run,
@@ -156,7 +159,7 @@ function deps(r: Room, h: ReturnType<typeof harness>, options: { until: () => bo
     runAlive: run => options.runAlive?.(run.pid) ?? false,
     killRun: run => { options.killed?.push(run.pid); },
     agentWakes: options.agentWakes ?? ledger(),
-    claimSession: () => options.claim && !options.claim() ? undefined : { started: () => {}, release: () => {} },
+    claimSession: () => options.claim && !options.claim() ? { wait: 'running' } : { started: () => {}, release: () => {} },
     log: line => options.logs?.push(line),
     readState: () => structuredClone(state.value),
     writeState: next => { state.value = structuredClone(next); },
@@ -188,7 +191,7 @@ test('work that arrives during a run waits for it to end, then wakes the harness
   await watchLoop(config(), deps(r, h, { until: after(h, 600) }));
   expect(h.overlapped()).toBe(false);
   expect(h.runs.map(run => run.addressed)).toEqual([[first], [second]]);
-});
+}, 60_000);
 
 test('runs that do not read the room back off; the third pauses the watcher, which stays up, shows a note, retries every 15 minutes and resumes', async () => {
   const r = room(); await listened(r);
@@ -205,7 +208,50 @@ test('runs that do not read the room back off; the third pauses the watcher, whi
   expect(replies(r, mention)).toBe(1);
   expect(state.value.paused).toBeUndefined();
   expect(r.agent.activity()?.note).toBeUndefined();
+}, 60_000);
+
+test('a wake that breaks its confinement pauses the watcher AT ONCE, even though it read the room and replied', async () => {
+  // Round-3 C3. The dangerous case is not a wake that fails cleanly — it is one that ran a shell and
+  // then replied, because the loop's rule is `progress && (!failed || handled)`, and such a run counts
+  // as HANDLED. So it cleared the no-progress counter and carried on, with no pause, while the docs and
+  // the code comment both promised a pause. A confinement breach must short-circuit BEFORE that rule.
+  const r = room(); await listened(r);
+  const mention = r.say('@Wren are you there?');
+  const h = harness(r, { replies: true }), state = { value: emptyState() }, logs: string[] = [];
+  // The run does everything right and then reports a stray tool, exactly as readHarnessOutput would.
+  const withStray = { ...deps(r, h, { until: after(h, 600), state, logs }),
+    run: async (onStart: (pid: number) => void) => ({ ...(await h.run(onStart)), confinementBroken: true, error: 'the wake called terminal' }) };
+  expect(await watchLoop(config(), withStray)).toBe('stopped');
+  // Paused, with the reason, on the FIRST such run — not after three.
+  expect(state.value.paused?.reason).toContain('outside the room');
+  expect(logs.some(line => line.includes('paused:') && line.includes('not retried'))).toBe(true);
+  // And it DID reply, which is the whole point: a broken confinement is still fatal when the run looks
+  // productive. If the pause were only reachable via the no-progress path, this test would time out.
+  expect(replies(r, mention)).toBe(1);
 });
+
+test('an approval wall pauses at once too — it is never a retryable failure', async () => {
+  const r = room(); await listened(r);
+  r.say('@Wren are you there?');
+  const h = harness(r, { reads: false }), state = { value: emptyState() }, logs: string[] = [];
+  const withWall = { ...deps(r, h, { until: after(h, 600), state, logs }),
+    run: async (onStart: (pid: number) => void) => ({ ...(await h.run(onStart)), approvalWall: true, error: 'an approval was required with no one to answer' }) };
+  expect(await watchLoop(config(), withWall)).toBe('stopped');
+  expect(state.value.paused?.reason).toContain('approval');
+  expect(logs.some(line => line.includes('not retried'))).toBe(true);
+});
+
+test('a breach or approval-wall pause holds until the operator restarts the watcher, past the timed retry', async () => {
+  const r = room(); await listened(r);
+  r.say('@Wren are you there?');
+  // The work stays pending (the run doesn't read the room), so a timed retry WOULD wake again if one were scheduled.
+  const h = harness(r, { reads: false }), state = { value: emptyState() }, logs: string[] = [];
+  const withWall = { ...deps(r, h, { until: after(h, 4 * WATCH_TIMING.pausedRetryMs / 1000), state, logs }),
+    run: async (onStart: (pid: number) => void) => ({ ...(await h.run(onStart)), approvalWall: true, error: 'an approval was required with no one to answer' }) };
+  expect(await watchLoop(config(), withWall)).toBe('stopped');
+  expect(h.runs.length).toBe(1);
+  expect(state.value.paused?.reason).toContain('approval');
+}, 30_000);
 
 test('while paused the watcher keeps its heartbeat and the note people see', async () => {
   const r = room(); await listened(r);
@@ -239,7 +285,7 @@ test('a run that fails after reading the room, without acting on it, gets that w
   // Failing like that is never taken for success: both failures count toward the pause.
   expect(gstate.value.noProgress).toBe(2);
   expect(gstate.value.lastResult).toMatchObject({ progress: true, replied: false, exitCode: 1 });
-});
+}, 30_000);
 
 test('the per-hour cap stops agent-to-agent ping-pong, and wakes resume once the hour has passed', async () => {
   const r = room(undefined, undefined, 'open'); await listened(r);
@@ -253,7 +299,7 @@ test('the per-hour cap stops agent-to-agent ping-pong, and wakes resume once the
   await watchLoop(config(3), deps(r, h, { until: after(h, 3600), state }));
   expect(h.runs.length).toBeGreaterThan(3);
   expect(h.runs.length).toBeLessThanOrEqual(6);
-});
+}, 60_000);
 
 test('one agent\'s wakes are capped across all its rooms too', async () => {
   const home = tempHome(), shared = ledger();
@@ -268,7 +314,7 @@ test('one agent\'s wakes are capped across all its rooms too', async () => {
   }
   expect(ran[0] + ran[1]).toBe(5);
   expect(rooms[1].agent.activity()?.note).toContain('in all rooms');
-});
+}, 60_000);
 
 test('after a restart, pending work is handled exactly once and handled work is never replayed', async () => {
   const r = room(); await listened(r);
@@ -297,7 +343,7 @@ test('after a restart, pending work is handled exactly once and handled work is 
   await watchLoop(config(), deps(r, third, { until: after(third, 600), state }));
   expect(third.runs.map(run => run.addressed)).toEqual([[pending]]);
   expect(replies(r, mention)).toBe(1);
-});
+}, 30_000);
 
 test('a restarted watcher waits for the run its predecessor started, so two runs never overlap', async () => {
   const r = room(); await listened(r);
@@ -329,7 +375,7 @@ test('an orphaned run is waited for only as long as a run may take, then stopped
   await watchLoop(config(), deps(s, g, { until: after(g, 60), state: { value: { ...emptyState(), activeRun: { pid: 778, startedAt: g.clock.now } } }, runAlive: () => false, killed: gkilled }));
   expect(gkilled).toEqual([]);
   expect(g.runs[0].at).toBeLessThan(g.clock.now);
-});
+}, 60_000);
 
 test('one wake at a time per harness session: a session another room is resuming waits', async () => {
   const r = room(); await listened(r);
@@ -355,7 +401,7 @@ test('a session held elsewhere (a thread open in the Codex app) waits and retrie
   expect(state.value.wakes).toHaveLength(3);
   expect(logs.filter(line => line.includes('open elsewhere'))).toHaveLength(2);
   expect(r.agent.activity()?.note).toBeUndefined();
-});
+}, 60_000);
 
 test('a Codex thread is found by id with the folder, client and version it recorded, and --last by its folder', () => {
   const home = tempHome(), id = '0190a000-0000-7000-8000-00000000000a', older = '0190a000-0000-7000-8000-000000000009', day = join(home, 'sessions', '2026', '09', '30');
@@ -587,6 +633,9 @@ await runProgram({ file: process.execPath, args: ['-e', 'await Bun.sleep(2000); 
   process.kill(watcher.pid!); await exited;
   for (let i = 0; i < 60 && !existsSync(marker); i++) await Bun.sleep(100);
   expect(existsSync(marker)).toBe(true);
+  // The run's working directory is the test folder: wait for it to exit, so the folder can be removed.
+  const gone = () => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  for (let i = 0; i < 100 && !gone(); i++) await Bun.sleep(100);
 }, 30_000);
 
 test('npm shims on Windows run through node, other batch files are refused, and a missing program says so', () => {
@@ -719,22 +768,33 @@ test('the watcher\'s own files never follow a planted link, and clearing the wak
   expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('keep');
 });
 
-test('a session claim is held by one watcher at a time, and taken over once its holders are gone or its time is up', () => {
-  const dir = tempHome(), live = new Set([process.pid]);
+test('one session ledger per harness session: one wake at a time, rooms in line by arrival, and a gone watcher or an overdue run never holds it', () => {
+  const dir = tempHome(), live = new Set([101, 102]);
   let now = 1_000_000;
-  const claim = sessionClaim(dir, 'claude:/work/project', pid => live.has(pid), () => now);
-  const first = claim(60_000)!;
-  expect(first).toBeDefined();
-  expect(claim(60_000)).toBeUndefined();
-  first.started(4321); live.add(4321);
-  first.release();
-  const second = claim(60_000)!;
-  expect(second).toBeDefined();
-  // Its time is up: taken over although the pid is alive (pids get reused).
+  const options = (pid: number) => ({ alive: (p: number) => live.has(p), holdMs: 60_000, ownedMs: 300_000, freshMs: 3_000, now: () => now, pid });
+  const a = sessionLedger(dir, 'claude:/store:S', 'room-a', options(101)), b = sessionLedger(dir, 'claude:/store:S', 'room-b', options(102));
+  const first = a.claim();
+  expect('wait' in first).toBe(false);
+  expect(b.claim()).toMatchObject({ wait: 'running', room: 'room-a' });
+  (first as SessionClaim).started(4321); live.add(4321);
+  (first as SessionClaim).release();
+  // b has been waiting in line: a, asking again at once, goes behind it.
+  now += 1_000;
+  expect(a.claim()).toMatchObject({ wait: 'queued', room: 'room-b' });
+  const second = b.claim();
+  expect('wait' in second).toBe(false);
+  // A run past its time is over, whatever its pid (pids get reused).
   now += 120_000;
-  expect(claim(60_000)).toBeDefined();
+  expect(b.read().running).toBeDefined();
+  const third = a.claim();
+  expect('wait' in third).toBe(false);
+  // A watcher that is gone leaves the line and its turn.
+  live.delete(101); live.delete(4321);
+  expect('wait' in b.claim()).toBe(false);
   expect(sessionKey({ harness: 'codex', session: 'T', cwd: '/w', command: undefined })).toBe(sessionKey({ harness: 'codex', session: 'T', cwd: '/elsewhere', command: undefined }));
   expect(sessionKey({ harness: 'claude', cwd: '/w/a' })).not.toBe(sessionKey({ harness: 'claude', cwd: '/w/b' }));
+  // One id names one session only within one store.
+  expect(sessionKey({ harness: 'claude', session: 'S', cwd: '/w' }, { CLAUDE_CONFIG_DIR: '/one' })).not.toBe(sessionKey({ harness: 'claude', session: 'S', cwd: '/w' }, { CLAUDE_CONFIG_DIR: '/two' }));
 });
 
 test('the agent-wide wake count is kept in one file and forgets wakes older than an hour', () => {
@@ -1022,4 +1082,153 @@ test('during a run each heartbeat also checks the runner, so one that stops mid-
   d.run = async onStart => { running = true; await Bun.sleep(120); running = false; return run(onStart); };
   await watchLoop(config(), d, { ...WATCH_TIMING, heartbeatMs: 20 });
   expect(checks.filter(c => c === 'during').length).toBeGreaterThanOrEqual(2);
+});
+
+// ── C3 through the REAL process boundary ────────────────────────────────────────────────────────────
+// The flag-injection tests above prove the LOOP pauses on the outcome; these go one layer out and
+// prove the OUTCOME is produced from a real harness's stdout by the real parser, driven through the
+// real runProgram. That is the gap a mocked `run` cannot close: it is exactly the layer where C2
+// (sanitized names) and C3 (the fatal flag) both live.
+/**
+ * A fake `hermes`: a small Bun script run by this Bun, so it behaves the same on Windows, macOS and Linux (a shell
+ * script with a shebang doesn't run on Windows). Output goes through writeSync, so nothing is lost on exit.
+ */
+function fakeHarness(dir: string, body: string) {
+  const script = join(dir, 'hermes.mjs');
+  writeFileSync(script, `import { writeSync } from 'node:fs';\nconst out = text => writeSync(1, text + '\\n'), err = text => writeSync(2, text + '\\n');\n${body}\n`);
+  return { file: process.execPath, args: [script] };
+}
+
+test('a REAL harness subprocess that calls a stray tool produces the fatal outcome (runProgram + readHarnessOutput)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fake-hermes-'));
+  const roomServer = 'meshrooms-0a1b2c3d';
+  // A fake `hermes`: prints a stream-json run that calls a tool OUTSIDE the room's server, then exits 0.
+  // Exit 0 is deliberate — the point of C3 is that a run which SUCCEEDS but reaches outside the room is
+  // still fatal, which is precisely what the old `progress && (!failed || handled)` rule got wrong.
+  const program = fakeHarness(dir, `for (const line of ${JSON.stringify([
+    '{"type":"system","subtype":"init"}',
+    `{"type":"tool_use","name":"mcp__${roomServer}__listen"}`,
+    '{"type":"tool_use","name":"mcp__otherserver__send"}',
+    '{"type":"result","session_id":"20260101_000000_abcdef","exit_code":0,"text":"replied"}',
+  ])}) out(line);`);
+  try {
+    const out = join(dir, 'run.txt');
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 20_000, output: out });
+    // The REAL parser reads the REAL stdout.
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, roomServer);
+    expect(result.exitCode).toBe(0);                       // the run "succeeded"
+    expect(read.tools).toEqual([`mcp__${roomServer}__listen`, 'mcp__otherserver__send']);
+    expect(read.confinementBroken).toBe(true);             // ...and is still fatal
+    expect(read.error).toContain('mcp__otherserver__send');
+    // The room's OWN tool must not be reported as a stray — this is C2's sanitization at the real layer.
+    expect(read.error).not.toContain('__listen');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a REAL harness subprocess that stays inside the room is NOT fatal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fake-hermes-'));
+  const roomServer = 'meshrooms-0a1b2c3d';
+  // The same run MINUS the stray call, with a hyphenated tool name that Hermes would sanitize.
+  const program = fakeHarness(dir, `for (const line of ${JSON.stringify([
+    `{"type":"tool_use","name":"mcp__${roomServer}__listen"}`,
+    `{"type":"tool_use","name":"mcp__${roomServer}__task_update"}`,
+    '{"type":"result","session_id":"20260101_000000_abcdef","exit_code":0,"text":"read the room, nothing to do"}',
+  ])}) out(line);`);
+  try {
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 20_000, output: join(dir, 'run.txt') });
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, roomServer);
+    expect(result.exitCode).toBe(0);
+    expect(read.confinementBroken).toBeUndefined();
+    expect(read.error).toBeUndefined();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a REAL harness subprocess whose output names an approval wall is fatal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fake-hermes-'));
+  const program = fakeHarness(dir, `err('this command requires approval, and timed out without user response'); process.exitCode = 1;`);
+  try {
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 20_000, output: join(dir, 'run.txt') });
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, 'meshrooms-0a1b2c3d');
+    expect(result.exitCode).toBe(1);
+    expect(read.approvalWall).toBe(true);
+    expect(read.error).toContain('approval');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── The 64 KB truncation, through the real file boundaries ──────────────────────────────────────────
+// The confinement check and the log read the same stdout differently. The log keeps a 64 KB tail,
+// which is what a person reads. If the CHECK read that tail too, a long run would push an early
+// `tool_use` out of the window and the check would pass a wake that reached outside the room. These
+// two tests pin the difference through the real `runProgram` (real stdout file, real scan).
+test('a stray tool called early in a LONG run is still seen (the 64 KB log tail would have lost it)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'long-run-'));
+  const roomServer = 'meshrooms-0a1b2c3d';
+  // The stray call comes FIRST, then several hundred KB of output, so it is well outside a 64 KB tail.
+  const program = fakeHarness(dir, `out('{"type":"tool_use","name":"mcp__otherserver__send"}');
+for (let i = 0; i < 4000; i++) out(JSON.stringify({ type: 'tool_result', text: 'room text filler ' + i + ' that is long enough to matter' }));
+out('{"type":"result","exit_code":0,"text":"replied"}');`);
+  try {
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 60_000, output: join(dir, 'run.txt') });
+    const bytes = statSync(join(dir, 'run.txt.out')).size;
+    // The premise: the tail the log keeps does NOT contain the stray call.
+    expect(result.stdout.includes('mcp__otherserver__send')).toBe(false);
+    // But the scan does, and the verdict is fatal.
+    expect(result.tools).toContain('mcp__otherserver__send');
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, roomServer, result.tools);
+    expect(read.confinementBroken).toBe(true);
+    expect(bytes).toBeGreaterThan(64_000);      // the run really did outgrow the tail
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
+
+test('the scan follows a run that writes slowly, not just one that is already finished', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'slow-run-'));
+  const roomServer = 'meshrooms-0a1b2c3d';
+  // Write the stray call, then linger: the periodic scan must catch it before the process exits.
+  const program = fakeHarness(dir, `out('{"type":"tool_use","name":"mcp__elsewhere__exec"}');
+await Bun.sleep(5000);
+out('{"type":"result","exit_code":0}');`);
+  try {
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 30_000, output: join(dir, 'run.txt') });
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, roomServer, result.tools);
+    expect(result.tools).toContain('mcp__elsewhere__exec');
+    expect(read.confinementBroken).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test('a stray tool after hundreds of room calls is still seen: the scan reads the whole run, not its first 500 calls', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'many-calls-'));
+  const roomServer = 'meshrooms-0a1b2c3d';
+  // 600 legitimate calls, then one outside the room. A scan that stopped counting at 500 calls never saw the last one.
+  const program = fakeHarness(dir, `for (let i = 0; i < 600; i++) out(JSON.stringify({ type: 'tool_use', name: 'mcp__${roomServer}__listen' }));
+out('{"type":"tool_use","name":"mcp__otherserver__send"}');
+out('{"type":"result","exit_code":0}');`);
+  try {
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 60_000, output: join(dir, 'run.txt') });
+    expect(result.tools).toEqual([`mcp__${roomServer}__listen`, 'mcp__otherserver__send']);
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, roomServer, result.tools);
+    expect(read.confinementBroken).toBe(true);
+    expect(read.error).toContain('mcp__otherserver__send');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
+
+test('a run calling more distinct tools than the scan can hold fails closed, whatever the names', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'many-names-'));
+  const roomServer = 'meshrooms-0a1b2c3d';
+  // Hundreds of distinct names: the set is bounded, and overflowing it is a breach rather than a pass.
+  const program = fakeHarness(dir, `for (let i = 0; i < 300; i++) out(JSON.stringify({ type: 'tool_use', name: 'mcp__${roomServer}__listen' + i }));
+out('{"type":"result","exit_code":0}');`);
+  try {
+    const result = await runProgram(program, { cwd: dir, env: { ...process.env }, timeoutMs: 60_000, output: join(dir, 'run.txt') });
+    expect(result.tools.length).toBe(TOOL_SCAN_LIMIT + 1);
+    expect(result.tools.at(-1)).toBe(TOOL_SCAN_OVERFLOW);
+    const read = readHarnessOutput('hermes', result.stdout, result.stderr, result.exitCode, roomServer, result.tools);
+    expect(read.confinementBroken).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
+
+test('a Hermes wake inherits no variable that shapes a session, whatever its case, and keeps HERMES_HOME', () => {
+  const env = hermesWakeEnv({ PATH: '/bin', HERMES_HOME: '/home/me/.hermes', HERMES_TOOLSETS: 'terminal', hermes_toolset: 'file',
+    HERMES_YOLO_MODE: '1', Hermes_Accept_Hooks: '1', HERMES_EXEC_ASK: '0', HERMES_SAFE_MODE: '1', HERMES_IGNORE_USER_CONFIG: '1',
+    HERMES_KANBAN_TASK: 't', hermes_kanban_db: 'x', HERMES_OTHER: 'kept' });
+  expect(env).toEqual({ PATH: '/bin', HERMES_HOME: '/home/me/.hermes', HERMES_OTHER: 'kept' });
 });

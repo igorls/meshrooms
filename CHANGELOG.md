@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.5) puts the room in charge of waking agents: a machine daemon owns every runner and
+  watcher, rooms bind to a harness session and take turns waking it, and a live session can listen in its own window.
+  The entries below, down to beta.4, ship in it, along with:
+  - `meshrooms mcp` serves one room to an agent over MCP (stdio): `listen`, `send`, the task board and decisions, the
+    same commands a wake may run and nothing more.
+  - `watch --harness hermes` wakes a Hermes session with only its room's MCP toolset, and pauses until restarted if a
+    wake uses any other tool or meets an approval prompt.
+  - A runner alone in its room counts as synced, so a watcher no longer waits forever for peers that aren't there, and
+    a slow Windows lookup no longer loses a new runner's start time.
+
+- `meshrooms bind` (`watch`'s new name) binds a room to a harness session; `unbind` turns wakes off and keeps the agent
+  connected; `bindings` lists every agent on the machine. Wakes are coalesced per harness session across rooms: one
+  at a time, rooms taking turns, nothing queued into a session held elsewhere, and a broken ownership registry halts
+  visibly. A wake that fails after reading has what it didn't answer offered again, with replies idempotent by a fixed
+  request id, and work that fails twice stays flagged rather than lost.
+
+- Agents can listen live: `listen --until-addressed`, run as a background command, costs nothing while idle and exits
+  only when there is work (exit 0), the room closed (3), the agent was removed (4), or the runner couldn't be repaired
+  (5). Claude Code then wakes the operator's own session in their window, instead of a headless run beside it. While
+  it waits it holds a live lease, and after returning work a 10-minute pickup window; the watcher wakes nothing during
+  either, for every harness, and takes over when the listener stops or the window passes. `connect --session` records
+  the harness session, so a Claude Code, Codex or Hermes watcher resumes exactly it, and a Claude Code one refuses to
+  guess in a folder with several recent sessions. Each wake logs the session it resumed, and the next listen reports what headless wakes did (`wokenRuns`).
+
+- The agent bridge has a machine daemon: `meshrooms daemon` is one background process per user that keeps every agent
+  on the machine connected. It keeps each room's runner alive, and each bound room's watcher, restarting what dies with
+  a backoff, and it is their single owner while it runs: commands and watchers leave starts to it. `daemon install`
+  starts it at login (a LaunchAgent on macOS, a systemd user unit on Linux, the Run key on Windows), and `daemon status`
+  shows what it supervises. Closed rooms and removed agents are let go, never restarted. Runner and watcher output now
+  goes to bounded logs in the room folder. See [agent room watching](docs/flows/agent-room-watching.md).
+  - Upgrading turns off every watcher binding from an earlier bridge, and the daemon stops its watcher: run `watch`
+    again for each room that should keep waking its agent. A binding is now on only as `watch` authorised it.
+
 - The agent bridge (0.2.0-beta.4) keeps agents reachable in busy rooms and replaces a runner that stops syncing:
   - It prepares its connection offers to every peer at once instead of one after another, so in a room of seven or
     eight devices it no longer drops out between polls and leaves everyone seeing everyone offline. The room service

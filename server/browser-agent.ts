@@ -44,7 +44,7 @@ type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: stri
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody | ReactionBody; signature: string };
 type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[] };
-type Members = { memberId?: string; ownerId?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
+type Members = { memberId?: string; ownerId?: string; title?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
 /** A queued reaction toggle; `run` signs it against the current folded chips and revision. */
@@ -113,9 +113,10 @@ export class BrowserAgent {
   readonly dir: string;
   private identity?: Identity;
   private key?: CryptoKey;
-  constructor(dataDir: string, readonly origin: string, readonly roomId: string) {
+  /** `mkdir: false` only reads the room folder as it is (`bindings` lists rooms without changing them). */
+  constructor(dataDir: string, readonly origin: string, readonly roomId: string, options: { mkdir?: boolean } = {}) {
     this.dir = resolve(dataDir, 'browser-agents', roomId);
-    for (const sub of ['outbox', 'files', 'wants', LIVE]) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
+    if (options.mkdir !== false) for (const sub of ['outbox', 'files', 'wants', LIVE]) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
   }
   private path(name: string) { return join(this.dir, name); }
   /**
@@ -333,7 +334,7 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
 
 /**
  * The runner rewrites this every second with its pid, so a command that can't inspect processes can still tell it runs:
- * `{ pid, at, startedAt, loopAt, polledAt?, failingSince?, failure?, syncedAt? }`.
+ * `{ pid, at, startedAt, loopAt, polledAt?, failingSince?, failure?, syncedAt?, removedSince? }`.
  * - `at`: the process is alive (its ticker runs).
  * - `loopAt`: its loop last came round (reached the top of a pass, or had any outcome from its status poll). A pass is
  *   bounded, so a loop that stops coming round is stuck, and only that counts against the runner.
@@ -342,6 +343,8 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
  *   would drop data channels that still work), so it is reported, never repaired.
  * - `syncedAt`: a channel to another device first opened, or the room service said no other device is online, so
  *   there is no history to wait for (set once; see startFromNow).
+ * - `removedSince`: the room service has answered since then that this device is no longer in the room, which it was
+ *   (someone removed the agent). Cleared once it is admitted again.
  */
 export const RUNNER_ALIVE = 'runner-alive.json';
 /**
@@ -637,6 +640,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
    */
   const startedAt = Date.now();
   let loopAt = startedAt, polledAt: number | undefined, failingSince: number | undefined, failure: string | undefined, failureStatus: number | undefined;
+  /** Since when the room service has answered that this device is no longer in the room, after it was (see RUNNER_ALIVE). */
+  let removedSince: number | undefined;
   /**
    * Proof of life for commands that can't inspect processes (a harness sandbox denies it), so they don't start a second
    * runner. Written every second by the ticker rather than once per pass, so a long pass never makes the process look
@@ -645,7 +650,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const prove = () => {
     try {
       writeJson(join(agent.dir, RUNNER_ALIVE), { pid: process.pid, at: Date.now(), startedAt, loopAt, ...(polledAt ? { polledAt } : {}),
-        ...(failingSince ? { failingSince, failure, ...(failureStatus !== undefined ? { failureStatus } : {}) } : {}), ...(syncedAt ? { syncedAt } : {}) });
+        ...(failingSince ? { failingSince, failure, ...(failureStatus !== undefined ? { failureStatus } : {}) } : {}), ...(syncedAt ? { syncedAt } : {}),
+        ...(removedSince ? { removedSince } : {}) });
     } catch { /* Written again next second. */ }
   };
   prove();
@@ -953,6 +959,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined;
       // Everything after the poll shares one budget, so the next poll comes inside the service's presence window.
       const passEnds = Date.now() + deadlines.budget, left = (cap: number) => Math.max(0, Math.min(cap, passEnds - Date.now()));
+      // A device the room no longer has, with no request of its own, after it was a member: someone removed this agent.
+      // The proof says so, so the machine's daemon stops looking after a room that will never answer this device again.
+      removedSince = next.memberId || next.request || !agent.members().memberId ? undefined : removedSince ?? Date.now();
       if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await pause(3000); continue; }
       // The room's rules first, and on their own: listen, status and the watch peek read the floor from this file, so
       // nothing else in the pass (closing peers, a members.json busy on Windows) may leave it behind the room.
@@ -966,7 +975,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
-      keep('members.json', { memberId: next.memberId, ownerId: next.ownerId, former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
+      keep('members.json', { memberId: next.memberId, ownerId: next.ownerId, ...(typeof next.title === 'string' ? { title: next.title } : {}), former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
       await step('profile', () => applyPendingProfile(agent, log), left(deadlines.profile));
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
       const available = (next.devices || []).filter(d => d.id !== identity.id && d.session);
@@ -1142,7 +1151,18 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
     // The files only change while the runner runs: a long wait on a stopped one would never hear anything. Start it
     // again once; if that one stops too, hand the question back to the agent instead of waiting on frozen files.
     if (runnerStopped(agent, runnerSince)) {
-      if (!restartRunner || restarted) return unchanged('runner-stopped', { error: 'The background process stopped. Run listen again; it starts the process again.' });
+      if (!restartRunner || restarted) {
+        // In a WAKE the message above would be a lie: a wake's listen never restarts the runner (the
+        // watcher owns it), so "run listen again" cannot help and telling the model that is a loop.
+        // This lives in #57, not only the Hermes adapter, because the MCP server ALWAYS runs in wake
+        // mode (serveMcp sets MESHROOMS_WAKE_ROOM for its whole process), so a wake served through the
+        // MCP tools hits this path too. A wake says what is actually true instead: the work is still
+        // there, someone else must bring the connection back, and the agent should stop rather than retry.
+        const waking = process.env.MESHROOMS_WAKE_ROOM === agent.roomId;
+        return unchanged('runner-stopped', { error: waking
+          ? 'This agent has no live connection to the room right now, so the room cannot be read from here. Do not retry: nothing you do in this wake restarts it. Report this and end your turn.'
+          : 'The background process stopped. Run listen again; it starts the process again.' });
+      }
       restarted = true; await restartRunner(); runnerSince = Date.now();
     }
     await Bun.sleep(500);
