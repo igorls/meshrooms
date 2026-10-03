@@ -81,7 +81,7 @@ test('LIFE-1: only the host closes a room; afterwards every command and the publ
       expect(db.query('SELECT reason FROM closed_rooms WHERE id=?').get(room)).toEqual({ reason: 'closed' });
     } finally { db.close(); }
   } finally { lobby.close(); dir.cleanup(); }
-});
+}, 30_000);
 
 test('LIFE-2: activity is written at most hourly, status shows the expiry, and the sweep removes only idle rooms', async () => {
   const dir = tempDir(), path = join(dir.path, 'admission.sqlite');

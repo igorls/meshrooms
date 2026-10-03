@@ -1367,6 +1367,9 @@ async function daemonCommand(sub: string, values: Record<string, string>) {
   const dir = daemonDir({});
   if (sub === 'install') {
     const checked = bin ? trustedBinDir(bin) : undefined, item = daemonLoginItem(dir, checked);
+    // First install may precede daemon start: the startup entry creates only its own
+    // folder, while login.json is written here before startDaemon creates this one.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     // On Linux systemd runs it: a daemon started by hand gives way, so the one systemd starts takes the lock. If systemd
     // can't take it (no user session), the hand-started one is started again: install never leaves no daemon running.
     const handOver = process.platform === 'linux' && !!runningDaemon(running, dir) && (await stopDaemon(dir)).stopped;

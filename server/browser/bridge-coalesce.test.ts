@@ -231,6 +231,16 @@ test('a watcher restarted while its run still goes (a crash mid-run) waits for i
   r.control({ sleepMs: 4_000 });
   const child = spawn(process.execPath, [join(m.base, 'fake-harness.js'), promptFile, runFingerprint(w.config)], { detached: true, stdio: 'ignore', windowsHide: true,
     env: { ...process.env, MESHROOMS_WAKE_ROOM: r.roomId, FAKE_CONTROL: r.controlFile } });
+  // This test spans two clocks: the child takes real time, while watcher sleeps advance fake time.
+  // Synchronize the first simulated poll with the child's actual exit. Otherwise the fake orphan
+  // deadline can pass in under two real seconds, before the child's four-second run has finished.
+  // Keep the real detached child and identity check: a mocked process would miss that boundary.
+  const exited = new Promise<void>((done, fail) => {
+    child.once('error', fail);
+    child.once('exit', code => code === 0 ? done() : fail(new Error(`orphan harness exited ${code}`)));
+  });
+  const sleep = w.deps.sleep;
+  w.deps.sleep = async ms => { await exited; await sleep(ms); };
   try {
     let started: string | undefined;
     for (const by = Date.now() + 20_000; !(started = processInfo(child.pid!)?.started);) { if (Date.now() > by) throw new Error('no start time'); await Bun.sleep(50); }
@@ -436,7 +446,9 @@ test('a reply\'s request id is fixed per message for this agent, distinct per me
 
 test('a session ledger whose lock is damaged says so at once, never "queued" forever; a lock left by a crash ages out, and a watcher\'s own unreleased turn is over', () => {
   const dir = tempDir(), live = new Set([401, 402]);
-  const options = (pid: number) => ({ alive: (p: number) => live.has(p), holdMs: 60_000, ownedMs: 300_000, freshMs: 30_000, pid });
+  // A clock that moves on every read, so who joined the line first never comes down to two calls in one millisecond.
+  let tick = Date.now();
+  const options = (pid: number) => ({ alive: (p: number) => live.has(p), holdMs: 60_000, ownedMs: 300_000, freshMs: 30_000, pid, now: () => ++tick });
   const a = sessionLedger(dir, 'k', 'A', options(401)), b = sessionLedger(dir, 'k', 'B', options(402));
   const lock = `${a.file}.lock`;
   mkdirSync(dir, { recursive: true });

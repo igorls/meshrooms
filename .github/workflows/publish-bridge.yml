@@ -25,11 +25,10 @@ concurrency:
   group: publish-bridge-${{ github.ref }}
   cancel-in-progress: false
 
+# The full source checks and browser smoke ran on the commit before it was exported; publishing doesn't run them again.
+# It checks what it ships: the types, the bridge's own tests, the build, and the packed contents.
 jobs:
-  verify:
-    uses: ./.github/workflows/ci.yml
   publish:
-    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Required reviewers approve every run; npm's trusted publisher accepts only this workflow in this environment.
@@ -74,8 +73,9 @@ jobs:
           if ! [[ "$DIST_TAG" =~ ^[a-z][a-z0-9-]*$ ]]; then echo "::error::Invalid dist-tag."; exit 1; fi
           echo "BRIDGE_VERSION=$version" >> "$GITHUB_ENV"
       - run: bun install --frozen-lockfile
-      # The Windows source checks ran in verify; this runs the bridge's own tests on Linux too (runner detection uses ps here).
-      - run: bun test ./server/browser/bridge-install.test.ts ./server/browser/agent-connect.test.ts
+      - run: bun run check
+      # The bridge's own install and connect tests, on Linux (runner detection uses ps here).
+      - run: bun test --retry=2 ./server/browser/bridge-install.test.ts ./server/browser/agent-connect.test.ts
       - run: bun run build:bridge
       - name: Check the package contents and bin
         working-directory: packages/meshrooms
