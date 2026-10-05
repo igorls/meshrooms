@@ -1,0 +1,11 @@
+.agents { list-style: none; padding: 0; margin: 1.25rem 0 0; text-align: left; display: grid; gap: .6rem; font-size: 14px; }
+.agents li { display: grid; grid-template-columns: 1fr auto; gap: .15rem 1rem; align-items: center; padding: .6rem .75rem; border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent); border-radius: 8px; }
+.agents .who { font-weight: 600; }
+.agents .where, .agents .why { grid-column: 1; color: var(--muted); font-size: 13px; }
+.agents .state { grid-column: 1; font-size: 13px; }
+.agents li.failed .state { color: var(--danger); }
+.agents li.live .state { color: var(--accent); }
+.agents button { grid-column: 2; grid-row: 1 / span 3; padding: .35rem 1rem; }
+.agents .confirm { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-top: .35rem; }
+.agents .confirm .ask { flex-basis: 100%; color: var(--danger); font-size: 13px; }
+.agents .confirm button { grid-column: auto; grid-row: auto; }

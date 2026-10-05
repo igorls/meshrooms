@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-approvals-custom-check"
+description = "Enables the approvals_custom_check command without any pre-configured scope."
+commands.allow = ["approvals_custom_check"]
+
+[[permission]]
+identifier = "deny-approvals-custom-check"
+description = "Denies the approvals_custom_check command without any pre-configured scope."
+commands.deny = ["approvals_custom_check"]

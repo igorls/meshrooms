@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-join-confirm"
+description = "Enables the join_confirm command without any pre-configured scope."
+commands.allow = ["join_confirm"]
+
+[[permission]]
+identifier = "deny-join-confirm"
+description = "Denies the join_confirm command without any pre-configured scope."
+commands.deny = ["join_confirm"]

@@ -105,6 +105,15 @@ test('a new room gets its runner started once; afterwards it is looked at once a
   expect(w.calls.heartbeats).toBeGreaterThan(30);
 });
 
+test('the heartbeat names what the daemon looks after before the first room\'s checks, which can take long', async () => {
+  const w = world([room1]);
+  let beatsBeforeRepair: number | undefined;
+  const original = w.calls.repair.push.bind(w.calls.repair);
+  w.calls.repair.push = (...items) => { beatsBeforeRepair ??= w.calls.heartbeats; return original(...items); };
+  await w.supervisor.tick();
+  expect(beatsBeforeRepair).toBe(1);
+});
+
 test('a runner that exits is started again after the backoff, which doubles while it keeps failing and starts over after a good run', async () => {
   const w = world([room1]);
   await w.run(2);
@@ -519,7 +528,8 @@ test('the daemon starts at login on every system, from files written only where 
 test('the real daemon: one per user, seen by status, stopped by stop, and a crashed one\'s lock taken over by the next', async () => {
   const dir = tempDir(), registry = join(dir, 'agent-homes.json'), daemon = join(dir, 'daemon');
   writeFileSync(registry, '[]');
-  const env: Record<string, string | undefined> = { ...process.env, MESHROOMS_AGENT_REGISTRY: registry, MESHROOMS_AGENT_HOME: join(dir, 'agents') };
+  // MESHROOMS_LOCAL_PORT 0: the daemon's local API takes a free port, never the real one (4310).
+  const env: Record<string, string | undefined> = { ...process.env, MESHROOMS_AGENT_REGISTRY: registry, MESHROOMS_AGENT_HOME: join(dir, 'agents'), MESHROOMS_LOCAL_PORT: '0' };
   delete env.MESHROOMS_DAEMON_DIR;
   const cli = join(import.meta.dir, '..', 'agent-cli.ts');
   const pids: number[] = [];

@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "join-window",
+  "description": "The join window may call the join commands and nothing else: no core or plugin permissions, and none of the pairing window's commands.",
+  "windows": ["join"],
+  "permissions": [
+    "allow-join-view",
+    "allow-join-confirm",
+    "allow-join-cancel",
+    "allow-join-browse"
+  ]
+}

@@ -87,7 +87,14 @@ jobs:
           # Scoped, so npm publish needs --access public (passed below); the bin stays `meshrooms`.
           if [ "$name" != "@wormdb/meshrooms" ]; then echo "::error::Packed $name, expected @wormdb/meshrooms."; exit 1; fi
           if [ "$(jq -r '.bin | keys | join(",")' package.json)" != meshrooms ]; then echo "::error::The package must have exactly one bin, meshrooms."; exit 1; fi
-          if [ "$files" != "LICENSE,README.md,THIRD_PARTY_LICENSES.txt,bin/meshrooms.js,package.json" ]; then echo "::error::Unexpected package contents: $files"; exit 1; fi
+          # The bridge's files exactly, plus the built UI the daemon serves on 127.0.0.1: index.html and Vite's assets by
+          # name, no source maps, and exactly the files build:bridge made (their hashes are compiled into the bundle).
+          rest=$(jq -r '.[0].files | map(.path) | map(select(startswith("ui/") | not)) | sort | join(",")' "$RUNNER_TEMP/pack.json")
+          ui=$(jq -r '.[0].files | map(.path) | map(select(startswith("ui/"))) | sort | .[]' "$RUNNER_TEMP/pack.json")
+          if [ "$rest" != "LICENSE,README.md,THIRD_PARTY_LICENSES.txt,bin/meshrooms.js,package.json" ]; then echo "::error::Unexpected package contents: $files"; exit 1; fi
+          if ! grep -qx 'ui/index.html' <<< "$ui"; then echo "::error::The package has no ui/index.html."; exit 1; fi
+          if grep -vqE '^ui/(index\.html|assets/[A-Za-z0-9._-]+)$' <<< "$ui" || grep -qE '\.map$' <<< "$ui"; then echo "::error::Unexpected UI files: $ui"; exit 1; fi
+          if [ "$ui" != "$(find ui -type f | LC_ALL=C sort)" ]; then echo "::error::The packed UI is not the built one."; exit 1; fi
           if [ "$packed" != "$BRIDGE_VERSION" ]; then echo "::error::Packed $packed, expected $BRIDGE_VERSION."; exit 1; fi
           if [ "$(head -n 1 bin/meshrooms.js)" != '#!/usr/bin/env bun' ]; then echo "::error::bin/meshrooms.js has no Bun shebang."; exit 1; fi
           reported=$(bun bin/meshrooms.js version | jq -r .version)

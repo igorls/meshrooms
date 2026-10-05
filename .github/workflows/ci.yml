@@ -109,6 +109,47 @@ jobs:
           trap 'kill "$coordinator" 2>/dev/null || true' EXIT
           for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14331/api/lobby/health && break; sleep 0.5; done
           MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14331 node scripts/browser-background-smoke.mjs
+      # The desktop's local UI: a person device (the daemon, from this checkout, in a scratch home) joins a room a
+      # browser hosts, and the page it serves on 127.0.0.1 sends, reacts, adds a task and admits a guest.
+      - name: Local UI smoke (loopback coordinator on 14332)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14332 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-local.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14332/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14332 node scripts/local-ui-smoke.mjs
+      # The same, from the npm package as a release runs it: `daemon start` installs the bundle and its UI into the
+      # scratch ~/.meshrooms/bin, and the daemon serves the UI it verified against the bundle's hashes.
+      - name: Local UI smoke from the bridge package (loopback coordinator on 14333)
+        run: |
+          bun run build:bridge
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14333 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-release.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14333/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_SMOKE_BRIDGE=packages/meshrooms MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14333 node scripts/local-ui-smoke.mjs
+      # Agents and sessions from the local page: the daemon (with the app's approval routes) makes an agent, puts it into
+      # a room, starts and binds a session, and the agent replies to a mention. The harnesses are the smoke's own fakes.
+      - name: Local agents smoke (loopback coordinator on 14334)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14334 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-agents.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14334/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14334 node scripts/local-agents-smoke.mjs
+      # Pairing the hosted browser with this machine's person device. The app's side is `person pair`, as its window
+      # runs it, so no desktop app is needed. Three rooms: its own coordinator keeps it under the create-room limit.
+      - name: Pairing smoke (loopback coordinator on 14335)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14335 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-pairing.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14335/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14335 node scripts/pairing-smoke.mjs
       - name: Upload smoke evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -127,3 +168,78 @@ jobs:
           name: meshrooms-browser-release
           path: ${{ runner.temp }}/release
           retention-days: 14
+
+  # The desktop app's own windows, links and notifications, driven through its development hooks: the debug build of the
+  # Tauri app from this checkout (`--dev-*` hooks and MESHROOMS_DEV_* exist only in debug builds), in a scratch home, under
+  # Xvfb with a private D-Bus session bus (on Linux the single-instance plugin hands a second launch, a link or a hook, to
+  # the running app over D-Bus). Runs beside the other jobs and ends before the linux job does (about 6 minutes with a
+  # cold Rust cache). Skipped when the tag check calls this workflow, so it never holds up a release check.
+  desktop:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # WebKitGTK's DMA-BUF renderer has no GPU to use under Xvfb.
+      WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+      MESHROOMS_DESKTOP_APP: ${{ github.workspace }}/desktop/src-tauri/target/debug/meshrooms-desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Install the app's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev xvfb dbus
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+      - name: Build the development app
+        working-directory: desktop/src-tauri
+        run: cargo build --locked
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run build:agent
+      - run: bun run build:bridge
+      - name: Install Chromium
+        run: bunx playwright install --with-deps chromium
+      # Join links: before and after pairing through the app's window, a room the app is in, one it isn't (Join, then
+      # the host admits), and another room service refused.
+      - name: Join link smoke (loopback coordinator on 14336)
+        run: |
+          mkdir -p .impeccable/review
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14336 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-join-link.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14336/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14336 dbus-run-session -- xvfb-run -a node scripts/join-link-smoke.mjs
+      # Notifications from the daemon's feed (written to a file, never posted), the agents-live notice on start and
+      # after the daemon comes back, and the Review window's Pause and Resume.
+      - name: Notifications smoke (loopback coordinator on 14337)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14337 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-notifications.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14337/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14337 dbus-run-session -- xvfb-run -a node scripts/notifications-smoke.mjs
+      # The Approvals window: an identity an agent asks for, a request changed under the window, an existing-session
+      # bind from the local page, and a custom-command agent, each through the window's development hooks.
+      - name: Approvals smoke (loopback coordinator on 14338)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14338 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-approvals.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14338/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14338 dbus-run-session -- xvfb-run -a node scripts/approvals-smoke.mjs
+      - name: Upload smoke evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-smoke-linux
+          path: .impeccable/review
+          retention-days: 7

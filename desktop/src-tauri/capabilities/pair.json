@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pair-window",
+  "description": "The pairing window may call the pairing commands and nothing else: no core or plugin permissions. The join window has its own (join.json); every other window (the status page, link notices) has no capability at all.",
+  "windows": ["pair"],
+  "permissions": [
+    "allow-pair-view",
+    "allow-pair-check",
+    "allow-pair-verify",
+    "allow-pair-confirm",
+    "allow-pair-reject",
+    "allow-pair-unpair",
+    "allow-pair-close",
+    "allow-pair-open"
+  ]
+}

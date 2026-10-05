@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
+import { uiManifestOf } from '../server/local-ui';
 
 export type PackageOptions = {
   sourceDir: string;
@@ -304,11 +305,100 @@ export async function packageRuntime(options: PackageOptions): Promise<PackageRe
   };
 }
 
+export type BridgeOptions = {
+  sourceDir: string;
+  outputDir: string;
+  /** The Bun to bundle; defaults to the one running this script (the repository pins 1.4.2). */
+  bunPath?: string;
+  /** macOS only: Developer ID identity for bun, applied before hashing. */
+  codesignIdentity?: string;
+};
+
+/**
+ * The desktop app's bridge bundle: Bun, the single-file bridge (packages/meshrooms/bin/meshrooms.js, from
+ * `bun run build:bridge`), the built UI beside it (ui/, which the daemon serves on 127.0.0.1), its notices, and a
+ * manifest whose `version` is the bridge's version and whose `files` hold each file's SHA-256, the UI's included. The app installs it into ~/.meshrooms/app/bridge/<version>-<12 hex of the manifest's SHA-256>/,
+ * checks that folder against the bundled manifest (the manifest itself and every file's hash) each time it starts, and
+ * installs it again, moving the old folder aside, when anything differs or is missing.
+ */
+export async function packageBridge(options: BridgeOptions): Promise<PackageResult> {
+  const target: PackageTarget | undefined = TARGETS[`${process.platform}-${process.arch}` as keyof typeof TARGETS];
+  if (!target) throw new Error(`packageBridge currently targets Windows x64 and macOS arm64 only. Detected: ${process.platform}-${process.arch}`);
+  if (options.codesignIdentity && target.platform !== 'darwin') throw new Error('Code signing during packaging is only supported for macOS bundles.');
+  const sourceDir = resolve(options.sourceDir), outputDir = resolve(options.outputDir);
+  const packageDir = join(sourceDir, 'packages', 'meshrooms');
+  if (existsSync(outputDir)) throw new Error(`Output directory already exists: ${outputDir}. Refusing to overwrite.`);
+  const metadata = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
+  if (typeof metadata.version !== 'string' || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(metadata.version)) throw new Error('packages/meshrooms/package.json has no valid version.');
+  const bun = resolve(options.bunPath ?? process.execPath);
+  const inputs: [string, string][] = [
+    [join(packageDir, 'bin', 'meshrooms.js'), 'meshrooms.js'],
+    [join(packageDir, 'THIRD_PARTY_LICENSES.txt'), 'THIRD_PARTY_LICENSES.txt'],
+    [join(sourceDir, 'LICENSE'), 'LICENSE'],
+    [join(sourceDir, 'THIRD_PARTY_NOTICES.md'), 'THIRD_PARTY_NOTICES.md'],
+  ];
+  // The UI build:bridge made beside the bundle (index.html and assets/<name> only; its hashes are compiled into the bundle).
+  const ui = join(packageDir, 'ui');
+  if (!existsSync(join(ui, 'index.html'))) throw new Error(`The bridge's UI is not built (${ui}). Run bun run build:bridge first.`);
+  if (lstatSync(ui).isSymbolicLink()) throw new Error(`Bridge inputs cannot contain links: ${ui}`);
+  for (const rel of Object.keys(uiManifestOf(ui))) inputs.push([join(ui, ...rel.split('/')), `ui/${rel}`]);
+  const licenses = join(sourceDir, 'LICENSES');
+  if (existsSync(licenses)) {
+    if (lstatSync(licenses).isSymbolicLink()) throw new Error(`Bridge inputs cannot contain links: ${licenses}`);
+    for (const name of readdirSync(licenses)) {
+      if (!/^[a-zA-Z0-9._-]+\.(txt|md)$/.test(name)) throw new Error(`Unexpected release resource: ${name}`);
+      inputs.push([join(licenses, name), `LICENSES/${name}`]);
+    }
+  }
+  for (const [path, name] of [...inputs, [bun, target.bun] as [string, string]]) {
+    if (!existsSync(path)) throw new Error(name === 'meshrooms.js' ? `The bridge is not built (${path}). Run bun run build:bridge first.` : `Required bridge input missing: ${path}`);
+    if (lstatSync(path).isSymbolicLink() || !statSync(path).isFile()) throw new Error(`Bridge inputs must be plain files: ${path}`);
+  }
+
+  mkdirSync(dirname(outputDir), { recursive: true });
+  mkdirSync(outputDir);
+  const relativeFiles: string[] = [];
+  for (const [path, name] of inputs) {
+    mkdirSync(dirname(join(outputDir, name)), { recursive: true });
+    copyFileSync(path, join(outputDir, name));
+    relativeFiles.push(name);
+  }
+  copyFileSync(bun, join(outputDir, target.bun));
+  if (target.platform !== 'win32') chmodSync(join(outputDir, target.bun), 0o755);
+  relativeFiles.push(target.bun);
+  if (options.codesignIdentity) {
+    const file = join(outputDir, target.bun);
+    execFileSync('/usr/bin/codesign', ['--force', '--timestamp', '--options', 'runtime', '--sign', options.codesignIdentity,
+      '--entitlements', join(import.meta.dir, 'macos', 'bun.entitlements'), file], { stdio: 'pipe' });
+    execFileSync('/usr/bin/codesign', ['--verify', '--strict', file], { stdio: 'pipe' });
+  }
+
+  relativeFiles.sort();
+  const files: Record<string, string> = {};
+  for (const rel of relativeFiles) files[rel] = computeSha256(join(outputDir, rel));
+  const bunVersion = options.bunPath ? execFileSync(bun, ['--version'], { encoding: 'utf8' }).trim() : Bun.version;
+  const manifest = {
+    schema: 1 as const,
+    kind: 'bridge',
+    platform: target.platform,
+    arch: target.arch,
+    version: metadata.version as string,
+    bun: { version: bunVersion, bundled: true },
+    git: getGitInfo(sourceDir),
+    entry: `${target.bun} --no-env-file meshrooms.js`,
+    files,
+  };
+  const manifestPath = join(outputDir, 'manifest.json');
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  return { directory: outputDir, manifestPath };
+}
+
 if (import.meta.main) {
   const root = resolve(import.meta.dir, '..');
   let sourceDir = root;
-  let outputDir = resolve(root, '.local', 'packages', 'current');
+  let outputDir: string | undefined;
   let externalBun = false;
+  let bridge = false;
   let nativeLibraryPath: string | undefined;
   let codesignIdentity: string | undefined;
 
@@ -320,12 +410,15 @@ if (import.meta.main) {
       outputDir = resolve(args[++i]);
     } else if (args[i] === '--external-bun') {
       externalBun = true;
+    } else if (args[i] === '--bridge') {
+      bridge = true;
     } else if (args[i] === '--library') {
       nativeLibraryPath = resolve(args[++i]);
     } else if (args[i] === '--codesign-identity') {
       codesignIdentity = args[++i];
     } else if (args[i] === '--help' || args[i] === '-h') {
-      console.log('Usage: bun run scripts/package-runtime.ts [--source PATH] [--out PATH] [--library DLL] [--external-bun] [--codesign-identity NAME]');
+      console.log('Usage: bun run scripts/package-runtime.ts [--source PATH] [--out PATH] [--library DLL] [--external-bun] [--codesign-identity NAME]\n'
+        + '       bun run scripts/package-runtime.ts --bridge [--source PATH] [--out PATH] [--codesign-identity NAME]  (the desktop app\'s bridge bundle)');
       process.exit(0);
     } else {
       console.error(`Unknown argument: ${args[i]}`);
@@ -333,9 +426,12 @@ if (import.meta.main) {
     }
   }
 
-  packageRuntime({ sourceDir, outputDir, externalBun, nativeLibraryPath, codesignIdentity })
+  const packaged = bridge
+    ? packageBridge({ sourceDir, outputDir: outputDir ?? resolve(root, '.local', 'packages', 'desktop-bridge'), codesignIdentity })
+    : packageRuntime({ sourceDir, outputDir: outputDir ?? resolve(root, '.local', 'packages', 'current'), externalBun, nativeLibraryPath, codesignIdentity });
+  packaged
     .then((result) => {
-      console.log(JSON.stringify({ event: 'runtime.packaged', ...result }, null, 2));
+      console.log(JSON.stringify({ event: bridge ? 'bridge.packaged' : 'runtime.packaged', ...result }, null, 2));
     })
     .catch((err) => {
       console.error(err instanceof Error ? err.message : String(err));

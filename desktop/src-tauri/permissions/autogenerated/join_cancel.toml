@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-join-cancel"
+description = "Enables the join_cancel command without any pre-configured scope."
+commands.allow = ["join_cancel"]
+
+[[permission]]
+identifier = "deny-join-cancel"
+description = "Denies the join_cancel command without any pre-configured scope."
+commands.deny = ["join_cancel"]

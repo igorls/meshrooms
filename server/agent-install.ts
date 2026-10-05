@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writ
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { version as packageVersion } from '../packages/meshrooms/package.json';
+import { bundledUiManifest, uiFolders, verifiedUi, type UiManifest } from './local-ui';
 
 /** The version of this bridge: the npm package's version, inlined when the bundle is built. */
 export const BRIDGE_VERSION: string = packageVersion;
@@ -193,13 +194,37 @@ function withInstallLock<T>(dir: string, work: () => T): T {
 }
 
 /**
+ * The UI a bridge bundle carries (see server/local-ui.ts), as it should be installed beside it: every file its manifest
+ * lists, verified, from the first of its UI folders that has them all. Undefined when the bundle has no manifest or
+ * nothing beside it verifies (the room service's copy, an older package): that bridge serves no local page.
+ */
+function carriedUi(source: string, version: string, manifest: UiManifest | undefined) {
+  if (!manifest) return undefined;
+  for (const folder of uiFolders(source, version)) { const files = verifiedUi(folder, manifest); if (files) return { folder, files }; }
+  return undefined;
+}
+/** Writes the UI's verified files into `dir/ui-<version>`, replacing whatever was there; the daemon verifies them again. */
+function installUi(dir: string, version: string, ui: { folder: string; files: Map<string, Uint8Array> }) {
+  const target = join(dir, `ui-${version}`);
+  if (resolve(ui.folder) === resolve(target)) return;
+  const staging = join(dir, `.ui-${version}.${process.pid}.${randomUUID()}`);
+  try {
+    for (const [rel, bytes] of ui.files) { const path = join(staging, ...rel.split('/')); mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 }); writeFileSync(path, bytes, { mode: 0o644 }); }
+    whileBusy(() => rmSync(target, { recursive: true, force: true }));
+    whileBusy(() => renameSync(staging, target));
+  } finally { rmSync(staging, { recursive: true, force: true }); }
+}
+
+/**
  * Copies the running bundle into `dir` as meshrooms-<version>.js, records its hash in installed.json, and points the
  * launcher at the newest recorded version whose file still has its recorded hash. Files that merely look like a
- * version are ignored, and an older bunx cache never moves runners back to an older version.
+ * version are ignored, and an older bunx cache never moves runners back to an older version. The UI the bundle carries
+ * goes beside it as ui-<version>, file by file and verified against the hashes compiled into the bundle (`ui`), since
+ * the daemon runs from this folder, not from wherever the bundle came from.
  */
-export function installBridge(source: string, version = BRIDGE_VERSION, dir = binDir()) {
+export function installBridge(source: string, version = BRIDGE_VERSION, dir = binDir(), ui: UiManifest | undefined = bundledUiManifest()) {
   if (!isVersion(version)) throw new Error(`Not a version: ${version}`);
-  const intact = intactInstall(source, version, dir);
+  const intact = intactInstall(source, version, dir, ui);
   if (intact) return intact;
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -208,6 +233,8 @@ export function installBridge(source: string, version = BRIDGE_VERSION, dir = bi
     return withInstallLock(dir, () => {
       const versioned = join(dir, file);
       if (!existsSync(versioned) || sha256(readFileSync(versioned)) !== hash) writeAtomic(versioned, code);
+      const carried = carriedUi(source, version, ui);
+      if (carried) installUi(dir, version, carried);
       const manifest = readManifest(dir);
       manifest.versions[version] = { file, sha256: hash };
       const intact = Object.entries(manifest.versions).filter(([v, entry]) => {
@@ -233,8 +260,10 @@ export function installBridge(source: string, version = BRIDGE_VERSION, dir = bi
  * written (no lock, no manifest), so a command run from the installed launcher never needs the bin folder writable,
  * and the launcher is checked before a runner or watcher starts from it. Anything else takes the full install.
  */
-function intactInstall(source: string, version: string, dir: string) {
+function intactInstall(source: string, version: string, dir: string, ui: UiManifest | undefined) {
   try {
+    // A UI the bundle carries must be installed beside it too (hashing it takes a few milliseconds).
+    if (ui && carriedUi(source, version, ui) && !verifiedUi(join(dir, `ui-${version}`), ui)) return undefined;
     const hash = sha256(readFileSync(source)), file = `meshrooms-${version}.js`, manifest = readManifest(dir);
     if (manifest.versions[version]?.sha256 !== hash || manifest.versions[version]?.file !== file) return undefined;
     const entries = Object.entries(manifest.versions);

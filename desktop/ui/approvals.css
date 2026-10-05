@@ -1,0 +1,26 @@
+main { max-width: 36rem; }
+body { place-items: start center; }
+.requests { list-style: none; padding: 0; margin: 1.25rem 0 0; text-align: left; display: grid; gap: .75rem; font-size: 14px; }
+.requests li { padding: .75rem .9rem; border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent); border-radius: 8px; -webkit-user-select: text; user-select: text; }
+.requests li.changed, .requests li.refused { border-color: var(--danger); }
+.requests .heading { margin: 0; font-size: 15px; font-weight: 600; }
+.requests .asked { font-size: 13px; }
+.requests dl, .custom dl { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; margin: .6rem 0; }
+.requests dt, .custom dt { color: var(--muted); }
+.requests dd, .custom dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; overflow: hidden; }
+.requests dd.path, .custom dd.path { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; word-break: break-all; unicode-bidi: isolate; direction: ltr; }
+.requests dd.non-ascii, .custom dd.non-ascii { grid-column: 2; margin-top: -.2rem; color: var(--danger); font-size: 12px; }
+.requests .who { font-size: 13px; }
+.requests .notice { margin-top: .5rem; color: var(--danger); font-size: 13px; }
+.requests .actions { justify-content: flex-end; margin-top: .75rem; }
+.done { color: var(--accent); margin-top: 1rem; min-height: 1.5em; font-size: 13px; }
+.custom { margin-top: 1rem; text-align: left; border-top: 1px solid color-mix(in srgb, var(--muted) 35%, transparent); padding-top: 1rem; }
+.custom summary { cursor: pointer; font-weight: 600; }
+.custom .warning { margin-top: .75rem; color: var(--danger); font-size: 13px; }
+.custom .fields { display: grid; gap: .4rem; margin-top: .75rem; }
+.custom .hint { font-size: 12px; }
+.custom .optional { color: var(--muted); font-weight: 400; }
+.custom .actions { justify-content: flex-start; }
+.custom .confirm { margin-top: .75rem; padding: .75rem .9rem; border: 1px solid var(--danger); border-radius: 8px; -webkit-user-select: text; user-select: text; }
+.custom .confirm h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.custom .confirm .actions { justify-content: flex-end; }

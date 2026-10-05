@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pair-unpair"
+description = "Enables the pair_unpair command without any pre-configured scope."
+commands.allow = ["pair_unpair"]
+
+[[permission]]
+identifier = "deny-pair-unpair"
+description = "Denies the pair_unpair command without any pre-configured scope."
+commands.deny = ["pair_unpair"]

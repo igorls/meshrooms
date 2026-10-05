@@ -1,7 +1,8 @@
 import type { Database } from 'bun:sqlite';
 import { sniff } from '../attachments';
-import { createHash, createHmac, randomBytes } from 'node:crypto';
-import { browserProtocol, deviceId, MAX_REPOSITORIES, validRepository, verify, type BrowserDevice, type BrowserMember, type FormerDevice, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, DEFAULT_ROOM_SETTINGS, ROOM_CLOSED } from '../../src/browser/protocol';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { browserProtocol, deviceId, MAX_REPOSITORIES, validRepository, verify, type BrowserDevice, type BrowserMember, type FormerDevice, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, DEFAULT_ROOM_SETTINGS, PAIRING_NOT_FOUND, ROOM_CLOSED } from '../../src/browser/protocol';
+import { PAIRING_PROOF, PAIRING_SECRET, pairingMessage } from '../../src/browser/pairing';
 import { consumeInvite, inviteMessages } from './invites';
 import { openAdmission, retireRoom, type ClosedReason } from './store';
 
@@ -11,6 +12,14 @@ type StoredInvite = { tokenHash: string; operatorId: string; name: string; expir
 type Room = { id: string; title: string; ownerId: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; retired?: FormerDevice[]; settings?: Partial<RoomSettings>; repositories?: string[] };
 const RETIRED_DEVICES = 256;
 const INVITE_TTL = 900_000, INVITES_PER_PERSON = 4, AGENTS_PER_OPERATOR = 4;
+/** Devices one member may hold in a room, under the room's 16: one person can't fill the room with devices of their own. */
+export const DEVICES_PER_MEMBER = 4;
+/** Device codes a device may get wrong in a room per window before `link` answers 429 (codes are 64 bits and expire anyway). */
+export const LINK_FAILURES = 8, LINK_FAILURE_WINDOW = 600_000;
+/** Requests that wait in a room at once, per kind (people, companions, agents), so no kind can crowd out another. */
+export const WAITING_PER_KIND = 16;
+/** Requests from one address that wait in a room at once, so one network can't fill a kind's share on its own. */
+export const WAITING_PER_ADDRESS = 8;
 const tokenHash = (token: string) => createHash('sha256').update(token).digest('hex');
 /** Avatars are small pictures kept apart from the room record; members carry only a short hash of theirs. */
 const AVATAR_BYTES = 16 * 1024, AVATAR_SIDE = 256, AVATAR_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
@@ -71,6 +80,10 @@ export class BrowserLobby {
   private signals = new Map<string, (Signal & { at: number })[]>();
   private sequence = 0;
   private epoch = crypto.randomUUID();
+  /** Wrong device codes per room and device, in memory like presence: a bound on guessing, not a record. */
+  private linkFailures = new Map<string, { count: number; since: number }>();
+  /** Which address each waiting request came from (`room:request`), in memory like presence: a bound, never stored. */
+  private requestAddresses = new Map<string, string>();
   /** When each room's activity was last written and committed; see touch(). */
   private active = new Map<string, number>();
   /** Activity written by the transaction in progress; it reaches `active` only if that transaction commits. */
@@ -120,7 +133,7 @@ export class BrowserLobby {
   }
   private forget(roomId: string) {
     this.active.delete(roomId); this.pending.delete(roomId);
-    for (const map of [this.presence, this.signals]) for (const key of map.keys()) if (key.startsWith(`${roomId}:`)) map.delete(key);
+    for (const map of [this.presence, this.signals, this.requestAddresses]) for (const key of map.keys()) if (key.startsWith(`${roomId}:`)) map.delete(key);
   }
   /** Removes rooms no admitted device opened within the idle period. Returns how many were removed. */
   sweep(): number {
@@ -149,7 +162,11 @@ export class BrowserLobby {
   avatar(roomId: string, memberId: string, hash: string) {
     return this.db.query('SELECT type, bytes FROM avatars WHERE room=? AND member=? AND hash=?').get(roomId, memberId, hash) as { type: string; bytes: Uint8Array } | null;
   }
-  async execute(input: SignedCommand): Promise<RoomStatus | { roomId: string; token?: string }> {
+  /**
+   * `address`: who sent the command, as the HTTP layer keys addresses (one IPv4 address, or an IPv6 /64), for the cap
+   * on waiting requests per address. Commands without one (tests, local tools) aren't capped by address.
+   */
+  async execute(input: SignedCommand, address?: string): Promise<RoomStatus | { roomId: string; token?: string; admitted?: boolean }> {
     const c = input?.command;
     if (!c || c.protocol !== browserProtocol || c.origin !== this.options.origin || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) fail(400, 'This request has expired or is invalid. Try again.');
     if (typeof input.publicKey !== 'string' || typeof input.signature !== 'string' || !await verify(input.publicKey, c, input.signature)) fail(401, 'This device could not be authenticated.');
@@ -157,15 +174,17 @@ export class BrowserLobby {
     // After verification, all read/modify/write work is synchronous in one transaction. IMMEDIATE takes the write lock
     // up front, so an operator command writing the same file in between can't invalidate what this one read.
     try {
-      const result = this.run(c, id, input);
+      const result = this.run(c, id, input, address);
       for (const [room, at] of this.pending) this.active.set(room, at);
       return result;
     } finally { this.pending.clear(); }
   }
-  private run(c: SignedCommand['command'], id: string, input: SignedCommand): RoomStatus | { roomId: string; token?: string } {
+  private run(c: SignedCommand['command'], id: string, input: SignedCommand, address?: string): RoomStatus | { roomId: string; token?: string; admitted?: boolean } {
     return this.db.transaction(() => {
       if (c.action === 'status') return this.snapshot(this.load(c.roomId), id, c.payload);
       const serialized = fingerprint(c);
+      /** What an action adds to its answer (and to its receipt, so a retry gets the same). */
+      const answer: { admitted?: boolean } = {};
       const previous = this.db.query('SELECT body,result FROM receipts WHERE device=? AND id=?').get(id, c.id) as { body: string; result: string } | null;
       if (previous) {
         if (previous.body !== serialized) fail(409, 'That request ID was already used.');
@@ -199,6 +218,11 @@ export class BrowserLobby {
         const admit = (r: JoinRequest) => {
           if (room.devices.length >= 16) fail(429, 'This room has reached its device limit.');
           if (r.kind === 'companion' && !r.linkedMemberId) fail(409, 'Confirm this device from its existing identity first.');
+          if (r.linkedMemberId) {
+            // A device only ever joins a member who is still here, and each member holds at most DEVICES_PER_MEMBER.
+            if (!room.devices.some(d => d.memberId === r.linkedMemberId)) fail(409, 'The person this device belongs to is no longer in the room.');
+            if (room.devices.filter(d => d.memberId === r.linkedMemberId).length >= DEVICES_PER_MEMBER) fail(429, `Each person can have up to ${DEVICES_PER_MEMBER} devices in this room. Remove one first.`);
+          }
           if (r.kind === 'agent') {
             if (!r.operatorId || !isPerson(room, r.operatorId)) fail(409, 'This agent’s operator is no longer in the room.');
             nameAvailable(room, r.name);
@@ -206,30 +230,88 @@ export class BrowserLobby {
           const memberId = r.linkedMemberId || crypto.randomUUID();
           if (!r.linkedMemberId) room.members.push(r.kind === 'agent' ? { id: memberId, name: r.name, role: 'agent', operatorId: r.operatorId } : { id: memberId, name: r.name, role: 'human' });
           room.devices.push({ ...r.device, memberId, admittedAt: this.now() });
-          r.state = 'admitted'; delete r.code;
+          r.state = 'admitted'; delete r.code; delete r.pairing;
         };
         switch (c.action) {
           case 'request': {
             if (actor) break;
+            // A companion asks either for a code its person enters elsewhere, or (`pairing`, see src/browser/pairing.ts) to
+            // be linked by the browser holding the secret its proof was made with: never both, so neither check can stand in
+            // for the other. The proof is bound to this device's key, this room and the browser device that may link it.
+            const pairing = c.payload.pairing;
+            if (pairing !== undefined && (c.payload.kind !== 'companion' || typeof pairing !== 'string' || !PAIRING_PROOF.test(pairing))) fail(400, 'Only a companion request carries a pairing, as 64 lowercase hex characters.');
             const current = room.requests.find(r => r.device.id === id && r.state === 'pending' && r.expiresAt > this.now());
-            if (current) break;
+            // A request still waiting is kept, unless this device now pairs with a browser (another one, or for the first
+            // time): then it asks anew under the new proof. One a person already linked waits for the host as it is.
+            if (current && (pairing === undefined || current.pairing === pairing || current.linkedMemberId)) break;
             room.requests = room.requests.filter(r => r.device.id !== id && r.state === 'pending' && r.expiresAt > this.now());
-            if (room.requests.length >= 16) fail(429, 'The waiting room is full. Please try again later.');
             if (!['person', 'companion'].includes(String(c.payload.kind))) fail(400, 'Choose how to join.');
             const kind = c.payload.kind as JoinRequest['kind'];
+            // Each kind waits in its own share of the waiting room, so a flood of one (throwaway keys asking as companions,
+            // say) never keeps a person, or an agent, from asking. They expire after ten minutes; the host can decline them.
+            if (room.requests.filter(r => r.kind === kind).length >= WAITING_PER_KIND) fail(429, 'The waiting room is full. Please try again later, or ask the host to clear it.');
+            // And one address fills at most WAITING_PER_ADDRESS places, however many keys it makes.
+            for (const key of this.requestAddresses.keys()) if (key.startsWith(`${room.id}:`) && !room.requests.some(r => `${room.id}:${r.id}` === key)) this.requestAddresses.delete(key);
+            if (address !== undefined) {
+              if (room.requests.filter(r => this.requestAddresses.get(`${room.id}:${r.id}`) === address).length >= WAITING_PER_ADDRESS) fail(429, 'Too many requests from your network are waiting in this room. Try again later.');
+              this.requestAddresses.set(`${room.id}:${c.id}`, address);
+            }
             room.requests.push({ id: c.id, name: memberName(c.payload.name), kind, state: 'pending', expiresAt: this.now() + 600_000,
               device: { id, publicKey: input.publicKey, label: label(c.payload.label), memberId: '', admittedAt: 0 },
-              ...(kind === 'companion' ? { code: crypto.randomUUID().replaceAll('-', '').slice(0, 16) } : {}) });
+              ...(kind === 'companion' ? typeof pairing === 'string' ? { pairing } : { code: randomBytes(8).toString('hex') } : {}) });
             break;
           }
           case 'link': {
             if (!actor) fail(403, 'Join this room from your existing device first.');
             // Agents are participants of their own; they cannot add devices to anyone's identity.
             if (!isPerson(room, actor.memberId)) fail(403, 'Only people can confirm devices.');
-            const r = room.requests.find(r => r.kind === 'companion' && r.code === c.payload.code && r.state === 'pending' && r.expiresAt > this.now()) || fail(404, 'Device code not found or expired.');
+            // Wrong codes are counted per device and room outside the transaction (which rolls back with the failure).
+            const failures = `${room.id}:${id}`, failed = this.linkFailures.get(failures);
+            if (failed && this.now() - failed.since > LINK_FAILURE_WINDOW) this.linkFailures.delete(failures);
+            if ((this.linkFailures.get(failures)?.count ?? 0) >= LINK_FAILURES) fail(429, 'Too many wrong device codes. Wait a few minutes, then try again.');
+            const miss = (message: string, code?: string): never => {
+              const current = this.linkFailures.get(failures);
+              this.linkFailures.set(failures, { count: (current?.count ?? 0) + 1, since: current?.since ?? this.now() });
+              return fail(404, message, code);
+            };
+            const { code, pairing } = c.payload;
+            if (code !== undefined && pairing !== undefined) fail(400, 'Link with a device code or a pairing secret, not both.');
+            let r: JoinRequest | undefined;
+            if (pairing !== undefined) {
+              // The browser that made the secret links the app's request by it. Each waiting pairing's proof is made again
+              // here from the secret, with that request's own device key and this room, and compared in constant time.
+              const secret = typeof pairing === 'string' && PAIRING_SECRET.test(pairing) ? Buffer.from(pairing, 'base64url') : undefined;
+              if (!secret || secret.length !== 32 || secret.toString('base64url') !== pairing) fail(400, 'This pairing secret is not valid.');
+              const waiting = room.requests.filter(r => r.kind === 'companion' && r.pairing && r.state === 'pending' && r.expiresAt > this.now());
+              const matches = waiting.filter(r => {
+                // The linking device's own id: only the browser device the pairing link named can link it.
+                const proof = Buffer.from(createHmac('sha256', secret!).update(pairingMessage(room.id, r.device.publicKey, id)).digest('hex'));
+                const claimed = Buffer.from(r.pairing!);
+                return proof.length === claimed.length && timingSafeEqual(proof, claimed);
+              });
+              // Every link that matches nothing counts against this device's own budget in this room, whatever other devices
+              // asked: their requests can neither spend it nor spare it. The browser links once the app says it has asked.
+              if (!matches.length) miss('The desktop app has not asked to join this room yet, or the pairing expired.', PAIRING_NOT_FOUND);
+              // Two requests can't hold proofs from one secret unless something is wrong: link neither.
+              if (matches.length > 1) fail(409, 'More than one device answers this pairing, so none was linked. Pair again.');
+              r = matches[0];
+            } else {
+              r = typeof code === 'string' && /^[a-f0-9]{16}$/.test(code)
+                ? room.requests.find(r => r.kind === 'companion' && r.code === code && r.state === 'pending' && r.expiresAt > this.now()) : undefined;
+              if (!r) miss('Device code not found or expired.');
+            }
+            r = r!;
             if (r.linkedMemberId && r.linkedMemberId !== actor.memberId) fail(409, 'That device is already linked.');
             r.linkedMemberId = actor.memberId;
-            if (isHost) admit(r);
+            // A pairing secret links once: the request now belongs to this person, whatever the host decides.
+            delete r.pairing;
+            // The host admitted the person; adding their own devices is their call. The code is the secret and the
+            // request is linked to the linker's own member, so a link can only ever add a device to the linker. The host
+            // keeps the say over a device it removed (its key stays in `retired`), and over every device with hostApprovesDevices.
+            const removedBefore = (room.retired || []).some(d => d.id === r.device.id);
+            if (isHost || (!settingsOf(room).hostApprovesDevices && !removedBefore && isPerson(room, actor.memberId) && r.kind === 'companion' && r.linkedMemberId === actor.memberId)) admit(r);
+            // Whether the device is in now, or waits for the host: the browser that paired says which.
+            answer.admitted = r.state === 'admitted';
             break;
           }
           case 'agent-invite': {
@@ -262,7 +344,7 @@ export class BrowserLobby {
             const device = { id, publicKey: input.publicKey, label: label(c.payload.label), memberId: '', admittedAt: 0 };
             if (settingsOf(room).guestAgentApproval && invite.operatorId !== room.ownerId) {
               // The link was used, but the host decides whether a guest's agent enters.
-              if (room.requests.filter(r => r.state === 'pending' && r.expiresAt > this.now()).length >= 16) fail(429, 'The waiting room is full. Please try again later.');
+              if (room.requests.filter(r => r.kind === 'agent' && r.state === 'pending' && r.expiresAt > this.now()).length >= WAITING_PER_KIND) fail(429, 'The waiting room is full. Please try again later.');
               room.requests.push({ id: c.id, name: invite.name, kind: 'agent', state: 'pending', expiresAt: this.now() + 600_000, device, operatorId: invite.operatorId });
               break;
             }
@@ -281,7 +363,7 @@ export class BrowserLobby {
             if (!isHost) fail(403, 'Only the host can admit or decline requests.');
             const r = pending(c.payload.requestId);
             if (c.payload.admit === true) admit(r);
-            else if (c.payload.admit === false) { r.state = 'declined'; delete r.code; }
+            else if (c.payload.admit === false) { r.state = 'declined'; delete r.code; delete r.pairing; }
             else fail(400, 'Choose admit or decline.');
             break;
           }
@@ -363,7 +445,7 @@ export class BrowserLobby {
             if (!isHost) fail(403, 'Only the host can change room settings.');
             const next: Partial<RoomSettings> = { ...room.settings };
             if (c.payload.floor !== undefined) { if (!['humans-first', 'open'].includes(String(c.payload.floor))) fail(400, 'Choose when agents reply.'); next.floor = c.payload.floor as RoomSettings['floor']; }
-            for (const key of ['agentAssignmentsWake', 'guestAgentApproval'] as const) {
+            for (const key of ['agentAssignmentsWake', 'guestAgentApproval', 'hostApprovesDevices'] as const) {
               if (c.payload[key] === undefined) continue;
               if (typeof c.payload[key] !== 'boolean') fail(400, 'Choose on or off.');
               next[key] = c.payload[key] as boolean;
@@ -396,7 +478,7 @@ export class BrowserLobby {
         }
         if (c.action !== 'signal' && c.action !== 'close') this.save(room);
       }
-      const result = { roomId: c.roomId };
+      const result = { roomId: c.roomId, ...answer };
       this.db.query('DELETE FROM receipts WHERE at < ?').run(this.now() - 120_000);
       this.db.query('INSERT INTO receipts VALUES (?,?,?,?,?)').run(id, c.id, serialized, JSON.stringify(result), this.now());
       return result;
@@ -405,6 +487,7 @@ export class BrowserLobby {
   private save(room: Room) { this.db.query('INSERT OR REPLACE INTO rooms VALUES (?,?)').run(room.id, JSON.stringify(room)); }
   private snapshot(room: Room, id: string, payload: Record<string, unknown>): RoomStatus {
     for (const [key, value] of this.presence) if (value.at < this.now() - 30_000) this.presence.delete(key);
+    for (const [key, value] of this.linkFailures) if (this.now() - value.since > LINK_FAILURE_WINDOW) this.linkFailures.delete(key);
     for (const [key, value] of this.signals) {
       const active = value.filter(s => s.at > this.now() - 30_000);
       if (active.length) this.signals.set(key, active); else this.signals.delete(key);
@@ -417,7 +500,9 @@ export class BrowserLobby {
     const actor = room.devices.find(d => d.id === id);
     if (!actor) {
       const request = room.requests.find(r => r.device.id === id);
-      result.request = request?.state === 'pending' && request.expiresAt <= this.now() ? { ...request, state: 'expired', code: undefined } : request;
+      // A pairing proof is shown to nobody, the device that sent it included: it never needs it back.
+      const shown = request && (({ pairing, ...rest }) => rest)(request);
+      result.request = shown?.state === 'pending' && shown.expiresAt <= this.now() ? { ...shown, state: 'expired', code: undefined } : shown;
       return result;
     }
     if (!uuid(payload.session)) fail(400, 'Invalid browser session.');
@@ -426,7 +511,7 @@ export class BrowserLobby {
     result.memberId = actor.memberId; result.ownerId = room.ownerId;
     result.members = room.members.filter(m => room.devices.some(d => d.memberId === m.id));
     result.devices = room.devices.map(d => ({ ...d, session: online(d) }));
-    if (actor.memberId === room.ownerId) result.requests = room.requests.filter(r => r.state === 'pending' && r.expiresAt > this.now()).map(r => { const { code, ...rest } = r; return rest; });
+    if (actor.memberId === room.ownerId) result.requests = room.requests.filter(r => r.state === 'pending' && r.expiresAt > this.now()).map(r => { const { code, pairing, ...rest } = r; return rest; });
     if (room.retired?.length) result.formerDevices = room.retired;
     result.settings = settingsOf(room);
     if (room.repositories?.length) result.repositories = room.repositories;

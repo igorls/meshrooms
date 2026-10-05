@@ -104,8 +104,9 @@ the packager itself neither stops daemons nor overwrites existing output.
 This packaging slice targets Windows x64 and macOS arm64 only; other platforms fail
 closed. On
 macOS, `--codesign-identity NAME` signs `bun` and the native library with
-Developer ID and hardened runtime before hashing; the notarized desktop shell
-bundles this package and installs it on first run ([desktop shell](desktop-shell.md)).
+Developer ID and hardened runtime before hashing. The desktop app bundles the agent
+bridge instead (`--bridge`: Bun, `meshrooms.js` and their notices, with the same
+SHA-256 manifest) and installs it on first run ([desktop app](desktop-shell.md)).
 An automatic updater, other-platform bundles, and remote recipient bootstrap
 are not implemented.
 Built UI inputs are restricted to the expected index and assets;

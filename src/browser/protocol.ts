@@ -11,11 +11,23 @@ export type BrowserDevice = { id: string; publicKey: string; label: string; memb
 /** `avatar` is a short hash of the member's picture; fetch it from /api/lobby/rooms/:room/avatars/:member?h=<hash>. */
 /** Agents report `harness` (e.g. Claude Code) and `model` themselves; the room cannot verify either. */
 export type BrowserMember = { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; avatar?: string; harness?: string; model?: string };
-/** `agent` requests come only from a redeemed agent link while the host requires approval for guests' agents. */
+/**
+ * `agent` requests come only from a redeemed agent link while the host requires approval for guests' agents. A companion
+ * request carries either a `code` its person enters on another device, or `pairing`, a proof made with a secret the
+ * person's browser gave the desktop app (src/browser/pairing.ts), which that browser then links with: never both. The
+ * room service keeps the proof and shows it to nobody.
+ */
 export type JoinRequest = {
   id: string; device: BrowserDevice; name: string; kind: 'person' | 'companion' | 'agent';
-  state: 'pending' | 'admitted' | 'declined' | 'expired'; expiresAt: number; code?: string; linkedMemberId?: string; operatorId?: string;
+  state: 'pending' | 'admitted' | 'declined' | 'expired'; expiresAt: number; code?: string; pairing?: string; linkedMemberId?: string; operatorId?: string;
 };
+/**
+ * `link {pairing}` matched no request waiting in the room: the app hasn't asked there yet, or the pairing expired. It
+ * counts against the linking device's wrong codes like any miss, so the browser links once the app says it has asked.
+ */
+export const PAIRING_NOT_FOUND = 'pairing-not-found';
+/** The public room service (docs/browser-rooms.md): where the desktop app makes new rooms unless told otherwise. */
+export const PUBLIC_ROOM_SERVICE = 'https://meshrooms.wormdb.dev';
 /** Host-controlled room rules. Agents' own bridges enforce the floor and wake rules; the room service enforces admission. */
 export type RoomSettings = {
   /** Agents reply only when addressed, or to every message from a person. */
@@ -24,9 +36,11 @@ export type RoomSettings = {
   agentAssignmentsWake: boolean;
   /** Whether agents connected by people other than the host wait for the host to admit them. */
   guestAgentApproval: boolean;
+  /** Whether the host also admits each new device a member links to themselves (off: the member's own link admits it). */
+  hostApprovesDevices: boolean;
 };
 /** Defaults for new rooms. Hosts approve guests' agents unless they turn it off; rooms created before this default keep off. */
-export const DEFAULT_ROOM_SETTINGS: RoomSettings = { floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true };
+export const DEFAULT_ROOM_SETTINGS: RoomSettings = { floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true, hostApprovesDevices: false };
 /** A one-time agent link a person created and has not yet been used; the token itself is never stored or returned again. */
 export type AgentInvite = { name: string; expiresAt: number };
 export type Signal = { seq: number; from: string; session: string; targetSession: string; description: RTCSessionDescriptionInit };

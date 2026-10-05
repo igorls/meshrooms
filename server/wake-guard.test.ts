@@ -44,6 +44,24 @@ describe('wake mode — the refusals hold at the real CLI entry', () => {
     expect(message).toContain('operator');
   });
 
+  test('agent identities, bindings, the person and the daemon are refused: a wake can\'t make, ask for or bind an agent', async () => {
+    const env = { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: '/tmp' };
+    for (const argv of [['agent', 'create', '--name', 'X', '--harness', 'claude'], ['agent', 'request', '--name', 'X', '--harness', 'exec', '--command', 'x {prompt_file}'],
+      ['agent', 'list'], ['agent', 'approve'], ['bind', '--room', ROOM, '--harness', 'exec', '--command', 'x {prompt_file}'], ['unbind', '--room', ROOM],
+      ['person', 'open'], ['daemon', 'status'], ['bindings']]) {
+      const message = await refuse(argv, env);
+      expect(message).toContain("isn't available");
+    }
+  });
+
+  test('the person\'s commands are refused: a wake never pairs, creates rooms, unpairs or runs the person device', async () => {
+    for (const argv of [['person', 'pair', '--room', ROOM, '--origin', 'https://rooms.example', '--rooms', ROOM, '--name', 'x', '--device', 'a'.repeat(64)],
+      ['person', 'create', '--room', ROOM, '--title', 'x'], ['person', 'unpair', '--room', ROOM], ['person-run', '--room', ROOM]]) {
+      const message = await refuse(argv, { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: '/tmp' });
+      expect(message).toContain("isn't available");
+    }
+  });
+
   test('--out on an attachment is refused: a wake saves into its wake folder', async () => {
     const message = await refuse(['attachment', '--room', ROOM, '--id', 'x', '--out', '/tmp/anywhere'], { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: '/tmp' });
     expect(message).toContain('leave out --out');

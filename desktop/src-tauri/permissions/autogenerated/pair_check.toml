@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pair-check"
+description = "Enables the pair_check command without any pre-configured scope."
+commands.allow = ["pair_check"]
+
+[[permission]]
+identifier = "deny-pair-check"
+description = "Denies the pair_check command without any pre-configured scope."
+commands.deny = ["pair_check"]

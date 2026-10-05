@@ -4,12 +4,23 @@
  * Publish from that directory, with the maintainers' publish workflow; the repository root package is never published.
  */
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { buildAgent } from './build-agent';
+import { uiManifestOf } from '../server/local-ui';
 
 const root = resolve(import.meta.dir, '..');
 export const packageDir = join(root, 'packages', 'meshrooms');
+/** The built UI the daemon serves on 127.0.0.1 (server/local-ui.ts), shipped beside the bundle as ui/. */
+export const uiDir = join(packageDir, 'ui');
+
+/** Builds the UI (Vite) afresh into ui/ and returns its manifest: never a stale dist/. */
+export async function buildUi(out = uiDir) {
+  rmSync(out, { recursive: true, force: true });
+  const { build } = await import('vite');
+  await build({ root, logLevel: 'warn', build: { outDir: out, emptyOutDir: true, sourcemap: false } });
+  return uiManifestOf(out);
+}
 
 /** The npm packages whose code the bundle contains, from the build's input paths. */
 export function bundledPackages(inputs: string[]) {
@@ -32,7 +43,8 @@ function licenseText(dir: string) {
 }
 
 export async function buildBridgePackage(out = join(root, 'dist', 'agent')) {
-  const built = await buildAgent(out);
+  const ui = await buildUi();
+  const built = await buildAgent(out, { ui });
   const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
   const bin = join(packageDir, 'bin', 'meshrooms.js');
   mkdirSync(join(packageDir, 'bin'), { recursive: true });
@@ -51,7 +63,7 @@ export async function buildBridgePackage(out = join(root, 'dist', 'agent')) {
   writeFileSync(join(packageDir, 'THIRD_PARTY_LICENSES.txt'), notices.join('\n'));
   writeFileSync(join(packageDir, 'LICENSE'), readFileSync(join(root, 'LICENSE')));
   return { version: manifest.version as string, bin, bytes: readFileSync(bin).length,
-    sha256: createHash('sha256').update(readFileSync(bin)).digest('hex'), bundled: packages.map(p => p.name) };
+    sha256: createHash('sha256').update(readFileSync(bin)).digest('hex'), bundled: packages.map(p => p.name), uiFiles: Object.keys(ui).length };
 }
 
 if (import.meta.main) {

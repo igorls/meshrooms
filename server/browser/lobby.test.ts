@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { base64, type RoomStatus } from '../../src/browser/protocol';
-import { BrowserLobby, PRESENCE_MS } from './lobby';
+import { BrowserLobby, DEVICES_PER_MEMBER, LINK_FAILURES, LINK_FAILURE_WINDOW, PRESENCE_MS } from './lobby';
 import { browserHandler } from './http';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import { testDirectory } from '../test-directory';
@@ -140,7 +140,7 @@ test('HTTP protects origin, host, body limit, and private files', async () => {
   } finally { lobby.close(); }
 });
 
-test('companion confirmation by a guest still requires host admission; canceled requests cannot be admitted', async () => {
+test('a guest confirming their own companion admits it at once; canceled requests cannot be admitted', async () => {
   const lobby = new BrowserLobby(':memory:', { origin });
   try {
     const host = await client(lobby), guest = await client(lobby), second = await client(lobby), room = crypto.randomUUID();
@@ -149,10 +149,12 @@ test('companion confirmation by a guest still requires host admission; canceled 
     await host.send('decide', room, { requestId: (await host.status(room)).requests![0].id, admit: true });
     await second.send('request', room, { name: 'Companion', label: 'Tablet', kind: 'companion' });
     const request = (await second.status(room)).request!;
+    // The host admitted Sam; adding Sam's own devices is Sam's call, so no host decision is needed.
     await guest.send('link', room, { code: request.code });
-    expect((await second.status(room)).memberId).toBeUndefined();
-    await host.send('decide', room, { requestId: request.id, admit: true });
     expect((await second.status(room)).memberId).toBe((await guest.status(room)).memberId);
+    await expect(host.send('decide', room, { requestId: request.id, admit: true })).rejects.toThrow('no longer waiting');
+    // Admitted: the code is spent, so nobody can link it again.
+    await expect(host.send('link', room, { code: request.code })).rejects.toThrow('not found');
     await expect(second.send('remove', room, { deviceId: (await host.status(room)).deviceId })).rejects.toThrow('cannot remove');
     await host.send('remove', room, { deviceId: (await second.status(room)).deviceId });
     await second.send('request', room, { name: 'New request', label: 'Tablet', kind: 'person' });
@@ -160,6 +162,144 @@ test('companion confirmation by a guest still requires host admission; canceled 
     await expect(guest.send('cancel', room, { requestId: fresh.id })).rejects.toThrow('only cancel your own');
     await second.send('cancel', room, { requestId: fresh.id });
     await expect(host.send('decide', room, { requestId: fresh.id, admit: true })).rejects.toThrow('no longer waiting');
+  } finally { lobby.close(); }
+});
+
+test('self-link: a companion only ever becomes the linker\'s device; agents, strangers and removed members link nothing', async () => {
+  let now = Date.now(); const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam', () => now), pat = await admitPerson(lobby, host, room, 'Pat', () => now);
+    const samId = (await sam.status(room)).memberId!, patId = (await pat.status(room)).memberId!;
+    const companion = async (label: string, extra: Record<string, unknown> = {}) => {
+      const device = await client(lobby, () => now);
+      await device.send('request', room, { name: 'Companion device', label, kind: 'companion', ...extra });
+      return { device, code: (await device.status(room)).request!.code! };
+    };
+    // A request can't choose whose device it becomes: a member id in its payload is ignored.
+    const tablet = await companion('Tablet', { linkedMemberId: samId, memberId: samId });
+    expect((await host.status(room)).requests!.find(r => r.device.label === 'Tablet')).not.toHaveProperty('linkedMemberId');
+    // Codes are shown only to the device that asked: not to the host, not to other members.
+    expect((await host.status(room)).requests!.every(r => r.code === undefined)).toBe(true);
+    expect((await sam.status(room)).requests).toBeUndefined();
+    // Pat holds Sam's code: linking it makes the device Pat's, never Sam's. The code is the secret.
+    await pat.send('link', room, { code: tablet.code });
+    expect((await tablet.device.status(room)).memberId).toBe(patId);
+    expect((await host.status(room)).members).toHaveLength(3);
+    // Spent: the code admits nothing again.
+    await expect(sam.send('link', room, { code: tablet.code })).rejects.toThrow('not found or expired');
+
+    // Agents can't link, not even to their own member; nor can a device that is still waiting itself.
+    await host.send('settings', room, { guestAgentApproval: false });
+    const { token } = await sam.send('agent-invite', room, { name: 'Codex' }) as { token: string };
+    const agent = await client(lobby, () => now);
+    await agent.send('agent-redeem', room, { token, label: 'Agent node' });
+    const phone = await companion('Phone');
+    await expect(agent.send('link', room, { code: phone.code })).rejects.toThrow('Only people');
+    await expect(phone.device.send('link', room, { code: phone.code })).rejects.toThrow('existing device');
+    expect((await phone.device.status(room)).memberId).toBeUndefined();
+
+    // A member the host removed holds no device here, so their old devices can't link anything.
+    const kim = await admitPerson(lobby, host, room, 'Kim', () => now);
+    await host.send('remove', room, { deviceId: (await kim.status(room)).deviceId });
+    await expect(kim.send('link', room, { code: phone.code })).rejects.toThrow('existing device');
+
+    // An expired code admits nothing.
+    now += 600_001;
+    await expect(sam.send('link', room, { code: phone.code })).rejects.toThrow('not found or expired');
+  } finally { lobby.close(); }
+});
+
+test('self-link keeps the host in control: per-person and room device caps, removed devices, and an approval setting', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam'), samId = (await sam.status(room)).memberId!;
+    const companion = async (label: string) => {
+      const device = await client(lobby);
+      await device.send('request', room, { name: 'Companion device', label, kind: 'companion' });
+      return { device, code: (await device.status(room)).request!.code! };
+    };
+    // One person holds at most DEVICES_PER_MEMBER devices, so nobody fills the room's 16 alone.
+    const own = [];
+    for (let i = 1; i < DEVICES_PER_MEMBER; i++) { const c = await companion(`Device ${i}`); await sam.send('link', room, { code: c.code }); own.push(c); }
+    expect((await host.status(room)).devices!.filter(d => d.memberId === samId)).toHaveLength(DEVICES_PER_MEMBER);
+    const extra = await companion('One too many');
+    await expect(sam.send('link', room, { code: extra.code })).rejects.toThrow(`up to ${DEVICES_PER_MEMBER} devices`);
+    expect((await extra.device.status(room)).memberId).toBeUndefined();
+
+    // The host removes one of Sam's devices. It can't come back with its old code, and Sam linking its new request
+    // only confirms it: a device the host removed waits for the host again.
+    const removed = own[0];
+    await host.send('remove', room, { deviceId: (await removed.device.status(room)).deviceId });
+    await expect(sam.send('link', room, { code: removed.code })).rejects.toThrow('not found or expired');
+    await removed.device.send('request', room, { name: 'Companion device', label: 'Back again', kind: 'companion' });
+    const again = (await removed.device.status(room)).request!;
+    await sam.send('link', room, { code: again.code });
+    expect((await removed.device.status(room)).memberId).toBeUndefined();
+    await host.send('decide', room, { requestId: again.id, admit: true });
+    expect((await removed.device.status(room)).memberId).toBe(samId);
+
+    // With hostApprovesDevices, a person's link only confirms the device; the host admits it.
+    await host.send('remove', room, { deviceId: (await own[1].device.status(room)).deviceId });
+    await host.send('settings', room, { hostApprovesDevices: true });
+    const watch = await companion('Watch');
+    await sam.send('link', room, { code: watch.code });
+    expect((await watch.device.status(room)).memberId).toBeUndefined();
+    await host.send('decide', room, { requestId: (await watch.device.status(room)).request!.id, admit: true });
+    expect((await watch.device.status(room)).memberId).toBe(samId);
+    await host.send('settings', room, { hostApprovesDevices: false });
+
+    // The room's 16 still holds for self-links: the link fails and admits nothing.
+    const people = [sam];
+    while ((await host.status(room)).devices!.length < 16) people.push(await admitPerson(lobby, host, room, `Person ${people.length}`));
+    const late = await companion('Late');
+    await expect(people.at(-1)!.send('link', room, { code: late.code })).rejects.toThrow('device limit');
+    expect((await late.device.status(room)).memberId).toBeUndefined();
+  } finally { lobby.close(); }
+});
+
+test('a linked device whose person left before the host decided is not admitted', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { hostApprovesDevices: true });
+    const sam = await admitPerson(lobby, host, room, 'Sam');
+    const tablet = await client(lobby);
+    await tablet.send('request', room, { name: 'Companion device', label: 'Tablet', kind: 'companion' });
+    const request = (await tablet.status(room)).request!;
+    await sam.send('link', room, { code: request.code });
+    // Sam's only device leaves while the linked request waits for the host.
+    await host.send('remove', room, { deviceId: (await sam.status(room)).deviceId });
+    await expect(host.send('decide', room, { requestId: request.id, admit: true })).rejects.toThrow('no longer in the room');
+    expect((await tablet.status(room)).memberId).toBeUndefined();
+    expect((await host.status(room)).members!.map(m => m.name)).toEqual(['Alex']);
+    // Codes are 64 random bits, as hex.
+    expect(request.code).toMatch(/^[a-f0-9]{16}$/);
+  } finally { lobby.close(); }
+});
+
+test('wrong device codes are limited per device and room, so codes can\'t be guessed', async () => {
+  let now = Date.now(); const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam', () => now);
+    const tablet = await client(lobby, () => now);
+    await tablet.send('request', room, { name: 'Companion device', label: 'Tablet', kind: 'companion' });
+    const code = (await tablet.status(room)).request!.code!;
+    for (let i = 0; i < LINK_FAILURES; i++) await expect(sam.send('link', room, { code: i.toString(16).padStart(16, '0') })).rejects.toThrow('not found');
+    // Over the limit, even the right code waits; another person's guesses are their own.
+    await expect(sam.send('link', room, { code })).rejects.toThrow('Too many wrong device codes');
+    await expect(host.send('link', room, { code: 'not a code' })).rejects.toThrow('not found');
+    now += LINK_FAILURE_WINDOW + 1;
+    // Past the window it works again (the request itself was refreshed by a new request, as it would have expired).
+    await tablet.send('request', room, { name: 'Companion device', label: 'Tablet', kind: 'companion' });
+    await sam.send('link', room, { code: (await tablet.status(room)).request!.code });
+    expect((await tablet.status(room)).memberId).toBe((await sam.status(room)).memberId);
   } finally { lobby.close(); }
 });
 
@@ -367,14 +507,14 @@ test('the host controls room settings, and can require approval for guests’ ag
     await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
     const sam = await admitPerson(lobby, host, room, 'Sam');
     // SEC-12: new rooms approve guests' agents by default.
-    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true });
+    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true, hostApprovesDevices: false });
     await expect(sam.send('settings', room, { floor: 'open' })).rejects.toThrow('Only the host');
     await expect(host.send('settings', room, { floor: 'loud' })).rejects.toThrow('when agents reply');
     await expect(host.send('settings', room, { guestAgentApproval: 'yes' })).rejects.toThrow('on or off');
     await host.send('settings', room, { guestAgentApproval: false, agentAssignmentsWake: true });
-    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: false });
+    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: false, hostApprovesDevices: false });
     await host.send('settings', room, { guestAgentApproval: true });
-    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: true });
+    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: true, hostApprovesDevices: false });
 
     // A guest's agent waits for the host; the host's own agent joins right away.
     const samAgent = await client(lobby), hostAgent = await client(lobby), orphan = await client(lobby);

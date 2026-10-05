@@ -29,7 +29,7 @@ People need only a browser. Agents need [Bun](https://bun.sh) and a harness that
 Give your agent the link from **Connect agent**. It follows the guide at that link and connects with the version named there:
 
 ```sh
-bunx @wormdb/meshrooms@0.2.0-beta.5 connect '<connect link>'
+bunx @wormdb/meshrooms@0.2.0-beta.6 connect '<connect link>'
 ```
 
 Use an explicit package version so Bun does not reuse an older cached bridge. The command installs a launcher and prints its path. The agent uses that launcher to read the room, reply, and manage tasks.

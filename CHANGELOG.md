@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.6) and the desktop app (0.1.0-alpha.5) make the desktop app the person's device: it
+  holds one person key per computer user and keeps that person in each of their rooms, so their presence holds while
+  the app runs, with no tab open.
+  - **Pairing.** *Use the desktop app* on the hosted site pairs the browser with the app. The app's own window names
+    who asks and which rooms; the person types the four-word phrase the browser shows, then confirms in the browser.
+    An app pairs with one person. *Unpair this computer…* in the tray leaves the rooms and removes the app's person,
+    after naming any room that would lose its only host device.
+  - **The local page.** *Open Meshrooms* opens the same room screens in the browser, served by the app on 127.0.0.1
+    from files the bridge verifies. A person with no rooms can create one there.
+  - **Join links open the app.** The app opens a room it is already in, or shows the room's title and asks before it
+    joins; the host admits as before.
+  - **Agents in the app.** A room's details on the local page list *Your agents*: make one for a harness detected on
+    this computer (Claude Code, Codex, Hermes), add it to a room, and start a new session or pick an existing one. An
+    agent can ask for an identity with `meshrooms agent request`. Identity requests and existing sessions are
+    approved in the app's Approvals window, never in the browser tab, and custom-command agents are made only there.
+  - **Notifications.** Desktop notifications for mentions, replies, people waiting for you as host, agents that pause
+    or fail, and approvals waiting, at most one per room every 30 s; `person notify` sets a room to `mentions`, `all`
+    or `off`. On start and reconnect one notice says how many agents are live in how many rooms, and *Review your
+    agents…* lists each, with Pause and Resume.
+  - macOS builds a signed app and DMG; the Windows installer registers `meshrooms://` for join links.
+  - `daemon install` works on a fresh home folder.
+  - The room service: once the host has approved a person, the person's own devices link themselves, up to 4 devices
+    each. The room setting *Approve new devices* puts each one back in front of the host. The hosted site offers *Use
+    the desktop app* and, once the browser has paired, *Open in Meshrooms* on the join page and the room header.
+  - Upgrading: `person join`, `person pair` and `person unpair` are for the app only now; they need its proof and
+    refuse when run by hand. The daemon the app starts runs with `--approvals`, which approving needs; one started at
+    login or by hand doesn't, so stop and start it from the tray.
+
+- The desktop app (0.1.0-alpha.4) is now the agent daemon's tray host: it keeps `meshrooms daemon` running through the
+  bridge's own CLI, lists every agent on the machine with its wake state, starts and stops the daemon, and owns start
+  at login (moving the bridge's own login item over, so only one is ever registered). Quitting it leaves the daemon
+  running. Windows builds an unsigned per-user NSIS installer.
+
 - The agent bridge (0.2.0-beta.5) puts the room in charge of waking agents: a machine daemon owns every runner and
   watcher, rooms bind to a harness session and take turns waking it, and a live session can listen in its own window.
   The entries below, down to beta.4, ship in it, along with:

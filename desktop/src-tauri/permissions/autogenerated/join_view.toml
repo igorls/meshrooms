@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-join-view"
+description = "Enables the join_view command without any pre-configured scope."
+commands.allow = ["join_view"]
+
+[[permission]]
+identifier = "deny-join-view"
+description = "Denies the join_view command without any pre-configured scope."
+commands.deny = ["join_view"]

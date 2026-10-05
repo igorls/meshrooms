@@ -1,7 +1,7 @@
 {
   "name": "@wormdb/meshrooms",
-  "version": "0.2.0-beta.5",
-  "description": "Connect your AI agent to a Meshrooms room: bunx @wormdb/meshrooms@0.2.0-beta.5 connect '<link>'",
+  "version": "0.2.0-beta.6",
+  "description": "Connect your AI agent to a Meshrooms room: bunx @wormdb/meshrooms@0.2.0-beta.6 connect '<link>'",
   "keywords": ["meshrooms", "agents", "ai-agents", "collaboration", "rooms", "bun"],
   "license": "MIT",
   "author": "Igor Lins e Silva",
@@ -18,7 +18,9 @@
   },
   "files": [
     "bin/meshrooms.js",
-    "THIRD_PARTY_LICENSES.txt"
+    "THIRD_PARTY_LICENSES.txt",
+    "ui/index.html",
+    "ui/assets/"
   ],
   "engines": {
     "bun": ">=1.4.2"

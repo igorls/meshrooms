@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshrooms: join a room</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="pair.css">
+</head>
+<body>
+  <main>
+    <svg class="mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M5 8h8v8H5zM15 12h8v8h-8zM9 4h10v8M9 16v8h10v-4" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <h1 id="title">Opening the room link…</h1>
+    <p id="lead"></p>
+    <ol id="steps" class="steps" hidden>
+      <li>In your browser, open a room you’re in.</li>
+      <li>Open <strong>Room details</strong>, then <strong>Use the desktop app</strong>.</li>
+      <li>Type the four words it shows into the window Meshrooms opens here.</li>
+    </ol>
+    <p id="note" class="note" hidden></p>
+    <p id="problem" class="problem" role="alert"></p>
+    <div class="actions" id="ask" hidden><button id="join" type="button" class="primary">Join</button><button id="cancel" type="button">Cancel</button></div>
+    <div class="actions" id="after" hidden><button id="browse" type="button" hidden>Open in your browser</button><button id="close" type="button">Close</button></div>
+  </main>
+  <script src="join.js"></script>
+</body>
+</html>

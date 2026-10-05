@@ -81,7 +81,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     try {
       // A retry of a create that already succeeded is answered from its receipt and isn't charged again.
       if (action === 'create' && !await lobby.answered(input) && !charge(creates, addressKey(address), 3_600_000, options.createLimit || 6)) { status = 429; return json({ error: 'Room creation limit reached. Try again in an hour.' }, 429); }
-      const response = json(await lobby.execute(input as Parameters<BrowserLobby['execute']>[0]));
+      const response = json(await lobby.execute(input as Parameters<BrowserLobby['execute']>[0], addressKey(address)));
       status = 200;
       return response;
     } catch (error) {

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshrooms: pair this computer</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="pair.css">
+</head>
+<body>
+  <main>
+    <svg class="mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M5 8h8v8H5zM15 12h8v8h-8zM9 4h10v8M9 16v8h10v-4" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <h1 id="title">Pair this computer</h1>
+    <p id="lead"></p>
+    <form id="ask" hidden>
+      <label for="phrase">Type the four words your browser shows</label>
+      <input id="phrase" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="80">
+      <p id="problem" class="problem" role="alert"></p>
+      <div class="actions"><button id="next" type="submit" class="primary" disabled>Next</button><button id="reject" type="button">Reject</button></div>
+      <p class="note">The name and address come from the link, not from Meshrooms: only pair with a browser you opened yourself. If you didn't ask for this, reject it.</p>
+    </form>
+    <ul id="rooms" hidden></ul>
+    <div class="actions" id="review" hidden><button id="pair" type="button" class="primary">Pair these rooms</button><button id="reject2" type="button">Reject</button></div>
+    <div class="actions" id="unpair" hidden><button id="unpair-go" type="button" class="danger">Unpair</button><button id="unpair-cancel" type="button">Cancel</button></div>
+    <p id="after-problem" class="problem" role="alert"></p>
+    <div class="actions" id="after" hidden><button id="open" type="button" class="primary" hidden>Open Meshrooms</button><button id="close" type="button">Close</button></div>
+  </main>
+  <script src="pair.js"></script>
+</body>
+</html>

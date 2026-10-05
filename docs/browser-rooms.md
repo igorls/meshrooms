@@ -16,8 +16,10 @@ bun run browser
 Open http://127.0.0.1:4320/rooms. Create a room and open its link in a separate
 browser profile to test admission. Choose **Use my existing identity** to test a
 second device: enter its displayed code under **Room details → Add another device** in the
-trusted room session. A host can approve their own device in that action; another
-member confirms ownership before the host approves room access.
+trusted room session. Any member confirming their own device admits it at once: the
+host approved the person, and the person adds their own devices (up to four). The
+host still admits a device that was removed from the room before, and every new
+device when **Approve new devices** is on in Room settings.
 
 The loopback HTTP URL is for local development. Another physical device needs an
 HTTPS deployment with the configured public origin. A LAN HTTP address does not
@@ -47,8 +49,10 @@ served by this runtime; private admission data must never be in the web root.
 
 - Non-exportable P-256 private device keys are kept in IndexedDB. Commands prove
   key possession and bind the action, origin, room, request ID, and timestamp.
-- Only an authenticated host may admit new members. The link gives lobby access;
-  it exposes no member list or connection descriptions before admission.
+- Only an authenticated host may admit new members. A member's own companion
+  devices join when that member confirms them (their device code is the secret).
+  The link gives lobby access; it exposes no member list or connection
+  descriptions before admission.
 - Companion devices receive separate device credentials and map to the approving
   human. Display names never link identities. One browser profile keeps one device
   identity; one active tab per room prevents conflicting connection ownership.

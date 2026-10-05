@@ -7,6 +7,7 @@ import { BRIDGE_VERSION, BridgeTooOld, MANIFEST, assertPrivateDir, binDir, bunTo
 import { buildAgent } from '../../scripts/build-agent';
 import { deviceId } from '../../src/browser/protocol';
 import { testDirectory } from '../test-directory';
+import { localUi, uiManifestOf, verifiedUi } from '../local-ui';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import packageJson from '../../packages/meshrooms/package.json';
 import { fakeRunner, processRuns, type FakeKind } from './fake-runner';
@@ -78,6 +79,49 @@ test('an intact install writes nothing, so the bin folder need not be writable, 
     writeFileSync(first.launcher, 'console.log("changed");\n');
     installBridge(bundle, '0.2.0-beta.3', bin);
     expect(readFileSync(first.launcher, 'utf8')).toBe(launcherSource('0.2.0-beta.3', createHash('sha256').update(readFileSync(bundle)).digest('hex')));
+  } finally { dir.cleanup(); }
+});
+
+test('the UI a bundle carries is installed beside it, verified against the bundle\'s hashes; an install without it is not intact', () => {
+  const dir = testDirectory('bridge-install-ui');
+  try {
+    // The npm layout: bin/meshrooms.js with ui/ at the package's root.
+    const pkg = join(dir.path, 'pkg'), bin = join(dir.path, 'bin'), bundle = join(pkg, 'bin', 'meshrooms.js');
+    mkdirSync(join(pkg, 'bin'), { recursive: true }); mkdirSync(join(pkg, 'ui', 'assets'), { recursive: true });
+    writeFileSync(bundle, 'export async function main() {}\n');
+    writeFileSync(join(pkg, 'ui', 'index.html'), '<!doctype html><title>Meshrooms</title>');
+    writeFileSync(join(pkg, 'ui', 'assets', 'index-abc.js'), 'console.log(1)');
+    writeFileSync(join(pkg, 'ui', 'assets', 'extra.js'), 'not in the manifest');
+    const ui = uiManifestOf(join(pkg, 'ui'));
+    delete ui['assets/extra.js'];
+    installBridge(bundle, '0.2.0-beta.3', bin, ui);
+    const installed = join(bin, 'ui-0.2.0-beta.3');
+    expect(readdirSync(join(installed, 'assets'))).toEqual(['index-abc.js']);
+    expect(verifiedUi(installed, ui)?.size).toBe(2);
+    // The daemon, run from the installed bundle, finds it there; a UI changed on disk is not served at all.
+    expect(localUi('0.2.0-beta.3', { bundle: join(bin, 'meshrooms-0.2.0-beta.3.js'), manifest: ui })?.dir).toBe(installed);
+    writeFileSync(join(installed, 'assets', 'index-abc.js'), 'console.log("changed")');
+    expect(localUi('0.2.0-beta.3', { bundle: join(bin, 'meshrooms-0.2.0-beta.3.js'), manifest: ui })).toBeUndefined();
+    // A bundle without a manifest (the room service's copy) serves no page, whatever is beside it.
+    expect(localUi('0.2.0-beta.3', { bundle: join(bin, 'meshrooms-0.2.0-beta.3.js'), manifest: undefined })).toBeUndefined();
+    // The damaged UI makes the install not intact: the next install puts the verified files back.
+    installBridge(bundle, '0.2.0-beta.3', bin, ui);
+    expect(readFileSync(join(installed, 'assets', 'index-abc.js'), 'utf8')).toBe('console.log(1)');
+    // A source UI that doesn't match the bundle's hashes is never copied.
+    rmSync(installed, { recursive: true });
+    writeFileSync(join(pkg, 'ui', 'index.html'), '<!doctype html><script>tampered</script>');
+    installBridge(bundle, '0.2.0-beta.3', bin, ui);
+    expect(existsSync(installed)).toBe(false);
+  } finally { dir.cleanup(); }
+});
+
+test('a release bundle carries its UI\'s hashes; the room service\'s copy carries none', async () => {
+  const dir = testDirectory('bridge-ui-define');
+  try {
+    const ui = { 'index.html': 'a'.repeat(64), 'assets/index-abc.js': 'b'.repeat(64) };
+    const release = await buildAgent(join(dir.path, 'release'), { ui }), plain = await buildAgent(join(dir.path, 'plain'));
+    expect(readFileSync(release.file, 'utf8')).toContain('b'.repeat(64));
+    expect(readFileSync(plain.file, 'utf8')).not.toContain('index-abc.js');
   } finally { dir.cleanup(); }
 });
 

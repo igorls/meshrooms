@@ -25,7 +25,7 @@ import {
 import { cleanName, defaultName, sniff } from '../src/attachments';
 import { admissible, castVote, COMPACT_DECISIONS_AT, compactDecisions, decisionChunks, decisionWakes, due, foldDecisions, MAX_DECISION_OPS, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
   type Decision, type DecisionBody, type DecisionMode, type DecisionPacket, type DecisionSync, type VoteBody } from '../src/browser/decisions';
-import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, validActivity, validNote, type Activity, type ActivityOn } from '../src/browser/activity';
+import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, receiveActivity, validActivity, validActivityPacket, validNote, type Activity, type ActivityOn, type ActivityRecord } from '../src/browser/activity';
 import {
   COMPACT_REACTIONS_AT, MAX_REACTION_KEYS_PER_MEMBER, MAX_REACTION_OPS, REACTION_EMOJI, compactReactions, currentRevision,
   foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody, withinReactionKeyCap,
@@ -44,7 +44,8 @@ type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: stri
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody | ReactionBody; signature: string };
 type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[] };
-type Members = { memberId?: string; ownerId?: string; title?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string }[] };
+/** `online` (a person device's folders only): the device polled the room service within its presence window. */
+type Members = { memberId?: string; ownerId?: string; title?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string; online?: boolean }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
 /** A queued reaction toggle; `run` signs it against the current folded chips and revision. */
@@ -108,14 +109,40 @@ export function parseConnectLink(link: string) {
 /** settings.json. `checkedAt`: when the runner last had them from the room service (this machine's clock). */
 export type RoomRules = { floor: Floor; agentAssignmentsWake?: boolean; repositories?: string[]; checkedAt?: number };
 
-/** One agent's membership in one browser room. */
+/** Written by a person device's runner while it waits for admission: the request's state, and a companion's code. */
+export const ADMISSION_FILE = 'admission.json';
+/**
+ * Written by a person device's runner whenever the room as it last heard it changes: the room service's status without
+ * its signals and ICE servers (which carry TURN credentials), devices marked `online` instead of their sessions, the
+ * devices it has an open channel to (`connected`), and the agents' activity those channels reported. The local API
+ * serves it to the person's own page, which can't poll the room service itself: a second session would take this
+ * device's presence over.
+ */
+export const PERSON_STATUS_FILE = 'status.json';
+export type PersonStatus = Omit<RoomStatus, 'signals' | 'iceServers' | 'devices'> & {
+  devices?: (BrowserDevice & { online: boolean })[]; connected: string[]; activity: Record<string, ActivityRecord> };
+/** The status a person device's runner keeps for the local API (see PERSON_STATUS_FILE). */
+export function personStatusOf(next: RoomStatus, connected: string[], activity: Record<string, ActivityRecord>): PersonStatus {
+  const { signals: _, iceServers: __, devices, ...rest } = next;
+  return { ...rest, ...(devices ? { devices: devices.map(({ session, ...d }) => ({ ...d, online: !!session })) } : {}), connected, activity };
+}
+
+/**
+ * One agent's membership in one browser room, or (with `person`) one room of the machine's person device: the same
+ * peer, store and runner, signing with the person's one key (`person.identityFile`) and speaking as a person, so the
+ * agents' floor rules don't apply to what it sends.
+ */
 export class BrowserAgent {
   readonly dir: string;
+  readonly person: boolean;
+  private readonly identityFile: string;
   private identity?: Identity;
   private key?: CryptoKey;
   /** `mkdir: false` only reads the room folder as it is (`bindings` lists rooms without changing them). */
-  constructor(dataDir: string, readonly origin: string, readonly roomId: string, options: { mkdir?: boolean } = {}) {
+  constructor(dataDir: string, readonly origin: string, readonly roomId: string, options: { mkdir?: boolean; person?: { identityFile: string } } = {}) {
     this.dir = resolve(dataDir, 'browser-agents', roomId);
+    this.person = !!options.person;
+    this.identityFile = options.person ? resolve(options.person.identityFile) : join(this.dir, 'identity.json');
     if (options.mkdir !== false) for (const sub of ['outbox', 'files', 'wants', LIVE]) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
   }
   private path(name: string) { return join(this.dir, name); }
@@ -151,7 +178,7 @@ export class BrowserAgent {
   transfers(): Record<string, TransferState> { return readJson(this.path('transfers.json'), {}); }
   async ensureIdentity(): Promise<Identity> {
     if (this.identity) return this.identity;
-    const file = this.path('identity.json');
+    const file = this.identityFile;
     if (!existsSync(file)) {
       const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']) as CryptoKeyPair;
       const publicKey = b64(await crypto.subtle.exportKey('raw', keys.publicKey));
@@ -181,7 +208,7 @@ export class BrowserAgent {
       headers: { 'Content-Type': 'application/json', Origin: this.origin },
       body: JSON.stringify({ command, publicKey: identity.publicKey, signature: await this.sign(command) }) });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(result.error || `Room service rejected ${action} (${response.status}).`), { status: response.status });
+    if (!response.ok) throw Object.assign(new Error(result.error || `Room service rejected ${action} (${response.status}).`), { status: response.status, ...(typeof result.code === 'string' ? { code: result.code } : {}) });
     return result;
   }
   messages(): Stored[] { return readJson(this.path('messages.json'), []); }
@@ -238,7 +265,8 @@ export class BrowserAgent {
   /** The room as local-room shapes, so collab.ts rules apply unchanged. */
   view() {
     const { memberId, members } = this.members();
-    const participants: Participant[] = members.map(m => ({ id: m.id, name: m.name, role: m.id === memberId ? 'agent' : m.role ?? 'human',
+    const self = this.person ? 'human' as const : 'agent' as const;
+    const participants: Participant[] = members.map(m => ({ id: m.id, name: m.name, role: m.id === memberId ? self : m.role ?? 'human',
       state: m.id === memberId ? 'local' : 'remote', detail: 'Browser room member', ...(m.operatorId ? { operatorId: m.operatorId } : {}) }));
     const messages: Message[] = this.messages().map(({ packet: { body } }) => {
       const author = participants.find(p => p.id === body.memberId);
@@ -307,14 +335,16 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
   if (!it || typeof it !== 'object' || !id(it.id)) return 'its id is not a UUID';
   if (it.replyTo !== undefined && !id(it.replyTo)) return 'its reply target is not a UUID';
   const view = agent.view();
+  // A person's own device: the floor is for agents, and a person's vote counts rather than advises.
+  const speaks = (replyTo: unknown) => agent.person || mayAgentSpeak(view, memberId, replyTo as string | undefined);
   if (it.type === 'decision') {
     if (!id(it.decisionId)) return 'its decision id is not a UUID';
-    if (it.action === 'open') return mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'the room is humans-first and nothing addressed the agent';
+    if (it.action === 'open') return speaks(it.replyTo) ? undefined : 'the room is humans-first and nothing addressed the agent';
     const current = pickDecision(agent.decisions(), it.decisionId, memberId);
     if (!current) return undefined; // Nothing to change: the runner makes no change for it.
     if (it.action === 'vote') {
       const asked = current.askAgents === true || (Array.isArray(current.askAgents) && current.askAgents.includes(memberId));
-      return asked || mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'the decision did not ask the agent and nothing addressed it';
+      return asked || speaks(it.replyTo) ? undefined : 'the decision did not ask the agent and nothing addressed it';
     }
     if (it.action === 'close' || it.action === 'withdraw') {
       const { ownerId, members } = agent.members();
@@ -329,7 +359,7 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
   if (it.type !== undefined) return 'it is not a known kind';
   if (typeof it.text !== 'string' || it.text.length > 4000 || (!it.text.trim() && !(Array.isArray(it.attachments) && it.attachments.length)))
     return 'its text is empty or longer than 4,000 characters';
-  return mayAgentSpeak(view, memberId, it.replyTo) ? undefined : 'nothing in this room addressed the agent';
+  return speaks(it.replyTo) ? undefined : 'nothing in this room addressed the agent';
 }
 
 /**
@@ -634,6 +664,16 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
 
   const activity = activityAnnouncer(agent, () => [...peers.values()].map(p => p.channel));
+  /** A person device's view of its agents: their latest activity per device with an open channel (see PERSON_STATUS_FILE). */
+  const heard = new Map<string, ActivityRecord>();
+  let shownStatus = '';
+  /** Rewrites the person's status file only when what it says changed, so the local API's feed hears of real changes. */
+  const keepStatus = (next: RoomStatus) => {
+    const open = [...peers].filter(([id, p]) => p.channel?.readyState === 'open' && next.devices?.some(d => d.id === id)).map(([id]) => id);
+    const text = JSON.stringify(personStatusOf(next, open, Object.fromEntries([...heard].filter(([id]) => open.includes(id)))));
+    if (text === shownStatus) return;
+    try { replaceFile(join(agent.dir, PERSON_STATUS_FILE), text); shownStatus = text; } catch { /* Written again next pass. */ }
+  };
   /**
    * `loopAt`: when the loop last came round, which is what says the runner still works. `polledAt`: when the room service
    * last answered. `failingSince`/`failure`: it hasn't since then, and why (see RUNNER_ALIVE).
@@ -705,7 +745,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     channel.bufferedAmountLowThreshold = PACE_LOW_WATER;
     channel.bufferedAmountLow.subscribe(() => queue.pump());
     channel.stateChanged.subscribe(state => {
-      if (state === 'closed') { if (peers.get(id) === peer) transfers.closed(id); return; }
+      if (state === 'closed') { if (peers.get(id) === peer) { transfers.closed(id); heard.delete(id); } return; }
       // A peer that was retired (replaced, or its close still pending) has nothing more to exchange.
       if (state !== 'open' || peers.get(id) !== peer) return;
       syncedAt ??= Date.now();
@@ -722,7 +762,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       let packet: Packet; try { packet = JSON.parse(text); } catch { return; }
       // File transfers bypass the serialized queue: chunks arrive by the hundred and are cheap to check.
       if (isFilePacket(packet)) { if (peers.get(id) === peer && status?.devices?.some(d => d.id === id)) transfers.handle(id, packet); return; }
-      if (isActivityPacket(packet)) return; // For people's rosters; agents learn nothing from each other's activity.
+      // For people's rosters; agents learn nothing from each other's activity. A person device keeps it for its page.
+      if (isActivityPacket(packet)) { if (agent.person && peers.get(id) === peer && validActivityPacket(packet, agent.roomId)) heard.set(id, receiveActivity(packet)); return; }
       // Cheap and never queued: answered from the loop, at most once per interval.
       if (isSyncRequest(packet, agent.roomId)) { if (peers.get(id) === peer && status?.devices?.some(d => d.id === id)) { peer.resync.request(); resyncDue(peer); } return; }
       if (!gate.admit(id)) {
@@ -962,7 +1003,15 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       // A device the room no longer has, with no request of its own, after it was a member: someone removed this agent.
       // The proof says so, so the machine's daemon stops looking after a room that will never answer this device again.
       removedSince = next.memberId || next.request || !agent.members().memberId ? undefined : removedSince ?? Date.now();
-      if (!next.memberId) { log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await pause(3000); continue; }
+      if (!next.memberId) {
+        // A person device's commands read where its request stands (and a companion's code) from here, not by polling.
+        if (agent.person) {
+          keep(ADMISSION_FILE, next.request ? { state: next.request.state, kind: next.request.kind, ...(next.request.code ? { code: next.request.code } : {}),
+            expiresAt: next.request.expiresAt, at: Date.now() } : { state: 'none', at: Date.now() });
+          keepStatus(next);
+        }
+        log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await pause(3000); continue;
+      }
       // The room's rules first, and on their own: listen, status and the watch peek read the floor from this file, so
       // nothing else in the pass (closing peers, a members.json busy on Windows) may leave it behind the room.
       // Every admitted status from the room service carries them; one that doesn't (a service from before room settings)
@@ -975,7 +1024,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
-      keep('members.json', { memberId: next.memberId, ownerId: next.ownerId, ...(typeof next.title === 'string' ? { title: next.title } : {}), former, members: next.members || [], devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId })) });
+      keep('members.json', { memberId: next.memberId, ownerId: next.ownerId, ...(typeof next.title === 'string' ? { title: next.title } : {}), former, members: next.members || [],
+        devices: (next.devices || []).map(d => ({ id: d.id, memberId: d.memberId, ...(agent.person ? { online: !!d.session } : {}) })) });
+      if (agent.person && existsSync(join(agent.dir, ADMISSION_FILE))) rmSync(join(agent.dir, ADMISSION_FILE), { force: true });
       await step('profile', () => applyPendingProfile(agent, log), left(deadlines.profile));
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
       const available = (next.devices || []).filter(d => d.id !== identity.id && d.session);
@@ -1022,6 +1073,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       for (const peer of peers.values()) { peer.queue?.pump(); resyncDue(peer); }
       for (const id of quotaDrops.due()) requestSync(id);
       transfers.tick(); fetchWanted();
+      if (agent.person) keepStatus(next);
       if (Date.now() - pruned > 60_000) { prune(); pruned = Date.now(); }
     } catch (error) {
       // 410: the host closed the room or the service removed it. Nothing will change, so stop instead of retrying.

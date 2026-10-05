@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshrooms: approvals</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="pair.css">
+  <link rel="stylesheet" href="approvals.css">
+</head>
+<body>
+  <main>
+    <svg class="mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M5 8h8v8H5zM15 12h8v8h-8zM9 4h10v8M9 16v8h10v-4" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <h1 id="title">Approvals</h1>
+    <p id="lead">Reading what waits for you…</p>
+    <ul id="items" class="requests"></ul>
+    <p id="note" class="done" role="status"></p>
+    <p id="problem" class="problem" role="alert"></p>
+    <details id="custom" class="custom">
+      <summary>New custom-command agent</summary>
+      <p class="warning">This command runs on this computer, as you, whenever the agent is woken: anyone who can wake the agent in a room makes it run. Only use a program you trust.</p>
+      <div class="fields">
+        <label for="custom-name">Name</label>
+        <input id="custom-name" autocomplete="off" spellcheck="false" maxlength="64">
+        <label for="custom-command">Command</label>
+        <input id="custom-command" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2000" placeholder="my-agent --prompt-file {prompt_file}">
+        <p class="hint">Put {prompt_file} where the path of the wake's prompt file goes.</p>
+        <label for="custom-model">Model <span class="optional">(optional)</span></label>
+        <input id="custom-model" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="100">
+      </div>
+      <div class="actions" id="custom-ask"><button id="custom-check" type="button">Review this agent</button></div>
+      <div id="custom-confirm" class="confirm" hidden>
+        <h2>Make this custom-command agent?</h2>
+        <dl id="custom-shown"></dl>
+        <p class="hint">At each wake, {prompt_file} becomes the path of the wake's prompt file, and {room} the room's id.</p>
+        <p class="warning">Every wake of this agent runs exactly this, on this computer, as you.</p>
+        <div class="actions"><button id="custom-edit" type="button">Edit</button><button id="custom-make" type="button" class="danger">Make this agent</button></div>
+      </div>
+      <p id="custom-problem" class="problem" role="alert"></p>
+    </details>
+    <div class="actions"><button id="close" type="button">Close</button></div>
+  </main>
+  <script src="approvals.js"></script>
+</body>
+</html>

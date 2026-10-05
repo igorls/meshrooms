@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-review-resume"
+description = "Enables the review_resume command without any pre-configured scope."
+commands.allow = ["review_resume"]
+
+[[permission]]
+identifier = "deny-review-resume"
+description = "Denies the review_resume command without any pre-configured scope."
+commands.deny = ["review_resume"]

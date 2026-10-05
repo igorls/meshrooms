@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "review-window",
+  "description": "The Review window (the bound agents, with Pause and Resume) may call the review commands and nothing else: no core or plugin permissions, notifications included (the app posts those from Rust).",
+  "windows": ["review"],
+  "permissions": [
+    "allow-review-view",
+    "allow-review-pause",
+    "allow-review-resume",
+    "allow-review-close"
+  ]
+}

@@ -208,7 +208,8 @@ export type DaemonTiming = typeof DAEMON_TIMING;
 export const restartDelay = (failures: number, timing: Pick<DaemonTiming, 'restartBaseMs' | 'restartMaxMs'> = DAEMON_TIMING) =>
   Math.min(timing.restartMaxMs, timing.restartBaseMs * 2 ** Math.max(0, failures - 1));
 
-export type RoomRef = { home: string; roomId: string; dir: string };
+/** `person`: a room of the machine's person device (person.ts), whose runner is `person-run`, not an agent's. */
+export type RoomRef = { home: string; roomId: string; dir: string; person?: boolean };
 /** A process the daemon started and still holds: `exit` is filled in when it ends, so no process lookup is needed. */
 export type Handle = { pid: number; exit?: { at: number; code: number | null; signal?: string | null } };
 /** What a room's files say, read every tick (no process lookups). */
@@ -457,6 +458,10 @@ export function createSupervisor(deps: SupervisorDeps, timing: DaemonTiming = DA
         if (!rooms.has(key)) { rooms.set(key, { ref, state: 'starting', since: deps.now(), lastFull: 0, runner: proc(), watcher: proc(), wakes: 'unbound' }); log(`room ${ref.roomId}: supervising it (agent folder ${ref.home})`); }
       }
       for (const [key, room] of rooms) if (!seen.has(key)) { rooms.delete(key); say(room, 'its folder or agent folder is gone: no longer supervised'); }
+      // What it looks after is known now: say so before the first room's checks, which can take seconds (starting a
+      // runner, looking up processes on Windows). Until then the record named no folders, so a command run meanwhile
+      // didn't defer to this daemon for a room it was about to look after.
+      deps.heartbeat(status());
       let lookups = timing.lookupsPerTick;
       const lookup = () => lookups-- > 0;
       // The room checked longest ago goes first, so a slow tick still comes round to every room.

@@ -696,7 +696,7 @@ test('in a wake the bridge refuses whatever would configure it, other rooms, and
   const guard = (argv: Record<string, string>, attach: string[] = [], command = 'send', dir: string | null = wake) => () => wakeGuard(command, argv, attach, { MESHROOMS_WAKE_ROOM: room, MESHROOMS_WAKE_DIR: dir ?? undefined });
   // Outside a wake nothing changes.
   expect(wakeGuard('watch', {}, [], {})).toBeUndefined();
-  for (const command of ['watch', 'watch-stop', 'watch-run', 'stop', 'connect', 'profile', 'avatar', 'run', 'rooms', 'task-issue', 'issue-task'])
+  for (const command of ['watch', 'watch-stop', 'watch-run', 'stop', 'connect', 'profile', 'avatar', 'run', 'rooms', 'task-issue', 'issue-task', 'agent', 'bind', 'unbind', 'person', 'person-run', 'daemon', 'bindings'])
     expect(guard({ '--room': room }, [], command)).toThrow("isn't available to an agent the room watcher woke");
   expect(guard({ '--room': elsewhere })).toThrow(`This wake is for room ${room}`);
   expect(guard({ '--room': room, '--text-file': join(wake, 'reply.md') })()).toBe(wake);

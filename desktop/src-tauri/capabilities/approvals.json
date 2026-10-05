@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "approvals-window",
+  "description": "The Approvals window (agent identity requests, existing-session binds, and custom-command agents) may call the approvals commands and nothing else: no core or plugin permissions, notifications included (the app posts those from Rust).",
+  "windows": ["approvals"],
+  "permissions": [
+    "allow-approvals-view",
+    "allow-approvals-approve",
+    "allow-approvals-reject",
+    "allow-approvals-custom-check",
+    "allow-approvals-custom-make",
+    "allow-approvals-custom-edit",
+    "allow-approvals-close"
+  ]
+}

@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { packageRuntime, type PackageManifest } from './package-runtime';
+import { packageBridge, packageRuntime, type PackageManifest } from './package-runtime';
 import { testDirectory } from '../server/test-directory';
 
 const tempDirs: ReturnType<typeof testDirectory>[] = [];
@@ -294,5 +294,63 @@ describeMac('Runtime Packaging on macOS arm64 (packageRuntime)', () => {
     expect(manifest.files['bun']).toBeUndefined();
     expect(existsSync(join(result.directory, 'bun'))).toBe(false);
     expect(readFileSync(join(result.directory, '.local', 'native', 'libwormdb_ffi.dylib'), 'utf8')).toBe('CUSTOM_DYLIB');
+  });
+});
+
+const describeBridge = (process.platform === 'win32' && process.arch === 'x64') || (process.platform === 'darwin' && process.arch === 'arm64') ? describe : describe.skip;
+
+describeBridge('Desktop bridge packaging (packageBridge)', () => {
+  function bridgeSource(root: string) {
+    const source = join(root, 'source'), pkg = join(source, 'packages', 'meshrooms');
+    mkdirSync(join(pkg, 'bin'), { recursive: true });
+    mkdirSync(join(source, 'LICENSES'), { recursive: true });
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ version: '0.2.0-beta.9' }));
+    writeFileSync(join(pkg, 'bin', 'meshrooms.js'), '#!/usr/bin/env bun\nconsole.log("{}");\n');
+    writeFileSync(join(pkg, 'THIRD_PARTY_LICENSES.txt'), 'bundled notices');
+    writeFileSync(join(source, 'LICENSE'), 'Test license');
+    writeFileSync(join(source, 'THIRD_PARTY_NOTICES.md'), 'Test notices');
+    writeFileSync(join(source, 'LICENSES', 'bun.txt'), 'bun notice');
+    writeFileSync(join(source, '.env'), 'SECRET_KEY=12345');
+    mkdirSync(join(pkg, 'ui', 'assets'), { recursive: true });
+    writeFileSync(join(pkg, 'ui', 'index.html'), '<!doctype html><title>Meshrooms</title>');
+    writeFileSync(join(pkg, 'ui', 'assets', 'index-abc123.js'), 'console.log(1)');
+    return source;
+  }
+  const bunName = process.platform === 'win32' ? 'bun.exe' : 'bun';
+
+  it('packages bun, the bridge and its notices with a hash for each, under the bridge version', async () => {
+    const root = makeDir('bridge-package'), source = bridgeSource(root), out = join(root, 'out');
+    const result = await packageBridge({ sourceDir: source, outputDir: out });
+    const manifest = JSON.parse(readFileSync(result.manifestPath, 'utf8'));
+    expect(manifest.kind).toBe('bridge');
+    expect(manifest.version).toBe('0.2.0-beta.9');
+    expect(Object.keys(manifest.files).sort()).toEqual([bunName, 'LICENSE', 'LICENSES/bun.txt', 'THIRD_PARTY_LICENSES.txt', 'THIRD_PARTY_NOTICES.md', 'meshrooms.js',
+      'ui/assets/index-abc123.js', 'ui/index.html'].sort());
+    for (const [name, hash] of Object.entries(manifest.files)) {
+      expect(createHash('sha256').update(readFileSync(join(out, name))).digest('hex')).toBe(hash as string);
+    }
+    expect(existsSync(join(out, '.env'))).toBe(false);
+    expect(manifest.entry).toBe(`${bunName} --no-env-file meshrooms.js`);
+  });
+
+  it('refuses an unbuilt bridge and an existing output', async () => {
+    const root = makeDir('bridge-refuse'), source = bridgeSource(root), out = join(root, 'out');
+    rmSync(join(source, 'packages', 'meshrooms', 'bin', 'meshrooms.js'));
+    await expect(packageBridge({ sourceDir: source, outputDir: out })).rejects.toThrow(/build:bridge/);
+    expect(existsSync(out)).toBe(false);
+    mkdirSync(out);
+    await expect(packageBridge({ sourceDir: source, outputDir: out })).rejects.toThrow(/already exists/);
+  });
+
+  it('refuses a bridge without its built UI, or a UI with anything but index.html and built assets', async () => {
+    const root = makeDir('bridge-ui'), source = bridgeSource(root), ui = join(source, 'packages', 'meshrooms', 'ui');
+    rmSync(join(ui, 'index.html'));
+    await expect(packageBridge({ sourceDir: source, outputDir: join(root, 'a') })).rejects.toThrow(/UI is not built/);
+    writeFileSync(join(ui, 'index.html'), '<!doctype html>');
+    writeFileSync(join(ui, 'assets', 'index-abc123.js.map'), '{}');
+    await expect(packageBridge({ sourceDir: source, outputDir: join(root, 'b') })).rejects.toThrow(/source map/);
+    rmSync(join(ui, 'assets', 'index-abc123.js.map'));
+    writeFileSync(join(ui, 'notes.txt'), 'stray');
+    await expect(packageBridge({ sourceDir: source, outputDir: join(root, 'c') })).rejects.toThrow(/Unexpected file/);
   });
 });

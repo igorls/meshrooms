@@ -1,22 +1,26 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from 'react';
+import { Fragment, createContext, useContext, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from 'react';
 import { mentionedIds, type Task, type TaskStatus } from '../collab';
 import { FloorControl, MAX_MESSAGE_FILES, MAX_UPLOAD_BYTES, MentionText, MessageAttachments, PendingFiles, TaskBoard, formatBytes, uploadName, useAutoGrow, useMentions, useStickToBottom, type AttachmentSource, type PendingFile } from '../prototype/Collaboration';
 import { Wordmark } from '../prototype/RoomPrototype';
 import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
 import { deriveActivity, duration, type ActivityRecord, type AgentActivity } from './activity';
 import { issueLabel, mentionedRepositories, repositoryFrom, taskTimeline, type TaskBody, type TaskEvent } from './board';
-import { BrowserApi, type ApiError } from './client';
+import type { ApiError } from './client';
 import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
+import { DesktopPairing } from './DesktopPairing';
+import { joinLink, pairedHere } from './desktop-join';
+import { LocalAgentsSection, identityOfMember, useLocalAgents, wakeLabel } from './LocalAgents';
 import { due, foldDecisions, type Decision, type DecisionBody, type VoteBody } from './decisions';
 import { IMAGE_TYPES, attachmentRef, displayKind, shownText, type AttachmentRef } from './files';
 import { BOARD_DEFAULT, BOARD_STEP, boardLimits, clampBoardWidth, saveBoardWidth, savedBoardWidth } from './panel';
-import { BrowserPeers, type FileView, type SavedMessage } from './peers';
+import type { FileView, SavedMessage } from './peers';
 import { REACTION_EMOJI, memberReacted, type ReactionChip, type ReactionEmoji } from './reactions';
 import { agentPrompt, PROMPT_HARNESSES, type PromptHarness } from './agent-prompt';
-import { identity, onStorageProblem, persistStorage, read, write, type Fence } from './storage';
-import { BackgroundRooms, announceRooms, announceVisibility, claimRoom, forgetRoom, holdConnection, onRoomsChanged, recordOpened, type RecentRoom } from './background';
-import { badgeText, clearWaiting, countUnread, freshRequests, joinNotice, onCountsChanged, publishCount, publishedCounts, readPosition, saveReadPosition, tabTitle, unreadLabel, waitingLabel, waitingOf, type ReadPosition, type UnreadCount, type Waiting } from './unread';
-import { DEFAULT_ROOM_SETTINGS, INVITE_ERRORS, MAX_REPOSITORIES, ROOM_CLOSED, base64, type BrowserMember, type JoinRequest, type RoomSettings, type RoomStatus } from './protocol';
+import { onStorageProblem } from './storage';
+import type { RecentRoom } from './background';
+import { badgeText, countUnread, freshRequests, joinNotice, tabTitle, unreadLabel, waitingLabel, waitingOf, type ReadPosition, type UnreadCount, type Waiting } from './unread';
+import { DEFAULT_ROOM_SETTINGS, INVITE_ERRORS, MAX_REPOSITORIES, PUBLIC_ROOM_SERVICE, ROOM_CLOSED, base64, type BrowserMember, type RoomSettings, type RoomStatus } from './protocol';
+import { BrowserSource, type RoomSession, type RoomSource } from './source';
 import './browser.css';
 
 const closedError = (e: unknown) => (e as ApiError).status === 410 && (e as ApiError).code === ROOM_CLOSED;
@@ -121,10 +125,13 @@ const isAgent = (member: BrowserMember | undefined) => member?.role === 'agent';
 /** Room members in the shape the shared mention helpers expect. Members from before agents existed are people. */
 const participantsOf = (members: BrowserMember[] = []): Participant[] =>
   members.map(m => ({ id: m.id, name: m.name, role: m.role ?? 'human', state: 'remote', detail: '', operatorId: m.operatorId }));
+/** The page's room source (see source.ts), for the parts of the room that load their own data. */
+const Source = createContext<RoomSource | undefined>(undefined);
 /** A member's picture, or their initial (a rounded square for agents) when they have none. */
 function MemberAvatar({ member, roomId, fallback }: { member?: BrowserMember; roomId: string; fallback: string }) {
-  const agent = member?.role === 'agent';
-  if (member?.avatar) return <img className={`avatar avatar-picture ${agent ? 'agent' : ''}`} src={`/api/lobby/rooms/${roomId}/avatars/${member.id}?h=${member.avatar}`} alt="" />;
+  const agent = member?.role === 'agent', source = useContext(Source), [, loaded] = useReducer((n: number) => n + 1, 0);
+  const src = member?.avatar && source ? source.avatar(roomId, member.id, member.avatar, loaded) : undefined;
+  if (src) return <img className={`avatar avatar-picture ${agent ? 'agent' : ''}`} src={src} alt="" />;
   return <span className={`avatar ${agent ? 'agent' : ''}`} aria-hidden="true">{fallback.slice(0, 1)}</span>;
 }
 /** Crops to a centred square, scales to 128 px and encodes it small enough for the room service (16 KB). */
@@ -172,8 +179,11 @@ type TranscriptItem = { message: SavedMessage; event?: undefined; decision?: und
   | { decision: Decision; message?: undefined; event?: undefined };
 const itemAt = (item: TranscriptItem) => item.message?.packet.body.at ?? item.event?.at ?? item.decision!.createdAt;
 
-export function BrowserRooms() {
-  const [api] = useState(() => new BrowserApi());
+export function BrowserRooms({ source: given }: { source?: RoomSource } = {}) {
+  const [source] = useState<RoomSource>(() => given ?? new BrowserSource());
+  return <Source.Provider value={source}><Rooms source={source} /></Source.Provider>;
+}
+function Rooms({ source }: { source: RoomSource }) {
   const [status, setStatus] = useState<RoomStatus>();
   const [title, setTitle] = useState('');
   const [name, setName] = useState('');
@@ -189,6 +199,8 @@ export function BrowserRooms() {
   const [lostRoom, setLostRoom] = useState(false);
   const [inviteRequired, setInviteRequired] = useState(false);
   const [inviteCode, setInviteCode] = useState('');
+  /** Where the local page makes new rooms (the person device's room service), shown when it isn't the public one. */
+  const [roomService, setRoomService] = useState<string>();
   const [network, setNetwork] = useState('');
   /** Local saving is failing: shown until a save succeeds again, unlike network problems, which the next poll clears. */
   const [storageProblem, setStorageProblem] = useState<string>();
@@ -245,15 +257,17 @@ export function BrowserRooms() {
   const [now, setNow] = useState(() => Date.now());
   const composer = useRef<HTMLTextAreaElement>(null);
   const currentStatus = useRef<RoomStatus | undefined>(undefined);
-  const lastRequest = useRef<JoinRequest | undefined>(undefined);
-  const peers = useRef<BrowserPeers | null>(null);
-  /** This tab's claim on the open room's records (see claimRoom). */
-  const roomFence = useRef<Fence | undefined>(undefined);
+  /** The open room's actions, once its connection is held (see RoomSource.open). */
+  const peers = useRef<RoomSession | null>(null);
+  /** Older messages can be loaded (the local page hands out the newest first). */
+  const [olderAvailable, setOlderAvailable] = useState(false);
   const everJoined = useRef(false);
   const stick = useStickToBottom();
   const detailsHeading = useRef<HTMLHeadingElement>(null);
   const detailsButton = useRef<HTMLButtonElement>(null);
   const linkDevice = useRef<HTMLDetailsElement>(null);
+  /** Room details' "Use the desktop app", which the header's hint opens. */
+  const desktopPairing = useRef<HTMLDetailsElement>(null);
   const admitted = !!status?.memberId;
   const host = admitted && status?.memberId === status?.ownerId;
   const self = status?.members?.find(m => m.id === status.memberId);
@@ -263,6 +277,12 @@ export function BrowserRooms() {
   useAutoGrow(composer, text);
   const agents = status?.members?.filter(isAgent) || [];
   const people = (status?.members?.length || 0) - agents.length;
+  /** The local page: the person's agents on this computer, read while the details are open or one of them is in the room. */
+  const localAgents = useLocalAgents(source.agents, admitted && (detailsOpen || agents.some(a => a.operatorId === status?.memberId)));
+  /** The agent whose sessions the people list asked to show (`at`: each ask scrolls to it again). */
+  const [agentFocus, setAgentFocus] = useState<{ id: string; at: number }>();
+  /** How an agent of the person's wakes here, from its identity on this computer (the local page only). */
+  const wakeOf = (member: BrowserMember) => source.agents && member.operatorId === status?.memberId ? identityOfMember(localAgents.listing, urlRoom, member.id) : undefined;
   const reply = messages.find(m => m.packet.body.id === replyId);
   /** "you", or the operator's name, for an agent member. */
   const operatorOf = (member: BrowserMember | undefined) => {
@@ -291,7 +311,8 @@ export function BrowserRooms() {
   }, [messages, timeline, decisions]);
   // Close this person's own decisions once the result can't change or the deadline passes (agents' bridges do the same).
   useEffect(() => {
-    if (!status?.memberId) return;
+    // The person device behind the local page closes its own decisions itself.
+    if (!status?.memberId || source.isLocal) return;
     const tick = () => {
       const at = Date.now();
       if (decisions.some(d => d.state === 'open' && d.closesAt)) setNow(at);
@@ -301,149 +322,88 @@ export function BrowserRooms() {
       }
     };
     tick(); const timer = setInterval(tick, 5000); return () => clearInterval(timer);
-  }, [decisions, status?.memberId]);
+  }, [decisions, status?.memberId, source]);
 
   useEffect(() => {
-    let disposed = false, timer: ReturnType<typeof setTimeout>, wake: (() => void) | undefined;
-    let engine: BrowserPeers | undefined;
+    let disposed = false, room: { done: Promise<void>; dispose(): void } | undefined;
     setReady(false); setError('');
     void (async () => {
-      const device = await identity();
-      const rooms = await read<RecentRoom[]>('recent-rooms') || [];
-      const profile = await read<string>('display-name') || '';
+      const { deviceId: device, recent: rooms, name: profile } = await source.start();
       if (disposed) return;
-      setRecent(rooms); setName(profile); setDeviceId(device.id);
+      setRecent(rooms); setName(profile); setDeviceId(device);
       if (!urlRoom) {
-        const pendingCreate = await read<{ name: string; title: string }>('pending-create');
+        const pendingCreate = await source.readPref<{ name: string; title: string }>('pending-create');
         if (pendingCreate) { setName(pendingCreate.name); setTitle(pendingCreate.title); }
         // During the invite-only beta the service asks for a code to create rooms; joining by link never needs one.
-        void fetch('/api/lobby/health', { signal: AbortSignal.timeout(10_000) }).then(r => r.json())
-          .then(health => { if (!disposed && health?.inviteRequired === true) setInviteRequired(true); }).catch(() => { /* The create response says so too. */ });
+        void source.health().then(health => { if (disposed) return; if (health.inviteRequired === true) setInviteRequired(true); if (health.roomService) setRoomService(health.roomService); }).catch(() => { /* The create response says so too. */ });
         setReady(true); return;
       }
-      void fetch('/api/lobby/health', { signal: AbortSignal.timeout(10_000) }).then(r => r.json())
-        .then(health => { if (!disposed && typeof health?.currentAgentVersion === 'string') setAgentVersion(health.currentAgentVersion); }).catch(() => { /* The prompt falls back to @latest. */ });
-      void read<boolean>(`agent-cta-dismissed:${urlRoom}`).then(dismissed => { if (!disposed) setAgentCtaDismissed(!!dismissed); }).catch(() => setAgentCtaDismissed(false));
-      const response = await fetch(`/api/lobby/rooms/${urlRoom}`, { signal: AbortSignal.timeout(10_000) });
-      const info = await response.json();
-      if (response.status === 410 && info.code === ROOM_CLOSED) {
-        const rest = await forgetRoom(urlRoom);
-        if (!disposed) { setRecent(rest); setClosed(info.error); setReady(true); }
+      void source.health().then(health => { if (!disposed && typeof health.currentAgentVersion === 'string') setAgentVersion(health.currentAgentVersion); }).catch(() => { /* The prompt falls back to @latest. */ });
+      void source.readPref<boolean>(`agent-cta-dismissed:${urlRoom}`).then(dismissed => { if (!disposed) setAgentCtaDismissed(!!dismissed); }).catch(() => setAgentCtaDismissed(false));
+      const info = await source.room(urlRoom);
+      if ('closed' in info) {
+        const rest = await source.forget(urlRoom);
+        if (!disposed) { setRecent(rest); setClosed(info.closed); setReady(true); }
         return;
       }
-      if (!response.ok) throw new Error(info.error || 'Room unavailable.');
       if (disposed) return;
       setTitle(info.title);
-      await navigator.locks.request(`meshrooms-room:${urlRoom}`, { ifAvailable: true }, async lock => {
-        if (!lock) throw new Error('This room is already open in another tab of this browser. Close that tab, then retry here.');
-        if (disposed) return;
-        // The leader tab may hold this room in the background: it hands the connection over first.
-        await holdConnection(urlRoom, async () => {
-        if (disposed) return;
-        const session = crypto.randomUUID(); let cursor = 0, epoch = '', recorded = false;
-        let latest: SavedMessage[] = [];
-        engine = new BrowserPeers(api, urlRoom, device.id, session, (m, c, added) => {
-          latest = m;
-          if (disposed) return;
+      room = source.open(urlRoom, device, {
+        ready: session => { peers.current = session; },
+        messages: (m, c, added) => {
           if (added) {
-            const own = added.packet.body.deviceId === device.id;
+            const own = added.packet.body.deviceId === (currentStatus.current?.deviceId || device);
             stick.arrived(own);
             if (!own) {
               const author = currentStatus.current?.members?.find(p => p.id === added.packet.body.memberId)?.name || 'Room member';
               setLiveMessage({ id: added.packet.body.id, text: `${author}: ${shownText(added.packet.body) || `shared ${fileNames(added.packet.body)}`}` });
             }
           }
-          setMessages(m); setConnected(c);
-        }, message => { if (!disposed) setNetwork(message); }, (board, ops) => { if (!disposed) { setTasks(board); setTaskOps(ops); } }, view => { if (!disposed) setFiles(view); },
-        records => { if (!disposed) { setActivity(records); setNow(Date.now()); } }, ops => { if (!disposed) setDecisionOps(ops); },
-        chips => { if (!disposed) setReactions(chips); });
-        // This tab owns the room's records now: a background owner that lost the room can no longer write them.
-        const fence = await claimRoom(device.id, urlRoom);
-        engine.fenced(fence); roomFence.current = fence;
-        peers.current = engine; await engine.load();
-        const stored = await readPosition(device.id, urlRoom, latest.map(m => m.packet.body), fence);
-        if (!disposed) setPosition(stored);
-        // A write that found another tab's claim stops the engine; then this tab stops polling and connecting too.
-        while (!disposed && !engine.isStopped()) {
-          try {
-            const next = await api.command('status', urlRoom, { session, cursor, epoch });
-            if (disposed) break;
-            if (next.epoch !== epoch) cursor = 0;
-            epoch = next.epoch;
-            if (!next.memberId && !next.request && lastRequest.current) {
-              const prior = lastRequest.current;
-              if (prior.state === 'expired' || prior.state === 'declined') next.request = prior;
-              else if (prior.state === 'pending' && prior.expiresAt <= Date.now()) next.request = { ...prior, state: 'expired', code: undefined };
-            }
-            if (next.request?.state === 'expired' || next.request?.state === 'declined') setNotice('');
-            lastRequest.current = next.request;
-            currentStatus.current = next;
-            setStatus(next); setReady(true); setNetwork('');
-            if (next.memberId) {
-              everJoined.current = true;
-              if (!recorded) {
-                const joined = await navigator.locks.request('meshrooms-recent', async () => {
-                  const all = await read<RecentRoom[]>('recent-rooms') || [];
-                  // Opening a room keeps its place in the list (only its title refreshes); a newly joined room goes first.
-                  const known = all.some(r => r.id === urlRoom);
-                  await write('recent-rooms', (known ? all.map(r => r.id === urlRoom ? { ...r, title: next.title } : r) : [{ id: urlRoom, title: next.title }, ...all]).slice(0, 64));
-                  return !known;
-                });
-                await recordOpened(urlRoom); // The background keeps the most recently opened rooms.
-                if (joined) announceRooms();
-                recorded = true;
-                persistStorage(); // This browser now holds a room key; ask it not to evict site storage.
-              }
-            }
-            await engine.update(next);
-            for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
-          } catch (e) {
-            // The host closed the room, or the service removed it: stop polling and say so, instead of retrying forever.
-            if (closedError(e)) {
-              engine.stop(); publishCount(device.id, urlRoom, undefined);
-              if (!disposed) { setClosed(current => current || (e as Error).message); setStatus(undefined); setNetwork(''); setReady(true); void forgetRoom(urlRoom).then(setRecent); }
-              break;
-            }
-            if (!disposed) setNetwork((e as Error).message);
-          }
-          if (!disposed) await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(resolve, 1500); });
-        }
-        if (engine.lostRoom() && !disposed) { setLostRoom(true); setNetwork(''); }
-        // Every write finishes before the connection is handed back to the background.
-        await engine.close();
-        });
+          setMessages(m); setConnected(c); setOlderAvailable(!!peers.current?.hasOlder());
+        },
+        network: setNetwork,
+        board: (board, ops) => { setTasks(board); setTaskOps(ops); },
+        files: setFiles,
+        activity: records => { setActivity(records); setNow(Date.now()); },
+        decisions: setDecisionOps,
+        reactions: setReactions,
+        position: setPosition,
+        status: next => {
+          if (next.request?.state === 'expired' || next.request?.state === 'declined') setNotice('');
+          currentStatus.current = next;
+          setStatus(next); setReady(true); setNetwork('');
+          if (next.memberId) everJoined.current = true;
+        },
+        closed: reason => { setClosed(current => current || reason); setStatus(undefined); setNetwork(''); setReady(true); },
+        recent: setRecent,
+        lost: () => { setLostRoom(true); setNetwork(''); },
       });
+      await room.done;
     })().catch(e => { if (!disposed) { setError(e.message); setReady(true); } });
-    return () => { disposed = true; engine?.stop(); peers.current = null; clearTimeout(timer); wake?.(); };
-  }, [api, retry]);
+    return () => { disposed = true; room?.dispose(); peers.current = null; };
+  }, [source, retry]);
   useEffect(() => {
     const change = () => setVisible(document.visibilityState === 'visible');
     document.addEventListener('visibilitychange', change);
     return () => document.removeEventListener('visibilitychange', change);
   }, []);
-  // Once this browser's identity is known: follow the counts tabs publish, and queue to hold rooms in the background.
+  // Once this device is known: follow the counts of the person's rooms, and keep the other rooms connected.
   useEffect(() => {
     if (!deviceId) return;
-    const refresh = () => setCounts(publishedCounts(deviceId));
-    refresh();
-    const stopCounts = onCountsChanged(refresh);
-    const stopRooms = onRoomsChanged(() => void read<RecentRoom[]>('recent-rooms').then(rooms => setRecent(rooms || [])).catch(() => {}));
-    const stopBeats = announceVisibility();
-    const background = new BackgroundRooms(deviceId, urlRoom);
-    return () => { stopCounts(); stopRooms(); stopBeats(); background.dispose(); };
-  }, [deviceId]);
+    return source.watch(deviceId, urlRoom, { counts: setCounts, recent: setRecent });
+  }, [deviceId, source]);
   // The open room is read up to its newest message while the tab is visible and the conversation follows the end.
   const lastId = messages.at(-1)?.packet.body.id;
   const reading = visible && stick.following && admitted && !closed;
   useEffect(() => {
     if (!deviceId || !position || !reading || !lastId || position.id === lastId) return;
     setPosition({ id: lastId, at: Date.now() });
-    void saveReadPosition(deviceId, urlRoom, lastId, roomFence.current).catch(() => { /* Saved with the next message read. */ });
+    void peers.current?.markRead(lastId).catch(() => { /* Saved with the next message read. */ });
   }, [deviceId, position, reading, lastId]);
   // The open room's count, for this browser's other tabs (this one shows no badge for it).
   const ownCount = useMemo(() => position && status?.memberId ? { ...countUnread(messages.map(m => m.packet.body), position, status.memberId, status.members || []), waiting: waitingOf(status) } : undefined,
     [messages, position, status?.memberId, status?.members, status?.requests]);
-  useEffect(() => { if (deviceId && ownCount && !closed) publishCount(deviceId, urlRoom, ownCount); }, [deviceId, ownCount, closed]);
+  useEffect(() => { if (deviceId && ownCount && !closed) peers.current?.publishCount(ownCount); }, [deviceId, ownCount, closed]);
   /** Unread in the person's other rooms: the tab title's (N). */
   const others = recent.filter(r => r.id !== urlRoom);
   const otherUnread = others.reduce((sum, r) => sum + (counts[r.id]?.unread || 0), 0);
@@ -463,13 +423,13 @@ export function BrowserRooms() {
   const anyWaiting = Object.values(counts).some(c => c.waiting?.length);
   useEffect(() => {
     if (!deviceId || !anyWaiting) return;
-    const timer = setInterval(() => setCounts(publishedCounts(deviceId)), 5000);
+    const timer = setInterval(() => setCounts(source.counts(deviceId)), 5000);
     return () => clearInterval(timer);
-  }, [deviceId, anyWaiting]);
+  }, [deviceId, anyWaiting, source]);
   // Leaving this room: whoever holds it next says who is waiting, so no other tab announces a stale request.
   useEffect(() => {
     if (!deviceId || !urlRoom) return;
-    const leave = () => clearWaiting(deviceId, urlRoom);
+    const leave = () => source.leave(deviceId, urlRoom);
     addEventListener('pagehide', leave);
     return () => removeEventListener('pagehide', leave);
   }, [deviceId]);
@@ -563,40 +523,44 @@ export function BrowserRooms() {
     event.preventDefault();
     void act(async () => {
       // Persist the destination before submitting so a lost response can resume it.
-      const previous = await read<{ id: string; name: string; title: string }>('pending-create');
+      const previous = await source.readPref<{ id: string; name: string; title: string }>('pending-create');
       const operation = previous?.name === name && previous.title === title ? previous : { id: crypto.randomUUID(), name, title };
-      await write('pending-create', operation); await write('display-name', name);
+      await source.writePref('pending-create', operation); await source.writePref('display-name', name);
       // The invite code is sent, never stored in this browser.
       const invite = inviteCode.trim();
-      try { await api.command('create', operation.id, { name, title, label: deviceLabel, ...(invite ? { invite } : {}) }); }
+      try { await source.command('create', operation.id, { name, title, label: deviceLabel, ...(invite ? { invite } : {}) }); }
       catch (e) {
-        const recovered = await api.command('status', operation.id, { session: crypto.randomUUID() }).catch(() => null);
+        const recovered = await source.command('status', operation.id, { session: crypto.randomUUID() }).catch(() => null);
         if (!recovered?.memberId) {
           if ((INVITE_ERRORS as readonly string[]).includes((e as ApiError).code ?? '')) setInviteRequired(true);
           throw e;
         }
       }
-      await write('pending-create', null);
+      await source.writePref('pending-create', null);
       location.assign(`/r/${operation.id}`);
     });
   }
+  /** Pairing with the desktop app links the app's request in a room by the browser's secret (DesktopPairing). */
+  const pairRoom = (roomId: string, secret: string) => source.command('link', roomId, { pairing: secret });
   function request(kind: 'person' | 'companion') {
     void act(async () => {
-      await api.command('request', urlRoom, { name: kind === 'person' ? name : 'Companion device', label: deviceLabel, kind });
-      if (kind === 'person') await write('display-name', name);
+      await source.command('request', urlRoom, { name: kind === 'person' ? name : 'Companion device', label: deviceLabel, kind });
+      if (kind === 'person') await source.writePref('display-name', name);
       setNotice('Request sent.');
     });
   }
   /** The host deletes the room for everyone; members' rooms say it was closed on their next poll. */
   function deleteRoom() {
     void act(async () => {
-      await api.command('close', urlRoom);
+      await source.command('close', urlRoom);
       setConfirming(undefined); setDetailsOpen(false);
       setClosed('You deleted this room. Its link no longer works.'); setStatus(undefined);
-      peers.current?.stop(); setRecent(await forgetRoom(urlRoom));
+      peers.current?.stop(); setRecent(await source.forget(urlRoom));
     });
   }
-  const invite = `${location.origin}/r/${urlRoom}`;
+  /** The room's own origin: the local page runs on this computer, but the room lives on its room service. */
+  const roomOrigin = source.roomOrigin(urlRoom);
+  const invite = `${roomOrigin}/r/${urlRoom}`;
   async function copyInvite() {
     try { await navigator.clipboard.writeText(invite); setNotice('Room link copied.'); }
     catch { setDetailsOpen(true); setNotice('Copy the room link from Room details.'); }
@@ -658,13 +622,13 @@ export function BrowserRooms() {
     event.preventDefault(); const name = agentName.trim();
     void act(async () => {
       // The token is shown once; the room service keeps only its hash.
-      const { token } = await api.command('agent-invite', urlRoom, { name }) as unknown as { token: string };
-      setAgentLink({ name, url: `${location.origin}/agent/${urlRoom}#${token}` }); setAgentName('');
+      const { token } = await source.command('agent-invite', urlRoom, { name }) as unknown as { token: string };
+      setAgentLink({ name, url: `${roomOrigin}/agent/${urlRoom}#${token}` }); setAgentName('');
       // A name that says which harness it is picks that harness; the person can still change it.
       if (/codex/i.test(name)) setPromptHarness('codex'); else if (/claude/i.test(name)) setPromptHarness('claude');
     });
   }
-  const promptText = agentLink ? agentPrompt({ origin: location.origin, roomId: urlRoom, link: agentLink.url, name: agentLink.name, version: agentVersion, harness: promptHarness }) : '';
+  const promptText = agentLink ? agentPrompt({ origin: roomOrigin, roomId: urlRoom, link: agentLink.url, name: agentLink.name, version: agentVersion, harness: promptHarness }) : '';
   async function copyAgentLink(what: 'prompt' | 'link') {
     if (!agentLink) return;
     try {
@@ -674,14 +638,21 @@ export function BrowserRooms() {
   }
   function openAgentConnect() {
     setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false);
-    requestAnimationFrame(() => document.getElementById('browser-agent-name')?.focus());
+    requestAnimationFrame(() => {
+      // The local page: an agent of the person's not in this room yet goes first; else the new agent form opens.
+      const add = document.querySelector<HTMLButtonElement>('.browser-local-agent-add:not(:disabled)');
+      if (add) { add.focus(); return; }
+      const form = document.getElementById('browser-new-agent') as HTMLDetailsElement | null;
+      if (form) form.open = true;
+      document.getElementById('browser-agent-name')?.focus();
+    });
   }
-  function dismissAgentCta() { setAgentCtaDismissed(true); void write(`agent-cta-dismissed:${urlRoom}`, true).catch(() => { /* Shown again next visit. */ }); }
+  function dismissAgentCta() { setAgentCtaDismissed(true); void source.writePref(`agent-cta-dismissed:${urlRoom}`, true).catch(() => { /* Shown again next visit. */ }); }
   /** Removes every device of a member; this device goes last so leaving still reports its result. Their agents leave with them. */
   function removeMember(member: BrowserMember) {
     void act(async () => {
       const devices = (status?.devices?.filter(d => d.memberId === member.id) || []).sort((a, b) => Number(a.id === status?.deviceId) - Number(b.id === status?.deviceId));
-      for (const device of devices) await api.command('remove', urlRoom, { deviceId: device.id });
+      for (const device of devices) await source.command('remove', urlRoom, { deviceId: device.id });
       setConfirming(undefined);
       setNotice(member.id === status?.memberId ? 'You left this room.' : `${member.name} was removed from the room.`);
     });
@@ -689,7 +660,7 @@ export function BrowserRooms() {
   /** The shared TaskBoard offers "local" participants as assignees; in a browser room every member can be assigned. */
   const boardRoom = { id: urlRoom, title, project: '', sample: false, messages: [], tasks,
     participants: participants.map(p => ({ ...p, state: 'local' as const })) } as unknown as RoomSnapshot;
-  async function boardAction(work: (engine: BrowserPeers) => Promise<void>) {
+  async function boardAction(work: (engine: RoomSession) => Promise<void>) {
     setError('');
     try { if (!peers.current) throw new Error('Room connection is not ready.'); await work(peers.current); }
     catch (e) { setError((e as Error).message); throw e; }
@@ -703,7 +674,7 @@ export function BrowserRooms() {
   const settings = status?.settings ?? DEFAULT_ROOM_SETTINGS;
   function changeSettings(change: Partial<RoomSettings>, done: string) {
     void act(async () => {
-      await api.command('settings', urlRoom, change);
+      await source.command('settings', urlRoom, change);
       // Show the accepted change now rather than at the next status poll, so the control doesn't flick back.
       setStatus(current => current && { ...current, settings: { ...(current.settings ?? DEFAULT_ROOM_SETTINGS), ...change } });
       setNotice(done);
@@ -715,7 +686,7 @@ export function BrowserRooms() {
   const mentioned = detailsOpen ? mentionedRepositories([...messages].sort((a, b) => a.packet.body.at - b.packet.body.at).map(m => m.packet.body.text)).filter(r => !pinned.some(p => p.toLowerCase() === r.toLowerCase())) : [];
   function pinRepository(change: { pin: string } | { unpin: string }) {
     void act(async () => {
-      await api.command('repositories', urlRoom, change);
+      await source.command('repositories', urlRoom, change);
       const name = 'pin' in change ? change.pin : change.unpin, same = (r: string) => r.toLowerCase() === name.toLowerCase();
       // As the service does: pinning one already pinned, in any case, leaves the list as it is.
       setStatus(current => { if (!current) return current; const list = current.repositories ?? [];
@@ -729,12 +700,12 @@ export function BrowserRooms() {
     const target = avatarFor; if (!file || !target) return;
     void act(async () => {
       const avatar = await avatarData(file);
-      await api.command('profile', urlRoom, target === status?.memberId ? { avatar } : { avatar, memberId: target });
+      await source.command('profile', urlRoom, target === status?.memberId ? { avatar } : { avatar, memberId: target });
       setNotice('Picture updated.');
     });
   }
   function clearAvatar(memberId: string) {
-    void act(async () => { await api.command('profile', urlRoom, memberId === status?.memberId ? { avatar: null } : { avatar: null, memberId }); setNotice('Picture removed.'); });
+    void act(async () => { await source.command('profile', urlRoom, memberId === status?.memberId ? { avatar: null } : { avatar: null, memberId }); setNotice('Picture removed.'); });
   }
   const agentsOf = (member: BrowserMember) => status?.members?.filter(m => isAgent(m) && m.operatorId === member.id).length || 0;
   /** Inline confirmation for removing a person or leaving, naming the agents that go with them. */
@@ -747,6 +718,8 @@ export function BrowserRooms() {
     </div>;
   }
 
+  /** This browser paired with the desktop app (DesktopPairing): the room page offers to open rooms there. */
+  const appPaired = !source.isLocal && pairedHere();
   return <div className={`browser-rooms ${admitted ? 'browser-joined' : ''} ${admitted && railCollapsed ? 'browser-rail-collapsed' : ''}`}>
     <a className="skip-link" href="#browser-main">Skip to room</a>
     <aside className="browser-rail">
@@ -766,7 +739,7 @@ export function BrowserRooms() {
         <a href="/rooms" className="browser-mobile-rooms">Your rooms<RoomBadges count={{ unread: otherUnread, mentions: others.reduce((sum, r) => sum + (counts[r.id]?.mentions || 0), 0), waiting: otherWaiting }} /></a>
         <div className="browser-self"><MemberAvatar member={self} roomId={urlRoom} fallback={self?.name || ''} /><div><strong>{self?.name}</strong><span>{host ? 'Room host' : 'Room member'}</span></div></div>
       </> : <p className="browser-rail-intro">A shared room for your people and their agents.</p>}
-      <p className="browser-rail-footer">Meshrooms by WormDB<br />Browser preview</p>
+      <p className="browser-rail-footer">Meshrooms by WormDB<br />{source.label}</p>
     </aside>
     <main id="browser-main" className={`browser-main ${detailsOpen ? 'browser-details-open' : ''} ${boardOpen ? 'browser-board-open' : ''}`} tabIndex={-1}>
       {error && <div role="alert" className="browser-error">{error} <button onClick={() => { setError(''); if (!status) setRetry(v => v + 1); }}>{status ? 'Dismiss' : 'Retry'}</button></div>}
@@ -780,20 +753,22 @@ export function BrowserRooms() {
       {closed ? <section className="browser-entry"><h1>{title || 'Room closed'}</h1><h2>This room is closed</h2><p>{closed}</p>
           <p>Nobody can join, send messages or connect agents here any more.</p>
           <div className="browser-entry-actions"><a className="browser-text-link" href="/rooms">Start or open another room</a></div></section>
-      : !ready ? <section className="browser-entry" aria-busy="true"><h1>Opening your room…</h1><p>Restoring this browser’s identity.</p></section> : !urlRoom ?
+      : !ready ? <section className="browser-entry" aria-busy="true"><h1>Opening your room…</h1><p>{source.isLocal ? 'Reading your rooms from this computer.' : 'Restoring this browser’s identity.'}</p></section> : !urlRoom ?
         <section className="browser-entry"><h1>Start a room</h1><p>Share a link. Approve who joins. Start talking.</p>
           <form onSubmit={create} className="browser-form"><label>Your name<input autoComplete="name" value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label>
             <label>Room name<input value={title} onChange={e => setTitle(e.target.value)} required maxLength={80} placeholder="Project room" /></label>
             {inviteRequired && <label>Invite code<input value={inviteCode} onChange={e => setInviteCode(e.target.value)} required maxLength={32} autoComplete="off" autoCapitalize="characters" spellCheck={false} placeholder="XXXX-XXXX-XXXX-XXXX" /></label>}
             <button className="primary" disabled={busy}>{busy ? 'Creating room…' : 'Create room'}</button></form>
+          {source.isLocal && roomService && roomService !== PUBLIC_ROOM_SERVICE && <p className="browser-entry-note browser-room-service">This room will be made on <strong>{roomService}</strong>, not the public Meshrooms service.</p>}
           {inviteRequired && <p className="browser-entry-note">Meshrooms is invite-only during the beta: creating a room needs an invite code. Joining a room from its link doesn’t.</p>}
           {recent.length > 0 && <section className="browser-recent"><h2>Your rooms</h2>{recent.map(r => <a key={r.id} href={`/r/${r.id}`}>{r.title}<RoomBadges count={counts[r.id]} /></a>)}</section>}
+          {!source.isLocal && recent.length > 0 && <section className="browser-desktop-app" id="desktop-app" ref={section => { if (section && location.hash === '#desktop-app') { history.replaceState(null, '', location.pathname); section.scrollIntoView({ block: 'start' }); } }}><h2>Desktop app</h2><DesktopPairing rooms={recent} name={name} device={deviceId} link={pairRoom} /></section>}
         </section> : !admitted ?
         <section className="browser-entry"><h1>{title || 'Join room'}</h1>
           {pending ? <>
             <h2>{status.request!.kind === 'companion' && !status.request!.linkedMemberId ? 'Confirm on your other device' : status.hostOnline ? 'Waiting for approval' : 'Waiting for the host to return'}</h2>
             {status.request!.kind === 'companion' && !status.request!.linkedMemberId ? <><p>In this room on your trusted device, open <strong>Room details</strong>, then <strong>Add another device</strong>, and enter this code.</p><code className="browser-link-code">{status.request!.code}</code><p>This request expires in ten minutes.</p></> : <p>You’ll enter the conversation when the host admits you.</p>}
-            <div className="browser-entry-actions"><button className="secondary" disabled={busy} onClick={() => void act(async () => { await api.command('cancel', urlRoom, { requestId: status.request!.id }); setNotice('Join request canceled.'); })}>Cancel request</button>
+            <div className="browser-entry-actions"><button className="secondary" disabled={busy} onClick={() => void act(async () => { await source.command('cancel', urlRoom, { requestId: status.request!.id }); setNotice('Join request canceled.'); })}>Cancel request</button>
               <a className="browser-text-link" href="/rooms">Back to your rooms</a></div>
           </> : <>
             <p>{status?.request?.state === 'expired' ? 'Your request expired. Ask to join again when you’re ready.' : everJoined.current ? 'This device no longer has access. Ask the host to admit it again.' : status?.request?.state === 'declined' ? 'The host declined your request.' : 'The host will approve your request before you enter.'}</p>
@@ -801,16 +776,24 @@ export function BrowserRooms() {
               <button className="primary" disabled={busy || !status}>{busy ? 'Sending request…' : 'Ask to join'}</button></form>
             <button className="browser-text-link" disabled={busy || !status} onClick={() => request('companion')}>Use my existing identity</button>
             <p className="browser-entry-note">No installation or agent needed. This browser remembers your identity.</p>
+            {!source.isLocal && (appPaired
+              ? <div className="browser-entry-actions browser-open-app"><a className="secondary" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
+                <span className="browser-entry-note">Join from the desktop app on this computer instead. It asks before it joins.</span></div>
+              : <p className="browser-entry-note browser-app-hint">Have the desktop app? {recent.length
+                ? <><a href="/rooms#desktop-app">Use the desktop app</a> to pair it with this browser first.</>
+                : <>Join here first, then pair it from <strong>Room details</strong>, <strong>Use the desktop app</strong>.</>}</p>)}
           </>}
         </section> : <>
           <header className="browser-room-header">
             <div className="browser-room-heading"><h1>{title}</h1><p>{people} {people === 1 ? 'person' : 'people'}{agents.length ? ` and ${agents.length} agent${agents.length === 1 ? '' : 's'}` : ''} in this room{working ? ` · ${working} working` : ''}</p></div>
-            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); }}><RoomIcon kind="people" />Room details</button><button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
+            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); }}><RoomIcon kind="people" />Room details</button>{!source.isLocal && (appPaired
+              ? <a className="secondary browser-open-app" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
+              : <button className="browser-text-link browser-app-hint" onClick={() => { openDetails(); requestAnimationFrame(() => { const pair = desktopPairing.current; if (!pair) return; pair.open = true; pair.scrollIntoView({ block: 'nearest' }); }); }}>Have the desktop app?</button>)}<button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
           </header>
           {admitted && agents.length > 0 && <section className="browser-agent-strip" aria-label="Agents in this room">
             {present.map(agent => {
-              const a = activities.get(agent.id)!;
-              return <div className={`browser-agent-chip is-${a.state}`} key={agent.id} title={`${agent.name} · ${runtimeOf(agent) || 'agent'} · operated by ${operatorOf(agent)}`}>
+              const a = activities.get(agent.id)!, wakes = wakeOf(agent);
+              return <div className={`browser-agent-chip is-${a.state}`} key={agent.id} title={`${agent.name} · ${runtimeOf(agent) || 'agent'} · operated by ${operatorOf(agent)}${wakes ? ` · ${wakeLabel(wakes.room.binding)}` : ''}`}>
                 <span className="browser-person-avatar"><MemberAvatar member={agent} roomId={urlRoom} fallback={agent.name} /><span className={`agent-dot is-${a.state}${a.state !== 'offline' && a.state !== 'online' && a.quiet !== undefined ? ' is-quiet' : ''}`} aria-hidden="true" /></span>
                 <span className="browser-agent-chip-text"><strong>{agent.name}</strong>{activityLine(a)}</span></div>;
             })}
@@ -823,8 +806,8 @@ export function BrowserRooms() {
           <p className="sr-only" role="status">{host && status.requests?.length ? `${status.requests.length} request${status.requests.length === 1 ? '' : 's'} waiting to join. Use the join requests section to admit or decline.` : ''}</p>
           {host && !!status.requests?.length && <section className="browser-requests" aria-label="Join requests"><h2>Waiting to join <span>{status.requests.length}</span></h2>
             {status.requests.map(r => <div className="browser-request" key={r.id}><div><strong>{r.linkedMemberId ? status.members!.find(m => m.id === r.linkedMemberId)?.name : r.name}</strong><span>{r.kind === 'person' ? 'New person' : r.kind === 'agent' ? `Agent · operated by ${status.members!.find(m => m.id === r.operatorId)?.name || 'a former member'}` : r.linkedMemberId ? 'Confirmed companion device' : 'Waiting for identity confirmation'} · {r.device.label}</span></div>
-              <div className="browser-request-actions"><button disabled={busy} onClick={() => void act(async () => { await api.command('decide', urlRoom, { requestId: r.id, admit: false }); })}>Decline</button>
-                {(r.kind !== 'companion' || r.linkedMemberId) && <button className="primary" disabled={busy} onClick={() => void act(async () => { await api.command('decide', urlRoom, { requestId: r.id, admit: true }); })}>Admit</button>}</div></div>)}
+              <div className="browser-request-actions"><button disabled={busy} onClick={() => void act(async () => { await source.command('decide', urlRoom, { requestId: r.id, admit: false }); })}>Decline</button>
+                {(r.kind !== 'companion' || r.linkedMemberId) && <button className="primary" disabled={busy} onClick={() => void act(async () => { await source.command('decide', urlRoom, { requestId: r.id, admit: true }); })}>Admit</button>}</div></div>)}
           </section>}
           <p className="sr-only" aria-live="polite" aria-atomic="true">{liveMessage && <span key={liveMessage.id}>{liveMessage.text}</span>}</p>
           <div ref={workspace} className="browser-workspace" style={{ '--board-width': `${boardWidth}px` } as CSSProperties}>
@@ -836,6 +819,7 @@ export function BrowserRooms() {
               {dragging && <div className="drop-overlay" aria-hidden="true"><RoomIcon kind="clip" /><strong>Drop to attach</strong><span>Screenshots and files up to {formatBytes(MAX_UPLOAD_BYTES)}</span></div>}
               <section ref={stick.ref} className="browser-transcript" role="log" aria-live="off" aria-label="Conversation" tabIndex={0} onScroll={stick.onScroll}>
                 <div className="browser-message-list">
+                  {olderAvailable && <div className="browser-day"><button className="browser-text-link" disabled={busy} onClick={() => void act(async () => { setOlderAvailable(await peers.current!.loadOlder()); })}>Show earlier messages</button></div>}
                   {!messages.length && <div className="browser-empty"><RoomIcon kind="chat" /><h2>{status.members!.length > 1 ? 'Ready for your first message' : status.requests?.length ? 'Your conversation starts here' : 'Bring someone into the room'}</h2><p>{status.members!.length > 1 ? 'Send a message below to start the conversation.' : status.requests?.length ? 'Someone is waiting to join. Admit them above to get started.' : 'Share the room link with someone, or open it on another device.'}</p></div>}
                   {items.map((item, index) => {
                     const previous = items[index - 1], at = itemAt(item);
@@ -940,12 +924,14 @@ export function BrowserRooms() {
                   // The host may remove anyone but themselves; an operator may remove their own agents.
                   const removable = member.id !== status.memberId && (host ? member.id !== status.ownerId : isAgent(member) && member.operatorId === status.memberId);
                   const operatesIt = isAgent(member) && member.operatorId === status.memberId;
-                  const a = activities.get(member.id);
+                  const a = activities.get(member.id), wakes = isAgent(member) ? wakeOf(member) : undefined;
                   return <div className="browser-person" key={member.id}><span className="browser-person-avatar"><MemberAvatar member={member} roomId={urlRoom} fallback={member.name} />{a && <span className={`agent-dot is-${a.state}${a.state !== 'offline' && a.state !== 'online' && a.quiet !== undefined ? ' is-quiet' : ''}`} aria-hidden="true" />}</span><div><strong>{member.name}{member.id === status.memberId ? ' (you)' : ''}</strong>
                     <span>{isAgent(member) ? `Agent · operated by ${operatorOf(member)}` : `${member.id === status.ownerId ? 'Host · ' : ''}${devices} device${devices === 1 ? '' : 's'}`}</span>
                     {isAgent(member) && <span className="agent-runtime" title="Reported by the agent">{runtimeOf(member) || 'Harness and model not reported'}</span>}
                     {a && activityLine(a)}
                     {a && a.state !== 'offline' && a.state !== 'online' && a.note && <span className="agent-activity-note">{a.note}</span>}
+                    {wakes && <span className="agent-wakes">{wakeLabel(wakes.room.binding)}</span>}
+                    {wakes && <button className="browser-text-link browser-picture-link" onClick={() => setAgentFocus({ id: wakes.agent.id, at: Date.now() })}>Sessions</button>}
                     {removable && (confirming === member.id ? confirmRemove(member) : <button className="browser-remove" disabled={busy} aria-label={`Remove ${member.name} from the room`} onClick={() => setConfirming(member.id)}>{isAgent(member) ? 'Remove agent' : 'Remove'}</button>)}
                     {operatesIt && <button className="browser-text-link browser-picture-link" disabled={busy} onClick={() => pickAvatar(member.id)}>{member.avatar ? 'Change picture' : 'Set picture'}</button>}
                     {member.avatar && member.id !== status.memberId && (operatesIt || host) && <button className="browser-remove" disabled={busy} onClick={() => clearAvatar(member.id)}>Remove picture</button>}</div></div>;
@@ -958,7 +944,8 @@ export function BrowserRooms() {
                   {self?.avatar && <button className="browser-remove" disabled={busy} onClick={() => clearAvatar(self.id)}>Remove</button>}</div>
                 <p>Cropped to a square and kept under 16 KB. Everyone in this room sees it.</p>
               </section>
-              {!isAgent(self) && <section className="browser-agents"><h3>Your agents</h3><p>You’re connecting as <strong>{self?.name}</strong>: you’ll be the operator of any agent you connect here, and only you and the host can remove it. Use your own browser, not one an agent is driving.</p>
+              {!isAgent(self) && source.agents && <LocalAgentsSection api={source.agents} state={localAgents} roomId={urlRoom} selfName={self?.name} focus={agentFocus} />}
+              {!isAgent(self) && !source.agents && <section className="browser-agents"><h3>Your agents</h3><p>You’re connecting as <strong>{self?.name}</strong>: you’ll be the operator of any agent you connect here, and only you and the host can remove it. Use your own browser, not one an agent is driving.</p>
                 {agentLink && linkState !== 'open' ? <div className="browser-agent-link" role="status"><p>{linkState === 'joined' ? <>Used by <strong>{agentLink.name}</strong>, which joined the room.</>
                     : linkState === 'used' ? <>Used by <strong>{agentLink.name}</strong>, which is waiting for the host to let it in.</>
                     : <>The link for <strong>{agentLink.name}</strong> expired unused. Make a new one to connect it.</>}</p>
@@ -989,10 +976,12 @@ export function BrowserRooms() {
                   <FloorControl floor={settings.floor} disabled={busy} onChange={floor => changeSettings({ floor }, floor === 'humans-first' ? 'Agents now reply only when addressed.' : 'Agents may now reply to every message from a person.')} />
                   <label className="browser-setting"><input type="checkbox" checked={settings.agentAssignmentsWake} disabled={busy} onChange={e => changeSettings({ agentAssignmentsWake: e.target.checked }, e.target.checked ? 'Agents can now hand tasks to each other.' : 'Only people’s assignments wake agents now.')} /><span><strong>Agents can hand tasks to each other</strong>A task one agent assigns to another wakes it, as a person’s assignment does.</span></label>
                   <label className="browser-setting"><input type="checkbox" checked={settings.guestAgentApproval} disabled={busy} onChange={e => changeSettings({ guestAgentApproval: e.target.checked }, e.target.checked ? 'Guests’ agents now wait for your approval.' : 'Guests’ agents now join right away.')} /><span><strong>Approve guests’ agents</strong>Agents connected by other people wait for you to admit them. Your own agents join right away.</span></label>
+                  <label className="browser-setting"><input type="checkbox" checked={settings.hostApprovesDevices} disabled={busy} onChange={e => changeSettings({ hostApprovesDevices: e.target.checked }, e.target.checked ? 'New devices now wait for your approval.' : 'People now add their own devices.')} /><span><strong>Approve new devices</strong>A device someone links to themselves waits for you to admit it. Off: their own confirmation admits it.</span></label>
                 </> : <ul className="browser-settings-summary">
                   <li>{settings.floor === 'humans-first' ? 'Agents reply only when addressed.' : 'Agents may reply to every message from a person; one that @mentions someone wakes only the agents it names.'}</li>
                   <li>{settings.agentAssignmentsWake ? 'Agents can hand tasks to each other.' : 'Only people’s assignments wake agents.'}</li>
                   <li>{settings.guestAgentApproval ? 'The host approves agents connected by guests.' : 'Agents join as soon as their link is used.'}</li>
+                  <li>{settings.hostApprovesDevices ? 'The host approves each new device.' : 'People add their own devices.'}</li>
                 </ul>}
               </section>
               <section className="browser-invite"><h3>Invite someone</h3><p>New people wait for the host’s approval.</p><label className="sr-only" htmlFor="browser-invite-link">Room invite link</label><input id="browser-invite-link" readOnly value={invite} onFocus={e => e.target.select()} /></section>
@@ -1000,10 +989,13 @@ export function BrowserRooms() {
                 {host && status.devices!.filter(d => d.memberId === status.memberId).length === 1 && <p className="browser-only-device">This browser holds your only key for this room. Add another device so you don’t lose hosting.{' '}
                   <button className="browser-text-link" onClick={() => { const add = linkDevice.current; if (!add) return; add.open = true; add.scrollIntoView({ block: 'nearest' }); add.querySelector('input')?.focus(); }}>Link another device</button></p>}
                 <details ref={linkDevice} className="browser-link-device"><summary>Add another device</summary><p>Open this room link on your other device and choose <strong>Use my existing identity</strong>. Enter its code here.</p>
-                  <form onSubmit={e => { e.preventDefault(); void act(async () => { await api.command('link', urlRoom, { code: code.trim().toLowerCase() }); setCode(''); setNotice(host ? 'Your device is approved.' : 'Identity confirmed. The host can now admit your device.'); }); }}><label>Device code<input value={code} onChange={e => setCode(e.target.value)} required maxLength={16} autoComplete="off" spellCheck={false} /></label><button className="secondary" disabled={busy || code.trim().length !== 16}>Approve my device</button></form>
+                  <form onSubmit={e => { e.preventDefault(); void act(async () => { await source.command('link', urlRoom, { code: code.trim().toLowerCase() }); setCode(''); setNotice(host || !settings.hostApprovesDevices ? 'Your device is approved.' : 'Identity confirmed. The host can now admit your device.'); }); }}><label>Device code<input value={code} onChange={e => setCode(e.target.value)} required maxLength={16} autoComplete="off" spellCheck={false} /></label><button className="secondary" disabled={busy || code.trim().length !== 16}>Approve my device</button></form>
                 </details>
+                {!source.isLocal && <details ref={desktopPairing} className="browser-desktop-pairing"><summary>Use the desktop app</summary>
+                  <DesktopPairing rooms={[{ id: urlRoom, title }, ...recent.filter(r => r.id !== urlRoom)]} name={self?.name || name} device={deviceId} link={pairRoom} />
+                </details>}
                 <details className="browser-device-details"><summary>Manage your devices</summary>
-                  {status.devices!.filter(d => d.memberId === status.memberId).map(d => <div key={d.id}><strong>{d.label} · {d.id.slice(-6).toUpperCase()}</strong><span>{d.id === status.deviceId ? 'This device' : connected.includes(d.id) ? 'Connected' : 'Offline'}</span>{d.id !== status.deviceId && <button className="browser-remove" aria-label={`Remove ${d.label} ${d.id.slice(-6).toUpperCase()}`} disabled={busy} onClick={() => void act(async () => { await api.command('remove', urlRoom, { deviceId: d.id }); })}>Remove device</button>}</div>)}
+                  {status.devices!.filter(d => d.memberId === status.memberId).map(d => <div key={d.id}><strong>{d.label} · {d.id.slice(-6).toUpperCase()}</strong><span>{d.id === status.deviceId ? 'This device' : connected.includes(d.id) ? 'Connected' : 'Offline'}</span>{d.id !== status.deviceId && <button className="browser-remove" aria-label={`Remove ${d.label} ${d.id.slice(-6).toUpperCase()}`} disabled={busy} onClick={() => void act(async () => { await source.command('remove', urlRoom, { deviceId: d.id }); })}>Remove device</button>}</div>)}
                 </details>
                 {!host && self && (confirming === self.id ? confirmRemove(self) : <button className="browser-remove browser-leave" disabled={busy} onClick={() => setConfirming(self.id)}>Leave this room</button>)}
               </section>

@@ -29,6 +29,7 @@ dist-agent
 packages/meshrooms/bin/
 packages/meshrooms/LICENSE
 packages/meshrooms/THIRD_PARTY_LICENSES.txt
+packages/meshrooms/ui/
 *.tgz
 
 # Local agent and tool state
