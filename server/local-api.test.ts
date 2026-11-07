@@ -10,6 +10,7 @@ import { MAX_PENDING_ATTACHMENTS } from '../src/attachments';
 import type { AttachmentRef } from '../src/browser/files';
 import { PERSON_STATUS_FILE, personStatusOf } from './browser-agent';
 import { testDirectory } from './test-directory';
+import { retractedStub } from '../src/browser/retractions';
 import { BrowserLobby } from './browser/lobby';
 import { browserHandler } from './browser/http';
 import { mintInvite } from './browser/invites';
@@ -436,6 +437,65 @@ test('the events long poll reports new messages and member changes in order, and
   expect(await get(`/api/local/events?after=${api.feed.epoch}.99999&wait=0`)).toMatchObject({ reset: true });
   expect((await call('/api/local/events?after=nonsense', { headers: as(token) })).status).toBe(400);
   expect((await call(`/api/local/events?after=${answer.cursor}&wait=31`, { headers: as(token) })).status).toBe(400);
+});
+
+test('deleting: the author only, the page hears of it, and nothing of the message is left to read', async () => {
+  const { call, as, signIn, agent, history, message, api } = await served();
+  const token = await signIn(), rooms = `/api/local/rooms/${roomId}`;
+  const get = async (path: string) => (await call(path, { headers: as(token) })).json() as Promise<any>;
+  const post = (body: unknown) => call(`${rooms}/retract`, { method: 'POST', headers: as(token, { 'Content-Type': 'application/json' }), body: JSON.stringify(body) });
+  const stored = (changed: unknown[]) => writeFileSync(join(agent.dir, 'messages.json'), JSON.stringify(changed));
+  const [hello, , mine, last] = history as any[];
+  expect((await post({ messageId: hello.packet.body.id })).status).toBe(403);
+  expect((await post({ messageId: crypto.randomUUID() })).status).toBe(404);
+  expect((await post({ messageId: mine.packet.body.id, requestId: 'nope' })).status).toBe(400);
+  expect(readdirSync(join(agent.dir, 'outbox'))).toEqual([]);
+
+  // A stand-in runner makes the change as the real one does: the stub in place, the outbox item taken.
+  api.feed.poll();
+  const start = await get('/api/local/events');
+  const runner = setInterval(() => {
+    for (const file of readdirSync(join(agent.dir, 'outbox')).filter(f => f.endsWith('.json'))) {
+      stored(history.map((m: any) => m === mine ? retractedStub(m) : m)); rmSync(join(agent.dir, 'outbox', file));
+    }
+  }, 20);
+  try {
+    const answer = await post({ messageId: mine.packet.body.id });
+    expect(answer.status).toBe(200);
+    expect(await answer.json()).toEqual({ messageId: mine.packet.body.id, status: 'shared' });
+  } finally { clearInterval(runner); }
+
+  // The page reads again on a `room` event: no id changed, and a deletion is no new message.
+  api.feed.poll();
+  const heard = await get(`/api/local/events?after=${start.cursor}&wait=0`);
+  expect(heard.events.map((e: any) => e.type)).toEqual(['room']);
+  const view = await get(`${rooms}/view`);
+  expect(view.messages[2]).toMatchObject({ retracted: true, packet: { body: { text: '', id: mine.packet.body.id } } });
+  expect(view.messages[0]).not.toHaveProperty('retracted');
+  expect(JSON.stringify(view)).not.toContain('Thanks');
+  expect(view.deleted).toEqual([]);
+  // A page holding older pages hears of what was deleted before the newest window.
+  expect((await get(`${rooms}/view?limit=1`)).deleted).toEqual([mine.packet.body.id]);
+  const page = await get(`${rooms}/messages`);
+  expect(page.messages[2]).toMatchObject({ deleted: true, text: '' });
+  expect(page.messages[3]).not.toHaveProperty('deleted');
+  // Asked again it is simply done, and nothing is queued.
+  expect(await (await post({ messageId: mine.packet.body.id })).json()).toMatchObject({ status: 'shared' });
+  expect(readdirSync(join(agent.dir, 'outbox'))).toEqual([]);
+
+  // Arriving already deleted, a message says nothing to the feed or the notifications.
+  const late = retractedStub(message(alex, 'never seen', 6_000) as any);
+  stored([...history.map((m: any) => m === mine ? retractedStub(m) : m), late]);
+  api.feed.poll();
+  const after = await get(`/api/local/events?after=${heard.cursor}&wait=0`);
+  expect(after.events.filter((e: any) => e.type === 'message')).toEqual([]);
+  expect(JSON.stringify(after)).not.toContain('never seen');
+
+  // It counts as nothing to read: before the read position reaches it, and when the position is on it.
+  expect((await get('/api/local/rooms')).rooms[0]).toMatchObject({ unread: 0 });
+  await call(`${rooms}/read`, { method: 'POST', headers: as(token, { 'Content-Type': 'application/json' }), body: JSON.stringify({ messageId: last.packet.body.id }) });
+  stored([...history.map((m: any) => m === last ? retractedStub(m) : m), message(alex, 'Still here?', 7_000)]);
+  expect((await get('/api/local/rooms')).rooms[0]).toMatchObject({ unread: 1 });
 });
 
 test('the feed takes a baseline first and keeps only the last thousand events', async () => {

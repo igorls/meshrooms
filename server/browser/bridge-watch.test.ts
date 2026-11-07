@@ -985,7 +985,7 @@ test('the CLI peeks without consuming, and checks watch options before starting 
     const codexHome = join(home, 'codex'); mkdirSync(codexHome);
     writeFileSync(join(codexHome, 'config.toml'), 'sandbox_mode = "read-only"\n');
     const savedCodex = process.env.CODEX_HOME; process.env.CODEX_HOME = codexHome;
-    try { await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--session', '0190a000-0000-7000-8000-00000000000b'])).rejects.toThrow('never loosens it'); }
+    try { await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--codex-delivery', 'headless', '--session', '0190a000-0000-7000-8000-00000000000b'])).rejects.toThrow('never loosens it'); }
     finally { if (savedCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = savedCodex; }
     expect(existsSync(join(r.agent.dir, 'watch.json'))).toBe(false);
   } finally {

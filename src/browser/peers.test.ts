@@ -6,6 +6,7 @@ import { MAX_PENDING_INCOMING, PACE_HIGH_WATER, Resync, SYNC_REQUEST } from './p
 import { syncChunks, taskBody } from './board';
 import { FenceError, claimFence, identity } from './storage';
 import { QUOTA_BURST, QuotaDrops } from './quota';
+import { MAX_REACTION_KEYS_PER_MEMBER, REACTION_EMOJI } from './reactions';
 
 /**
  * BrowserPeers over an in-memory IndexedDB and fake data channels, so the receive paths (window, receipts, quotas,
@@ -320,5 +321,143 @@ describe('a stale owner after a takeover (fencing)', () => {
     engine.status = status;
     await expect(engine.send('never stored')).rejects.toThrow('Claim the room');
     expect(records.has(`messages:${local.id}:${roomId}`)).toBe(false);
+  });
+});
+
+describe('message retractions (HIST-3)', () => {
+  const retraction = async (target: string, signer = remote, memberId = them) => {
+    const body = { kind: 'retract', roomId, id: crypto.randomUUID(), deviceId: signer.id, memberId, at: Date.now(), target };
+    return { body, signature: await signer.sign(body) };
+  };
+  const stored = () => JSON.stringify([...records.values()]);
+  const held = (engine: any, id: string) => engine.messages.find((m: any) => m.packet.body.id === id);
+
+  test('deleting your own message leaves a stub, stores no text and tells connected peers', async () => {
+    const { engine, channel } = await room();
+    await engine.send('take this back');
+    const id = engine.messages[0].packet.body.id;
+    await engine.retract(id);
+    expect(held(engine, id)).toMatchObject({ retracted: true, targets: [], packet: { signature: '', body: { id, text: '' } } });
+    expect(stored()).not.toContain('take this back');
+    const sent = channel.sent.map(t => JSON.parse(t)).find(p => p.body?.kind === 'retract');
+    expect(sent.body.target).toBe(id);
+    await engine.retract(id);
+    expect(channel.sent.map(t => JSON.parse(t)).filter(p => p.body?.kind === 'retract').length).toBe(1);
+  });
+  test('someone else’s message cannot be deleted from this browser', async () => {
+    const { engine, deliver, settle } = await room();
+    const message = await messageFrom('theirs');
+    deliver(message); await settle();
+    await expect(engine.retract(message.body.id)).rejects.toThrow('You can only delete your own messages.');
+    expect(held(engine, message.body.id).packet.body.text).toBe('theirs');
+  });
+  test('the author’s retraction removes the message here, and survives a reload', async () => {
+    const { engine, deliver, settle } = await room();
+    const message = await messageFrom('gone soon');
+    deliver(message); await settle();
+    deliver(await retraction(message.body.id)); await settle();
+    expect(held(engine, message.body.id).retracted).toBe(true);
+    expect(stored()).not.toContain('gone soon');
+    const again = await room();
+    expect(held(again.engine, message.body.id).retracted).toBe(true);
+    again.deliver(message); await again.settle();
+    expect(held(again.engine, message.body.id).packet.body.text).toBe('');
+  });
+  test('another member cannot retract a message, even with a valid signature of their own', async () => {
+    const { engine, deliver, settle } = await room();
+    await engine.send('mine stays');
+    const id = engine.messages[0].packet.body.id;
+    deliver(await retraction(id)); await settle();
+    expect(held(engine, id).packet.body.text).toBe('mine stays');
+    expect(engine.retractOps).toEqual([]);
+  });
+  test('a retraction with a bad signature or a false member is refused', async () => {
+    const { engine, deliver, settle } = await room();
+    const message = await messageFrom('still here');
+    deliver(message); await settle();
+    const forged = await retraction(message.body.id);
+    deliver({ ...forged, signature: (await retraction(message.body.id)).signature }); await settle();
+    deliver({ kind: 'retractions', roomId, ops: [{ ...forged, signature: 'AAAA' }] }); await settle();
+    deliver(await retraction(message.body.id, remote, me)); await settle();
+    expect(held(engine, message.body.id).packet.body.text).toBe('still here');
+  });
+  test('a retraction that arrives first means the message is never stored, and is still confirmed', async () => {
+    const { engine, channel, deliver, settle } = await room();
+    const message = await messageFrom('never kept');
+    deliver(await retraction(message.body.id)); await settle();
+    deliver(message); await settle();
+    expect(held(engine, message.body.id).retracted).toBe(true);
+    expect(stored()).not.toContain('never kept');
+    expect(receipts(channel)).toContain(message.body.id);
+  });
+  test('a sender still retrying the original gets a receipt, so it stops', async () => {
+    const { channel, deliver, settle } = await room();
+    const message = await messageFrom('retrying');
+    deliver(message); await settle();
+    deliver(await retraction(message.body.id)); await settle();
+    channel.sent.length = 0;
+    deliver(message); await settle();
+    expect(receipts(channel)).toEqual([message.body.id]);
+    expect(stored()).not.toContain('retrying');
+  });
+  test('a retraction exchanged on connect verifies against a former device of the author', async () => {
+    const { engine, deliver, settle } = await room();
+    const message = await messageFrom('from the old laptop');
+    deliver(message); await settle();
+    const former = await keyPair();
+    engine.status = { ...status, formerDevices: [{ id: former.id, publicKey: former.publicKey, label: 'old', memberId: them, admittedAt: 1 }] };
+    deliver({ kind: 'retractions', roomId, ops: [await retraction(message.body.id, former)] }); await settle();
+    expect(held(engine, message.body.id).retracted).toBe(true);
+    engine.status = status;
+  });
+  test('the log is sent to peers with the rest of the state, and a stub never is', async () => {
+    const { engine, channel } = await room();
+    await engine.send('old news');
+    const id = engine.messages[0].packet.body.id;
+    await engine.retract(id);
+    channel.sent.length = 0;
+    engine.flush(); engine.sendState(engine.peers.get(remote.id));
+    engine.peers.get(remote.id).queue.pump();
+    const sent = channel.sent.map(t => JSON.parse(t));
+    expect(sent.find(p => p.kind === 'retractions').ops[0].body.target).toBe(id);
+    expect(sent.some(p => p.body?.kind === 'message')).toBe(false);
+  });
+  test('a deleted message takes no new reactions', async () => {
+    const { engine } = await room();
+    await engine.send('quiet');
+    const id = engine.messages[0].packet.body.id;
+    await engine.retract(id);
+    await expect(engine.react(id, '👍')).rejects.toThrow('That message is not in this browser.');
+  });
+  test('reactions on deleted messages stop counting toward the member’s cap', async () => {
+    const { engine } = await room();
+    const ids: string[] = [];
+    for (let i = 0; i < MAX_REACTION_KEYS_PER_MEMBER / REACTION_EMOJI.length; i++) {
+      await engine.send(`message ${i}`);
+      const id = engine.messages.at(-1).packet.body.id; ids.push(id);
+      for (const emoji of REACTION_EMOJI) await engine.react(id, emoji);
+    }
+    await engine.send('still here');
+    const kept = engine.messages.at(-1).packet.body.id;
+    await expect(engine.react(kept, '👍')).rejects.toThrow('too many reactions');
+    for (const id of ids) await engine.retract(id);
+    await engine.react(kept, '👍');
+    expect(engine.chips().some((chip: { messageId: string }) => chip.messageId === kept)).toBe(true);
+  });
+  test('a file write under way when its message is deleted is removed behind it', async () => {
+    const { engine } = await room();
+    const sha = 'a'.repeat(64);
+    const writing = engine.storeFile(sha, new Uint8Array([1, 2, 3]), 'application/octet-stream');
+    engine.syncFiles();
+    await writing; await engine.fileSerial;
+    expect(engine.index[sha]).toBeUndefined();
+    expect(records.has(`file:${local.id}:${roomId}:${sha}`)).toBe(false);
+  });
+  test('a stale owner cannot write a retraction', async () => {
+    const stale = await room();
+    await stale.engine.send('held');
+    const id = stale.engine.messages[0].packet.body.id;
+    await room();
+    await expect(stale.engine.retract(id)).rejects.toThrow(FenceError);
   });
 });

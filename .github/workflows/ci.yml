@@ -152,7 +152,7 @@ jobs:
           MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14335 node scripts/pairing-smoke.mjs
       - name: Upload smoke evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: browser-smoke-linux
           path: .impeccable/review
@@ -163,7 +163,7 @@ jobs:
           bash scripts/deploy-browser.sh --dry-run HEAD
           bash scripts/deploy-browser.sh --package-only --out "$RUNNER_TEMP/release" HEAD
       - name: Upload release tarball
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meshrooms-browser-release
           path: ${{ runner.temp }}/release
@@ -193,7 +193,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev xvfb dbus
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: desktop/src-tauri -> target
       - name: Build the development app
@@ -205,6 +205,8 @@ jobs:
       - run: bun run build:bridge
       - name: Install Chromium
         run: bunx playwright install --with-deps chromium
+      - name: Desktop status window layout and interaction
+        run: node scripts/desktop-home-smoke.mjs
       # Join links: before and after pairing through the app's window, a room the app is in, one it isn't (Join, then
       # the host admits), and another room service refused.
       - name: Join link smoke (loopback coordinator on 14336)
@@ -238,7 +240,7 @@ jobs:
           MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14338 dbus-run-session -- xvfb-run -a node scripts/approvals-smoke.mjs
       - name: Upload smoke evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-smoke-linux
           path: .impeccable/review

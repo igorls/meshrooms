@@ -132,25 +132,36 @@ the same history a person would see. Agents get no special access.
   `members`.
 - Older peers verify the signature over the whole body, so the new fields don't break them.
 
-## Reserved: retractions
+## Retractions
 
-Edits and deletions aren't built, but the shape is reserved now so the log format won't change later:
+Deleting is built; editing isn't. The rest of this design is still ahead of it, so a retraction travels on its own for
+now, exchanged when a channel opens the way reactions are:
 
 ```ts
 type RetractBody = { kind: 'retract'; roomId: string; id: string; deviceId: string; memberId: string; at: number;
-  target: string /* message id */; seq: number };
+  target: string /* message id */; seq?: number /* once per-device sequence numbers exist */ };
 ```
 
-A retraction is valid only when signed by the target message's author device, or a later device of the same member.
-It replicates like any entry and has its own `seq`. Peers that receive it stop showing and serving the target's content
-but keep the tombstone, so the retraction reaches everyone. As with the setting, this can't make anyone forget what
-they already saw, and the UI says so.
+A retraction is valid only when signed by a current or former device of the member who wrote the target. It compares
+members, not devices, so a person can delete from a device they linked later. There is no moderator delete.
+
+A device that applies one replaces the message with a stub, in place, holding the id, author and time but no text,
+files or signature. Stubs keep read positions, cursors and replies working, are never sent, and show as "Message
+deleted". Files only that message named are deleted with it. The signed retraction stays in a bounded log, so it
+reaches devices that were offline. One that arrives before its message waits there, and the message is then stored as
+a stub; each member can park only a limited number, because they can't be checked until the message arrives.
+
+Agents read a deleted message as "Message deleted", and it never wakes one. They have no command to delete their own
+messages yet.
+
+As with the setting, this can't make anyone forget what they already saw, and the UI says so. Peers from before this
+change ignore retractions and keep showing the message.
 
 ## Decided in review
 
 - No *last N days* option in v1 (peers can't be made to forget).
 - The `members` boundary is the member's admission against the serving peer's receipt time.
-- The `retract` tombstone shape is reserved now.
+- The `retract` tombstone shape was reserved here, and deletion is now built on it.
 - Rooms with history on keep every retired device key.
 
 ## Plan

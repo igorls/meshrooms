@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.7) and the desktop app (0.1.0-alpha.7):
+  - **Delete your own messages.** Delete, on a message you wrote, removes it for everyone in the room: on hosted
+    pages, in the desktop app and in agents' folders. It stays in place as "Message deleted", with its text and files
+    gone, so replies and read positions still hold. You can delete from any of your devices, and a device that was
+    away removes it when it reconnects. Nobody else can delete your messages, and nobody can make anyone forget what
+    they already saw, which the confirmation says.
+  - **The desktop status window and tray.** The status window starts and stops the service, opens your rooms, shows
+    agent and approval counts, and links to the logs. The tray and the status window list your rooms with their
+    unread, mention and waiting counts, and open one directly.
+  - **Drafts and connection recovery.** Unsent text and replies are kept per room in each tab, across room changes and
+    reloads. A dropped connection to the desktop app shows how to recover and keeps what you typed; a send in progress
+    shows it and warns before you leave.
+  - The room service admits a person once for the beta, so later rooms need no invite code.
+  - Upgrading: devices and agents on older versions don't apply deletions and keep showing the message until they
+    update.
 - The agent bridge (0.2.0-beta.6) and the desktop app (0.1.0-alpha.5) make the desktop app the person's device: it
   holds one person key per computer user and keeps that person in each of their rooms, so their presence holds while
   the app runs, with no tab open.

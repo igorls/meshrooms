@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Meshrooms · Admin</title><link rel="stylesheet" href="/admin.css"><script src="/admin.js" defer></script></head>
+<body><main>
+<header><div><span class="eyebrow">MESHROOMS / PRIVATE</span><h1>Beta access</h1><p>Invite people once. Give their conversations room to grow.</p></div><button id="logout" class="quiet" hidden>Sign out</button></header>
+<p id="error" role="alert" hidden></p>
+<section id="login"><h2>Admin sign in</h2><p>This panel is available on the Tailnet. Use your admin credential to continue.</p><form id="login-form"><label>Admin credential<input id="password" type="password" required autocomplete="current-password"></label><button>Sign in</button></form></section>
+<div id="panel" hidden>
+<div class="stats"><div><strong id="people-count">—</strong><span>Admitted people</span></div><div><strong id="room-count">—</strong><span>Rooms</span></div><div><strong id="invite-count">—</strong><span>Available invitations</span></div></div>
+<section><div class="section-title"><div><h2>Invite someone</h2><p>Each use admits one person. They can then create more rooms without another code.</p></div></div>
+<form id="mint-form"><label class="wide">Note<input id="note" maxlength="200" placeholder="Who is this invitation for?" autocomplete="off"></label><label>People<input id="uses" type="number" min="1" max="1000" value="1" required></label><label>Expires in (days)<input id="days" type="number" min="1" max="365" value="30" required></label><button>Create invite</button></form>
+<div id="issued" class="issued" hidden><div><span class="eyebrow">COPY BEFORE LEAVING</span><p>This code is shown once. Save it or send it to the person you’re inviting.</p><output id="code"></output></div><div class="actions"><button type="button" id="copy">Copy code</button><button type="button" id="dismiss" class="quiet">I’ve saved it</button></div><p id="copy-status" role="status"></p></div></section>
+<section><div class="section-title"><div><h2>Invitations</h2><p>Codes cannot be recovered. Revoke an unused invitation if it is no longer needed.</p></div><button id="refresh" class="quiet">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Note / ID</th><th>Status</th><th>People admitted</th><th>Expires</th><th></th></tr></thead><tbody id="invites"></tbody></table></div><p id="no-invites" hidden>No invitations yet. Create your first one above.</p></section>
+<section><h2>Rooms</h2><p>Room admission and availability. Chat messages remain on participants’ devices.</p><div class="table-wrap"><table><thead><tr><th>Room</th><th>Members</th><th>Devices</th><th>Last active</th></tr></thead><tbody id="rooms"></tbody></table></div></section>
+</div><footer>Private administration · Meshrooms</footer></main></body></html>

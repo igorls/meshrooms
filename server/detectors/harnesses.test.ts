@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import {
   CLAUDE_VERIFIED, CODEX_VERIFIED, SESSION_LIMIT, TITLE_CODE_POINTS, claudeSessionFolder, folderLabel, freshClaudeSession, freshCodexThread, harnessScanner, headLines, hermesIdFresh,
   listClaudeSessions, listCodexThreads, listSessions,
-  parseClaudeVersion, parseCodexVersion, plainText, promptTitle, runBounded, scanHarnesses, type CommandResult, type ScanDeps,
+  parseClaudeVersion, parseCodexVersion, plainText, promptTitle, resolveHarnessProgram, runBounded, scanHarnesses, type CommandResult, type ScanDeps,
 } from './harnesses';
 import { HERMES_VERIFIED_BUILD } from './hermes';
 import { testDirectory } from '../test-directory';
@@ -16,6 +16,17 @@ const uuid = () => crypto.randomUUID();
 const jsonl = (lines: unknown[]) => lines.map(line => JSON.stringify(line)).join('\n') + '\n';
 /** Sets a file's last write `secondsAgo` seconds back, so listings order by it. */
 const age = (path: string, secondsAgo: number) => { const at = new Date(Date.now() - secondsAgo * 1000); utimesSync(path, at, at); };
+
+test.skipIf(process.platform === 'win32')('a macOS login launch finds bundled Codex without PATH and keeps an operator PATH choice first', () => {
+  const dir = folder(), binary = join(dir, 'ChatGPT.app', 'Contents', 'Resources', 'codex-cli', 'CodexCLI.app', 'Contents', 'MacOS', 'codex');
+  mkdirSync(join(binary, '..'), { recursive: true }); writeFileSync(binary, 'bundled codex', { mode: 0o755 });
+  const options = { platform: 'darwin' as const, env: { PATH: '' }, applications: [dir] };
+  expect(resolveHarnessProgram('codex', options)).toEqual({ file: binary, prefix: [] });
+  const preferred = join(dir, 'codex'); writeFileSync(preferred, 'operator codex', { mode: 0o755 });
+  expect(resolveHarnessProgram('codex', { ...options, env: { PATH: dir } })).toEqual({ file: preferred, prefix: [] });
+  expect(() => resolveHarnessProgram('claude', options)).toThrow("Couldn't find claude");
+  expect(() => resolveHarnessProgram('codex', { ...options, platform: 'linux' })).toThrow("Couldn't find codex");
+});
 
 /** A Claude Code config folder with sessions in two projects, written as Claude Code writes them (synthetic text only). */
 function claudeFixture() {
@@ -49,6 +60,7 @@ test('versions: only the version is kept, and only measured ones open the sessio
   expect(CLAUDE_VERIFIED.test('2.1.289')).toBe(true);
   expect(CLAUDE_VERIFIED.test('3.0.0')).toBe(false);
   expect(CODEX_VERIFIED.test('0.159.2')).toBe(true);
+  expect(CODEX_VERIFIED.test('0.163.0-alpha.10.2')).toBe(true);
   expect(CODEX_VERIFIED.test('0.160.0')).toBe(false);
 });
 

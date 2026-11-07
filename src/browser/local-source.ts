@@ -11,19 +11,20 @@ import type { DecisionBody, VoteBody } from './decisions';
 import type { ActivityRecord } from './activity';
 import type { FileView, SavedMessage } from './peers';
 import type { ReactionChip } from './reactions';
+import { retractedStub } from './retractions';
 import type { RecentRoom } from './background';
 import type { UnreadCount, Waiting } from './unread';
 import type { BrowserDevice, RoomStatus } from './protocol';
-import type { HarnessScan, LocalAgent, LocalAgents, RoomAction, RoomEvents, RoomSession, RoomSource, SessionListing } from './source';
+import type { HarnessScan, LocalAgent, LocalAgents, MessageNotificationLevel, RoomAction, RoomEvents, RoomNotifications, RoomSession, RoomSource, SessionListing } from './source';
 
 const TOKEN_KEY = 'meshrooms:local-session';
-const SIGN_IN = 'Open Meshrooms from the app (Open Meshrooms in its menu) to sign in on this browser.';
+const SIGN_IN = 'Open Meshrooms and choose Open your rooms to sign in again. Keep this tab open if you have an unsent draft.';
 /** The page's routes on the local origin; another path is never navigated to. */
 type RoomSummary = { roomId: string; origin: string; title: string | null; state: string; unread: number; mentions: number; waiting?: Waiting[] };
 type PersonStatus = Omit<RoomStatus, 'devices' | 'signals' | 'iceServers'> & { devices?: (BrowserDevice & { online: boolean })[]; connected: string[]; activity: Record<string, ActivityRecord> };
 type View = {
   roomId: string; origin: string; title: string | null; state: 'joined' | 'waiting' | 'declined' | 'expired' | 'closed' | 'removed' | 'starting'; code?: string; reason?: string;
-  memberId: string | null; status: PersonStatus | null; messages: SavedMessage[]; more: boolean; taskOps: TaskBody[]; decisionOps: (DecisionBody | VoteBody)[];
+  memberId: string | null; status: PersonStatus | null; messages: SavedMessage[]; deleted: string[]; more: boolean; taskOps: TaskBody[]; decisionOps: (DecisionBody | VoteBody)[];
   reactions: ReactionChip[]; files: Record<string, { held: boolean; transfer?: FileView['transfer'] }>; read: { id?: string; at: number };
 };
 type LocalEvent = { type: 'message' | 'members' | 'room'; roomId: string } | { type: 'rooms'; roomIds: string[] };
@@ -34,8 +35,16 @@ function storedToken() { try { return sessionStorage.getItem(TOKEN_KEY) ?? undef
 export class LocalSource implements RoomSource {
   readonly isLocal = true;
   readonly label = 'Meshrooms on this computer';
+  readonly notifications: RoomNotifications = {
+    read: async roomId => (await this.call<{ level: MessageNotificationLevel }>(`/api/local/rooms/${roomId}/notify`)).level,
+    save: async (roomId, level) => (await this.call<{ level: MessageNotificationLevel }>(`/api/local/rooms/${roomId}/notify`, { method: 'POST', json: { level } })).level,
+  };
   /** The agent routes of the local API (server/local-agents.ts), with this page's session token. */
   readonly agents: LocalAgents = {
+    apps: () => this.call('/api/local/agent-apps', { timeout: 30_000 }),
+    deliveries: () => this.call('/api/local/agent-apps/deliveries'),
+    configureApp: async (harness, preference) => { await this.call(`/api/local/agent-apps/${harness}`, { method: 'POST', json: preference }); },
+    resolveDelivery: async (id, action) => { await this.call(`/api/local/agent-apps/deliveries/${id}`, { method: 'POST', json: { action } }); },
     list: () => this.call<{ agents: LocalAgent[]; approvalsWaiting: number }>('/api/local/agents'),
     harnesses: async () => (await this.call<{ harnesses: HarnessScan[] }>('/api/local/harnesses', { timeout: 30_000 })).harnesses,
     sessions: harness => this.call<SessionListing>(`/api/local/harnesses/${harness}/sessions`, { timeout: 30_000 }),
@@ -52,7 +61,7 @@ export class LocalSource implements RoomSource {
   private token = storedToken();
   private signIn?: Promise<void>;
   private rooms: RoomSummary[] = [];
-  private listeners = new Set<(events: LocalEvent[], reset: boolean) => void>();
+  private listeners = new Set<{ change(events: LocalEvent[], reset: boolean): void; failed?(error: ApiFailure): void }>();
   private polling = false;
   private avatars = new Map<string, string | Promise<void>>();
   /** `ticket`: the one-time ticket from the link the app opened (#access=…), exchanged once for a session token. */
@@ -60,10 +69,12 @@ export class LocalSource implements RoomSource {
     if (ticket) this.signIn = this.exchange(ticket);
   }
   private async exchange(ticket: string) {
-    const response = await fetch('/api/local/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket }), signal: AbortSignal.timeout(10_000) });
+    let response: Response;
+    try { response = await fetch('/api/local/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket }), signal: AbortSignal.timeout(10_000) }); }
+    catch { throw Object.assign(new Error(`This sign-in link could not be used. ${SIGN_IN}`), { status: 401 }); }
     const result = await response.json().catch(() => ({})) as { token?: string; error?: string };
     // A link already used (a reload of it) is fine while this tab still holds its session.
-    if (!response.ok || typeof result.token !== 'string') { if (this.token) return; throw new Error(result.error || SIGN_IN); }
+    if (!response.ok || typeof result.token !== 'string') { if (this.token) return; throw Object.assign(new Error(SIGN_IN), { status: 401 }); }
     this.token = result.token;
     try { sessionStorage.setItem(TOKEN_KEY, result.token); } catch { /* Kept in memory: a reload signs in again from the app. */ }
   }
@@ -80,12 +91,19 @@ export class LocalSource implements RoomSource {
       if ((error as DOMException)?.name === 'AbortError' && rest.signal?.aborted) throw error;
       throw new Error('Meshrooms on this computer does not answer. Check that the app is running.');
     }
-    if (response.status === 401) { this.token = undefined; try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* Not kept. */ } }
+    if (response.status === 401) {
+      this.token = undefined; try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* Not kept. */ }
+      const error = Object.assign(new Error(SIGN_IN), { status: 401 });
+      for (const listener of [...this.listeners]) listener.failed?.(error);
+    }
     const result = await response.json().catch(() => ({})) as T & { error?: string; code?: unknown; approval?: unknown };
     // `code`: a room service's reason (an invite code it wants), passed on by the local API. `approval`: the request
     // was filed for the person to approve in the app (binding an existing session), which the page shows as waiting.
     if (!response.ok) throw Object.assign(new Error(response.status === 401 ? SIGN_IN : result.error || 'Meshrooms on this computer could not do that.'),
       { status: response.status, ...(typeof result.code === 'string' ? { code: result.code } : {}), ...(result.approval === 'pending' ? { approval: 'pending' } : {}) });
+    // Another request can reject the session while this answer is in flight. A late success must not restore a stale
+    // green connection after the event poll has stopped for sign-in.
+    if (!this.token) throw Object.assign(new Error(SIGN_IN), { status: 401 });
     return result;
   }
   private async blob(path: string) {
@@ -96,14 +114,15 @@ export class LocalSource implements RoomSource {
   }
 
   /** The events long poll, shared by everything on the page while anything listens. */
-  private subscribe(listener: (events: LocalEvent[], reset: boolean) => void) {
+  private subscribe(change: (events: LocalEvent[], reset: boolean) => void, failed?: (error: ApiFailure) => void) {
+    const listener = { change, failed };
     this.listeners.add(listener);
     if (!this.polling) void this.poll();
     return () => { this.listeners.delete(listener); };
   }
   private async poll() {
     this.polling = true;
-    let cursor = '';
+    let cursor = '', recovering = false;
     try {
       while (this.listeners.size) {
         try {
@@ -112,9 +131,12 @@ export class LocalSource implements RoomSource {
           cursor = answer.cursor;
           // The first answer only sets the cursor: whatever changed before it is read again from here, so nothing falls
           // between a page's first read and its first event.
-          if (answer.events.length || answer.reset || first) for (const listener of [...this.listeners]) listener(answer.events, !!answer.reset || first);
+          if (answer.events.length || answer.reset || first || recovering) for (const listener of [...this.listeners]) listener.change(answer.events, !!answer.reset || first || recovering);
+          recovering = false;
           if (first) continue;
         } catch (error) {
+          recovering = true;
+          for (const listener of [...this.listeners]) listener.failed?.(error as ApiFailure);
           if ((error as ApiFailure).status === 401) return;
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
@@ -228,6 +250,8 @@ export class LocalSource implements RoomSource {
         if (!next) { events.network('Meshrooms on this computer is still connecting to this room.'); return; }
         events.status(next);
         events.network('');
+        const deleted = new Set(view.deleted);
+        older = older.map(m => deleted.has(m.packet.body.id) ? retractedStub(m) : m);
         const messages = [...older.filter(m => !view.messages.some(v => v.packet.body.id === m.packet.body.id)), ...view.messages];
         if (first) more = view.more;
         // Only the newest window brings arrivals: an older page loaded on request is history, never announced as new.
@@ -247,7 +271,7 @@ export class LocalSource implements RoomSource {
           events.position({ ...(position.id ? { id: position.id } : {}), at: Date.now() });
         }
       } catch (error) {
-        if (!disposed) events.network((error as Error).message);
+        if (!disposed) events.network((error as Error).message, (error as ApiFailure).status === 401);
       }
     };
     // One read at a time, so an older answer never lands after a newer one; a change during a read reads again after it.
@@ -268,6 +292,7 @@ export class LocalSource implements RoomSource {
         soon();
       },
       react: async (messageId, emoji) => { await this.changed(`${base}/react`, { messageId, emoji, requestId: crypto.randomUUID() }); soon(); },
+      retract: async messageId => { await this.changed(`${base}/retract`, { messageId, requestId: crypto.randomUUID() }); soon(); },
       changeTask: async (change, current, removed = false) => {
         await this.changed(`${base}/task`, { requestId: crypto.randomUUID(), ...(current ? { taskId: current.id } : {}), change, ...(removed ? { removed: true } : {}) });
         soon();
@@ -299,7 +324,8 @@ export class LocalSource implements RoomSource {
       stop: () => { disposed = true; resolveDone(); },
     };
     events.ready(session);
-    const stop = this.subscribe((list, reset) => { if (reset || list.some(e => e.type === 'rooms' || ('roomId' in e && e.roomId === roomId))) soon(); });
+    const stop = this.subscribe((list, reset) => { if (reset || list.some(e => e.type === 'rooms' || ('roomId' in e && e.roomId === roomId))) soon(); },
+      error => { if (!disposed) events.network(error.message, error.status === 401); });
     void read();
     return { done, dispose() { disposed = true; clearTimeout(timer); stop(); resolveDone(); } };
   }

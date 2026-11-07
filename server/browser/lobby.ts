@@ -3,7 +3,7 @@ import { sniff } from '../attachments';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { browserProtocol, deviceId, MAX_REPOSITORIES, validRepository, verify, type BrowserDevice, type BrowserMember, type FormerDevice, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, DEFAULT_ROOM_SETTINGS, PAIRING_NOT_FOUND, ROOM_CLOSED } from '../../src/browser/protocol';
 import { PAIRING_PROOF, PAIRING_SECRET, pairingMessage } from '../../src/browser/pairing';
-import { consumeInvite, inviteMessages } from './invites';
+import { admitBetaDevice, betaPerson, consumeInvite, inviteMessages } from './invites';
 import { openAdmission, retireRoom, type ClosedReason } from './store';
 
 /** Only a hash of an agent link's token is kept; the link itself is shown once to the person who made it. */
@@ -91,6 +91,15 @@ export class BrowserLobby {
   constructor(path: string, private options: LobbyOptions) {
     this.now = options.now || Date.now;
     this.db = openAdmission(path, this.now());
+    // Grandfather existing creators and their authenticated companion devices, never guests or agents.
+    if (this.inviteRequired) this.db.transaction(() => {
+      for (const { body } of this.db.query('SELECT body FROM rooms').all() as { body: string }[]) {
+        const room = JSON.parse(body) as Room;
+        const hosts = room.devices.filter(d => d.memberId === room.ownerId && isPerson(room, d.memberId));
+        const person = hosts.map(d => betaPerson(this.db, d.id)).find(Boolean) ?? hosts[0]?.id;
+        if (person) for (const device of hosts) this.admitCreator(device.id, person);
+      }
+    }).immediate();
     this.resume();
   }
   close() { try { this.heartbeat(); } finally { this.db.close(); } }
@@ -112,6 +121,21 @@ export class BrowserLobby {
   }
   /** Reads a real table, so a missing or unreadable database file fails the health check. */
   healthy() { this.db.query('SELECT COUNT(*) AS n FROM rooms').get(); return true; }
+  /** Devices linked before beta redemption belong to the same person too. Never follow agent operators or names. */
+  private admitCreator(device: string, person = device) {
+    const rooms = (this.db.query('SELECT body FROM rooms').all() as { body: string }[]).map(row => JSON.parse(row.body) as Room);
+    const devices = new Set([device]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const room of rooms) for (const member of room.members.filter(m => isPerson(room, m.id))) {
+        const linked = room.devices.filter(d => d.memberId === member.id);
+        if (!linked.some(d => devices.has(d.id))) continue;
+        for (const d of linked) if (!devices.has(d.id)) { devices.add(d.id); changed = true; }
+      }
+    }
+    for (const id of devices) admitBetaDevice(this.db, id, person, this.now());
+  }
   private load(id: string): Room {
     const row = this.db.query('SELECT body FROM rooms WHERE id=?').get(id) as { body: string } | null;
     if (row) return JSON.parse(row.body);
@@ -181,6 +205,7 @@ export class BrowserLobby {
   }
   private run(c: SignedCommand['command'], id: string, input: SignedCommand, address?: string): RoomStatus | { roomId: string; token?: string; admitted?: boolean } {
     return this.db.transaction(() => {
+      if (c.action === 'creation-status') return { roomId: c.roomId, admitted: !this.inviteRequired || !!betaPerson(this.db, id) };
       if (c.action === 'status') return this.snapshot(this.load(c.roomId), id, c.payload);
       const serialized = fingerprint(c);
       /** What an action adds to its answer (and to its receipt, so a retry gets the same). */
@@ -203,9 +228,10 @@ export class BrowserLobby {
           devices: [{ id, publicKey: input.publicKey, label: label(c.payload.label), memberId, admittedAt: this.now() }], requests: [],
           settings: { guestAgentApproval: DEFAULT_ROOM_SETTINGS.guestAgentApproval } };
         // Last, so nothing above can fail after a use was taken; the transaction rolls it back if anything below does.
-        if (this.inviteRequired) {
+        if (this.inviteRequired && !betaPerson(this.db, id)) {
           const problem = consumeInvite(this.db, c.payload.invite, this.now());
           if (problem) fail(problem === 'invite-required' || problem === 'invite-invalid' ? 403 : 410, inviteMessages[problem], problem);
+          this.admitCreator(id);
         }
         this.save(room);
         this.touch(room.id);
@@ -230,6 +256,10 @@ export class BrowserLobby {
           const memberId = r.linkedMemberId || crypto.randomUUID();
           if (!r.linkedMemberId) room.members.push(r.kind === 'agent' ? { id: memberId, name: r.name, role: 'agent', operatorId: r.operatorId } : { id: memberId, name: r.name, role: 'human' });
           room.devices.push({ ...r.device, memberId, admittedAt: this.now() });
+          if (r.kind === 'companion' && r.linkedMemberId && isPerson(room, memberId)) {
+            const person = room.devices.filter(d => d.memberId === memberId && d.id !== r.device.id).map(d => betaPerson(this.db, d.id)).find(Boolean);
+            if (person) this.admitCreator(r.device.id, person);
+          }
           r.state = 'admitted'; delete r.code; delete r.pairing;
         };
         switch (c.action) {

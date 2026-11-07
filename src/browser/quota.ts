@@ -10,7 +10,7 @@
  * flood in an envelope; what that can do is bounded by the per-member caps (live reaction keys, decision shares, task
  * revision jumps) and the room-wide log caps, not by this quota.
  */
-export type QuotaKind = 'message' | 'task' | 'decision' | 'reaction';
+export type QuotaKind = 'message' | 'task' | 'decision' | 'reaction' | 'retract';
 export const QUOTA_PER_MINUTE = 60, QUOTA_BURST = 20;
 /** A peer whose state was dropped over quota is asked for it again once no drop has happened for this long. */
 export const QUOTA_QUIET_MS = 5000;

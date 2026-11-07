@@ -7,13 +7,13 @@
  * Prints one repository-relative path per line, sorted. Exits non-zero if the runtime imports a
  * package (the release ships without node_modules) or references a file that does not exist.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, relative, resolve, sep } from 'node:path';
 import { builtinModules } from 'node:module';
 
 export const RUNTIME_ENTRY = 'server/browser/main.ts';
 /** The service plus the commands operators run on the host (invite codes, listing and retiring rooms). */
-export const RELEASE_ENTRIES = [RUNTIME_ENTRY, 'server/browser/invites.ts', 'server/browser/rooms.ts'];
+export const RELEASE_ENTRIES = [RUNTIME_ENTRY, 'server/browser/invites.ts', 'server/browser/rooms.ts', 'server/browser/admin-main.ts'];
 const builtins = new Set(builtinModules);
 const isBuiltin = (specifier: string) => specifier.startsWith('bun:') || specifier.startsWith('node:') || builtins.has(specifier);
 // Files the runtime opens by URL relative to the module, e.g. `new URL('./agent-join.md', import.meta.url)`.
@@ -41,7 +41,7 @@ export function releaseFiles(root: string, entries: string | string[] = RELEASE_
       if (isBuiltin(specifier)) continue;
       if (!specifier.startsWith('.')) { problems.push(`${name} imports package "${specifier}"; the release has no node_modules`); continue; }
       const base = resolve(dirname(file), specifier);
-      const found = extensions.map(ext => base + ext).find(candidate => existsSync(candidate) && !candidate.endsWith(sep));
+      const found = extensions.map(ext => base + ext).find(candidate => existsSync(candidate) && statSync(candidate).isFile());
       if (!found) problems.push(`${name} imports missing "${specifier}"`);
       else pending.push(found);
     }

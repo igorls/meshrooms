@@ -39,7 +39,7 @@ async function open(context, url) {
   return p;
 }
 async function visible(p, text) { await p.getByText(text, { exact: true }).first().waitFor(); }
-async function send(p, text) { await p.getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
+async function send(p, text) { await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
 const roomLink = (p, id) => p.locator(`.browser-room-nav a[href="/r/${id}"]`);
 async function badge(p, id, scope = '.browser-room-nav') { const b = p.locator(`${scope} a[href="/r/${id}"] .browser-room-badge`); return (await b.count()) ? { text: await b.innerText(), mention: await b.evaluate(el => el.classList.contains('is-mention')) } : undefined; }
 async function waitBadge(p, id, text, scope = '.browser-room-nav', timeout = 20_000) {
@@ -243,7 +243,7 @@ try {
   const draft = 'Written in a tab that lost the room.';
   await send(a2, draft);
   await a2.getByText('This room is open in another tab. Reload to use it here.').waitFor();
-  assert.equal(await a2.getByRole('combobox', { name: /^Message / }).inputValue(), draft, 'The draft comes back.');
+  assert.equal(await a2.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).inputValue(), draft, 'The draft comes back.');
   const pollsAfter = await a2.evaluate(s => window.__statusLog.filter(e => e.session === s).length, fencedSession);
   await sleep(4000);
   assert.equal(await a2.evaluate(s => window.__statusLog.filter(e => e.session === s).length, fencedSession), pollsAfter, 'A fenced-out tab stops polling.');

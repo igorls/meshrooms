@@ -26,6 +26,8 @@ export type Message = {
   author: string;
   role: Role;
   text: string;
+  /** Its author deleted it: it keeps its place, holds no content and wakes nobody. */
+  deleted?: boolean;
   time: string;
   sample?: boolean;
   replyTo?: string;

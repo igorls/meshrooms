@@ -29,7 +29,7 @@ export type RoomEvents = {
   ready(session: RoomSession): void;
   status(next: RoomStatus): void;
   messages(messages: SavedMessage[], connected: string[], added?: SavedMessage): void;
-  network(problem: string): void;
+  network(problem: string, signInRequired?: boolean): void;
   board(tasks: Task[], ops: TaskBody[]): void;
   files(view: Record<string, FileView>): void;
   activity(records: Record<string, ActivityRecord>): void;
@@ -48,6 +48,8 @@ export type RoomEvents = {
 export interface RoomSession {
   send(text: string, replyTo?: string, files?: { ref: AttachmentRef; bytes: Uint8Array }[]): Promise<void>;
   react(messageId: string, emoji: ReactionEmoji): Promise<void>;
+  /** Delete one of this person's messages for everyone. */
+  retract(messageId: string): Promise<void>;
   changeTask(change: TaskChange, current?: Task, removed?: boolean): Promise<void>;
   openDecision(draft: DecisionDraft): Promise<unknown>;
   reviseDecision(decision: Decision, change: { addOption?: string; close?: boolean; withdraw?: boolean }): Promise<void>;
@@ -70,10 +72,11 @@ export interface RoomSession {
  * (titles, folder labels, names, errors) and is shown as plain text only.
  */
 export type HarnessId = 'claude' | 'codex' | 'hermes' | 'exec';
-export type HarnessScan = { harness: HarnessId; label: string; detected: boolean; version?: string; sessionsAvailable: boolean; reason?: string };
+export type HarnessScan = { harness: HarnessId; label: string; detected: boolean; version?: string; sessionsAvailable: boolean; reason?: string; enabled?: boolean; codexDelivery?: 'desktop' | 'headless' };
 export type HarnessSession = { id: string; title: string | null; folder: string | null; lastActiveAt: string | null; lastActiveLabel?: string | null };
 export type SessionListing = { harness: HarnessId; sessionsAvailable: boolean; reason?: string; truncated: boolean; sessions: HarnessSession[] };
 export type AgentBinding = {
+  delivery?: 'desktop' | 'headless';
   wakes: 'unbound' | 'on' | 'off' | 'paused' | 'halted'; kind?: 'new' | 'existing'; state?: 'starting' | 'bound' | 'failed';
   reason?: 'bootstrap-failed' | 'bind-refused' | 'not-finished'; session?: string | null; error?: string; offReason?: string;
   /** Wakes are on and the watcher listens (it has its listen cursor); until then a mention could pass unnoticed. */
@@ -82,6 +85,10 @@ export type AgentBinding = {
 export type AgentRoom = { roomId: string; title: string | null; memberId: string | null; state: 'connected' | 'waiting' | 'closed' | 'removed'; runner: 'alive' | 'down'; binding: AgentBinding };
 export type LocalAgent = { id: string; name: string; harness: HarnessId; label: string; model: string | null; custom: boolean; createdAt: string; rooms: AgentRoom[] };
 export interface LocalAgents {
+  apps?(): Promise<import('../../server/harness-apps').AgentAppListing>;
+  deliveries?(): Promise<import('../../server/harness-apps').AgentAppListing['deliveries']>;
+  configureApp?(harness: HarnessId, preference: { enabled: boolean; codexDelivery?: 'desktop' | 'headless' }): Promise<void>;
+  resolveDelivery?(id: string, action: 'received' | 'retry'): Promise<void>;
   list(): Promise<{ agents: LocalAgent[]; approvalsWaiting: number }>;
   harnesses(): Promise<HarnessScan[]>;
   sessions(harness: HarnessId): Promise<SessionListing>;
@@ -98,6 +105,12 @@ export interface LocalAgents {
 }
 /** The room service actions the screens send, besides what a RoomSession does. */
 export type RoomAction = Extract<Command['action'], 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'agent-invite' | 'settings' | 'profile' | 'repositories' | 'close'>;
+export type MessageNotificationLevel = 'mentions' | 'all' | 'off';
+/** Message notifications for this person's room on this computer, available from the desktop app's local page only. */
+export interface RoomNotifications {
+  read(roomId: string): Promise<MessageNotificationLevel>;
+  save(roomId: string, level: MessageNotificationLevel): Promise<MessageNotificationLevel>;
+}
 export interface RoomSource {
   /** The page the desktop app serves: the person device does the work. */
   readonly isLocal: boolean;
@@ -105,6 +118,7 @@ export interface RoomSource {
   readonly label: string;
   /** The person's agents on this computer: only the local page has them; the hosted site connects agents by link. */
   readonly agents?: LocalAgents;
+  readonly notifications?: RoomNotifications;
   /** This device, the person's rooms and the name they last used. */
   start(): Promise<{ deviceId: string; recent: RecentRoom[]; name: string }>;
   /** What the room service says about itself: whether creating a room needs an invite, the agents' bridge version, and (the local page) which room service new rooms are made on. */
@@ -147,7 +161,8 @@ export class BrowserSource implements RoomSource {
   }
   async health() {
     const health = await fetch('/api/lobby/health', { signal: AbortSignal.timeout(10_000) }).then(r => r.json());
-    return { ...(health?.inviteRequired === true ? { inviteRequired: true } : {}), ...(typeof health?.currentAgentVersion === 'string' ? { currentAgentVersion: health.currentAgentVersion } : {}) };
+    const admission = health?.inviteRequired === true ? await this.api.command('creation-status', crypto.randomUUID()) as unknown as { admitted?: boolean } : undefined;
+    return { ...(health?.inviteRequired === true && !admission?.admitted ? { inviteRequired: true } : {}), ...(typeof health?.currentAgentVersion === 'string' ? { currentAgentVersion: health.currentAgentVersion } : {}) };
   }
   async room(roomId: string) {
     const response = await fetch(`/api/lobby/rooms/${roomId}`, { signal: AbortSignal.timeout(10_000) });
@@ -202,6 +217,7 @@ export class BrowserSource implements RoomSource {
         events.ready({
           send: (text, replyTo, files) => peers.send(text, replyTo, files),
           react: (messageId, emoji) => peers.react(messageId, emoji),
+          retract: messageId => peers.retract(messageId),
           changeTask: (change, current, removed) => peers.changeTask(change, current, removed),
           openDecision: draft => peers.openDecision(draft),
           reviseDecision: (decision, change) => peers.reviseDecision(decision, change),

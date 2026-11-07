@@ -17,6 +17,7 @@ import { localControlToken, readLocalApi, startLocalApi } from './local-api';
 import type { AgentServices } from './local-agents';
 import { initPerson, joinRoom, personAgent, queueMessage, roomState } from './person';
 import { testDirectory } from './test-directory';
+import { saveHarnessPreference } from './harness-apps';
 
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) try { await cleanup(); } catch { /* Best effort. */ } });
@@ -115,6 +116,29 @@ function fakeDeps() {
   return { deps, calls, services };
 }
 const existingClaude = '4b8f6c1e-2d3a-4e5f-8a9b-0c1d2e3f4a5b';
+
+test('desktop Codex bindings preserve the chosen delivery mode through approval and require a desktop-aware review', async () => {
+  const room = await admittedPerson(), api = await served(room, { approvals: true });
+  const thread = crypto.randomUUID();
+  api.services.scanner.scan = async () => [{ harness: 'codex', label: 'Codex', detected: true, sessionsAvailable: true }];
+  api.services.scanner.sessions = async () => ({ harness: 'codex', sessionsAvailable: true, truncated: false, sessions: [{ id: thread, title: 'Existing desktop chat', folder: 'project', lastActiveAt: null }] });
+  const made = await api.call('page', 'POST', '/api/local/agents', { name: 'Desktop Codex', harness: 'codex' }), id = made.body.agent.id;
+  await api.call('page', 'POST', `/api/local/rooms/${room.roomId}/agents`, { identity: id });
+  await admitAgents(room); await rosterOf(room, id);
+  const member = readIdentities(room.home).find(a => a.id === id)!;
+  const agent = new BrowserAgent(identityHome(room.home, id), room.origin, room.roomId, { mkdir: false });
+  const route = `/api/local/rooms/${room.roomId}/agents/${agent.members().memberId}/bind`;
+  expect((await api.call('page', 'POST', route, { session: 'new' })).status).toBe(409);
+  expect(api.calls.bootstrap).toHaveLength(0);
+  expect((await api.call('page', 'POST', route, { session: thread })).status).toBe(403);
+  const approval = (await api.call('control', 'GET', '/api/local/approvals')).body.approvals[0];
+  expect(approval.codexDelivery).toBe('desktop');
+  expect((await api.call('control', 'POST', `/api/local/approvals/${approval.id}/approve`, { digest: approval.digest })).status).toBe(409);
+  saveHarnessPreference(room.home, 'codex', { enabled: true, codexDelivery: 'headless' });
+  expect((await api.call('control', 'POST', `/api/local/approvals/${approval.id}/approve`, { digest: approval.digest, deliveryReview: 'desktop-v1' })).status).toBe(200);
+  expect(api.calls.bind.at(-1)?.values).toMatchObject({ '--harness': 'codex', '--session': thread, '--codex-delivery': 'desktop' });
+  expect(member.harness).toBe('codex');
+});
 
 /** The local API on a loopback port, with fake agent deps; `page` is the Meshrooms page (its Origin and session token). */
 async function served(room: Awaited<ReturnType<typeof admittedPerson>>, options: { approvals?: boolean } = {}) {

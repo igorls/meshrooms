@@ -36,8 +36,10 @@ function render(view) {
   $('unpair-go').disabled = false;
   $('unpair-go').textContent = view.stage === 'unpair-failed' ? 'Try again' : view.soleHost?.length ? 'Unpair anyway' : 'Unpair';
   $('unpair-cancel').textContent = view.stage === 'unpair-failed' ? 'Close' : 'Cancel';
-  $('after').hidden = ['asking', 'reviewing', 'unpair', 'unpair-failed', 'sending', 'unpairing'].includes(view.stage);
-  $('open').hidden = view.stage !== 'done';
+  $('after').hidden = ['asking', 'reviewing', 'unpair', 'unpair-failed', 'sending', 'cancelling', 'unpairing'].includes(view.stage);
+  $('open').hidden = view.stage !== 'done' && !(view.stage === 'cancelled' && view.rooms?.some(r => r.state === 'joined'));
+  $('cancel-pairing').hidden = !['waiting', 'cancel-failed'].includes(view.stage);
+  $('cancel-pairing').disabled = false;
   $('after-problem').textContent = view.problem || '';
   if (view.stage === 'asking') {
     text('Pair this computer?', `A browser calling itself ${view.name}, at ${view.origin}, asks to add ${count} to this computer.`);
@@ -69,9 +71,12 @@ function render(view) {
     names(view.listed || [], 'No host');
     return;
   }
-  rooms(['sending', 'waiting', 'done', 'failed'].includes(view.stage) ? view.rooms || [] : [], true);
+  rooms(['sending', 'waiting', 'cancelling', 'cancelled', 'cancel-failed', 'done', 'failed'].includes(view.stage) ? view.rooms || [] : [], true);
   if (view.stage === 'sending') text('Asking to join your rooms…', `Sending the requests to ${view.origin}.`);
-  else if (view.stage === 'waiting') text('Now confirm in your browser', `The requests are sent. In ${view.name}'s browser, press Confirm pairing.`);
+  else if (view.stage === 'waiting') text('Now confirm in your browser', `The requests are sent. In ${view.name}'s browser, open Have the desktop app? at the top of the room, then press Confirm pairing. Keep that browser tab open until it confirms.`);
+  else if (view.stage === 'cancelling') text('Cancelling pairing…', 'Withdrawing this computer’s pending requests.');
+  else if (view.stage === 'cancel-failed') text('Could not cancel pairing', 'Try again to withdraw the pending requests.');
+  else if (view.stage === 'cancelled') text('Pairing cancelled', 'Pending requests were withdrawn. Any rooms already joined are still on this computer. You can start a new pairing from your browser.');
   else if (view.stage === 'done') text('Paired', 'Your rooms are on this computer now.');
   else if (view.stage === 'failed') text('Pairing failed', '');
   else if (view.stage === 'expired') text('This pairing expired', 'Start again from your browser.');
@@ -109,8 +114,13 @@ $('unpair-go').addEventListener('click', async () => {
   try { await invoke('pair_unpair'); } catch (error) { $('after-problem').textContent = String(error); }
   refresh();
 });
+$('cancel-pairing').addEventListener('click', async () => {
+  $('cancel-pairing').disabled = true;
+  try { await invoke('pair_cancel'); } catch (error) { $('after-problem').textContent = String(error); }
+  refresh();
+});
 for (const id of ['reject', 'reject2', 'unpair-cancel']) $(id).addEventListener('click', close);
-$('close').addEventListener('click', () => (['sending', 'waiting', 'unpairing'].includes(stage) ? invoke('pair_close') : close()).catch(() => {}));
+$('close').addEventListener('click', () => (['sending', 'waiting', 'cancel-failed', 'unpairing'].includes(stage) ? invoke('pair_close') : close()).catch(() => {}));
 $('open').addEventListener('click', () => invoke('pair_open').catch(() => {}));
 refresh();
 setInterval(refresh, 700);

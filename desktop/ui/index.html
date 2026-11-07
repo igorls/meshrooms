@@ -5,13 +5,34 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Meshrooms</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="home.css">
 </head>
-<body>
-  <main>
-    <svg class="mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M5 8h8v8H5zM15 12h8v8h-8zM9 4h10v8M9 16v8h10v-4" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-    <h1 id="title">Meshrooms is running</h1>
-    <p id="detail">Checking the daemon…</p>
-    <p class="note">It keeps this machine's agents connected from the tray. Closing this window, or quitting the app, leaves the daemon running.</p>
+<body class="home">
+  <main aria-labelledby="title">
+    <header class="home-brand"><svg class="mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><path d="M5 8h8v8H5zM15 12h8v8h-8zM9 4h10v8M9 16v8h10v-4" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg><div><strong>Meshrooms</strong><span>by WormDB</span></div></header>
+    <h1 id="title">On this computer</h1>
+    <section class="home-status" aria-labelledby="connection-title">
+      <h2 id="connection-title"><span id="status-dot" aria-hidden="true"></span><span id="connection" aria-live="polite">Checking background service…</span></h2>
+      <p id="detail">Reading this computer’s status.</p>
+    </section>
+    <p id="problem" class="home-problem" role="alert" hidden></p>
+    <button id="open" class="home-primary" data-action="open" disabled><span id="open-label">Open your rooms</span><span aria-hidden="true">↗</span></button>
+    <p class="home-browser-note">Conversations open in your default browser.</p>
+    <section id="your-rooms" class="home-rooms" aria-labelledby="rooms-heading" hidden>
+      <h2 id="rooms-heading">Your rooms</h2>
+      <p id="rooms-problem" role="status" hidden></p>
+      <ul id="rooms-list"></ul>
+    </section>
+    <div class="home-tools" aria-label="Agent controls">
+      <button data-action="review">Review agents<span>Check sessions, pause or resume</span></button>
+      <button id="approvals" data-action="approvals">Approvals<span id="approvals-detail">Review requests before they run</span></button>
+    </div>
+    <div class="home-settings">
+      <label class="home-login"><input id="login" type="checkbox" disabled><span>Start at login<small id="login-detail">Checking login settings…</small></span></label>
+      <div class="home-service"><button id="service" data-action="start" disabled>Start background service</button><button data-action="refresh">Refresh status</button><button data-action="logs">Open logs</button></div>
+    </div>
+    <p id="activity" class="home-activity" role="status" aria-live="polite"></p>
+    <footer>Closing this window keeps Meshrooms in the tray.<br>Quitting the app leaves the background service running.</footer>
   </main>
   <script src="main.js"></script>
 </body>

@@ -20,6 +20,7 @@ import { foldBoard, taskBody, validTaskBody, type TaskChange } from '../src/brow
 import type { TaskStatus } from '../src/collab';
 import { castVote, openDecision, reviseDecision, type DecisionMode } from '../src/browser/decisions';
 import { MAX_REACTION_KEYS_PER_MEMBER, isReactionEmoji, liveKeysForMember, memberReacted } from '../src/browser/reactions';
+import { isRetracted } from '../src/browser/retractions';
 import { countUnread } from '../src/browser/unread';
 import { DEVICE_ID, PAIRING_MAX_ROOMS, decodeSecret, pairingMessage, pairingName } from '../src/browser/pairing';
 import { PUBLIC_ROOM_SERVICE } from '../src/browser/protocol';
@@ -265,6 +266,39 @@ export async function pairRooms(input: { origin: unknown; rooms: unknown; name: 
   return { deviceId: identity.id, created: made.created, origin, rooms: results };
 }
 
+/** Cancel only the pending companion requests of this pairing. Admitted rooms and the person's key stay intact. */
+export async function cancelPairing(input: { origin: unknown; rooms: unknown; device: unknown }, stop: (agent: BrowserAgent) => Promise<StopOutcome>, home = personHome()) {
+  const origin = roomService(input.origin), paired = pairedWith(home);
+  if (!paired || paired.origin !== origin || paired.device !== input.device) throw new Error('This is not the browser pairing held by this app.');
+  const wanted = typeof input.rooms === 'string' ? [...new Set(input.rooms.split(','))] : [];
+  if (!wanted.length || wanted.length > PAIRING_MAX_ROOMS || !wanted.every(r => UUID.test(r))) throw new Error('Give the rooms of this pairing as room ids.');
+  const identity = requireIdentity(home), cancelled = new Set<string>();
+  const rooms: { roomId: string; state: 'cancelled' | 'joined' | 'failed'; title?: string | null; error?: string }[] = [];
+  for (const roomId of wanted) {
+    const known = personRooms(home).find(r => r.roomId === roomId && r.origin === origin);
+    if (!known) { rooms.push({ roomId, state: 'cancelled' }); continue; }
+    const agent = personAgent(roomId, home, origin);
+    try {
+      const status = await agent.command('status', { session: randomUUID() });
+      if (status?.roomId !== roomId || status?.deviceId !== identity.id) throw new Error('The room service gave an unexpected answer.');
+      if (status.memberId) { rooms.push({ roomId, title: status.title ?? null, state: 'joined' }); continue; }
+      if (status.request?.state === 'pending') {
+        if (status.request.kind !== 'companion') throw new Error('This request is not a desktop pairing.');
+        await agent.command('cancel', { requestId: status.request.id });
+      }
+      if (await stop(agent) === 'alive') throw new Error('Its background process is still closing. Try cancelling again.');
+      rmSync(join(agent.dir, PERSON_ROOM), { force: true });
+      cancelled.add(roomId);
+      rooms.push({ roomId, title: status.title ?? null, state: 'cancelled' });
+    } catch (error) {
+      rooms.push({ roomId, state: 'failed', error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  // Keep caches and the identity, and read the list again so other rooms added meanwhile are preserved.
+  if (cancelled.size) replaceFile(join(home, PERSON_ROOMS), JSON.stringify(personRooms(home).filter(r => r.origin !== origin || !cancelled.has(r.roomId)), null, 2));
+  return { cancelled: !rooms.some(r => r.state === 'failed'), rooms };
+}
+
 /**
  * `person titles`: the rooms a pairing link names, as their room service shows them to anyone (GET /api/lobby/rooms/:id),
  * for the app's window to list before the final Pair. Plain, short text; a room that doesn't answer is null.
@@ -455,15 +489,15 @@ export function markReadUpTo(agent: BrowserAgent, messageId: unknown) {
   return { read: body.id };
 }
 
-/** A message as the local API hands it out: plain text and metadata, never a signature or a key. */
-export type LocalMessage = { id: string; authorId: string; author: string; role: 'human' | 'agent'; own: boolean; text: string; at: string; replyTo?: string;
+/** A message as the local API hands it out: plain text and metadata, never a signature or a key. `deleted`: its author deleted it, and its text is empty. */
+export type LocalMessage = { id: string; authorId: string; author: string; role: 'human' | 'agent'; own: boolean; text: string; at: string; replyTo?: string; deleted?: true;
   attachments?: { id: string; name: string; type: string; size: number }[] };
 export function localMessages(agent: BrowserAgent, stored = agent.messages()): LocalMessage[] {
   const { memberId, members } = agent.members(), names = new Map(members.map(m => [m.id, m]));
-  return stored.map(({ packet: { body } }) => {
+  return stored.map(({ packet: { body }, retracted }) => {
     const author = names.get(body.memberId);
     return { id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human', own: body.memberId === memberId,
-      text: shownText(body), at: new Date(body.at).toISOString(), ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+      text: shownText(body), at: new Date(body.at).toISOString(), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(retracted ? { deleted: true as const } : {}),
       ...(body.attachments?.length ? { attachments: body.attachments.map(({ id, name, type, size }) => ({ id, name, type, size })) } : {}) };
   });
 }
@@ -624,15 +658,27 @@ export async function queueTask(agent: BrowserAgent, input: { requestId?: unknow
 export async function queueReaction(agent: BrowserAgent, input: { requestId?: unknown; messageId?: unknown; emoji?: unknown }) {
   const memberId = admittedIn(agent), id = requestIdOf(input.requestId);
   if (!isReactionEmoji(input.emoji)) throw httpError(400, 'Choose one of the room’s reaction emoji.');
-  if (typeof input.messageId !== 'string' || !agent.messages().some(m => m.packet.body.id === input.messageId)) throw httpError(404, 'That message is not in this room.');
+  if (typeof input.messageId !== 'string' || !agent.messages().some(m => m.packet.body.id === input.messageId && !isRetracted(m))) throw httpError(404, 'That message is not in this room.');
   const done = () => agent.reactionOps().some(p => p.body.id === id);
   if (!done()) {
     const already = memberReacted(agent.reactionChips(), input.messageId, input.emoji, memberId);
-    if (!already && liveKeysForMember(agent.reactionOps().map(p => p.body), memberId) >= MAX_REACTION_KEYS_PER_MEMBER)
+    if (!already && liveKeysForMember(agent.countedReactions(), memberId) >= MAX_REACTION_KEYS_PER_MEMBER)
       throw httpError(409, 'You have too many reactions in this room. Remove some before adding more.');
     enqueue(agent, id, { type: 'reaction', id, messageId: input.messageId, emoji: input.emoji });
   }
   return { messageId: input.messageId, status: await signed(agent, id, done) };
+}
+/** Deleting the person's own message, for everyone. Any of their devices can, so it is the member that is compared. */
+export async function queueRetract(agent: BrowserAgent, input: { requestId?: unknown; messageId?: unknown }) {
+  const memberId = admittedIn(agent), id = requestIdOf(input.requestId), messageId = input.messageId;
+  const held = () => agent.messages().find(m => m.packet.body.id === messageId);
+  const message = held();
+  if (!message) throw httpError(404, 'That message is not in this room.');
+  if (message.packet.body.memberId !== memberId) throw httpError(403, 'You can only delete your own messages.');
+  // Deleted is what was asked for, even if another of the person's devices got there first.
+  const done = () => { const current = held(); return !!current && isRetracted(current); };
+  if (!done()) enqueue(agent, id, { type: 'retract', id, messageId });
+  return { messageId, status: await signed(agent, id, done) };
 }
 /**
  * A decision change from the page: open one, vote (or take a vote back with `optionId: null`), add an option, close or
@@ -698,7 +744,7 @@ export function roomView(room: PersonRoom, agent: BrowserAgent, options: { limit
     end = all.findIndex(m => m.packet.body.id === options.before);
     if (end < 0) throw httpError(404, 'That message is not in this room (it may have left the history window).');
   }
-  const page = all.slice(Math.max(0, end - limit), end);
+  const start = Math.max(0, end - limit), page = all.slice(start, end);
   const transfers = agent.transfers(), files: Record<string, { held: boolean; transfer?: unknown }> = {};
   for (const { packet: { body } } of page) for (const ref of body.attachments ?? []) {
     const held = agent.files.has(ref.sha256);
@@ -709,7 +755,9 @@ export function roomView(room: PersonRoom, agent: BrowserAgent, options: { limit
   const { memberId, title } = agent.members();
   return { roomId: room.roomId, origin: room.origin, title: title ?? null, ...roomState(agent), memberId: memberId ?? null,
     status: personRoomStatus(agent) ?? null,
-    messages: page.map(({ packet: { body }, targets, receipts }) => ({ packet: { body }, targets, receipts })), more: end - page.length > 0,
+    messages: page.map(({ packet: { body }, targets, receipts, retracted }) => ({ packet: { body }, targets, receipts, ...(retracted ? { retracted } : {}) })), more: end - page.length > 0,
+    // Older pages the page already loaded aren't read again, so it hears here of what was deleted in them.
+    deleted: all.slice(0, start).filter(isRetracted).map(m => m.packet.body.id),
     taskOps: agent.taskOps().map(p => p.body), decisionOps: agent.decisionOps().map(p => p.body), reactions: agent.reactionChips(),
     files, read: readUpTo(agent, room.joinedAt) };
 }

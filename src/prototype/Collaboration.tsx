@@ -188,7 +188,8 @@ export function useStickToBottom(threshold = 80) {
   }, [threshold]);
   /** Your own message always shows; others' are counted while the reader is scrolled up. */
   const arrived = useCallback((own: boolean) => { if (own) toBottom(); else if (!pinned.current) setUnread(count => count + 1); }, [toBottom]);
-  return { ref, onScroll, toBottom, arrived, unread, following };
+  const pauseFollowing = useCallback(() => { pinned.current = false; setFollowing(false); }, []);
+  return { ref, viewport: element, onScroll, toBottom, arrived, unread, following, pauseFollowing };
 }
 
 /** Sizes a textarea to its content; its CSS max-height caps the growth, after which it scrolls. */

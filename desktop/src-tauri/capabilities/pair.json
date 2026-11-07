@@ -9,6 +9,7 @@
     "allow-pair-verify",
     "allow-pair-confirm",
     "allow-pair-reject",
+    "allow-pair-cancel",
     "allow-pair-unpair",
     "allow-pair-close",
     "allow-pair-open"

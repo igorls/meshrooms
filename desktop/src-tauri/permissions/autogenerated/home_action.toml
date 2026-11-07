@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-home-action"
+description = "Enables the home_action command without any pre-configured scope."
+commands.allow = ["home_action"]
+
+[[permission]]
+identifier = "deny-home-action"
+description = "Denies the home_action command without any pre-configured scope."
+commands.deny = ["home_action"]

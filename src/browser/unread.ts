@@ -56,6 +56,7 @@ export function mentionsMember(body: UnreadBody, memberId: string, participants:
 /**
  * Messages by others after the read position, and how many of them are for this member. A position whose message
  * is no longer stored (the rolling window evicted it) means everything stored arrived after it, so all of it counts.
+ * A deleted message, the only kind with no text, holds its place as a position but is nothing to read.
  */
 export function countUnread(bodies: UnreadBody[], position: ReadPosition, memberId: string, members: BrowserMember[]): UnreadCount {
   let start = 0;
@@ -66,7 +67,7 @@ export function countUnread(bodies: UnreadBody[], position: ReadPosition, member
   let unread = 0, mentions = 0;
   for (let i = start; i < bodies.length; i++) {
     const body = bodies[i];
-    if (body.memberId === memberId) continue;
+    if (body.memberId === memberId || !body.text) continue;
     unread++;
     if (mentionsMember(body, memberId, participants, authorOf)) mentions++;
   }

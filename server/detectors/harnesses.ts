@@ -19,7 +19,7 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, type 
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { recentClaudeSessions, claudeConfigDir, claudeProjectDir } from '../agent-live';
-import { resolveProgram, type Program } from '../agent-watch';
+import { locateProgram, resolveProgram, type Program } from '../agent-watch';
 import { detectHermes, runHermesCommand, type HermesRunner } from './hermes';
 
 export type HarnessId = 'claude' | 'codex' | 'hermes' | 'exec';
@@ -39,6 +39,26 @@ export const SESSION_LIMIT = 20, TITLE_CODE_POINTS = 60, FOLDER_CODE_POINTS = 40
 /** A prompt is read for its title only this far, and what is kept of it before the title is cut is this long. */
 export const PROMPT_SCAN_CHARS = 64 * 1024, TITLE_SOURCE_CHARS = 2 * 1024;
 export const VERSION_TIMEOUT_MS = 10_000, VERSION_MAX_BYTES = 4 * 1024;
+/** Desktop-only users need no separate CLI install just to list their chats. Fixed local bundle paths, never a shell. */
+export function resolveHarnessProgram(name: string, options: { platform?: NodeJS.Platform; env?: Record<string, string | undefined>; applications?: string[] } = {}): Program {
+  const platform = options.platform ?? process.platform, env = options.env ?? process.env;
+  try {
+    if (platform === 'win32') return resolveProgram(name, env, platform);
+    const file = locateProgram(name, env, platform);
+    if (file) return { file, prefix: [] };
+    throw new Error(`Couldn't find ${name} on PATH.`);
+  }
+  catch (error) {
+    if (name !== 'codex' || platform !== 'darwin') throw error;
+    for (const root of options.applications ?? ['/Applications', join(homedir(), 'Applications')]) {
+      for (const relative of ['ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex', 'Codex.app/Contents/Resources/codex']) {
+        const file = join(root, relative);
+        try { if (statSync(file).isFile()) return { file, prefix: [] }; } catch { /* Try the next known bundle. */ }
+      }
+    }
+    throw error;
+  }
+}
 /** The most of a transcript's start read for its title and folder; a first prompt after that leaves the title unknown. */
 export const HEAD_BYTES = 256 * 1024;
 /** The most Codex rollout files whose first line is read to find SESSION_LIMIT threads that aren't subagents'. */
@@ -50,7 +70,7 @@ export const CODEX_INDEX_BYTES = 2 * 1024 * 1024;
  * prompt and `cwd`). Codex CLI: 0.159.x (sessions/YYYY/MM/DD/rollout-*-<id>.jsonl with a session_meta first line, and
  * session_index.jsonl with thread names). Anything else fails closed.
  */
-export const CLAUDE_VERIFIED = /^2\.\d+\.\d+$/, CODEX_VERIFIED = /^0\.159\.\d+$/;
+export const CLAUDE_VERIFIED = /^2\.\d+\.\d+$/, CODEX_VERIFIED = /^0\.(159|163)\.\d+(?:-alpha\.\d+(?:\.\d+)?)?$/;
 
 /** The output of a command, or why there is none. Never stderr, never an exception's text. */
 export type CommandResult = { ok: true; stdout: string } | { ok: false; reason: 'not-found' | 'failed' | 'timeout' | 'output-limit' };
@@ -250,7 +270,7 @@ export type ScanDeps = {
   codexHome: string;
 };
 export const machineScanDeps = (): ScanDeps => ({
-  resolve: name => resolveProgram(name),
+  resolve: name => resolveHarnessProgram(name),
   run: (program, args) => runBounded(program, args),
   hermes: args => runHermesCommand(args, () => resolveProgram('hermes')),
   claudeDir: claudeConfigDir(),

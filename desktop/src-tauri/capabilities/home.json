@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "home-window",
+  "description": "Only the bundled desktop status window can read cached status and use its fixed tray actions. No core, plugin, remote page, or other window permissions.",
+  "windows": ["main"],
+  "permissions": ["allow-home-view", "allow-home-action"]
+}

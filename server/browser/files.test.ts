@@ -212,3 +212,16 @@ test("a stalled source is not asked again before the retry delay", async () => {
   expect(asked).toHaveLength(3);
 });
 
+
+test('a file let go while it is being hashed is not stored', async () => {
+  const bytes = png(), ref = await attachmentRef(bytes, 'gone.png');
+  let puts = 0;
+  const store: FileStore = { has: () => false, get: async () => undefined, put: async () => { puts++; } };
+  const transfers = new FileTransfers({ roomId, store, referenced: () => ref, channel: () => undefined, peers: () => [] }) as any;
+  transfers.want(ref);
+  Object.assign(transfers.incoming.get(ref.sha256), { source: 'peer', received: bytes.length, bytes });
+  const finishing = transfers.done('peer', ref.sha256);
+  transfers.keep(() => false);
+  await finishing;
+  expect(puts).toBe(0);
+});

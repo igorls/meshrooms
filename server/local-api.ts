@@ -35,6 +35,7 @@
  *   POST   /api/local/rooms/:id/read {messageId}          the read position moves there
  *   POST   /api/local/rooms/:id/task {requestId?, taskId?, change, removed?}
  *   POST   /api/local/rooms/:id/react {requestId?, messageId, emoji}
+ *   POST   /api/local/rooms/:id/retract {requestId?, messageId}  deletes the person's own message for everyone
  *   POST   /api/local/rooms/:id/decision {requestId?, action: open|vote|option|close|withdraw, ...}
  *   POST   /api/local/rooms/:id/command {action, payload} a room service action the person device signs (PAGE_COMMANDS)
  *   POST   /api/local/rooms/:id/files?name=               (application/octet-stream, 10 MB) a file for the next message
@@ -63,8 +64,8 @@ import { PERSON_STATUS_FILE, replaceFile } from './browser-agent';
 import { IMAGE_TYPES, MAX_ATTACHMENT_BYTES, isSha256 } from '../src/browser/files';
 import { sniff } from '../src/attachments';
 import {
-  VIEW_LIMIT, listedAgents, localMessages, markReadUpTo, messagePage, queueDecision, queueMessage, queueReaction, queueTask, roomMembers, roomState, roomSummary, roomView,
-  personHome, storeUpload, uploadAllowed, wantFile, createRoom, defaultRoomService, type LocalMessage,
+  VIEW_LIMIT, listedAgents, localMessages, markReadUpTo, messagePage, queueDecision, queueMessage, queueReaction, queueRetract, queueTask, roomMembers, roomState, roomSummary, roomView,
+  personHome, personAgent, personIdentity, storeUpload, uploadAllowed, wantFile, createRoom, defaultRoomService, type LocalMessage,
 } from './person';
 import { agentRoute, type AgentServices } from './local-agents';
 import { agentReview, pauseIdentity, resumeIdentity } from './agents';
@@ -143,7 +144,7 @@ type EventBody =
   | { type: 'message'; roomId: string; message: LocalMessage }
   | { type: 'members'; roomId: string; state: string; members: ReturnType<typeof roomMembers> }
   | { type: 'rooms'; roomIds: string[] }
-  /** Anything else of the room the page shows changed: its board, decisions, reactions, files, status or read position. */
+  /** Anything else of the room the page shows changed: its board, decisions, reactions, files, status, read position or a message deleted. */
   | { type: 'room'; roomId: string };
 export type LocalEvent = { seq: number; at: string } & EventBody;
 const KEPT_EVENTS = 1_000;
@@ -160,7 +161,7 @@ export class EventFeed {
   readonly epoch = randomUUID().slice(0, 8);
   private seq = 0;
   private events: LocalEvent[] = [];
-  private rooms = new Map<string, { messages: string; ids: Set<string>; members: string; shown: string; rest: string }>();
+  private rooms = new Map<string, { messages: string; ids: Set<string>; deleted: number; members: string; shown: string; rest: string }>();
   private roomList = '';
   /** Waiting long polls, each with whose they are (a hash of its session token), so one token can't take every slot. */
   private waiters = new Map<() => void, string>();
@@ -187,13 +188,16 @@ export class EventFeed {
       const members = ['members.json', 'admission.json', 'room-closed.json', 'runner-alive.json'].map(f => stamp(join(agent.dir, f))).join('|');
       const rest = ROOM_FILES.map(f => stamp(join(agent.dir, f))).join('|');
       if (known && known.messages === messages && known.members === members && known.rest === rest) continue;
-      const entry = known ?? { messages: '', ids: new Set<string>(), members: '', shown: '', rest: '' };
+      const entry = known ?? { messages: '', ids: new Set<string>(), deleted: 0, members: '', shown: '', rest: '' };
       if (known && known.rest !== rest) this.push({ type: 'room', roomId: room.roomId });
       entry.rest = rest;
       if (!known || known.messages !== messages) {
         const all = localMessages(agent);
-        if (known) for (const message of all) if (!entry.ids.has(message.id)) this.push({ type: 'message', roomId: room.roomId, message });
-        entry.ids = new Set(all.map(m => m.id)); entry.messages = messages;
+        // A message that arrives already deleted is no news; one deleted in place changes no ids, so it is reported as a change.
+        if (known) for (const message of all) if (!entry.ids.has(message.id) && !message.deleted) this.push({ type: 'message', roomId: room.roomId, message });
+        const deleted = all.filter(m => m.deleted).length;
+        if (known && deleted !== entry.deleted) this.push({ type: 'room', roomId: room.roomId });
+        entry.ids = new Set(all.map(m => m.id)); entry.deleted = deleted; entry.messages = messages;
       }
       if (!known || known.members !== members) {
         // The proof of life is rewritten every second; only what it changes about the room counts.
@@ -240,7 +244,7 @@ const MAX_BODY = 32_768, MAX_WAIT_SECONDS = 30;
 /** Marks the page as served by the local API, so it talks to the person device (LocalSource) instead of the room service. */
 export const LOCAL_PAGE_FLAG = '<meta name="meshrooms-source" content="local" />';
 /** The page's routes, all answered with the built index.html: the room list and one room. */
-const PAGE_ROUTES = /^\/(?:|rooms|r\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/;
+const PAGE_ROUTES = /^\/(?:|rooms|agent-apps|r\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/;
 /** Built assets: Vite's hashed files, by name only. Nothing else in the folder is ever served. */
 const ASSET = /^\/assets\/[\w.-]{1,200}$/;
 /** Room service actions the page may ask the person device to sign. Never create, status or signal (the runner's). */
@@ -405,6 +409,7 @@ export function localApiHandler({ access, port, feed, home = personHome(), distD
       if (part === 'notify' && !key && method === 'POST') { at(); return json(setNotifyLevel(home, roomId, (await body(request)).level)); }
       if (part === 'task' && !key && method === 'POST') return json(await queueTask(at().agent, await body(request)));
       if (part === 'react' && !key && method === 'POST') return json(await queueReaction(at().agent, await body(request)));
+      if (part === 'retract' && !key && method === 'POST') return json(await queueRetract(at().agent, await body(request)));
       if (part === 'decision' && !key && method === 'POST') return json(await queueDecision(at().agent, await body(request)));
       if (part === 'command' && !key && method === 'POST') return json(await command(at(), await body(request)));
       if (part === 'files' && !key && method === 'POST') {
@@ -436,7 +441,8 @@ export function localApiHandler({ access, port, feed, home = personHome(), distD
       const response = await fetch(`${origin}/api/lobby/health`, { redirect: 'error', signal: AbortSignal.timeout(5_000) });
       const bytes = await capped(response.headers.get('content-length'), response.body, 4_096);
       const health = bytes ? JSON.parse(Buffer.from(bytes).toString('utf8')) as { inviteRequired?: unknown } : undefined;
-      return { origin, ...(health?.inviteRequired === true ? { inviteRequired: true } : {}) };
+      const admission = health?.inviteRequired === true && personIdentity(home) ? await personAgent(crypto.randomUUID(), home, origin, { mkdir: false }).command('creation-status') : undefined;
+      return { origin, ...(health?.inviteRequired === true && !admission?.admitted ? { inviteRequired: true } : {}) };
     } catch { return { origin }; }
   }
   /**

@@ -35,6 +35,12 @@ describe('unread counts', () => {
     expect(countUnread(all, { at: 0 }, 'me', members)).toEqual({ unread: 3, mentions: 0 });
   });
 
+  test('a deleted message holds its place as a position but is nothing to read', () => {
+    const a = message('sam'), gone = message('sam', ''), mention = message('sam', '', a.id), c = message('sam');
+    expect(countUnread([a, gone, mention, c], { id: a.id, at: 0 }, 'me', members)).toEqual({ unread: 1, mentions: 0 });
+    expect(countUnread([a, gone, c], { id: gone.id, at: 0 }, 'me', members)).toEqual({ unread: 1, mentions: 0 });
+  });
+
   test('a position the rolling window evicted counts everything still stored', () => {
     const kept = [message('sam'), message('sam'), message('me')];
     expect(countUnread(kept, { id: 'evicted-long-ago', at: 0 }, 'me', members)).toEqual({ unread: 2, mentions: 0 });

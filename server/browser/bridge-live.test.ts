@@ -549,7 +549,7 @@ test('the watcher never overwrites a note the agent set itself while a live sess
   expect(logs).toContain('live session attached; not waking');
 });
 
-test('watch for Codex and Hermes resumes the session connect recorded for that harness, in its own format', async () => {
+test('watch for legacy Codex and Hermes resumes the session connect recorded for that harness, in its own format', async () => {
   const codexId = '0190a000-0000-7000-8000-00000000000c', hermesId = '20260101_000000_abcdef';
   expect(recordedSessionFor('codex', { id: codexId, harness: 'codex' })).toBe(codexId);
   expect(recordedSessionFor('codex', { id: codexId, harness: 'claude' })).toBeUndefined();
@@ -566,11 +566,11 @@ test('watch for Codex and Hermes resumes the session connect recorded for that h
       const watch = (...rest: string[]) => agentCli(['watch', '--room', r.roomId, ...rest]);
       // Nothing recorded: a thread must be named.
       record();
-      await expect(watch('--harness', 'codex')).rejects.toThrow('For Codex, name the thread to wake');
+      await expect(watch('--harness', 'codex', '--codex-delivery', 'headless')).rejects.toThrow('For Codex, name the thread to wake');
       await expect(watch('--harness', 'hermes', '--cwd', r.home)).rejects.toThrow('For Hermes, name the session to wake');
-      // Recorded for Codex: the thread is known, so watch goes on to its next check (here, the read-only sandbox it never loosens).
+      // Legacy Codex: the thread is known, so watch goes on to its read-only sandbox check.
       record({ id: codexId, harness: 'codex' });
-      await expect(watch('--harness', 'codex')).rejects.toThrow('never loosens it');
+      await expect(watch('--harness', 'codex', '--codex-delivery', 'headless')).rejects.toThrow('never loosens it');
       // Recorded for another harness: not used.
       await expect(watch('--harness', 'hermes', '--cwd', r.home)).rejects.toThrow('For Hermes, name the session to wake');
       record({ id: hermesId, harness: 'hermes' });

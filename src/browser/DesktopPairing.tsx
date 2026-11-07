@@ -22,12 +22,17 @@ type RoomState = 'waiting' | 'joined' | 'host' | 'missing' | 'failed';
 type Run = { phrase: string; href: string; rooms: (RecentRoom & { state: RoomState; problem?: string })[]; linking?: boolean; outcome?: 'paired' | 'expired'; problem?: string };
 const stateText: Record<RoomState, string> = { waiting: 'Waiting for the app', joined: 'Joined', host: 'Waiting for the host to admit it', missing: 'The app hasn’t asked here yet', failed: 'Not paired' };
 
-export function DesktopPairing({ rooms, name, device, link }: { rooms: RecentRoom[]; name: string; device?: string; link(roomId: string, secret: string): Promise<Record<string, unknown>> }) {
+export function DesktopPairing({ rooms, name, device, link, onActiveChange }: { rooms: RecentRoom[]; name: string; device?: string; link(roomId: string, secret: string): Promise<Record<string, unknown>>; onActiveChange?(active: boolean): void }) {
   const [run, setRun] = useState<Run>();
   /** The secret of the pairing shown, while it lasts. */
   const pairing = useRef<{ secret: Uint8Array; until: number; stopped: boolean } | undefined>(undefined);
   const forget = () => { if (pairing.current) { pairing.current.stopped = true; pairing.current.secret.fill(0); } pairing.current = undefined; };
   useEffect(() => forget, []);
+  const active = !!run && !run.outcome;
+  useEffect(() => {
+    onActiveChange?.(active);
+    return () => onActiveChange?.(false);
+  }, [active, onActiveChange]);
 
   async function start() {
     forget();
@@ -91,7 +96,7 @@ export function DesktopPairing({ rooms, name, device, link }: { rooms: RecentRoo
         <code className="browser-link-code browser-pairing-phrase">{run.phrase}</code>
         <p>The app shows a window asking to pair with your browser. If it didn’t open, <a href={run.href} className="browser-pairing-open">open Meshrooms</a>. No app yet? <a href={DOWNLOAD_URL} target="_blank" rel="noreferrer">Download Meshrooms</a>.</p>
         <p>When the app says it has asked to join your rooms, confirm here.</p>
-        {waiting && <button className="secondary" disabled={run.linking} onClick={() => void confirm()}>{run.linking ? 'Confirming…' : 'Confirm pairing'}</button>}</>}
+        {waiting && <button className="primary" data-desktop-pairing-confirm disabled={run.linking} onClick={() => void confirm()}>{run.linking ? 'Confirming…' : 'Confirm pairing'}</button>}</>}
     {run.problem && <p role="alert">{run.problem}</p>}
     <ul className="browser-pairing-rooms">{run.rooms.map(r => <li key={r.id}><span>{r.title}</span><span className={`is-${r.state}`}>{r.problem ?? stateText[r.state]}</span></li>)}</ul>
     <button className="browser-text-link" onClick={cancel}>{run.outcome ? 'Done' : 'Cancel pairing'}</button>

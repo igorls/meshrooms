@@ -24,6 +24,7 @@ import { locksDir, readBinding, rotateLog } from './agent-daemon';
 import { tryLock } from './locks';
 import { listedAgents, personHome } from './person';
 import { HARNESS_IDS, HARNESS_LABELS, RENDERS_BLANK, plainText, type HarnessId } from './detectors/harnesses';
+import { harnessPreferences, type CodexDelivery } from './harness-apps';
 
 /** Files in the person's folder. */
 export const AGENTS_FILE = 'agents.json', APPROVALS_FILE = 'approvals.json', AGENTS_LOG = 'agents.log', AGENTS_LOCK = 'agents.lock';
@@ -308,7 +309,7 @@ function identityRooms(home: string, identity: AgentIdentity, now = Date.now()):
     return [{ roomId, title: plainText(title, 120), memberId: memberId ?? null, state, runner: typeof proof?.at === 'number' && now - proof.at < 15_000 ? 'alive' as const : 'down' as const,
       binding: { wakes, ...(record ? { kind: record.kind, state: record.state, ...(record.reason ? { reason: record.reason } : {}),
           ...(record.error ? { error: plainText(pathFree(record.error), 300) ?? undefined } : {}) } : {}),
-        ...(binding ? { session: binding.session ?? null } : record?.session ? { session: record.session } : {}),
+        ...(binding ? { session: binding.session ?? null, ...(binding.config.harness === 'codex' ? { delivery: binding.config.codexDelivery ?? 'headless' } : {}) } : record?.session ? { session: record.session } : {}),
         ...(binding?.offReason ? { offReason: plainText(pathFree(binding.offReason), 300) ?? undefined } : {}),
         ...(typeof why === 'string' && plainText(pathFree(why), 300) ? { why: plainText(pathFree(why), 300)! } : {}),
         ...(record?.paused !== undefined && wakes === 'off' && !held ? { pausedInApp: true as const } : {}),
@@ -480,6 +481,9 @@ const setBound = (home: string, identity: AgentIdentity, roomId: string, record:
  */
 export async function bindNewSession(roomId: string, key: string, deps: AgentDeps, home = personHome(), options: { background?: boolean } = {}) {
   const { identity, agent } = identityInRoom(home, roomId, key);
+  const preference = harnessPreferences(home)[identity.harness];
+  if (!preference.enabled) throw httpError(409, 'Enable this integration in Agent apps first.');
+  if (identity.harness === 'codex' && preference.codexDelivery === 'desktop') throw httpError(409, 'Open a chat in Codex and choose Use an existing session. Meshrooms delivers into that chat.');
   if (roomClosed(agent)) throw httpError(410, 'This room is closed.');
   const wake = wakeDir({ roomDir: agent.dir });
   mkdirSync(wake, { recursive: true, mode: 0o700 });
@@ -510,7 +514,7 @@ export async function bindNewSession(roomId: string, key: string, deps: AgentDep
       reason = 'bind-refused';
       // Deleted while its session started (delete waits for this lock, so only from outside the daemon): nothing is bound.
       stillThere(home, identity.id);
-      const bound = await bindChecked(deps, agent, { '--harness': harness, '--session': session, ...(harness === 'codex' ? {} : { '--cwd': wake }), ...model });
+      const bound = await bindChecked(deps, agent, { '--harness': harness, '--session': session, ...(harness === 'codex' ? { '--codex-delivery': 'headless' } : { '--cwd': wake }), ...model });
       await setBound(home, identity, roomId, { kind: 'new', state: 'bound', session, at: Date.now() });
       logAgents(home, { event: 'bound', identity: identity.id, room: roomId, harness, session, warnings: bound.warnings?.length ?? 0 });
       return session;
@@ -591,7 +595,7 @@ function rebindValues(identity: AgentIdentity, record: BoundRecord, agent: Brows
       throw httpError(409, 'That session\'s folder changed since you approved it, so it was not bound again. Bind it from the Meshrooms page.');
     cwd = record.cwd;
   }
-  return { '--harness': identity.harness, '--session': record.session, ...(cwd !== undefined ? { '--cwd': cwd } : {}), ...model };
+  return { '--harness': identity.harness, '--session': record.session, ...(identity.harness === 'codex' ? { '--codex-delivery': readBinding(agent.dir)?.config.codexDelivery ?? 'headless' } : {}), ...(cwd !== undefined ? { '--cwd': cwd } : {}), ...model };
 }
 /**
  * Resumes an identity's wakes in a room from the app's Review window: binds the recorded session again (never a new one,
@@ -676,6 +680,7 @@ export function agentReview(home = personHome(), now = Date.now(), daemonStarted
 export type Approval =
   | { id: string; kind: 'identity'; name: string; harness: HarnessId; model?: string; requestedAt: number; expiresAt: number }
   | { id: string; kind: 'bind-existing'; identityId: string; roomId: string; harness: HarnessId; session: string; title: string | null; folder: string | null;
+      codexDelivery?: CodexDelivery;
       /** The full folder the session would be bound to work in (null for Codex, which works in the room's own): shown in the app, part of the digest. */
       cwd: string | null; requestedAt: number; expiresAt: number };
 function validApproval(value: unknown, now: number): value is Approval {
@@ -684,7 +689,8 @@ function validApproval(value: unknown, now: number): value is Approval {
   if (!HARNESS_IDS.includes(a.harness as HarnessId)) return false;
   // Exactly the fields of its kind, each checked: anything else in the file (a command, rooms, a folder, tools) makes the
   // entry no request at all, so the app always shows everything an approval would apply.
-  const keys = Object.keys(a).sort().join(',');
+  if (a.codexDelivery !== undefined && (a.kind !== 'bind-existing' || a.harness !== 'codex' || !['desktop', 'headless'].includes(a.codexDelivery as string))) return false;
+  const keys = Object.keys(a).filter(key => key !== 'codexDelivery').sort().join(',');
   const shownText = (v: unknown, limit: number) => v === null || (typeof v === 'string' && plainText(v, limit) === v);
   if (a.kind === 'identity') return (keys === 'expiresAt,harness,id,kind,name,requestedAt' || keys === 'expiresAt,harness,id,kind,model,name,requestedAt')
     && nameProblem(a.name) === undefined && a.harness !== 'exec' && (a.model === undefined || (typeof a.model === 'string' && MODEL.test(a.model)));
@@ -770,18 +776,21 @@ function existingCwd(deps: Pick<AgentDeps, 'sessionFolder'>, harness: HarnessId,
  */
 export async function requestExistingBinding(roomId: string, key: string, session: { id: string; title: string | null; folder: string | null }, deps: Pick<AgentDeps, 'sessionFolder'>, home = personHome()) {
   const { identity, agent } = identityInRoom(home, roomId, key);
+  const preference = harnessPreferences(home)[identity.harness];
+  if (!preference.enabled) throw httpError(409, 'Enable this integration in Agent apps first.');
   if (roomClosed(agent)) throw httpError(410, 'This room is closed.');
   if (identity.harness === 'exec') throw httpError(400, 'A custom-command agent has no sessions to bind.');
   const cwd = existingCwd(deps, identity.harness, session.id, agent);
   if (cwd === undefined) throw httpError(409, 'That session\'s folder could not be found, so it can\'t be bound.');
-  return fileApproval({ kind: 'bind-existing', identityId: identity.id, roomId, harness: identity.harness, session: session.id, title: session.title, folder: session.folder, cwd }, home);
+  return fileApproval({ kind: 'bind-existing', identityId: identity.id, roomId, harness: identity.harness, session: session.id, title: session.title, folder: session.folder, cwd,
+    ...(identity.harness === 'codex' ? { codexDelivery: preference.codexDelivery ?? 'desktop' } : {}) }, home);
 }
 /**
  * The app's answer to an approval. Reject drops it. Approve does what it asked: makes the identity, or binds the existing
  * session (bind, with the session's own folder for Claude Code). An approval whose action fails stays waiting, with
  * the reason returned, so the person can fix the cause or reject it.
  */
-export async function decideApproval(id: string, approve: boolean, deps: AgentDeps, home = personHome(), shown?: unknown, detected: (harness: HarnessId) => Promise<boolean> = async () => true) {
+export async function decideApproval(id: string, approve: boolean, deps: AgentDeps, home = personHome(), shown?: unknown, detected: (harness: HarnessId) => Promise<boolean> = async () => true, deliveryReview?: unknown) {
   if (!UUID.test(id)) throw httpError(400, 'Use an approval id.');
   const approval = readApprovals(home).find(a => a.id === id);
   if (!approval) throw httpError(404, 'That approval is not waiting any more.');
@@ -790,6 +799,7 @@ export async function decideApproval(id: string, approve: boolean, deps: AgentDe
   // The digest covers the request and, for a bind, the labels it was shown with and the model it applies.
   const labels = approvalLabeller(home)(approval);
   if (typeof shown !== 'string' || shown !== approvalDigest(approval, labels)) throw httpError(409, 'This request changed since it was shown, or the approval named no digest. Look at it again before approving.');
+  if (approval.kind === 'bind-existing' && approval.codexDelivery === 'desktop' && deliveryReview !== 'desktop-v1') throw httpError(409, 'Update the Meshrooms app to review desktop delivery and the existing chat’s permissions before approving.');
   let result: Record<string, unknown>;
   if (approval.kind === 'identity') {
     // Only a harness this machine has: what the app showed is what is made, and nothing more (no room, no binding).
@@ -803,6 +813,7 @@ export async function decideApproval(id: string, approve: boolean, deps: AgentDe
     if (existingCwd(deps, approval.harness, approval.session, agent) !== approval.cwd) throw httpError(409, 'That session\'s folder changed since it was shown, so it was not bound. Reject this and ask again.');
     mkdirSync(wakeDir({ roomDir: agent.dir }), { recursive: true, mode: 0o700 });
     await withIdentity(identity.id, async () => (stillThere(home, identity.id), bindChecked(deps, agent, { '--harness': approval.harness, '--session': approval.session,
+      ...(approval.harness === 'codex' ? { '--codex-delivery': approval.codexDelivery ?? 'headless' } : {}),
       ...(approval.cwd !== null ? { '--cwd': approval.cwd } : {}), ...('identityModel' in labels && labels.identityModel ? { '--model': labels.identityModel } : {}) })));
     await setBound(home, identity, approval.roomId, { kind: 'existing', state: 'bound', session: approval.session, ...(approval.cwd !== null ? { cwd: approval.cwd } : {}), at: Date.now() });
     result = { identityId: identity.id, roomId: approval.roomId, session: approval.session };

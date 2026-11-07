@@ -2,7 +2,7 @@
 export const browserProtocol = 'meshrooms-browser-v1';
 export type Command = {
   protocol: typeof browserProtocol; origin: string; id: string; at: number;
-  action: 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'repositories' | 'close';
+  action: 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'repositories' | 'close';
   roomId: string; payload: Record<string, unknown>;
 };
 export type SignedCommand = { command: Command; publicKey: string; signature: string };

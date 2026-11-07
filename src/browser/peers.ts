@@ -12,6 +12,7 @@ import {
   foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody, withinReactionKeyCap,
   type ReactionChip, type ReactionEmoji, type ReactionPacket,
 } from './reactions';
+import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket } from './retractions';
 import { FenceError, StorageError, read, sign, update, type Fence } from './storage';
 import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRecord } from './activity';
 import { awaitingDelivery, windowHistory } from './history';
@@ -22,8 +23,8 @@ import { QuotaDrops, ReceiveQuota, type QuotaKind } from './quota';
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
 const isId = (value: unknown) => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
-type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body'] | DecisionBody | VoteBody | ReactionPacket['body']; signature: string };
-export type SavedMessage = { packet: Packet & { body: MessageBody }; targets: string[]; receipts: string[] };
+type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body'] | DecisionBody | VoteBody | ReactionPacket['body'] | RetractBody; signature: string };
+export type SavedMessage = { packet: Packet & { body: MessageBody }; targets: string[]; receipts: string[]; retracted?: true };
 /**
  * `sent`: when each outbox message was last sent on this connection, so an unconfirmed one isn't resent every tick.
  * `queue` paces this device's board, decisions and reactions onto the channel; `resync` answers the peer's requests for them.
@@ -60,6 +61,8 @@ export class BrowserPeers {
   private reactionOps: ReactionPacket[] = [];
   /** Verified reactions whose message has not arrived yet; retried when that message is stored. */
   private pendingReactions: ReactionPacket[] = [];
+  private retractKey: string;
+  private retractOps: RetractPacket[] = [];
   private filesKey: string;
   private index: FileIndex = {};
   private refs = new Map<string, AttachmentRef>();
@@ -83,6 +86,7 @@ export class BrowserPeers {
     this.boardKey = `board:${deviceId}:${roomId}`;
     this.decisionKey = `decisions:${deviceId}:${roomId}`;
     this.reactionKey = `reactions:${deviceId}:${roomId}`;
+    this.retractKey = `retractions:${deviceId}:${roomId}`;
     this.filesKey = `files:${deviceId}:${roomId}`;
     this.files = new FileTransfers({ roomId, referenced: sha => this.refs.get(sha), changed: () => this.notifyFiles(),
       store: { has: sha => sha in this.index, get: sha => this.readFile(sha), put: (sha, bytes, type) => this.storeFile(sha, bytes, type) },
@@ -112,6 +116,7 @@ export class BrowserPeers {
     this.messages = await read<SavedMessage[]>(this.key) || []; this.ops = await read<TaskPacket[]>(this.boardKey) || [];
     this.decisionOps = await read<DecisionPacket[]>(this.decisionKey) || [];
     this.reactionOps = await read<ReactionPacket[]>(this.reactionKey) || [];
+    this.retractOps = await read<RetractPacket[]>(this.retractKey) || [];
     this.index = await read<FileIndex>(this.filesKey) || {};
     for (const sha of Object.keys(this.index)) await this.fileUrl(sha);
     this.notify(); this.notifyBoard(); this.notifyDecisions(); this.notifyReactions(); this.syncFiles();
@@ -146,8 +151,10 @@ export class BrowserPeers {
     this.retained = retainedFiles(lists);
     this.files.keep(sha => this.retained.has(sha));
     for (const ref of this.retained.values()) this.files.want(ref);
-    if (Object.keys(this.index).some(sha => !this.retained.has(sha))) void this.fileChain(async () => {
+    // Always queued, behind any write under way, which the index doesn't show yet.
+    void this.fileChain(async () => {
       const evicted = Object.keys(this.index).filter(sha => !this.retained.has(sha));
+      if (!evicted.length) return;
       const next = Object.fromEntries(Object.entries(this.index).filter(([sha]) => this.retained.has(sha)));
       await this.put([[this.filesKey, next]], evicted.map(sha => this.fileKey(sha)));
       this.index = next;
@@ -186,6 +193,11 @@ export class BrowserPeers {
       for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* The board is exchanged again on reconnect. */ } }
     });
   }
+  /** Reactions on a deleted message are hidden and can't be taken back, so they don't count toward a member's cap. */
+  private countedReactions() {
+    const gone = new Set(this.messages.filter(isRetracted).map(m => m.packet.body.id));
+    return this.reactionOps.map(op => op.body).filter(op => !gone.has(op.messageId));
+  }
   private async addReactionOps(incoming: ReactionPacket[]) {
     const held = new Set(this.messages.map(m => m.packet.body.id));
     let ready: ReactionPacket[] = [];
@@ -195,7 +207,7 @@ export class BrowserPeers {
       else if (mayHoldPending(this.pendingReactions, op)) this.pendingReactions.push(op);
     }
     // Each member keeps at most MAX_REACTION_KEYS_PER_MEMBER live reactions here too, not only when sending.
-    ready = withinReactionKeyCap(this.reactionOps.map(op => op.body), ready);
+    ready = withinReactionKeyCap(this.countedReactions(), ready);
     if (!ready.length) return;
     let next = [...this.reactionOps, ...ready];
     if (next.length > COMPACT_REACTIONS_AT) next = compactReactions(next);
@@ -213,10 +225,11 @@ export class BrowserPeers {
     return this.transaction(async () => {
       if (!this.status?.memberId || this.stopped) throw new Error('Join the room before reacting.');
       if (!isReactionEmoji(emoji)) throw new Error('Choose one of the room’s reaction emoji.');
-      if (!this.messages.some(m => m.packet.body.id === messageId)) throw new Error('That message is not in this browser.');
+      const message = this.messages.find(m => m.packet.body.id === messageId);
+      if (!message || isRetracted(message)) throw new Error('That message is not in this browser.');
       const bodies = this.reactionOps.map(op => op.body);
       const remove = memberReacted(this.chips(), messageId, emoji, this.status.memberId);
-      if (!remove && liveKeysForMember(bodies, this.status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
+      if (!remove && liveKeysForMember(this.countedReactions(), this.status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
         throw new Error('You have too many reactions in this room. Remove some before adding more.');
       }
       const body = {
@@ -231,6 +244,45 @@ export class BrowserPeers {
         try { peer.channel.send(JSON.stringify(packet)); } catch { /* Reactions are exchanged again on reconnect. */ }
       }
     });
+  }
+  /** Keep verified retractions and remove what they name. The log and the messages are written together. */
+  private async addRetractionOps(incoming: RetractPacket[]) {
+    const { log, added } = addRetractions(this.retractOps, incoming, this.messages);
+    if (!added.length) return;
+    const { messages, changed } = applyRetractions(this.messages, log.map(op => op.body));
+    const puts: [string, unknown][] = [[this.retractKey, log]];
+    if (changed.length) puts.push([this.key, messages]);
+    await this.put(puts); this.retractOps = log;
+    if (changed.length) { this.messages = messages; this.notify(); this.syncFiles(); }
+  }
+  /** Delete one of this member's messages for everyone. Any of their devices can, so it is the member that is compared. */
+  async retract(messageId: string) {
+    return this.transaction(async () => {
+      if (!this.status?.memberId || this.stopped) throw new Error('Join the room before deleting a message.');
+      const message = this.messages.find(m => m.packet.body.id === messageId);
+      if (!message) throw new Error('That message is not in this browser.');
+      if (message.packet.body.memberId !== this.status.memberId) throw new Error('You can only delete your own messages.');
+      if (isRetracted(message)) return;
+      const body: RetractBody = { kind: 'retract', roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId, memberId: this.status.memberId, at: Date.now(), target: messageId };
+      const packet: RetractPacket = { body, signature: await sign(body) };
+      await this.addRetractionOps([packet]);
+      for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') {
+        try { peer.channel.send(JSON.stringify(packet)); } catch { /* Retractions are exchanged again on reconnect. */ }
+      }
+    });
+  }
+  /** A retraction relayed in an exchange is checked against its author's own device, current or former, not the sender's. */
+  private async acceptRetractions(sync: { roomId?: unknown; ops?: unknown }) {
+    if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
+    const accepted: RetractPacket[] = [];
+    const held = new Set(this.retractOps.map(op => op.body.id));
+    for (const op of sync.ops as RetractPacket[]) {
+      if (held.has(op?.body?.id)) continue;
+      const author = this.status?.devices?.find(d => d.id === op?.body?.deviceId) ?? this.status?.formerDevices?.find(d => d.id === op?.body?.deviceId);
+      if (!author || !validRetractBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
+      if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
+    }
+    await this.addRetractionOps(accepted);
   }
   private async acceptReactions(sync: { roomId?: unknown; ops?: unknown }) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
@@ -264,7 +316,7 @@ export class BrowserPeers {
   private sendState(peer: Peer) {
     if (!peer.queue) return;
     peer.resync.sent();
-    const chunks = [...syncChunks(this.roomId, this.ops), ...decisionChunks(this.roomId, this.decisionOps), ...reactionSyncChunks(this.roomId, this.reactionOps)];
+    const chunks = [...syncChunks(this.roomId, this.ops), ...decisionChunks(this.roomId, this.decisionOps), ...reactionSyncChunks(this.roomId, this.reactionOps), ...retractionSyncChunks(this.roomId, this.retractOps)];
     peer.queue.push(chunks.map(chunk => JSON.stringify(chunk)));
   }
   /** Ask a peer for its state again after this device dropped some of its packets under load. */
@@ -371,7 +423,7 @@ export class BrowserPeers {
     const { kept, evicted } = windowHistory([...this.messages, added], m => this.awaiting(m));
     await this.put([[this.key, kept]]); this.messages = kept; this.receiptsDirty = false;
     const stored = kept.at(-1) === added;
-    this.notify(stored ? added : undefined);
+    this.notify(stored && !isRetracted(added) ? added : undefined);
     if (added.packet.body.attachments || evicted.some(m => m.packet.body.attachments)) this.syncFiles();
     if (stored) await this.flushPendingReactions(added.packet.body.id);
   }
@@ -448,6 +500,7 @@ export class BrowserPeers {
         if ((packet as unknown as { kind?: unknown })?.kind === 'board') { await this.acceptBoard(packet as never); return; }
         if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never); return; }
         if ((packet as unknown as { kind?: unknown })?.kind === 'reactions') { await this.acceptReactions(packet as never); return; }
+        if ((packet as unknown as { kind?: unknown })?.kind === 'retractions') { await this.acceptRetractions(packet as never); return; }
         const b = packet?.body;
         if (!b || b.roomId !== this.roomId || b.deviceId !== id || !isId(b.id) || typeof packet.signature !== 'string' || !await verify(device.publicKey, b, packet.signature)) return;
         if (b.kind === 'message') {
@@ -456,11 +509,13 @@ export class BrowserPeers {
           if (b.replyTo !== undefined && !isId(b.replyTo)) return;
           if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
           const existing = this.messages.find(m => m.packet.body.id === b.id);
-          if (existing && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
+          // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
+          if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
           // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
           if (!existing) {
             if (!this.allowed(device.memberId, 'message', id)) return; // Unconfirmed, so its sender retries later.
-            await this.save({ packet: packet as SavedMessage['packet'], targets: [], receipts: [] });
+            const saved: SavedMessage = { packet: packet as SavedMessage['packet'], targets: [], receipts: [] };
+            await this.save(this.retractOps.some(op => mayRetract(op.body, b)) ? retractedStub(saved) : saved);
           }
           // A receipt means an IndexedDB transaction completed, not that a person read it.
           const receipt: ReceiptBody = { kind: 'receipt', roomId: this.roomId, id: b.id, deviceId: this.deviceId };
@@ -477,6 +532,9 @@ export class BrowserPeers {
         } else if (b.kind === 'reaction') {
           if (validReactionBody(b, this.roomId) && b.memberId === device.memberId && ![...this.reactionOps, ...this.pendingReactions].some(op => op.body.id === b.id)
             && this.allowed(device.memberId, 'reaction', id)) await this.addReactionOps([{ body: b, signature: packet.signature }]);
+        } else if (b.kind === 'retract') {
+          if (validRetractBody(b, this.roomId) && b.memberId === device.memberId && !this.retractOps.some(op => op.body.id === b.id)
+            && this.allowed(device.memberId, 'retract', id)) await this.addRetractionOps([{ body: b, signature: packet.signature }]);
         }
       }).catch(e => this.fail(e)).finally(() => { for (const from of this.incoming.done()) this.requestSync(from); });
     };

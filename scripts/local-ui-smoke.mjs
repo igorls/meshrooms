@@ -18,6 +18,9 @@ import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
+import { checkRoomDraft } from './check-room-draft.mjs';
+import { checkLocalRecovery } from './check-local-recovery.mjs';
+import { checkLocalHistory } from './check-local-history.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MESHROOMS_PLAYWRIGHT_MODULE || 'playwright');
 const origin = process.env.MESHROOMS_BROWSER_TEST_ORIGIN || 'http://127.0.0.1:14332';
@@ -63,7 +66,7 @@ async function page(viewport = { width: 1365, height: 900 }) {
 const visible = (p, text) => p.getByText(text, { exact: true }).first().waitFor();
 const flat = text => text.replace(/\s+/g, ' ').trim();
 const visibleMessage = (p, text) => p.waitForFunction(t => [...document.querySelectorAll('.message-text')].some(el => el.innerText.replace(/\s+/g, ' ').trim() === t), flat(text), { timeout: 45_000 });
-async function send(p, text) { await p.getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
+async function send(p, text) { await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
 async function snapshot(p, name) { await p.screenshot({ path: resolve(output, name), fullPage: true, animations: 'disabled' }); }
 try {
   // The host: a browser on the hosted site, as anyone would use it.
@@ -111,9 +114,25 @@ try {
     const page = new URL(url).origin, elsewhere = requests.filter(u => !u.startsWith('blob:') && !u.startsWith('data:') && new URL(u).origin !== page);
     assert.deepEqual(elsewhere, [], 'The local page talks to its own origin (127.0.0.1:<port>) only.');
   };
+  await local.route('**/api/local/service', route => route.fulfill({ json: { origin, inviteRequired: true } }));
   await local.goto(url);
-  // The ticket is spent and gone from the address; the page lists the room.
+  // An invite-only service must not make opening an already paired room look like beta enrollment.
   await local.waitForURL(u => !u.hash && u.pathname === '/rooms');
+  await local.getByRole('heading', { name: 'Your rooms', exact: true }).waitFor();
+  const invite = local.getByLabel('Invite code', { exact: true });
+  await invite.waitFor({ state: 'attached' });
+  assert.equal(await invite.isVisible(), false);
+  assert.equal(await local.getByLabel('Your name', { exact: true }).isVisible(), false);
+  await snapshot(local, 'local-ui-paired-rooms-desktop.png');
+  const landingViewport = local.viewportSize();
+  await local.setViewportSize({ width: 412, height: 915 });
+  assert.equal(await invite.isVisible(), false);
+  assert.equal(await local.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  await snapshot(local, 'local-ui-paired-rooms-mobile.png');
+  await local.setViewportSize(landingViewport);
+  await local.locator('#create-room > summary').click();
+  assert.equal(await invite.isVisible(), true, 'Only explicit room creation asks for an invite.');
+  await local.unroute('**/api/local/service');
   await local.getByRole('link', { name: /Local UI check/ }).first().click();
   await local.waitForURL(new RegExp(`/r/${roomId}$`));
   await visibleMessage(local, before);
@@ -121,6 +140,60 @@ try {
   ownOrigin();
   assert.ok(requests.some(u => u.includes('/api/local/rooms/')) && requests.some(u => u.includes('/assets/')));
   await snapshot(local, 'local-ui-room.png');
+  await checkRoomDraft(local, 'Local UI check', before);
+
+  // Desktop message preferences are this computer's, available to every person in the local room, never on the host's
+  // hosted page. Read failures must not pretend the default was loaded; failed writes keep the last saved selection.
+  await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  assert.equal(await host.getByRole('region', { name: 'Desktop notifications', exact: true }).count(), 0);
+  await host.getByRole('button', { name: 'Close room details', exact: true }).click();
+  const notifyPath = `**/api/local/rooms/${roomId}/notify`;
+  let failRead = true;
+  await local.route(notifyPath, route => {
+    if (failRead && route.request().method() === 'GET') {
+      failRead = false;
+      return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Notification settings could not be read.' }) });
+    }
+    return route.continue();
+  });
+  await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  const notifications = local.getByRole('region', { name: 'Desktop notifications', exact: true });
+  const notificationChoice = notifications.getByLabel('Message notifications', { exact: true });
+  await notifications.getByRole('alert').filter({ hasText: 'could not be read' }).waitFor();
+  assert.equal(await notificationChoice.isDisabled(), true);
+  await notifications.getByRole('button', { name: 'Try again', exact: true }).click();
+  await until(async () => await notificationChoice.inputValue() === 'mentions' && await notificationChoice.isEnabled(), 'the default notification preference');
+  await local.unroute(notifyPath);
+  await notificationChoice.selectOption('all');
+  await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
+  const notificationSettings = () => JSON.parse(readFileSync(join(person, 'notifications.json'), 'utf8')).rooms;
+  assert.equal(notificationSettings()[roomId], 'all');
+  await local.route(notifyPath, route => route.request().method() === 'POST'
+    ? route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Notification settings could not be saved.' }) })
+    : route.continue());
+  await notificationChoice.selectOption('off');
+  await notifications.getByRole('alert').filter({ hasText: 'could not be saved' }).waitFor();
+  assert.equal(await notificationChoice.inputValue(), 'all');
+  assert.equal(notificationSettings()[roomId], 'all');
+  await local.unroute(notifyPath);
+  await notificationChoice.selectOption('off');
+  await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
+  assert.equal(notificationSettings()[roomId], 'off');
+  await snapshot(local, 'local-ui-notifications-desktop.png');
+  await local.reload();
+  await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await until(async () => await notificationChoice.inputValue() === 'off' && await notificationChoice.isEnabled(), 'the notification preference after reload');
+  await notificationChoice.selectOption('mentions');
+  await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
+  assert.deepEqual(notificationSettings(), {});
+  await notificationChoice.selectOption('off');
+  await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
+  await local.setViewportSize({ width: 412, height: 884 });
+  await notifications.scrollIntoViewIfNeeded();
+  assert.equal(await local.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await snapshot(local, 'local-ui-notifications-mobile.png');
+  await local.setViewportSize({ width: 1365, height: 900 });
+  await local.getByRole('button', { name: 'Close room details', exact: true }).click();
 
   // Sent from the local page: the person device signs it, and the host's browser receives it peer to peer.
   const hello = 'Hello from the app on this computer';
@@ -187,16 +260,22 @@ try {
   await guest.getByLabel('Your name', { exact: true }).fill('Sam');
   await guest.getByRole('button', { name: 'Ask to join', exact: true }).click();
   await local.getByRole('button', { name: 'Admit', exact: true }).click({ timeout: 45_000 });
-  await guest.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
   await local.locator('.browser-requests').waitFor({ state: 'detached', timeout: 20_000 });
   await visible(local, '2 people in this room');
   await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await until(async () => await notificationChoice.inputValue() === 'mentions' && await notificationChoice.isEnabled(), 'a second room to keep its own notification preference');
+  await notificationChoice.selectOption('all');
+  await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
+  assert.deepEqual(notificationSettings(), { [roomId]: 'off', [hostedId]: 'all' });
   const handOff = local.locator('label.browser-setting', { hasText: 'Agents can hand tasks to each other' }).locator('input');
   await handOff.click();
   await visible(local, 'Agents can now hand tasks to each other.');
   await until(async () => { await host.reload(); await host.getByRole('button', { name: 'Room details', exact: true }).click();
     return host.locator('label.browser-setting', { hasText: 'Agents can hand tasks to each other' }).locator('input').isChecked(); }, 'the setting to reach the host', 45_000);
   await snapshot(local, 'local-ui-host-actions.png');
+  await checkLocalHistory(local);
+  await checkLocalRecovery(local);
 
   // After everything above (rooms, files, pictures, decisions, host actions), still nothing but its own origin.
   ownOrigin();
@@ -204,7 +283,8 @@ try {
   // The token belongs to this page: a fresh page without a ticket is not signed in.
   const stranger = await page();
   await stranger.goto(`${new URL(url).origin}/rooms`);
-  await stranger.getByText('to sign in on this browser').first().waitFor();
+  await stranger.getByRole('heading', { name: 'Open your rooms from the app', exact: true }).waitFor();
+  assert.equal(await stranger.getByRole('button', { name: 'Create room', exact: true }).count(), 0, 'A signed-out tab never offers to create replacement rooms.');
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ ok: true, room: roomId.slice(0, 8), localApi: new URL(url).origin }));
 } catch (error) {

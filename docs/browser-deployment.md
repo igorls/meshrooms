@@ -212,7 +212,7 @@ MESHROOMS_ROOM_IDLE_DAYS, so retiring by hand is for abuse or a host who can't.
 Confirm the exact UUID with `rooms list` and back up admission first. Never retire
 rooms by title or age in bulk, and don't remove other rooms to make a test pass.
 The service caps rooms at MESHROOMS_MAX_ROOMS (256) and hosted rooms per device at
-eight. Production smoke tests need an invite code (MESHROOMS_TEST_INVITE); mint a
+eight. Production smoke tests with a fresh identity need an invite code (MESHROOMS_TEST_INVITE); mint a
 one-use code for the run.
 
 Local and HTTPS origins have separate browser identity/history. Moving a local
@@ -227,3 +227,39 @@ Telegram. See [deploy/probe/README.md](../deploy/probe/README.md).
 
 References: [Bun installation](https://bun.sh/docs/installation),
 [Coturn configuration](https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf).
+
+
+## Private administration on the Tailnet
+
+`server/browser/admin-main.ts` is a separate service, bound only to `127.0.0.1:4330`.
+It is never mounted by the public coordinator and must never be added to the public
+Nginx configuration. Publish it with **Tailscale Serve**, not Funnel. Serve provides
+Tailnet-only HTTPS; the panel also requires a separate random admin credential.
+Tagged devices can use that credential without relying on user identity headers.
+Local services on the host are trusted; do not expose the loopback backend through
+another proxy. Tailscale ACLs should restrict the chosen HTTPS port to operators.
+
+Install `deploy/systemd/meshrooms-admin.service` as root after the release is on
+`/opt/meshrooms/current`. Make `/etc/meshrooms/admin.env` root:meshrooms mode 0640,
+with `MESHROOMS_BROWSER_DATA=/var/lib/meshrooms-browser`,
+`MESHROOMS_ADMIN_ORIGIN=https://<host>.<tailnet>.ts.net:8443`,
+`MESHROOMS_ADMIN_PORT=4330` and `MESHROOMS_ADMIN_PASSWORD_HASH=<sha256>`.
+Generate a fresh 32-byte random credential (`openssl rand -hex 32`) and store it in
+an operator password manager; hash its exact bytes with SHA-256 (no trailing newline).
+Only its hash belongs in the environment file. Do not log or commit the credential.
+
+After `systemctl daemon-reload` and `systemctl enable --now meshrooms-admin`, run
+`tailscale serve --bg --https=8443 http://127.0.0.1:4330` on the host. Inspect existing
+Serve configuration first so another service is not replaced. Verify `tailscale
+serve status --json` has no Funnel exposure, `ss -ltnp` shows the backend only on
+loopback, unauthenticated `/api/state` answers 401, and the public site does not
+expose the panel or its API. Test sign-in, mint, copy and revoke from an authorized
+Tailnet device. A credential rotation requires restarting the admin service; its
+in-memory sessions then expire. Restart this service after deploying new code.
+
+The panel shows invitation usage, admitted-person counts, and room metadata. Codes
+appear only in the successful mint response; subsequent listings cannot recover
+them. Mint and revoke actions are logged by invitation ID, without codes or passwords.
+Revoking an invite prevents future redemptions; already-admitted people retain access.
+Sign-in is rate-limited, sessions last eight hours, and mutations require an exact
+Origin plus a per-session CSRF token. Cookies are Secure, HttpOnly and SameSite=Strict.

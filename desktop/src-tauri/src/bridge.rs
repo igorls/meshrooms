@@ -160,6 +160,16 @@ fn bridge_variable(key: &str) -> bool {
     key.to_ascii_uppercase().starts_with("MESHROOMS_")
 }
 
+/// Login-launched apps get a system-only PATH. Append standard user/tool locations without reading shell profiles.
+#[cfg(target_os = "macos")]
+fn desktop_search_path(home: &Path, original: Option<&std::ffi::OsStr>) -> Result<std::ffi::OsString, String> {
+    let mut paths: Vec<PathBuf> = env::split_paths(original.unwrap_or(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"))).collect();
+    for dir in [home.join(".local/bin"), home.join(".bun/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")] {
+        if !paths.contains(&dir) { paths.push(dir); }
+    }
+    env::join_paths(paths).map_err(|error| format!("Cannot prepare the desktop command search path: {error}"))
+}
+
 /// Runs one bridge command (`bun --no-env-file meshrooms.js <args>`, from a private folder) and returns the last JSON
 /// object it printed. A failure is its last stderr line; a command that outlives its limit is stopped and reported.
 pub fn cli(bridge: &Bridge, args: &[&str]) -> Result<Value, String> {
@@ -171,6 +181,8 @@ pub fn cli(bridge: &Bridge, args: &[&str]) -> Result<Value, String> {
 pub fn cli_with_input(bridge: &Bridge, args: &[&str], input: Option<&[u8]>) -> Result<Value, String> {
     let mut command = hidden(&bridge.bun);
     command.arg("--no-env-file").arg(&bridge.script).args(args).current_dir(workdir()?);
+    #[cfg(target_os = "macos")]
+    command.env("PATH", desktop_search_path(&home()?, env::var_os("PATH").as_deref())?);
     for (key, _) in env::vars_os() {
         if bridge_variable(&key.to_string_lossy()) {
             command.env_remove(&key);
@@ -331,6 +343,21 @@ mod tests {
         for key in ["PATH", "USERPROFILE", "HOME", "XMESHROOMS_X", "MESHROOMS"] {
             assert!(!bridge_variable(key), "{key}");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn login_launch_finds_user_tools_without_overriding_an_operator_path() {
+        let home = Path::new("/test-home");
+        let defaults = desktop_search_path(home, None).unwrap();
+        let dirs: Vec<_> = env::split_paths(&defaults).collect();
+        assert_eq!(dirs.first().unwrap(), Path::new("/usr/bin"));
+        assert!(dirs.contains(&home.join(".local/bin")));
+        let original = std::ffi::OsStr::new("/custom/tools:/test-home/.local/bin:/usr/bin");
+        let augmented = desktop_search_path(home, Some(original)).unwrap();
+        let dirs: Vec<_> = env::split_paths(&augmented).collect();
+        assert_eq!(dirs.first().unwrap(), Path::new("/custom/tools"));
+        assert_eq!(dirs.iter().filter(|dir| **dir == home.join(".local/bin")).count(), 1);
     }
 
     #[test]

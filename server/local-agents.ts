@@ -30,6 +30,7 @@
  * extension, the app's own window can't. With approvals off these routes don't exist (404).
  */
 import { HARNESS_IDS, harnessScanner, type HarnessId } from './detectors/harnesses';
+import { agentApps, desktopDeliveries, harnessPreferences, resolveAppDelivery, saveHarnessPreference } from './harness-apps';
 import {
   approvalsView, bindNewSession, createIdentity, decideApproval, deleteIdentity, httpError, identityInRoom, listIdentities, pathFree, putIntoRoom, readApprovals, requestExistingBinding,
   unbindIdentity, type AgentDeps,
@@ -84,11 +85,28 @@ async function route(url: URL, method: string, ctx: AgentRouteContext): Promise<
     if (approval[1] && method === 'POST') {
       const approve = approval[2] === 'approve';
       const detected = async (harness: HarnessId) => (await services.scanner.scan()).some(s => s.harness === harness && s.detected);
-      return { status: 200, value: await decideApproval(approval[1], approve, services.deps, ctx.home, approve ? (await ctx.body()).digest : undefined, detected) };
+      const input = approve ? await ctx.body() : {};
+      return { status: 200, value: await decideApproval(approval[1], approve, services.deps, ctx.home, input.digest, detected, input.deliveryReview) };
     }
     throw httpError(405, 'Use GET for the list, POST to approve or reject.');
   }
-  if (path === '/api/local/harnesses' && method === 'GET') return { status: 200, value: { harnesses: await need(ctx).scanner.scan() } };
+  if (path === '/api/local/agent-apps' && method === 'GET') return { status: 200, value: await agentApps(ctx.home, await need(ctx).scanner.scan()) };
+  if (path === '/api/local/agent-apps/deliveries' && method === 'GET') return { status: 200, value: desktopDeliveries() };
+  const appSetting = /^\/api\/local\/agent-apps\/([a-z]+)$/.exec(path);
+  if (appSetting && method === 'POST') {
+    if (!HARNESS_IDS.includes(appSetting[1] as HarnessId)) throw httpError(404, 'There is no such agent app.');
+    try { return { status: 200, value: saveHarnessPreference(ctx.home, appSetting[1] as HarnessId, await ctx.body()) }; }
+    catch { throw httpError(400, 'Choose a valid app availability and delivery mode.'); }
+  }
+  const delivery = /^\/api\/local\/agent-apps\/deliveries\/([a-f0-9-]{36})$/.exec(path);
+  if (delivery && method === 'POST') {
+    try { resolveAppDelivery(delivery[1], (await ctx.body()).action); return { status: 200, value: { resolved: true } }; }
+    catch { throw httpError(409, 'This delivery changed or no longer needs a decision. Refresh Agent apps.'); }
+  }
+  if (path === '/api/local/harnesses' && method === 'GET') {
+    const preferences = harnessPreferences(ctx.home);
+    return { status: 200, value: { harnesses: (await need(ctx).scanner.scan()).map(h => ({ ...h, ...preferences[h.harness] })) } };
+  }
   const sessions = SESSIONS.exec(path);
   if (sessions && method === 'GET') {
     if (!HARNESS_IDS.includes(sessions[1] as HarnessId)) throw httpError(404, 'There is no such harness.');

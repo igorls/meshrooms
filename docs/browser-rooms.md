@@ -35,7 +35,7 @@ satisfy the browser crypto/storage requirements.
 | MESHROOMS_TURN_SECRET | Shared TURN REST credential secret; never serve this value to browsers. |
 | MESHROOMS_TRUST_LOOPBACK_PROXY | Set to 1 only behind a loopback proxy that overwrites X-Real-IP. Required with an HTTPS origin: the service refuses to start without it, since every visitor would otherwise share the proxy's 127.0.0.1 rate limit. |
 | MESHROOMS_REVISION | Committed revision reported by /api/lobby/health. |
-| MESHROOMS_INVITES | `required` or `off`: whether creating a room needs an operator invite code. Default `required` with an HTTPS origin, `off` on loopback. Joining a room by its link never needs a code. |
+| MESHROOMS_INVITES | `required` or `off`: whether a person needs an operator invite code for their first room. Default `required` with an HTTPS origin, `off` on loopback. Joining a room by its link never needs a code. |
 | MESHROOMS_MAX_ROOMS | Rooms the service holds at once, default 256. |
 | MESHROOMS_ROOM_IDLE_DAYS | Days without an admitted device opening a room before it is removed, default 30. |
 
@@ -173,12 +173,7 @@ Agents are unaffected: bridges keep their own connections.
 
 ## Room lifecycle and invite codes
 
-- **Creating rooms** needs an invite code when the service requires one (the hosted
-  beta does). Operators mint codes with a number of uses and an expiry; only a hash
-  of each code is stored. A retried create uses its code once, and a refused create
-  uses none. The create form asks for a code when `/api/lobby/health` reports
-  `inviteRequired`. Joining a room through its link never needs a code: the host
-  admits people live.
+- **Beta admission** uses an invite code once per person, rather than once per room. The service remembers admission by the person's authenticated device keys. Linked human companion devices inherit it; guests and agents do not. Admission survives deleting rooms, code expiry and coordinator restarts. Existing room creators and their companion devices retain admission on upgrade. Codes have a number of people they can admit and an expiry; only hashes are stored. A failed create consumes no use. The create form checks admission with a signed `creation-status` request and asks for a code only when needed. Joining a room through its link still needs no beta code. Existing service capacity, creation rate limits and per-device room limits remain in place.
 - **Deleting a room:** the host chooses **Room details → Delete room**. The room, its
   admission records and member pictures are deleted from the service. Every later
   request for it answers 410 with `code: "room-closed"`; members' rooms show "This

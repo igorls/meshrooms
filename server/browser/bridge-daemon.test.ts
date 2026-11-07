@@ -16,13 +16,13 @@ import { processRuns } from './fake-runner';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-const tempDir = () => { const dir = mkdtempSync(join(tmpdir(), 'mr-bridge-daemon-')); dirs.push(dir); return dir; };
+const tempDir = () => { const dir = mkdtempSync(join(realpathSync(tmpdir()), 'mr-bridge-daemon-')); dirs.push(dir); return dir; };
 // Nothing here may reach the real ~/.meshrooms: a call that falls back on the default agent folder, registry or daemon
 // folder lands in a folder of this file's own (inFolders narrows it further per test).
 const sandboxKeys = ['MESHROOMS_AGENT_HOME', 'MESHROOMS_AGENT_REGISTRY', 'MESHROOMS_DAEMON_DIR'] as const;
 let sandbox: { dir: string; saved: (string | undefined)[] } | undefined;
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), 'mr-bridge-daemon-home-'));
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'mr-bridge-daemon-home-'));
   sandbox = { dir, saved: sandboxKeys.map(key => process.env[key]) };
   process.env.MESHROOMS_AGENT_HOME = join(dir, 'agents'); process.env.MESHROOMS_AGENT_REGISTRY = join(dir, 'agent-homes.json'); delete process.env.MESHROOMS_DAEMON_DIR;
 });

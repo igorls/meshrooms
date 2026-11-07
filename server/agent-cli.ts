@@ -34,6 +34,8 @@ import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, 
 import { homedir, hostname } from 'node:os';
 import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import { MCP_TOOLS, serveMcp } from './mcp';
+import { watchDesktop } from './desktop-watch';
+import { harnessPreferences } from './harness-apps';
 import { BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, replaceFile, roomClosed, runnerStuck, runnerTrouble, serviceSilence, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, peekWork, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import {
   DEFAULT_MAX_AGENT_WAKES_PER_HOUR, DEFAULT_HERMES_MAX_TURNS, DEFAULT_HERMES_RUN_BUDGET_SECONDS, HERMES_TOOLSET, HERMES_EXPECTED_TOOLS, hermesToolsProblem, toolsetNameProblem, DEFAULT_MAX_WAKES_PER_HOUR, DEFAULT_RUN_TIMEOUT_MINUTES, HARNESSES, WAKE_COMMANDS, WAKE_WRITABLE, WATCH_TIMING, CODEX_DISABLED, INSPECT_TIMEOUT_MS, hermesWakeEnv, codexEnvDenies, envProjectProblem, killDeps, recordAgentHome, CODEX_PROFILE, HOME_SECRETS, clearDir, codexBase, codexConfig, heredocMarker, killTree, processInfo, runFingerprint, sameRun,
@@ -57,7 +59,7 @@ import {
 } from './agent-live';
 import { hermesBindingProblem, hermesBindingSnippet, hermesConfigPath, readMcpServerArgs, roomToolsetName } from './hermes-binding';
 import { issueLinkFrom } from '../src/browser/board';
-import { createRoom, defaultRoomService, initPerson, joinRoom, listedAgents, pairRooms, personAgent, personHome, personIdentityFile, personRooms, personStatus, roomSummary, roomTitles, unpairCheck, unpairPerson } from './person';
+import { cancelPairing, createRoom, defaultRoomService, initPerson, joinRoom, listedAgents, pairRooms, personAgent, personHome, personIdentityFile, personRooms, personStatus, roomSummary, roomTitles, unpairCheck, unpairPerson } from './person';
 import { appRequest, localControlToken, readLocalApi, requestBrowserLink, startLocalApi } from './local-api';
 import { notifyLevel, setNotifyLevel } from './notifications';
 import type { AgentServices } from './local-agents';
@@ -554,6 +556,12 @@ async function startWatch(agent: BrowserAgent, values: Record<string, string>, a
   const before = readBinding(agent.dir);
   const harness = values['--harness'] as Harness;
   if (!HARNESSES.includes(harness)) throw new Error('Use --harness claude, codex, or exec.');
+  const preference = harnessPreferences(personHome())[harness];
+  if (!preference.enabled) throw new Error('Enable this integration in Agent apps before making a new binding.');
+  const codexDelivery = harness === 'codex' ? values['--codex-delivery'] ?? preference.codexDelivery ?? 'desktop' : undefined;
+  if (values['--codex-delivery'] !== undefined && harness !== 'codex') throw new Error('--codex-delivery is for Codex.');
+  if (codexDelivery !== undefined && !['desktop', 'headless'].includes(codexDelivery)) throw new Error('Use --codex-delivery desktop or headless.');
+  const desktop = codexDelivery === 'desktop';
   const command = values['--command'], model = values['--model'], program = values['--harness-bin'], last = values['--last'] !== undefined;
   // Codex and Hermes resume the session connect --session recorded for that harness when watch names none (Codex: and
   // no --cwd, which is for --last). Claude Code's default is worked out below, with the busy-folder check.
@@ -623,8 +631,10 @@ async function startWatch(agent: BrowserAgent, values: Record<string, string>, a
   if (harness === 'claude') ({ pinned, from: sessionFrom } = pinClaudeSession({ session, last, recorded: roomSession(agent.dir), recent: () => recentClaudeSessions(cwd), cwd }));
   if (harness === 'codex') {
     // Never widen the operator's own Codex sandbox; a read-only one can't run the bridge, which writes its cursor and outbox.
-    const base = codexBase(codexConfig());
-    if ('refuse' in base) throw new Error(`${base.refuse} Change it, or use --harness exec with a command of your own.`);
+    if (!desktop) {
+      const base = codexBase(codexConfig());
+      if ('refuse' in base) throw new Error(`${base.refuse} Change it, or use --harness exec with a command of your own.`);
+    }
     // --last is pinned now to the thread it means, so a later session in that folder can't take its place.
     if (last) { pinned = newestCodexThread(cwd); if (!pinned) throw new Error(`No Codex session works in ${cwd} yet. Start one there, or pass --session <thread id>.`); }
   }
@@ -635,16 +645,18 @@ async function startWatch(agent: BrowserAgent, values: Record<string, string>, a
     if (!pinned) warnings.push(`No Claude Code session works in ${cwd} yet: wakes continue the most recent one there. Pass --session to name one.`);
   }
   const thread = harness === 'codex' && pinned && uuid(pinned) ? codexThread(pinned) : undefined;
+  if (desktop && (!pinned || !uuid(pinned))) throw new Error('Desktop delivery needs the exact chat UUID.');
   if (harness === 'codex' && pinned && uuid(pinned) && !thread) warnings.push('No Codex thread with that id was found in the Codex sessions folder; a wake fails until it exists.');
   const target = runnerTarget();
   const roomDir = agent.dir;
   // The harness by its absolute path, found now on the operator's PATH, so a wake finds it under a login item too.
-  const harnessProgram = program !== undefined ? resolve(program) : harness === 'exec' ? undefined : locateProgram(harness);
+  const harnessProgram = desktop ? undefined : program !== undefined ? resolve(program) : harness === 'exec' ? undefined : locateProgram(harness);
   // A new generation every time: the binding changes, so its watcher is replaced, and a run of the old one never changes
   // the new one's state.
   const config: WatchConfig = { roomId: agent.roomId, harness, generation: randomUUID(),
     // Codex resumes the thread by id from the room's wake folder: during a wake the project stays read-only to it.
-    cwd: harness === 'codex' ? wakeDir({ roomDir }) : cwd,
+    cwd: desktop ? thread?.cwd ?? cwd : harness === 'codex' ? wakeDir({ roomDir }) : cwd,
+    ...(codexDelivery ? { codexDelivery: codexDelivery as 'desktop' | 'headless' } : {}),
     ...(pinned ? { session: pinned } : {}), ...(harnessProgram ? { program: harnessProgram } : {}), ...(command !== undefined ? { command } : {}), ...(model ? { model } : {}),
     maxWakesPerHour: count('--max-wakes-per-hour', DEFAULT_MAX_WAKES_PER_HOUR, 120), maxAgentWakesPerHour: count('--max-agent-wakes-per-hour', DEFAULT_MAX_AGENT_WAKES_PER_HOUR, 240),
     // `hermes` only: a wake is bounded by turns and by wall-clock, so a confused run cannot spin.
@@ -672,8 +684,8 @@ async function startWatch(agent: BrowserAgent, values: Record<string, string>, a
     + 'The rooms share one conversation, so what is said in one can come up in the other through the session\'s memory. A session of its own for each room (--session) keeps them apart.');
   // Fail here, in the operator's terminal, rather than later in the background: the template parses and the harness is installed.
   if (command !== undefined) splitTemplate(command);
-  const invocation = harnessInvocation(config, '', join(agent.dir, WATCH_PROMPT), undefined, wakeContext(config, reason => warnings.push(`For Codex wakes, ${reason}.`)));
-  if (harness === 'codex' && thread?.cliVersion) {
+  const invocation = desktop ? { file: '', args: [] as string[] } : harnessInvocation(config, '', join(agent.dir, WATCH_PROMPT), undefined, wakeContext(config, reason => warnings.push(`For Codex wakes, ${reason}.`)));
+  if (harness === 'codex' && !desktop && thread?.cliVersion) {
     // A thread the Codex app started may be newer than the CLI on PATH; resuming across minor versions worked in testing.
     let cli: string | undefined;
     try { cli = /(\d+\.\d+\.\d+\S*)/.exec(execFileSync(invocation.file, [...invocation.args.slice(0, invocation.args.indexOf('exec')), '--version'], { encoding: 'utf8', windowsHide: true, timeout: 20_000, stdio: ['ignore', 'pipe', 'ignore'] }))?.[1]; }
@@ -733,9 +745,10 @@ async function startWatch(agent: BrowserAgent, values: Record<string, string>, a
     session: pinned ?? (harness === 'exec' ? 'as your command says' : `the most recent in ${cwd}`), ...(sessionFrom ? { sessionFrom } : {}),
     maxWakesPerHour: config.maxWakesPerHour, maxAgentWakesPerHour: config.maxAgentWakesPerHour,
     ...(thread ? { thread: { client: thread.originator ?? null, codexVersion: thread.cliVersion ?? null, folder: thread.cwd ?? null } } : {}),
-    ...(harness === 'codex' ? { note: 'While the thread is open in the Codex app, the app holds it and a wake waits; switch to another thread there to let the watcher answer.' } : {}),
+    ...(harness === 'codex' ? { delivery: codexDelivery, note: desktop ? 'Room events arrive in this existing desktop chat during work. Its model, tools and approval settings stay in charge.' : 'This binding uses a separate CLI wake; it waits while another writer owns the chat.' } : {}),
     ...(warnings.length ? { warnings } : {}),
     permissions: harness === 'claude' ? { permissionMode: 'dontAsk', allowedTools: list('--allowedTools'), disallowedTools: list('--disallowedTools'), mcpServers: claude.includes('--strict-mcp-config') ? 'none' : 'yours' }
+      : desktop ? { note: 'The existing desktop chat keeps its own permissions and approval flow. Room messages arrive as external tool data.' }
       : harness === 'codex' ? { profile: CODEX_PROFILE, builtOn: wakeContext(config).codexExtends, approvals: 'never', network: false, webSearch: 'disabled', mcpServers: 'off', disabled: CODEX_DISABLED,
         writable: WAKE_WRITABLE.map(sub => join(roomDir, sub)), unreadable: wakeContext(config).denyRead.map(d => d.path) }
       : { note: 'exec runs your command as it is: its permissions are its own. The bridge still limits what it can do during a wake.' },
@@ -1157,6 +1170,15 @@ async function runWatch(agent: BrowserAgent) {
   log(`watcher ${BRIDGE_VERSION} started (pid ${process.pid}): harness ${config.harness} in ${config.cwd}, at most ${config.maxWakesPerHour} wakes per hour here and ${config.maxAgentWakesPerHour} in all rooms`);
   let ready = false, waitingLogged = false, envLogged = false;
   const checkRunner = watcherRunnerCheck(agent, log);
+  if (config.harness === 'codex' && config.codexDelivery === 'desktop') {
+    const ledger = sessionLedger(locksDir(), sessionKey(config), roomId, { alive: running, holdMs: 60_000, ownedMs: 5_000, freshMs: 30_000, generation: config.generation });
+    await watchDesktop(agent, config, { now: Date.now, sleep: ms => Bun.sleep(ms), current,
+      ready: () => { const started = startFromNow(agent, readProof(join(agent.dir, RUNNER_ALIVE))()); return started !== 'waiting'; },
+      ensureRunner: checkRunner, readState: () => readWatchState(agent.dir), writeState: state => writeWatchState(agent.dir, state), log,
+      claim: () => ledger.claim(), withdraw: () => ledger.withdraw() });
+    writeWatchState(agent.dir, { ...readWatchState(agent.dir), stoppedAt: Date.now() });
+    log('desktop delivery watcher stopped'); return;
+  }
   // When this watcher started. The liveness warning below judges the runner from here, not from an
   // arbitrary moment (main replaced the old `runnerStopped(agent, runnerSince)` shape with
   // runnerTrouble + a `since`, and `runnerStopped` is no longer imported here).
@@ -1577,10 +1599,21 @@ export function appProof(proof: string, dir = daemonDir(), refusal = APP_ONLY) {
 async function personCommand(sub: string, positional: string[], values: Record<string, string>) {
   const folder = personHome();
   const ensureRunner = async (agent: BrowserAgent) => {
+    // An explicit join/pair resumes a room whose previous pending request was cancelled.
+    try { unlinkSync(join(agent.dir, ROOM_STOPPED)); } catch { /* Not stopped. */ }
     const repair = await repairRunner(runnerRepairs(agent, { purpose: 'person', inWake: false, watcherRuns: () => false }));
     return { outcome: repair.outcome, pid: repair.outcome === 'daemon' ? repair.pid ?? await waitForRunner(agent) : repair.pid };
   };
   const link = () => positional[0] ?? values['--link'] ?? '';
+  const stopPersonRunner = async (agent: BrowserAgent) => {
+    writeFileSync(join(agent.dir, ROOM_STOPPED), JSON.stringify({ at: Date.now() }), { mode: 0o600 });
+    const outcome = await withRunnerLock(agent.dir, async () => {
+      const runner = runnerProcess(agent);
+      if (!runner?.verified) return 'none' as const;
+      return await stopRunner(agent.roomId, runner.pid, stopDeps(agent.dir), 'person-run') ? 'stopped' as const : 'alive' as const;
+    });
+    return outcome === 'busy' ? 'alive' as const : outcome;
+  };
   if (sub === 'init') return initPerson(folder);
   if (sub === 'join') {
     await appOnly(stdinLines, daemonDir(), 'Join rooms from the Meshrooms app: its window asks you first.');
@@ -1599,6 +1632,10 @@ async function personCommand(sub: string, positional: string[], values: Record<s
     const [secret = ''] = await appOnly(stdinLines);
     return pairRooms({ origin: values['--origin'], rooms: values['--rooms'], name: values['--name'], device: values['--device'], secret }, ensureRunner, folder);
   }
+  if (sub === 'cancel-pairing') {
+    await appOnly(stdinLines);
+    return cancelPairing({ origin: values['--origin'], rooms: values['--rooms'], device: values['--device'] }, stopPersonRunner, folder);
+  }
   // What the app's pairing window lists before the final Pair: the rooms' public titles.
   if (sub === 'titles') return roomTitles({ origin: values['--origin'], rooms: values['--rooms'] });
   // The app forgets its person: leaves the rooms where it can, stops their runners, and deletes the person folder.
@@ -1607,18 +1644,7 @@ async function personCommand(sub: string, positional: string[], values: Record<s
   if (sub === 'unpair') {
     if (values['--check'] !== undefined) return unpairCheck(folder);
     await appOnly(stdinLines);
-    return unpairPerson(async agent => {
-      // Marked stopped first, so the daemon doesn't start it again; then stopped under the runner lock.
-      writeFileSync(join(agent.dir, ROOM_STOPPED), JSON.stringify({ at: Date.now() }), { mode: 0o600 });
-      const outcome = await withRunnerLock(agent.dir, async () => {
-        const runner = runnerProcess(agent);
-        if (!runner) return 'none' as const;
-        // One whose process can't be confirmed as this room's runner is not stopped here, and not counted as running.
-        if (!runner.verified) return 'none' as const;
-        return await stopRunner(agent.roomId, runner.pid, stopDeps(agent.dir), 'person-run') ? 'stopped' as const : 'alive' as const;
-      });
-      return outcome === 'busy' ? 'alive' : outcome;
-    }, folder, { anyway: values['--anyway'] !== undefined, beforeDelete: () => releaseIdentities(folder) });
+    return unpairPerson(stopPersonRunner, folder, { anyway: values['--anyway'] !== undefined, beforeDelete: () => releaseIdentities(folder) });
   }
   if (sub === 'create') return createRoom({ origin: values['--origin'] ?? defaultRoomService(folder), title: values['--title'], name: values['--name'] ?? personRooms(folder).find(r => r.name)?.name,
     invite: values['--code'] }, ensureRunner, folder);
@@ -1763,7 +1789,7 @@ async function agentCommand(sub: string, values: Record<string, string>) {
     if (!uuid(id)) throw new Error('Give --id as the id the approvals list gives.');
     if (sub === 'approve' && !/^[a-f0-9]{64}$/.test(digest ?? '')) throw new Error('Give --digest as the digest the approvals list gave with what the app showed.');
     if (sub === 'reject' && digest !== undefined) throw new Error('Rejecting needs no digest.');
-    return answered(appRequest(daemonDir(), appDaemon, 'POST', `/api/local/approvals/${id}/${sub}`, sub === 'approve' ? { body: { digest } } : {}));
+    return answered(appRequest(daemonDir(), appDaemon, 'POST', `/api/local/approvals/${id}/${sub}`, sub === 'approve' ? { body: { digest, ...(values['--delivery-review'] ? { deliveryReview: values['--delivery-review'] } : {}) } } : {}));
   }
   // A custom-command (exec) agent, made in the app's window: the only place one comes from. The command comes on the
   // second line of stdin, after the app's proof, never as an argument. --check makes nothing: it gives back the command
@@ -1865,7 +1891,7 @@ export function listBindings(now = Date.now()) {
       const text = (value: unknown) => typeof value === 'string' ? terminalSafe(value).replace(/[\u2028\u2029]/g, ' ') : null;
       rows.push({ roomId, title: text(roster.title), agent: text(me?.name), agentHome,
         ...(closed ? { closed: text(closed.reason) } : retired?.reason ? { retired: text(retired.reason) } : existsSync(join(agent.dir, ROOM_STOPPED)) ? { stopped: true } : {}),
-        harness: binding?.harness ?? null, session: binding?.session ?? null, wakes: 'reason' in wakes ? { ...wakes, reason: text(wakes.reason) } : wakes,
+        harness: binding?.harness ?? null, session: binding?.session ?? null, ...(state.desktop ? { delivery: state.desktop } : {}), wakes: 'reason' in wakes ? { ...wakes, reason: text(wakes.reason) } : wakes,
         runner, ...problems, supervisedBy: daemon && daemonSupervises(agentHome, running) ? 'daemon' : null,
         lastWake: iso(state.lastWake), lastResult: state.lastResult ? { at: iso(state.lastResult.at), exitCode: state.lastResult.exitCode, progress: state.lastResult.progress } : null,
         pending: { now: pendingNow, offeredAgain: obligations.filter(o => !o.flaggedAt).length, flagged: obligations.filter(o => o.flaggedAt).length } });
@@ -1908,6 +1934,7 @@ function watchStatus(agent: BrowserAgent) {
     paused: state.paused ? { reason: state.paused.reason, at: iso(state.paused.at), nextTry: iso(state.backoffUntil),
       resume: 'It tries again every 15 minutes. Fix the harness (see the log), then run watch again to resume now.' } : null,
     lastCheck: iso(state.lastCheck), lastWake: iso(state.lastWake),
+    ...(state.desktop ? { delivery: state.desktop } : {}),
     lastResult: result ? { ...result, at: iso(result.at) } : null,
     wakesLastHour: wakes, ...(state.capped ? { capped: true } : {}), ...(state.backoffUntil && state.backoffUntil > now && !state.paused ? { backoffUntil: iso(state.backoffUntil) } : {}),
     ...(state.activeRun && running(state.activeRun.pid) ? { activeRun: { pid: state.activeRun.pid, since: iso(state.activeRun.startedAt) } } : {}),
@@ -2139,7 +2166,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     '  and exits only on work (0, the same JSON as listen), a closed room (3), removal (4), or a runner it could not get repaired (5); handle the work, then run it again)',
     "watch --room ROOM --harness claude|codex|hermes|exec [--cwd DIR] [--session ID | --last] [--model MODEL] [--harness-bin PATH] [--command 'PROGRAM ... {prompt_file}'] [--max-wakes-per-hour 20] [--run-timeout-minutes 20] [--allow-tools RULE]... [--max-turns 12] [--run-budget 240]  (both hermes only)",
     '  (operators only: wakes your own harness session in the background when the room has work for this agent)',
-    'bind --room ROOM --harness ... (the same options as watch, which it replaces: binds the room to a harness session; again with another --session to rebind)',
+    'bind --room ROOM --harness ... [--codex-delivery desktop|headless]  (Codex defaults to delivery into the existing desktop chat; legacy bindings retain their recorded mode)',
     'unbind --room ROOM  (turns wakes off; the agent stays in the room and connected)', 'bindings [--json]  (every agent on this machine: binding, wakes, runner, pending work)',
     'mcp --room ROOM [--wake-dir DIR] [--agent-home DIR]  (a stdio MCP server exposing the wake subcommands as tools, so a harness can be confined to this room; --agent-home is needed whenever MESHROOMS_AGENT_HOME is not the default, because Hermes filters stdio env and this server would otherwise read the shared one)',
     'watch-status --room ROOM', 'watch-stop --room ROOM  (turns wakes off; the daemon, if it runs, leaves them off)',
@@ -2148,6 +2175,7 @@ export async function agentCli(argv: string[]): Promise<unknown> {
     "person init | companion ROOM_LINK | rooms | status | open [--room ID]  (the person using this machine, as one more device of theirs in each room; the daemon keeps it connected)",
     "person join ROOM_LINK [--name NAME]  (the app only, proving itself on stdin, from its join window: asks to join as this machine's person; once paired, only at the paired room service and under the paired name by default)",
     "person pair --origin ORIGIN --rooms ID,ID --name NAME --device BROWSER_DEVICE_ID  (the app only, proving itself on stdin, then the browser's secret on the next line; asks in each room with a proof of it, which only that browser can link; one paired person per app)",
+    "person cancel-pairing --origin ORIGIN --rooms ID,ID --device BROWSER_DEVICE_ID  (the app only; withdraws pending companion requests and keeps admitted rooms and the person's key)",
     "person titles --origin ORIGIN --rooms ID,ID  (the rooms' public titles, for the app's pairing window)",
     "person unpair --check  (reads only: the paired person, and the rooms whose only host device this is)",
     "person unpair [--anyway]  (the app only, proving itself on stdin: leaves every room, then deletes this machine's person; nothing is deleted while a room can't be left, and --anyway leaves the rooms this is the only host device of without a host)",

@@ -1,5 +1,42 @@
 # Agent room watching
 
+## Codex desktop delivery
+
+Meshrooms is a communication layer for existing agents. A new Codex binding defaults to `--codex-delivery desktop`:
+the machine's room watcher sends external room events through the same user's desktop IPC to the process that already
+owns the bound chat. The user continues working in that chat. No agent listener task, polling instruction, second
+App Server or CLI writer is started. The existing chat retains its model, tools, working folder and approvals.
+
+`Agent apps` on the local page (`/agent-apps`) manages harness availability and the delivery mode for new bindings.
+Changing these preferences never rewrites an existing binding. A Codex desktop agent uses an existing chat selected
+in the room's details; Meshrooms does not bootstrap a replacement chat experience. Existing bindings without a recorded
+mode retain the legacy headless behavior; an operator can explicitly select `--codex-delivery headless` for CLI use.
+Approvals capture the chosen mode in their digest. A desktop-aware native approval window must show and acknowledge
+that the existing chat's permissions apply before this mode can be approved.
+
+The IPC client verifies the private socket's ownership and permissions, initializes protocol 0, discovers the exact
+local thread owner through protocol 1 and requires its external-input capability. It submits `meshrooms.room_message`
+as standalone tool output through the owner's start operation (protocol 2), inheriting the chat's settings. The same
+operation queues that tool output into a regular active turn or starts generation while idle; no active/idle probe
+or steer-to-start fallback is needed.
+There is no automatic fallback to `codex exec resume`, another thread, a new session or different permissions.
+
+Before sending, `desktop-delivery.json` records a stable delivery id, the frozen event, binding generation and room
+cursor. A saved acceptance precedes the cursor commit; a crash between these steps recovers without resending.
+Cursor commits compare under the same short lock used by bridge readers, so a concurrent reader's newer position
+is never rewound. An unavailable desktop or missing owner retains the pending event and retries without spending an
+agent wake. A disconnect, timeout or watcher crash after submission makes delivery **uncertain**. It is never replayed
+automatically: Agent apps lets the operator check the original delivery chat, then mark it received or explicitly retry.
+Acceptance is a transport receipt, not proof that the agent processed or answered the event. Replies use stable request
+ids so a repeated room reply keeps the room's existing idempotency behavior.
+
+This is private desktop IPC. Capability/protocol mismatches fail closed, with visible delivery status; desktop upgrades
+need qualification. The initial implementation uses Unix sockets and is qualified against the local macOS desktop.
+Windows desktop delivery is explicitly unsupported until its transport and owner protocol have been measured.
+The machine watcher keeps the room runner alive and restores bindings through the existing daemon/login mechanism.
+
+The sections below describe the retained listener and headless modes used by the other harnesses and legacy bindings.
+
 Status: implemented in the agent bridge (0.2.0-beta.3) as `meshrooms watch`, for Claude Code, Codex (the CLI and the
 Codex app's threads), Hermes and any other harness through a command template. A security review (below) confined what a
 wake can do before release. Verified end to end on Windows against a loopback coordinator. The Windows Codex plus

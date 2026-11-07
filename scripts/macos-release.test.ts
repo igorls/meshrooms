@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { packageBridge } from './package-runtime';
@@ -83,7 +83,7 @@ async function fixture(check: (f: {
   git: (...args: string[]) => string;
   run: (args: string[]) => { status: number | null; output: string; events: Event[] };
 }) => void | Promise<void>) {
-  const sandbox = mkdtempSync(join(tmpdir(), 'mr-release-contract-'));
+  const sandbox = mkdtempSync(join(realpathSync(tmpdir()), 'mr-release-contract-'));
   const root = join(sandbox, 'checkout with spaces'), bin = join(sandbox, 'bin'), temp = join(sandbox, 'tmp');
   const seed = join(sandbox, 'seed'), log = join(sandbox, 'commands.jsonl');
   const env = {
@@ -112,6 +112,8 @@ async function fixture(check: (f: {
     put(join(root, 'desktop/src-tauri/tauri.conf.json'), '{"version":"1.2.3"}\n');
     put(join(root, 'packages/meshrooms/package.json'), '{"version":"1.2.3"}\n');
     put(join(root, 'packages/meshrooms/bin/meshrooms.js'), 'bridge component fixture\n');
+    put(join(root, 'packages/meshrooms/ui/index.html'), '<!doctype html><title>Release fixture</title>\n');
+    put(join(root, 'packages/meshrooms/ui/assets/fixture.js'), 'console.log("release fixture");\n');
     put(join(root, 'packages/meshrooms/THIRD_PARTY_LICENSES.txt'), 'license fixture\n');
     put(join(root, 'THIRD_PARTY_NOTICES.md'), 'notice fixture\n');
     put(join(root, 'LICENSE'), 'license fixture\n');

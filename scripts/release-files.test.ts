@@ -10,6 +10,10 @@ test('the coordinator release carries its import closure and runtime assets only
   expect(files).toContain('server/browser/lobby.ts');
   expect(files).toContain('server/browser/http.ts');
   expect(files).toContain('server/browser/agent-join.md');
+  expect(files).toContain('server/browser/admin-main.ts');
+  expect(files).toContain('server/browser/admin/index.html');
+  expect(files).toContain('server/browser/admin/admin.js');
+  expect(files).toContain('server/browser/admin/admin.css');
   expect(files).toContain('src/browser/protocol.ts');
   expect(files).toContain('server/instance.ts');
   // Type-only imports are erased at runtime and must not widen the package.
@@ -21,6 +25,8 @@ test('a package import or a missing asset fails loudly', () => {
   const root = mkdtempSync(join(tmpdir(), 'meshrooms-release-files-'));
   try {
     mkdirSync(join(root, 'server/browser'), { recursive: true });
+    // An asset directory beside helper.ts must never shadow the imported source module.
+    mkdirSync(join(root, 'server/browser/helper'));
     writeFileSync(join(root, 'server/browser/main.ts'), "import { x } from 'left-pad';\nimport './helper';\nconsole.log(x);\n");
     writeFileSync(join(root, 'server/browser/helper.ts'), "export const page = new URL('./missing.md', import.meta.url);\n");
     expect(() => releaseFiles(root, 'server/browser/main.ts')).toThrow(/package "left-pad"[\s\S]*missing "\.\/missing\.md"|missing "\.\/missing\.md"[\s\S]*package "left-pad"/);

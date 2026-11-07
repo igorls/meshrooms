@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { BrowserLobby, LobbyError } from './lobby';
 import { browserHandler } from './http';
 import { consumeInvite, invitesCli, listInvites, mintInvite, normalizeInvite, revokeInvite } from './invites';
@@ -106,7 +109,7 @@ test('SEC-2: the operator CLI mints, lists without codes, and revokes', () => {
     invitesCli(['mint', '--uses', '5', '--days', '14', '--note', 'Beta cohort A'], db(store), line => out.push(line));
     const code = /Code \(shown only now\): (\S+)/.exec(out.join('\n'))![1];
     const id = /^Invite ([a-f0-9]{8}):/.exec(out[0])![1];
-    expect(out[0]).toContain('5 rooms'); expect(out[0]).toContain('Beta cohort A');
+    expect(out[0]).toContain('5 users'); expect(out[0]).toContain('Beta cohort A');
     out.length = 0;
     invitesCli(['list'], db(store), line => out.push(line));
     expect(out[0]).toStartWith(`${id}\tactive\t0/5 used`); expect(out.join('\n')).not.toContain(code);
@@ -117,4 +120,82 @@ test('SEC-2: the operator CLI mints, lists without codes, and revokes', () => {
     expect(out[0]).toContain('revoked');
     expect(() => invitesCli(['bogus'], db(store))).toThrow('Usage');
   } finally { store.close(); }
+});
+
+test('a beta invite admits a person once, across rooms, expiry and a service restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'meshrooms-beta-')), path = join(dir, 'admission.sqlite');
+  let now = Date.now(), lobby = new BrowserLobby(path, { origin, invites: 'required', now: () => now });
+  try {
+    const invite = mintInvite(db(lobby), { uses: 1, days: 1, now });
+    const host = await client(lobby, () => now), first = crypto.randomUUID();
+    expect(await host.send('creation-status', first)).toMatchObject({ admitted: false });
+    await host.send('create', first, { title: 'First', name: 'Alex', label: 'Browser', invite: invite.code });
+    await host.send('create', crypto.randomUUID(), { title: 'Second', name: 'Alex', label: 'Browser' });
+    expect(listInvites(db(lobby))[0].remaining).toBe(0);
+    await host.send('close', first);
+    now += 2 * DAY;
+    lobby.close(); lobby = new BrowserLobby(path, { origin, invites: 'required', now: () => now });
+    expect(await lobby.execute(await host.signed('creation-status', crypto.randomUUID()))).toMatchObject({ admitted: true });
+    await lobby.execute(await host.signed('create', crypto.randomUUID(), { title: 'Third', name: 'Alex', label: 'Browser' }));
+    // A name, guest admission or knowledge of a used code cannot impersonate an admitted person.
+    expect((await rejected(create(lobby, undefined, () => now))).code).toBe('invite-required');
+    expect((await rejected(create(lobby, invite.code, () => now))).code).toBe('invite-expired');
+  } finally { lobby.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('only a linked human companion inherits beta admission, never a guest or an agent', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
+  try {
+    const { code } = mintInvite(db(lobby), { uses: 1, days: 1 });
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Beta', name: 'Alex', label: 'Browser', invite: code });
+    const companion = await client(lobby), guest = await client(lobby), agent = await client(lobby);
+    await companion.send('request', room, { kind: 'companion', name: 'Alex', label: 'Desktop' });
+    const waiting = (await companion.status(room)).request!;
+    await host.send('link', room, { code: waiting.code });
+    expect(await companion.send('creation-status', crypto.randomUUID())).toMatchObject({ admitted: true });
+    await companion.send('create', crypto.randomUUID(), { title: 'From desktop', name: 'Alex', label: 'Desktop' });
+    await guest.send('request', room, { kind: 'person', name: 'Alex guest', label: 'Browser' });
+    const request = (await host.status(room)).requests!.find(r => r.name === 'Alex guest')!;
+    await host.send('decide', room, { requestId: request.id, admit: true });
+    expect(await guest.send('creation-status', crypto.randomUUID())).toMatchObject({ admitted: false });
+    const link = await host.send('agent-invite', room, { name: 'Helper' }) as { token: string };
+    await agent.send('agent-redeem', room, { token: link.token, label: 'Agent' });
+    expect(await agent.send('creation-status', crypto.randomUUID())).toMatchObject({ admitted: false });
+    expect(listInvites(db(lobby))[0].remaining).toBe(0);
+  } finally { lobby.close(); }
+});
+
+test('existing room hosts keep admission on upgrade, without admitting guests', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'meshrooms-beta-upgrade-')), path = join(dir, 'admission.sqlite');
+  let lobby = new BrowserLobby(path, { origin });
+  try {
+    const host = await client(lobby), guest = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Before upgrade', name: 'Alex', label: 'Browser' });
+    await guest.send('request', room, { kind: 'person', name: 'Guest', label: 'Browser' });
+    await host.send('decide', room, { requestId: (await host.status(room)).requests![0].id, admit: true });
+    lobby.close(); lobby = new BrowserLobby(path, { origin, invites: 'required' });
+    expect(await lobby.execute(await host.signed('creation-status', room))).toMatchObject({ admitted: true });
+    expect(await lobby.execute(await guest.signed('creation-status', room))).toMatchObject({ admitted: false });
+    await lobby.execute(await host.signed('create', crypto.randomUUID(), { title: 'After upgrade', name: 'Alex', label: 'Browser' }));
+  } finally { lobby.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('devices linked before their person redeems an invite inherit admission without another code', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
+  try {
+    const hostInvite = mintInvite(db(lobby), { uses: 1, days: 1 });
+    const host = await client(lobby), guest = await client(lobby), companion = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Existing room', name: 'Host', label: 'Browser', invite: hostInvite.code });
+    await guest.send('request', room, { kind: 'person', name: 'Guest', label: 'Browser' });
+    await host.send('decide', room, { requestId: (await host.status(room)).requests![0].id, admit: true });
+    await companion.send('request', room, { kind: 'companion', name: 'Guest', label: 'Desktop' });
+    await guest.send('link', room, { code: (await companion.status(room)).request!.code });
+    expect(await companion.send('creation-status', room)).toMatchObject({ admitted: false });
+    const invite = mintInvite(db(lobby), { uses: 1, days: 1 });
+    await guest.send('create', crypto.randomUUID(), { title: 'Guest becomes creator', name: 'Guest', label: 'Browser', invite: invite.code });
+    expect(await companion.send('creation-status', room)).toMatchObject({ admitted: true });
+    await companion.send('create', crypto.randomUUID(), { title: 'Linked desktop', name: 'Guest', label: 'Desktop' });
+    expect(listInvites(db(lobby)).every(i => i.remaining === 0)).toBe(true);
+  } finally { lobby.close(); }
 });

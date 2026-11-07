@@ -1,6 +1,6 @@
 [package]
 name = "meshrooms-desktop"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 description = "Tray app that keeps the Meshrooms agent daemon running"
 edition = "2021"
 license = "MIT"

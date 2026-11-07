@@ -15,3 +15,6 @@ deploy/turnserver.conf.example denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ff
 scripts/browser-room-smoke.mjs r.local  # a property on ICE route stats (r.local === 'relay'), not a host name
 server/collab.test.ts igor@codex.dev  # an email-shaped string whose domain starts with an agent name; the test proves mentions ignore it
 server/markdown.test.tsx mailto:a@github.com  # a mailto link the test proves is never rendered as a repository reference
+server/browser/admin.test.ts meshrooms.example.ts.net  # synthetic Tailnet hostname used to test the private admin origin, not a deployed host
+server/browser/admin.test.ts machine.example.ts.net  # synthetic hostname used to prove plain HTTP admin origins are refused
+server/browser/admin.test.ts 100.64.1.2  # synthetic Tailnet peer address used to prove the loopback admin backend refuses direct peer access

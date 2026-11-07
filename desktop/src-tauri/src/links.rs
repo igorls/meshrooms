@@ -141,7 +141,7 @@ fn fields<const N: usize>(query: &str, keys: [&str; N]) -> Result<[String; N], I
 }
 
 /// A room id as the room service makes them: a lowercase UUID.
-fn room_id(room: &str) -> bool {
+pub(crate) fn room_id(room: &str) -> bool {
     room.len() == 36
         && room.bytes().enumerate().all(|(i, b)| {
             if matches!(i, 8 | 13 | 18 | 23) {
@@ -203,12 +203,62 @@ fn validate_origin(origin: &str) -> Result<(), Invalid> {
     Ok(())
 }
 
-pub fn route(app: &tauri::AppHandle, raw: &str) {
-    match parse(raw) {
-        Ok(Request::Pair { origin, name, device, rooms, secret }) => crate::pair::open(app, origin, name, device, rooms, secret),
-        Ok(Request::Join { origin, room }) => crate::join::open(app, origin, room),
-        Err(_) => {
-            notice_limited(app, "Unsupported or invalid Meshrooms link. No action was taken.");
+const QUEUED_LINKS: usize = 8;
+
+enum Incoming {
+    Valid(Request),
+    Invalid,
+}
+
+impl Incoming {
+    /// A full queue must not retain a pairing secret. Raw links never enter the queue.
+    fn discard(mut self) {
+        if let Self::Valid(Request::Pair { secret, .. }) = &mut self {
+            for byte in secret {
+                unsafe { std::ptr::write_volatile(byte, 0) };
+            }
+        }
+    }
+}
+
+/// Tauri emits deep links while holding its plugin-store lock. Building a window inside that callback takes the same
+/// lock again and deadlocks the macOS event loop. The callback only parses and queues; one worker opens the windows
+/// after it returns. A bounded queue also keeps a link flood from creating threads or retaining unlimited secrets.
+#[derive(Clone)]
+pub struct Dispatcher {
+    sender: std::sync::mpsc::SyncSender<Incoming>,
+}
+
+impl Dispatcher {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self::worker(move |incoming| match incoming {
+            Incoming::Valid(Request::Pair { origin, name, device, rooms, secret }) => crate::pair::open(&app, origin, name, device, rooms, secret),
+            Incoming::Valid(Request::Join { origin, room }) => crate::join::open(&app, origin, room),
+            Incoming::Invalid => {
+                notice_limited(&app, "Unsupported or invalid Meshrooms link. No action was taken.");
+            }
+        })
+    }
+
+    fn worker(mut handle: impl FnMut(Incoming) + Send + 'static) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUED_LINKS);
+        std::thread::spawn(move || {
+            while let Ok(incoming) = receiver.recv() {
+                handle(incoming);
+            }
+        });
+        Self { sender }
+    }
+
+    /// Never waits for the worker, including while the event callback holds Tauri's lock. Excess links are ignored.
+    pub fn offer(&self, raw: &str) -> bool {
+        let incoming = parse(raw).map(Incoming::Valid).unwrap_or(Incoming::Invalid);
+        match self.sender.try_send(incoming) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(incoming) | std::sync::mpsc::TrySendError::Disconnected(incoming)) => {
+                incoming.discard();
+                false
+            }
         }
     }
 }
@@ -272,6 +322,41 @@ mod tests {
     const ROOM2: &str = "00000000-0000-4000-8000-000000000002";
     const ZERO: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const DEVICE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    #[test]
+    fn dispatch_does_not_wait_for_the_event_callbacks_lock() {
+        let event_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held = event_lock.lock().unwrap();
+        let worker_lock = event_lock.clone();
+        let (done, received) = std::sync::mpsc::channel();
+        let dispatcher = Dispatcher::worker(move |_| {
+            let _guard = worker_lock.lock().unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(dispatcher.offer(&join("https://rooms.example")));
+        assert!(received.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        drop(held);
+        received.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn a_busy_worker_has_a_bounded_nonblocking_queue() {
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let dispatcher = Dispatcher::worker(move |_| {
+            started.send(()).ok();
+            wait.recv().ok();
+        });
+        let raw = join("https://rooms.example");
+        assert!(dispatcher.offer(&raw));
+        running.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        for _ in 0..QUEUED_LINKS {
+            assert!(dispatcher.offer(&raw));
+        }
+        assert!(!dispatcher.offer(&raw));
+        // Dropping releases each queued handler without keeping test threads alive.
+        drop(release);
+    }
+
     fn join(origin: &str) -> String {
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("origin", origin)

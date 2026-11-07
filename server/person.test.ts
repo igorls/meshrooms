@@ -1,17 +1,19 @@
 import { afterAll, afterEach, beforeAll, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { agentCli, appOnly, isRunnerCommand, sameRunner } from './agent-cli';
 import { daemonDir, runningDaemon } from './agent-daemon';
-import { BrowserAgent, outboxProblem, runBridge } from './browser-agent';
+import { BrowserAgent, ROOM_CLOSED_FILE, outboxProblem, runBridge } from './browser-agent';
 import { BrowserLobby } from './browser/lobby';
 import { browserHandler } from './browser/http';
 import { client } from './browser/test-client';
+import { rawPeer } from './browser/raw-peer';
 import { processRuns } from './browser/fake-runner';
 import { localControlToken, readLocalApi, requestBrowserLink } from './local-api';
-import { createRoom, defaultRoomService, initPerson, joinRoom, pairRooms, personAgent, personHome, personIdentity, personRoomStatus, personRooms, personStatus, queueMessage, recordPersonRoom, roomState, roomTitles, unpairCheck, unpairPerson } from './person';
+import { cancelPairing, createRoom, defaultRoomService, initPerson, joinRoom, pairRooms, personAgent, personHome, personIdentity, personRoomStatus, personRooms, personStatus, queueMessage, queueRetract, recordPersonRoom, roomState, roomTitles, unpairCheck, unpairPerson } from './person';
 import { deviceId } from '../src/browser/protocol';
+import { attachmentRef, type AttachmentRef } from '../src/browser/files';
 const deviceIdOf = async (device: { signed: (a: 'status', r: string) => Promise<{ publicKey: string }> }) => deviceId((await device.signed('status', crypto.randomUUID())).publicKey);
 import { mintInvite } from './browser/invites';
 import { testDirectory } from './test-directory';
@@ -156,6 +158,140 @@ test('join asks as a person and the host admits; the runner then keeps the room,
   expect((await bridge as { status?: number }).status).toBe(410);
   expect(roomState(agent).state).toBe('closed');
 }, 60_000);
+
+test('a deletion crosses real channels: at once to a device that is there, and on reconnecting to one that was away', async () => {
+  const room = await hostedRoom();
+  const person = async (name: string) => {
+    const { home } = folders(), { deviceId } = await initPerson(home);
+    await joinRoom({ url: room.url, kind: 'person', name, label: 'Meshrooms app' }, noRunner, home);
+    return { deviceId, agent: personAgent(room.roomId, home) };
+  };
+  const robin = await person('Robin'), sam = await person('Sam');
+  // Two runners at a real runner's pace or near it: faster than this, the room service rate-limits them.
+  const run = (agent: BrowserAgent) => runBridge(agent, quiet, { pause: () => Bun.sleep(250) }).catch(error => error);
+  const robinRuns = run(robin.agent); let samRuns = run(sam.agent);
+  for (const { id } of (await room.host.status(room.roomId)).requests!) await room.host.send('decide', room.roomId, { requestId: id, admit: true });
+  const linked = (from: typeof robin, to: typeof robin) => personRoomStatus(from.agent)?.connected.includes(to.deviceId);
+  await until(() => linked(robin, sam) && linked(sam, robin), 40_000);
+  const held = (id: string) => sam.agent.messages().find(m => m.packet.body.id === id);
+  const onDisk = () => readFileSync(join(sam.agent.dir, 'messages.json'), 'utf8');
+
+  const live = await queueMessage(robin.agent, { text: 'said while both are here' });
+  await until(() => held(live.messageId));
+  expect(await queueRetract(robin.agent, { messageId: live.messageId })).toMatchObject({ status: 'shared' });
+  await until(() => held(live.messageId)?.retracted);
+  expect(onDisk()).not.toContain('said while both are here');
+
+  const missed = await queueMessage(robin.agent, { text: 'deleted while Sam is away' });
+  await until(() => held(missed.messageId));
+  // Sam's runner stops; nothing else about the room changes.
+  const command = sam.agent.command.bind(sam.agent);
+  sam.agent.command = async () => { throw Object.assign(new Error('stopped for this test'), { status: 410 }); };
+  await samRuns;
+  sam.agent.command = command;
+  rmSync(join(sam.agent.dir, ROOM_CLOSED_FILE), { force: true });
+  await until(() => !linked(robin, sam), 40_000);
+  expect(await queueRetract(robin.agent, { messageId: missed.messageId })).toMatchObject({ status: 'shared' });
+  expect(onDisk()).toContain('deleted while Sam is away');
+
+  samRuns = run(sam.agent);
+  await until(() => held(missed.messageId)?.retracted, 40_000);
+  expect(onDisk()).not.toContain('deleted while Sam is away');
+  expect(sam.agent.retractOps().map(op => op.body.target)).toEqual([live.messageId, missed.messageId]);
+
+  await room.host.send('close', room.roomId);
+  expect((await robinRuns as { status?: number }).status).toBe(410);
+  expect((await samRuns as { status?: number }).status).toBe(410);
+}, 120_000);
+
+/** A real runner (Sam's) and devices on real channels to it that send only what the test tells them to. */
+async function runnerAndPeers(names: string[], pause = 250) {
+  const room = await hostedRoom();
+  const member = async (name: string) => {
+    const { home } = folders(), { deviceId } = await initPerson(home);
+    await joinRoom({ url: room.url, kind: 'person', name, label: 'Meshrooms app' }, noRunner, home);
+    return { deviceId, agent: personAgent(room.roomId, home) };
+  };
+  const sam = await member('Sam'), others = await Promise.all(names.map(member));
+  const runner = runBridge(sam.agent, quiet, { pause: () => Bun.sleep(pause) }).catch(error => error);
+  for (const { id } of (await room.host.status(room.roomId)).requests!) await room.host.send('decide', room.roomId, { requestId: id, admit: true });
+  const peers = await Promise.all(others.map(async ({ agent }) => {
+    const peer = await rawPeer(agent, sam.deviceId);
+    cleanups.push(() => void peer.stop());
+    const signed = async <T extends object>(body: T) => ({ body, signature: await agent.sign(body) });
+    return Object.assign(peer, {
+      say: (text: string, attachments?: AttachmentRef[]) => signed({ kind: 'message', roomId: room.roomId, id: crypto.randomUUID(), deviceId: peer.id, memberId: peer.memberId, text, at: Date.now(), ...(attachments ? { attachments } : {}) }),
+      retract: (target: string, memberId = peer.memberId) => signed({ kind: 'retract', roomId: room.roomId, id: crypto.randomUUID(), deviceId: peer.id, memberId, at: Date.now(), target }),
+    });
+  }));
+  await until(() => peers.every(peer => peer.open), 40_000);
+  const held = (id: string) => sam.agent.messages().find(m => m.packet.body.id === id);
+  const onDisk = () => readFileSync(join(sam.agent.dir, 'messages.json'), 'utf8');
+  const finish = async () => {
+    await Promise.all(peers.map(peer => peer.stop()));
+    await room.host.send('close', room.roomId);
+    expect((await runner as { status?: number }).status).toBe(410);
+  };
+  return { sam: sam.agent, peers, held, onDisk, finish };
+}
+
+test('a sender still retrying a deleted message gets its receipt and the content stays gone', async () => {
+  const { peers: [robin], held, onDisk, finish } = await runnerAndPeers(['Robin']);
+  const message = await robin!.say('the secret'), id = message.body.id;
+  const receipts = () => robin!.heard.filter(p => p.body?.kind === 'receipt' && p.body.id === id).length;
+  robin!.send(message);
+  await until(() => held(id) && receipts() === 1);
+  robin!.send(await robin!.retract(id));
+  await until(() => held(id)?.retracted);
+  robin!.send(message);
+  await until(() => receipts() === 2);
+  expect(held(id)).toMatchObject({ retracted: true, packet: { body: { text: '' } } });
+  expect(onDisk()).not.toContain('the secret');
+  await finish();
+}, 90_000);
+
+test('a live retraction counts by who signed it, not by which device relayed it', async () => {
+  const { peers: [robin, wren], held, onDisk, finish } = await runnerAndPeers(['Robin', 'Wren']);
+  const message = await wren!.say('the secret'), id = message.body.id;
+  wren!.send(message);
+  await until(() => held(id));
+  // Robin claims to be Wren with Robin's own key, then alters what Wren signed. Neither gets through.
+  robin!.send(await robin!.retract(id, wren!.memberId));
+  const real = await wren!.retract(id);
+  robin!.send({ ...real, body: { ...real.body, at: real.body.at + 1 } });
+  // Packets are handled in order, so once this one is stored the two before it were refused.
+  const marker = await robin!.say('after those');
+  robin!.send(marker);
+  await until(() => held(marker.body.id));
+  expect(onDisk()).toContain('the secret');
+  robin!.send(real);
+  await until(() => held(id)?.retracted);
+  expect(onDisk()).not.toContain('the secret');
+  await finish();
+}, 90_000);
+
+test('a retraction during a file transfer stops it, and what arrives afterwards is not kept', async () => {
+  // Passes far apart, so it is the retraction itself that stops the transfer and not the next pass tidying up.
+  const { sam, peers: [robin], held, onDisk, finish } = await runnerAndPeers(['Robin'], 2_000);
+  const bytes = Uint8Array.from({ length: 2_000 }, (_, i) => (i * 31) & 0xff), ref = await attachmentRef(bytes, 'secret.bin'), sha = ref.sha256;
+  const message = await robin!.say('Look at this', [ref]), id = message.body.id;
+  const chunk = (from: number, to: number) => ({ kind: 'file-chunk', roomId: sam.roomId, sha256: sha, offset: from, data: Buffer.from(bytes.subarray(from, to)).toString('base64') });
+  robin!.send({ kind: 'files', roomId: sam.roomId, version: 1 });
+  robin!.send(message);
+  await until(() => held(id));
+  writeFileSync(join(sam.dir, 'wants', sha), '');
+  await until(() => robin!.heard.some(p => p.kind === 'file-want' && p.sha256 === sha));
+  robin!.send(chunk(0, 1_000));
+  robin!.send(await robin!.retract(id));
+  await until(() => held(id)?.retracted);
+  robin!.send(chunk(1_000, 2_000));
+  robin!.send({ kind: 'file-done', roomId: sam.roomId, sha256: sha, size: bytes.length });
+  await Bun.sleep(500);
+  expect(existsSync(sam.files.path(sha))).toBe(false);
+  expect(existsSync(join(sam.dir, 'wants', sha))).toBe(false);
+  expect(onDisk()).not.toContain(sha);
+  await finish();
+}, 90_000);
 
 test('a paired app joins as the paired person, and only at the paired room service', async () => {
   const { home } = folders(), room = await hostedRoom();
@@ -339,6 +475,33 @@ test('pair asks in every room with a proof of the browser\'s secret, and that se
   expect((await alex.status(hosted)).devices!.length).toBe(2);
   const again = await pair({ device: alexId, name: 'Alex', rooms: hosted });
   expect(again.rooms[0]).toMatchObject({ roomId: hosted, state: 'waiting' });
+});
+
+test('cancelling pairing withdraws pending requests, keeps admitted rooms and the key, and can be retried', async () => {
+  const { home } = folders(), service = coordinator(), browser = await client(service.lobby, Date.now, service.origin);
+  const admitted = crypto.randomUUID(), pending = crypto.randomUUID(), untouched = crypto.randomUUID();
+  for (const room of [admitted, pending, untouched]) await browser.send('create', room, { title: room, name: 'Robin', label: 'Browser' });
+  const device = (await browser.status(admitted)).deviceId, secret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+  const input = { origin: service.origin, rooms: `${admitted},${pending}`, device };
+  const pair = () => pairRooms({ ...input, rooms: `${admitted},${pending},${untouched}`, name: 'Robin', secret }, noRunner, home);
+  await pair();
+  await browser.send('link', admitted, { pairing: secret });
+  const identity = readFileSync(join(home, 'identity.json'), 'utf8'), stopped: string[] = [];
+  await expect(cancelPairing({ ...input, device: 'b'.repeat(64) }, async () => 'none', home)).rejects.toThrow('not the browser pairing');
+  const incomplete = await cancelPairing(input, async () => 'alive', home);
+  expect(incomplete.cancelled).toBe(false);
+  expect(personRooms(home)).toHaveLength(3);
+  expect((await browser.status(pending)).requests).toHaveLength(0);
+  const result = await cancelPairing(input, async agent => { stopped.push(agent.roomId); return 'stopped'; }, home);
+  expect(result.cancelled).toBe(true);
+  expect(result.rooms.map(r => [r.roomId, r.state])).toEqual([[admitted, 'joined'], [pending, 'cancelled']]);
+  expect(stopped).toEqual([pending]);
+  expect(personRooms(home).map(r => r.roomId)).toEqual([admitted, untouched]);
+  expect((await browser.status(untouched)).requests).toHaveLength(1);
+  expect(readFileSync(join(home, 'identity.json'), 'utf8')).toBe(identity);
+  expect((await browser.status(admitted)).devices).toHaveLength(2);
+  await pair();
+  expect((await browser.status(pending)).requests).toHaveLength(1);
 });
 
 test('only the app\'s proof (the running daemon\'s control token) opens pair and unpair', async () => {

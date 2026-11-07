@@ -1,4 +1,4 @@
-import { Fragment, createContext, useContext, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from 'react';
+import { Fragment, createContext, useContext, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from 'react';
 import { mentionedIds, type Task, type TaskStatus } from '../collab';
 import { FloorControl, MAX_MESSAGE_FILES, MAX_UPLOAD_BYTES, MentionText, MessageAttachments, PendingFiles, TaskBoard, formatBytes, uploadName, useAutoGrow, useMentions, useStickToBottom, type AttachmentSource, type PendingFile } from '../prototype/Collaboration';
 import { Wordmark } from '../prototype/RoomPrototype';
@@ -7,9 +7,12 @@ import { deriveActivity, duration, type ActivityRecord, type AgentActivity } fro
 import { issueLabel, mentionedRepositories, repositoryFrom, taskTimeline, type TaskBody, type TaskEvent } from './board';
 import type { ApiError } from './client';
 import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
+import { roomDrafts } from './drafts';
 import { DesktopPairing } from './DesktopPairing';
 import { joinLink, pairedHere } from './desktop-join';
 import { LocalAgentsSection, identityOfMember, useLocalAgents, wakeLabel } from './LocalAgents';
+import { AgentApps } from './AgentApps';
+import { RoomNotificationControls } from './RoomNotificationControls';
 import { due, foldDecisions, type Decision, type DecisionBody, type VoteBody } from './decisions';
 import { IMAGE_TYPES, attachmentRef, displayKind, shownText, type AttachmentRef } from './files';
 import { BOARD_DEFAULT, BOARD_STEP, boardLimits, clampBoardWidth, saveBoardWidth, savedBoardWidth } from './panel';
@@ -177,11 +180,12 @@ function describeTask(event: TaskEvent, name: (memberId: string, subject?: boole
 }
 type TranscriptItem = { message: SavedMessage; event?: undefined; decision?: undefined } | { event: TaskEvent; message?: undefined; decision?: undefined }
   | { decision: Decision; message?: undefined; event?: undefined };
+type HistoryAnchor = { node: HTMLElement; offset: number; focus: boolean };
 const itemAt = (item: TranscriptItem) => item.message?.packet.body.at ?? item.event?.at ?? item.decision!.createdAt;
 
 export function BrowserRooms({ source: given }: { source?: RoomSource } = {}) {
   const [source] = useState<RoomSource>(() => given ?? new BrowserSource());
-  return <Source.Provider value={source}><Rooms source={source} /></Source.Provider>;
+  return <Source.Provider value={source}>{source.isLocal && source.agents && location.pathname === '/agent-apps' ? <AgentApps api={source.agents} /> : <Rooms source={source} />}</Source.Provider>;
 }
 function Rooms({ source }: { source: RoomSource }) {
   const [status, setStatus] = useState<RoomStatus>();
@@ -202,6 +206,8 @@ function Rooms({ source }: { source: RoomSource }) {
   /** Where the local page makes new rooms (the person device's room service), shown when it isn't the public one. */
   const [roomService, setRoomService] = useState<string>();
   const [network, setNetwork] = useState('');
+  const [openingError, setOpeningError] = useState('');
+  const [signInRequired, setSignInRequired] = useState(false);
   /** Local saving is failing: shown until a save succeeds again, unlike network problems, which the next poll clears. */
   const [storageProblem, setStorageProblem] = useState<string>();
   useEffect(() => onStorageProblem(setStorageProblem), []);
@@ -212,6 +218,9 @@ function Rooms({ source }: { source: RoomSource }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [liveMessage, setLiveMessage] = useState<{ id: string; text: string }>();
   const [replyId, setReplyId] = useState<string>();
+  const [confirmDelete, setConfirmDelete] = useState<string>();
+  const draftOwner = useRef('');
+  const [draftProblem, setDraftProblem] = useState(false);
   const [agentName, setAgentName] = useState('');
   const [repositoryDraft, setRepositoryDraft] = useState('');
   /** The agent link just made; `expiresAt` is filled in once room status lists it as unused. */
@@ -243,6 +252,20 @@ function Rooms({ source }: { source: RoomSource }) {
   const avatarInput = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<Record<string, FileView>>({});
   const [chosen, setChosen] = useState<ChosenFile[]>([]);
+  const [sending, setSending] = useState(false);
+  const sendPending = useRef(false);
+  // Save before the browser can follow a room link. This is tab storage, never a message or a daemon preference.
+  useLayoutEffect(() => {
+    if (!urlRoom || !deviceId || draftOwner.current !== `${deviceId}:${urlRoom}`) return;
+    setDraftProblem(!roomDrafts.save(deviceId, urlRoom, { text, replyId }));
+  }, [deviceId, text, replyId]);
+  // Files and an in-flight send are held in memory. Warn before leaving while anything cannot be restored as a draft.
+  useEffect(() => {
+    if (!sending && !chosen.length && !(draftProblem && (text || replyId))) return;
+    const leaving = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', leaving);
+    return () => window.removeEventListener('beforeunload', leaving);
+  }, [sending, chosen.length, draftProblem, text, replyId]);
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [taskOps, setTaskOps] = useState<TaskBody[]>([]);
@@ -261,13 +284,47 @@ function Rooms({ source }: { source: RoomSource }) {
   const peers = useRef<RoomSession | null>(null);
   /** Older messages can be loaded (the local page hands out the newest first). */
   const [olderAvailable, setOlderAvailable] = useState(false);
+  const [olderLoading, setOlderLoading] = useState(false);
+  const historyLoading = useRef(false), historyAnchor = useRef<HistoryAnchor | undefined>(undefined);
+  const [restoreHistory, setRestoreHistory] = useState<HistoryAnchor>();
   const everJoined = useRef(false);
   const stick = useStickToBottom();
+  function captureHistory(focus = false): HistoryAnchor | undefined {
+    const view = stick.viewport.current;
+    if (!view) return;
+    const top = view.getBoundingClientRect().top;
+    const node = Array.from(view.querySelector('.browser-message-list')?.children ?? []).find(row =>
+      !row.classList.contains('browser-day') && row.getBoundingClientRect().bottom > top) as HTMLElement | undefined;
+    if (node) return { node, offset: node.getBoundingClientRect().top - top, focus };
+  }
+  useLayoutEffect(() => {
+    const view = stick.viewport.current;
+    if (!restoreHistory) return;
+    if (!view || !restoreHistory.node.isConnected) { setRestoreHistory(undefined); return; }
+    if (!view.clientHeight) return;
+    view.scrollTop += restoreHistory.node.getBoundingClientRect().top - view.getBoundingClientRect().top - restoreHistory.offset;
+    if (restoreHistory.focus && document.activeElement === document.body) {
+      restoreHistory.node.tabIndex = -1; restoreHistory.node.focus({ preventScroll: true });
+    }
+    setRestoreHistory(undefined);
+  }, [restoreHistory, detailsOpen, boardOpen]);
+  async function loadEarlier(event: React.MouseEvent<HTMLButtonElement>) {
+    if (historyLoading.current || !peers.current) return;
+    historyLoading.current = true; setOlderLoading(true);
+    historyAnchor.current = captureHistory(document.activeElement === event.currentTarget);
+    stick.pauseFollowing();
+    try {
+      setOlderAvailable(await peers.current.loadOlder());
+      setRestoreHistory(historyAnchor.current);
+    } catch (error) { setError((error as Error).message); }
+    finally { historyLoading.current = false; setOlderLoading(false); }
+  }
   const detailsHeading = useRef<HTMLHeadingElement>(null);
   const detailsButton = useRef<HTMLButtonElement>(null);
   const linkDevice = useRef<HTMLDetailsElement>(null);
   /** Room details' "Use the desktop app", which the header's hint opens. */
   const desktopPairing = useRef<HTMLDetailsElement>(null);
+  const [desktopPairingActive, setDesktopPairingActive] = useState(false);
   const admitted = !!status?.memberId;
   const host = admitted && status?.memberId === status?.ownerId;
   const self = status?.members?.find(m => m.id === status.memberId);
@@ -326,10 +383,15 @@ function Rooms({ source }: { source: RoomSource }) {
 
   useEffect(() => {
     let disposed = false, room: { done: Promise<void>; dispose(): void } | undefined;
-    setReady(false); setError('');
+    setReady(false); setError(''); setOpeningError(''); setNetwork(''); setSignInRequired(false);
     void (async () => {
       const { deviceId: device, recent: rooms, name: profile } = await source.start();
       if (disposed) return;
+      if (urlRoom && draftOwner.current !== `${device}:${urlRoom}`) {
+        const draft = roomDrafts.read(device, urlRoom);
+        draftOwner.current = `${device}:${urlRoom}`;
+        setText(draft.text); setReplyId(draft.replyId);
+      }
       setRecent(rooms); setName(profile); setDeviceId(device);
       if (!urlRoom) {
         const pendingCreate = await source.readPref<{ name: string; title: string }>('pending-create');
@@ -351,7 +413,8 @@ function Rooms({ source }: { source: RoomSource }) {
       room = source.open(urlRoom, device, {
         ready: session => { peers.current = session; },
         messages: (m, c, added) => {
-          if (added) {
+          setLiveMessage(current => current && m.some(saved => saved.retracted && saved.packet.body.id === current.id) ? undefined : current);
+          if (added && !added.retracted) {
             const own = added.packet.body.deviceId === (currentStatus.current?.deviceId || device);
             stick.arrived(own);
             if (!own) {
@@ -361,7 +424,7 @@ function Rooms({ source }: { source: RoomSource }) {
           }
           setMessages(m); setConnected(c); setOlderAvailable(!!peers.current?.hasOlder());
         },
-        network: setNetwork,
+        network: (problem, needsSignIn = false) => { setNetwork(problem); setSignInRequired(needsSignIn); if (problem) setReady(true); },
         board: (board, ops) => { setTasks(board); setTaskOps(ops); },
         files: setFiles,
         activity: records => { setActivity(records); setNow(Date.now()); },
@@ -371,7 +434,7 @@ function Rooms({ source }: { source: RoomSource }) {
         status: next => {
           if (next.request?.state === 'expired' || next.request?.state === 'declined') setNotice('');
           currentStatus.current = next;
-          setStatus(next); setReady(true); setNetwork('');
+          setStatus(next); setReady(true); setNetwork(''); setSignInRequired(false);
           if (next.memberId) everJoined.current = true;
         },
         closed: reason => { setClosed(current => current || reason); setStatus(undefined); setNetwork(''); setReady(true); },
@@ -379,7 +442,7 @@ function Rooms({ source }: { source: RoomSource }) {
         lost: () => { setLostRoom(true); setNetwork(''); },
       });
       await room.done;
-    })().catch(e => { if (!disposed) { setError(e.message); setReady(true); } });
+    })().catch(e => { if (!disposed) { setOpeningError(e.message); setSignInRequired(e.status === 401); setReady(true); } });
     return () => { disposed = true; room?.dispose(); peers.current = null; };
   }, [source, retry]);
   useEffect(() => {
@@ -567,10 +630,11 @@ function Rooms({ source }: { source: RoomSource }) {
   }
   const readyFiles = chosen.filter(f => f.status === 'ready');
   // More than MAX_MESSAGE_FILES only after a failed send brought its files back: the person removes some before sending.
-  const canSend = !busy && chosen.length <= MAX_MESSAGE_FILES && chosen.every(f => f.status === 'ready') && (!!text.trim() || readyFiles.length > 0);
+  const canSend = !busy && !signInRequired && chosen.length <= MAX_MESSAGE_FILES && chosen.every(f => f.status === 'ready') && (!!text.trim() || readyFiles.length > 0);
   function send(event: FormEvent) {
-    event.preventDefault(); if (!canSend) return;
-    const draft = text, replyTo = reply ? replyId : undefined, sending = readyFiles;
+    event.preventDefault(); if (!canSend || sendPending.current) return;
+    sendPending.current = true; setSending(true);
+    const draft = text, replyTo = replyId, sending = readyFiles;
     // Clear at once, so whatever is typed while this sends is a new draft; a failed send puts its text back in front.
     setText(''); setReplyId(undefined); setChosen(current => current.filter(f => !sending.includes(f)));
     void act(async () => {
@@ -582,6 +646,8 @@ function Rooms({ source }: { source: RoomSource }) {
         setReplyId(current => current ?? replyTo);
         setChosen(current => [...sending, ...current]); // Files added while it was sending are kept too.
         throw e;
+      } finally {
+        sendPending.current = false; setSending(false);
       }
       sending.forEach(f => f.preview && URL.revokeObjectURL(f.preview));
     });
@@ -718,8 +784,21 @@ function Rooms({ source }: { source: RoomSource }) {
     </div>;
   }
 
+  function newRoomForm() {
+    return <>
+          <form onSubmit={create} className="browser-form"><label>Your name<input autoComplete="name" value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label>
+            <label>Room name<input value={title} onChange={e => setTitle(e.target.value)} required maxLength={80} placeholder="Project room" /></label>
+            {inviteRequired && <label>Invite code<input value={inviteCode} onChange={e => setInviteCode(e.target.value)} required maxLength={32} autoComplete="off" autoCapitalize="characters" spellCheck={false} placeholder="XXXX-XXXX-XXXX-XXXX" /></label>}
+            <button className="primary" disabled={busy}>{busy ? 'Creating room…' : 'Create room'}</button></form>
+          {source.isLocal && roomService && roomService !== PUBLIC_ROOM_SERVICE && <p className="browser-entry-note browser-room-service">This room will be made on <strong>{roomService}</strong>, not the public Meshrooms service.</p>}
+          {inviteRequired && <p className="browser-entry-note">Enter your beta invite once. Then create more rooms without a code. Joining a room from its link doesn’t need one.</p>}
+    </>;
+  }
+
   /** This browser paired with the desktop app (DesktopPairing): the room page offers to open rooms there. */
   const appPaired = !source.isLocal && pairedHere();
+  const connectionProblem = network || openingError;
+  const retryConnection = () => setRetry(v => v + 1);
   return <div className={`browser-rooms ${admitted ? 'browser-joined' : ''} ${admitted && railCollapsed ? 'browser-rail-collapsed' : ''}`}>
     <a className="skip-link" href="#browser-main">Skip to room</a>
     <aside className="browser-rail">
@@ -731,20 +810,25 @@ function Rooms({ source }: { source: RoomSource }) {
           {[{ id: urlRoom, title }, ...recent.filter(r => r.id !== urlRoom)].map(r => {
             // The open room shows no badge: it is being read here.
             const count = r.id === urlRoom ? undefined : counts[r.id], label = roomLabel(count);
-            return <a key={r.id} href={`/r/${r.id}`} className={count?.unread ? 'has-unread' : undefined} title={railCollapsed ? label ? `${r.title} · ${label}` : r.title : undefined} aria-current={r.id === urlRoom ? 'page' : undefined}>
-              <RoomIcon kind="chat" /><span>{r.title}</span><RoomBadges count={count} /></a>;
+            const hasDraft = deviceId && r.id !== urlRoom && roomDrafts.has(deviceId, r.id);
+            return <a key={r.id} href={`/r/${r.id}`} className={count?.unread ? 'has-unread' : undefined} title={railCollapsed ? label ? `${r.title} · ${label}` : r.title : undefined} aria-current={r.id === urlRoom ? 'page' : undefined} aria-describedby={hasDraft ? `room-draft-${r.id}` : undefined}>
+              <RoomIcon kind="chat" /><span>{r.title}</span>{hasDraft && <span id={`room-draft-${r.id}`} className="browser-room-draft" aria-hidden="true">Draft</span>}<RoomBadges count={count} /></a>;
           })}
-          <a href="/rooms" className="browser-all-rooms" title={railCollapsed ? 'Create a room' : undefined}><RoomIcon kind="plus" /><span>Create a room</span></a>
+          <a href={source.isLocal ? '/rooms#create-room' : '/rooms'} className="browser-all-rooms" title={railCollapsed ? 'Create a room' : undefined}><RoomIcon kind="plus" /><span>Create a room</span></a>
         </nav>
         <a href="/rooms" className="browser-mobile-rooms">Your rooms<RoomBadges count={{ unread: otherUnread, mentions: others.reduce((sum, r) => sum + (counts[r.id]?.mentions || 0), 0), waiting: otherWaiting }} /></a>
         <div className="browser-self"><MemberAvatar member={self} roomId={urlRoom} fallback={self?.name || ''} /><div><strong>{self?.name}</strong><span>{host ? 'Room host' : 'Room member'}</span></div></div>
       </> : <p className="browser-rail-intro">A shared room for your people and their agents.</p>}
+      {source.isLocal && <a href="/agent-apps" className="browser-agent-apps-link">Agent apps</a>}
       <p className="browser-rail-footer">Meshrooms by WormDB<br />{source.label}</p>
     </aside>
     <main id="browser-main" className={`browser-main ${detailsOpen ? 'browser-details-open' : ''} ${boardOpen ? 'browser-board-open' : ''}`} tabIndex={-1}>
       {error && <div role="alert" className="browser-error">{error} <button onClick={() => { setError(''); if (!status) setRetry(v => v + 1); }}>{status ? 'Dismiss' : 'Retry'}</button></div>}
       {storageProblem && <p role="alert" className="browser-error">{storageProblem}</p>}
-      {network && <p role="status" className="browser-error">{network}</p>}
+      {connectionProblem && status && <section role="status" className="browser-recovery" aria-label="Connection problem"><div>
+        <strong>{signInRequired ? 'Sign in again from the app' : source.isLocal ? 'Connection to this computer interrupted' : 'Connection interrupted'}</strong>
+        <p>{connectionProblem}</p>{!signInRequired && <p className="browser-recovery-hint">{openingError ? 'Try again when the app is available. Your draft stays in this tab.' : 'We’ll keep trying to reconnect. Your draft stays in this tab.'}</p>}
+        </div>{!signInRequired && <button className="secondary" disabled={busy} onClick={retryConnection}>Try again</button>}</section>}
       {notice && <p role="status" className="browser-notice">{notice}</p>}
       {alertShown && alertRoom && <div role="status" className="browser-notice browser-join-notice"><span>{joinNotice(alertShown.request, alertRoom)}</span>
         {alertsMore > 0 && <span className="browser-join-more">{alertsMore} more waiting</span>}
@@ -753,15 +837,19 @@ function Rooms({ source }: { source: RoomSource }) {
       {closed ? <section className="browser-entry"><h1>{title || 'Room closed'}</h1><h2>This room is closed</h2><p>{closed}</p>
           <p>Nobody can join, send messages or connect agents here any more.</p>
           <div className="browser-entry-actions"><a className="browser-text-link" href="/rooms">Start or open another room</a></div></section>
-      : !ready ? <section className="browser-entry" aria-busy="true"><h1>Opening your room…</h1><p>{source.isLocal ? 'Reading your rooms from this computer.' : 'Restoring this browser’s identity.'}</p></section> : !urlRoom ?
-        <section className="browser-entry"><h1>Start a room</h1><p>Share a link. Approve who joins. Start talking.</p>
-          <form onSubmit={create} className="browser-form"><label>Your name<input autoComplete="name" value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label>
-            <label>Room name<input value={title} onChange={e => setTitle(e.target.value)} required maxLength={80} placeholder="Project room" /></label>
-            {inviteRequired && <label>Invite code<input value={inviteCode} onChange={e => setInviteCode(e.target.value)} required maxLength={32} autoComplete="off" autoCapitalize="characters" spellCheck={false} placeholder="XXXX-XXXX-XXXX-XXXX" /></label>}
-            <button className="primary" disabled={busy}>{busy ? 'Creating room…' : 'Create room'}</button></form>
-          {source.isLocal && roomService && roomService !== PUBLIC_ROOM_SERVICE && <p className="browser-entry-note browser-room-service">This room will be made on <strong>{roomService}</strong>, not the public Meshrooms service.</p>}
-          {inviteRequired && <p className="browser-entry-note">Meshrooms is invite-only during the beta: creating a room needs an invite code. Joining a room from its link doesn’t.</p>}
-          {recent.length > 0 && <section className="browser-recent"><h2>Your rooms</h2>{recent.map(r => <a key={r.id} href={`/r/${r.id}`}>{r.title}<RoomBadges count={counts[r.id]} /></a>)}</section>}
+      : !ready ? <section className="browser-entry" aria-busy="true"><h1>{urlRoom ? 'Opening your room…' : 'Opening your rooms…'}</h1><p>{source.isLocal ? 'Reading your rooms from this computer.' : 'Restoring this browser’s identity.'}</p></section>
+      : connectionProblem && !status ? <section className="browser-entry browser-entry-recovery" role="alert">
+          <h1>{signInRequired ? 'Open your rooms from the app' : source.isLocal ? 'Cannot reach Meshrooms on this computer' : 'Your room could not be opened'}</h1>
+          <p>{connectionProblem}</p>
+          {source.isLocal && !signInRequired && <p>Your rooms and settings are kept on this computer. Open Meshrooms and check that the background service is running.</p>}
+          {!signInRequired && <button className="primary" onClick={retryConnection}>Try again</button>}
+        </section> : !urlRoom ?
+        <section className="browser-entry"><h1>{source.isLocal && recent.length ? 'Your rooms' : 'Start a room'}</h1>
+          <p>{source.isLocal && recent.length ? 'Open a room paired with this computer.' : 'Share a link. Approve who joins. Start talking.'}</p>
+          {source.isLocal && recent.length > 0 && <nav className="browser-recent browser-paired-rooms" aria-label="Your rooms">{recent.map(r => <a key={r.id} href={`/r/${r.id}`}>{r.title}<RoomBadges count={counts[r.id]} /></a>)}</nav>}
+          {source.isLocal && recent.length > 0 ? <details className="browser-create-room" id="create-room" ref={section => { if (section && location.hash === '#create-room') { section.open = true; history.replaceState(null, '', location.pathname); section.scrollIntoView({ block: 'start' }); } }}>
+            <summary>Create a room</summary>{newRoomForm()}</details> : newRoomForm()}
+          {!source.isLocal && recent.length > 0 && <section className="browser-recent"><h2>Your rooms</h2>{recent.map(r => <a key={r.id} href={`/r/${r.id}`}>{r.title}<RoomBadges count={counts[r.id]} /></a>)}</section>}
           {!source.isLocal && recent.length > 0 && <section className="browser-desktop-app" id="desktop-app" ref={section => { if (section && location.hash === '#desktop-app') { history.replaceState(null, '', location.pathname); section.scrollIntoView({ block: 'start' }); } }}><h2>Desktop app</h2><DesktopPairing rooms={recent} name={name} device={deviceId} link={pairRoom} /></section>}
         </section> : !admitted ?
         <section className="browser-entry"><h1>{title || 'Join room'}</h1>
@@ -786,9 +874,9 @@ function Rooms({ source }: { source: RoomSource }) {
         </section> : <>
           <header className="browser-room-header">
             <div className="browser-room-heading"><h1>{title}</h1><p>{people} {people === 1 ? 'person' : 'people'}{agents.length ? ` and ${agents.length} agent${agents.length === 1 ? '' : 's'}` : ''} in this room{working ? ` · ${working} working` : ''}</p></div>
-            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); }}><RoomIcon kind="people" />Room details</button>{!source.isLocal && (appPaired
+            <div className="browser-room-actions"><button className="secondary" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button className="secondary" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button className="secondary" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); }}><RoomIcon kind="people" />Room details</button>{!source.isLocal && (appPaired && !desktopPairingActive
               ? <a className="secondary browser-open-app" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
-              : <button className="browser-text-link browser-app-hint" onClick={() => { openDetails(); requestAnimationFrame(() => { const pair = desktopPairing.current; if (!pair) return; pair.open = true; pair.scrollIntoView({ block: 'nearest' }); }); }}>Have the desktop app?</button>)}<button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
+              : <button className={desktopPairingActive ? "primary browser-app-hint" : "browser-text-link browser-app-hint"} onClick={() => { openDetails(); requestAnimationFrame(() => { const pair = desktopPairing.current; if (!pair) return; pair.open = true; (pair.querySelector('[data-desktop-pairing-confirm]') || pair).scrollIntoView({ block: 'center' }); }); }}>{desktopPairingActive ? 'Finish desktop pairing' : 'Have the desktop app?'}</button>)}<button className="primary" onClick={() => void copyInvite()}><RoomIcon kind="link" />Copy room link</button></div>
           </header>
           {admitted && agents.length > 0 && <section className="browser-agent-strip" aria-label="Agents in this room">
             {present.map(agent => {
@@ -817,9 +905,12 @@ function Rooms({ source }: { source: RoomSource }) {
               onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false); }}
               onDrop={e => { if (!e.dataTransfer.files.length) return; e.preventDefault(); setDragging(false); addFiles(e.dataTransfer.files); }}>
               {dragging && <div className="drop-overlay" aria-hidden="true"><RoomIcon kind="clip" /><strong>Drop to attach</strong><span>Screenshots and files up to {formatBytes(MAX_UPLOAD_BYTES)}</span></div>}
-              <section ref={stick.ref} className="browser-transcript" role="log" aria-live="off" aria-label="Conversation" tabIndex={0} onScroll={stick.onScroll}>
+              <section ref={stick.ref} className="browser-transcript" role="log" aria-live="off" aria-label="Conversation" tabIndex={0} onScroll={() => {
+                stick.onScroll();
+                if (historyLoading.current) historyAnchor.current = captureHistory(historyAnchor.current?.focus);
+              }}>
                 <div className="browser-message-list">
-                  {olderAvailable && <div className="browser-day"><button className="browser-text-link" disabled={busy} onClick={() => void act(async () => { setOlderAvailable(await peers.current!.loadOlder()); })}>Show earlier messages</button></div>}
+                  {olderAvailable && <div className="browser-day"><button className="browser-text-link" disabled={busy || olderLoading || signInRequired} aria-busy={olderLoading} onClick={loadEarlier}>{olderLoading ? 'Loading earlier messages…' : 'Show earlier messages'}</button></div>}
                   {!messages.length && <div className="browser-empty"><RoomIcon kind="chat" /><h2>{status.members!.length > 1 ? 'Ready for your first message' : status.requests?.length ? 'Your conversation starts here' : 'Bring someone into the room'}</h2><p>{status.members!.length > 1 ? 'Send a message below to start the conversation.' : status.requests?.length ? 'Someone is waiting to join. Admit them above to get started.' : 'Share the room link with someone, or open it on another device.'}</p></div>}
                   {items.map((item, index) => {
                     const previous = items[index - 1], at = itemAt(item);
@@ -842,20 +933,21 @@ function Rooms({ source }: { source: RoomSource }) {
                     const m = item.message, body = m.packet.body;
                     const member = status.members!.find(p => p.id === body.memberId);
                     const author = member?.name || 'Former member';
-                    const target = body.replyTo ? messages.find(t => t.packet.body.id === body.replyTo)?.packet.body : undefined;
+                    const replied = body.replyTo ? messages.find(t => t.packet.body.id === body.replyTo) : undefined, target = replied?.packet.body;
+                    const gone = !!m.retracted, mine = body.memberId === status.memberId;
                     const continuation = grouped(previous?.message, m);
                     const next = items[index + 1]?.message;
                     const own = body.deviceId === status.deviceId;
-                    const showReceipt = own && (!next || !grouped(m, next) || m.receipts.length < m.targets.length);
+                    const showReceipt = own && !gone && (!next || !grouped(m, next) || m.receipts.length < m.targets.length);
                     const forYou = body.memberId !== status.memberId && (mentionedIds(body.text, participants).includes(status.memberId!) || target?.memberId === status.memberId);
                     const operator = operatorOf(member);
-                    const shown = shownText(body), quoted = target && (shownText(target) || fileNames(target));
-                    const chips = reactions.filter(r => r.messageId === body.id);
+                    const shown = shownText(body), quoted = target && (replied?.retracted ? 'a deleted message' : shownText(target) || fileNames(target));
+                    const chips = gone ? [] : reactions.filter(r => r.messageId === body.id);
                     const picking = reactPicker === body.id;
                     // Without reactions the control sits next to Reply (in the top corner for a grouped message, whose header is
                     // hidden), shown on hover or focus (always, quietly, on touch);
                     // with reactions it ends their row. Either way there is no row of its own for a lone button.
-                    const addReaction = admitted && <div className={`browser-reaction-add ${chips.length ? '' : 'browser-reaction-add-header'}`}>
+                    const addReaction = admitted && !gone && <div className={`browser-reaction-add ${chips.length ? '' : 'browser-reaction-add-header'}`}>
                       <button type="button" className="browser-reaction-picker-toggle" disabled={busy} aria-expanded={picking} aria-label={`Add a reaction to ${own ? 'your' : `${author}’s`} message`}
                         title="Add a reaction" onClick={() => setReactPicker(picking ? undefined : body.id)}><ReactionIcon /></button>
                       {picking && <div className="browser-reaction-picker" role="listbox" aria-label="Reaction emoji">
@@ -872,9 +964,15 @@ function Rooms({ source }: { source: RoomSource }) {
                       <article id={`message-${body.id}`} className={`browser-message ${highlight === body.id ? 'browser-message-highlight' : ''} ${continuation ? 'browser-message-continuation' : ''} ${forYou ? 'browser-message-for-you' : ''} ${isAgent(member) ? 'browser-message-agent' : ''}`}>
                         <MemberAvatar member={member} roomId={urlRoom} fallback={author} />
                         <div><header className={continuation ? 'browser-continuation-header' : ''}><strong>{author}</strong>{isAgent(member) && <span className="browser-role" title={runtimeOf(member) ? `${runtimeOf(member)} (reported by the agent)` : 'Agent'}>agent</span>}{operator && <span className="browser-operator">for {operator}</span>}{body.memberId === status.memberId && <span className="browser-author-you">you</span>}<time dateTime={new Date(body.at).toISOString()}>{new Date(body.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
-                          <button className="browser-reply-button" aria-label={`Reply to ${own ? 'your' : `${author}’s`} message`} title="Reply" onClick={() => startReply(body.id)}>Reply</button>{!chips.length && addReaction}</header>
+                          {!gone && <button className="browser-reply-button" aria-label={`Reply to ${own ? 'your' : `${author}’s`} message`} title="Reply" onClick={() => startReply(body.id)}>Reply</button>}
+                          {mine && !gone && admitted && <button className="browser-reply-button browser-delete-button" aria-label="Delete your message" aria-expanded={confirmDelete === body.id} title="Delete" onClick={() => setConfirmDelete(confirmDelete === body.id ? undefined : body.id)}>Delete</button>}{!chips.length && addReaction}</header>
                           {body.replyTo && <p className="browser-reply-reference">{target ? <>Replying to <strong>{nameOf(target.memberId)}</strong>: {quoted!.length > 120 ? `${quoted!.slice(0, 120)}…` : quoted}</> : 'Replying to an earlier message'}</p>}
-                          {shown && <div className="message-text"><MentionText text={shown} participants={participants} viewerId={status.memberId} repositories={pinned} /></div>}
+                          {gone ? <p className="browser-message-deleted">Message deleted</p> : shown && <div className="message-text"><MentionText text={shown} participants={participants} viewerId={status.memberId} repositories={pinned} /></div>}
+                          {confirmDelete === body.id && !gone && <div className="browser-delete-confirm" role="group" aria-label="Delete this message" onKeyDown={e => { if (e.key === 'Escape') setConfirmDelete(undefined); }}>
+                            <p>Delete this for everyone? Anyone who already saw it may still have a copy.</p>
+                            <button type="button" className="secondary" autoFocus onClick={() => setConfirmDelete(undefined)}>Keep</button>
+                            <button type="button" className="browser-delete-confirm-action" disabled={busy} onClick={() => void act(async () => { if (!peers.current) throw new Error('Room connection is not ready.'); await peers.current.retract(body.id); setConfirmDelete(undefined); })}>Delete</button>
+                          </div>}
                           {body.attachments && <MessageAttachments roomId={urlRoom} attachments={attachmentsOf(body)} author={own ? 'You' : author} source={fileSource} />}
                           {chips.length > 0 && <div className="browser-reactions">
                             {chips.map(chip => {
@@ -899,18 +997,20 @@ function Rooms({ source }: { source: RoomSource }) {
                 {stick.unread > 0 && <button className="secondary browser-unread" onClick={stick.toBottom}>{stick.unread === 1 ? 'New message' : `${stick.unread} new messages`} <span aria-hidden="true">↓</span></button>}
                 {deciding && <DecisionForm agents={agents.length} onCancel={() => setDeciding(false)}
                   onSubmit={async draft => { await peers.current!.openDecision(draft); setDeciding(false); stick.toBottom(); }} />}
-                {reply && <div className="browser-reply-draft"><span>Replying to <strong>{reply.packet.body.memberId === status.memberId ? 'your message' : nameOf(reply.packet.body.memberId)}</strong></span><button className="browser-close" aria-label="Cancel reply" onClick={() => setReplyId(undefined)}><RoomIcon kind="close" /></button></div>}
+                {replyId && <div className="browser-reply-draft"><span>Replying to <strong>{reply ? reply.packet.body.memberId === status.memberId ? 'your message' : nameOf(reply.packet.body.memberId) : 'an earlier message'}</strong></span><button className="browser-close" aria-label="Cancel reply" onClick={() => setReplyId(undefined)}><RoomIcon kind="close" /></button></div>}
                 <form className="browser-composer" onSubmit={send}>{mentions.list}<label className="sr-only" htmlFor="browser-message">Message {title}</label><textarea ref={composer} id="browser-message" value={text} {...mentions.inputProps}
                   onChange={e => { setText(e.target.value); mentions.track(e.target.value, e.target.selectionStart); }} onSelect={e => mentions.track(e.currentTarget.value, e.currentTarget.selectionStart)} onBlur={mentions.close}
                   onPaste={e => { const pasted = [...e.clipboardData.files]; if (pasted.length) { e.preventDefault(); addFiles(pasted); } }}
-                  onKeyDown={e => { if (mentions.onKeyDown(e)) return; if (e.key === 'Escape' && reply) { setReplyId(undefined); return; } if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); send(e); } }}
+                  onKeyDown={e => { if (mentions.onKeyDown(e)) return; if (e.key === 'Escape' && replyId) { setReplyId(undefined); return; } if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); send(e); } }}
                   maxLength={4000} rows={2} placeholder={agents.length ? `Message ${title} · type @ to ask an agent` : `Message ${title}`} />
                   <PendingFiles files={chosen} onRemove={removeFile} onRetry={key => { const item = chosen.find(f => f.key === key); if (item) prepareFile(item); }} />
                   <div><span className="browser-compose-tools"><input ref={fileInput} type="file" multiple hidden onChange={e => { addFiles(e.target.files); e.target.value = ''; }} />
                     <button type="button" className="secondary browser-attach" title="Attach screenshots or files (you can also paste or drop them)" onClick={() => fileInput.current?.click()}><RoomIcon kind="clip" /><span>Attach</span></button>
                     <button type="button" className="secondary browser-attach" aria-expanded={deciding} title="Ask the room to decide between options, or to review a plan" onClick={() => setDeciding(!deciding)}><RoomIcon kind="vote" /><span>Decide</span></button>
-                    <span className="browser-key-hint">Enter to send · Shift + Enter for a new line</span></span><button className="primary" disabled={!canSend}><span>Send</span><RoomIcon kind="send" /></button></div></form>
-                <p className="browser-connection" role="status"><span className={`browser-connection-dot ${connected.length ? 'is-connected' : ''}`} aria-hidden="true" />{connected.length ? `Connected to ${connected.length} other device${connected.length === 1 ? '' : 's'}` : status.devices!.length > 1 ? 'Waiting for another device to connect' : 'You’re the first one here'}</p>
+                    <span className="browser-key-hint">Enter to send · Shift + Enter for a new line</span></span><button className="primary" disabled={!canSend} aria-busy={sending}><span>{sending ? 'Sending…' : 'Send'}</span><RoomIcon kind="send" /></button></div></form>
+                {draftProblem ? <p className="browser-draft-problem" role="status">Draft changes could not be saved in this tab. Keep this page open or copy your text before leaving.</p>
+                  : !sending && (text || replyId || chosen.length > 0) ? <p className="browser-draft-saved">{text || replyId ? 'Draft saved in this tab.' : ''}{chosen.length > 0 ? ' Unsent files stay here while this page is open.' : ''}</p> : null}
+                <p className="browser-connection" role="status"><span className={`browser-connection-dot ${!connectionProblem && connected.length ? 'is-connected' : ''}`} aria-hidden="true" />{connectionProblem ? signInRequired ? 'Sign in again from the app to reconnect' : 'Reconnecting…' : connected.length ? `Connected to ${connected.length} other device${connected.length === 1 ? '' : 's'}` : status.devices!.length > 1 ? 'Waiting for another device to connect' : 'You’re the first one here'}</p>
               </div>
             </div>
             {boardOpen && <BoardHandle workspace={workspace} width={boardWidth} onCommit={width => { setBoardWidth(width ?? BOARD_DEFAULT); saveBoardWidth(width); }} />}
@@ -944,6 +1044,7 @@ function Rooms({ source }: { source: RoomSource }) {
                   {self?.avatar && <button className="browser-remove" disabled={busy} onClick={() => clearAvatar(self.id)}>Remove</button>}</div>
                 <p>Cropped to a square and kept under 16 KB. Everyone in this room sees it.</p>
               </section>
+              {detailsOpen && source.notifications && <RoomNotificationControls key={urlRoom} api={source.notifications} roomId={urlRoom} />}
               {!isAgent(self) && source.agents && <LocalAgentsSection api={source.agents} state={localAgents} roomId={urlRoom} selfName={self?.name} focus={agentFocus} />}
               {!isAgent(self) && !source.agents && <section className="browser-agents"><h3>Your agents</h3><p>You’re connecting as <strong>{self?.name}</strong>: you’ll be the operator of any agent you connect here, and only you and the host can remove it. Use your own browser, not one an agent is driving.</p>
                 {agentLink && linkState !== 'open' ? <div className="browser-agent-link" role="status"><p>{linkState === 'joined' ? <>Used by <strong>{agentLink.name}</strong>, which joined the room.</>
@@ -992,7 +1093,7 @@ function Rooms({ source }: { source: RoomSource }) {
                   <form onSubmit={e => { e.preventDefault(); void act(async () => { await source.command('link', urlRoom, { code: code.trim().toLowerCase() }); setCode(''); setNotice(host || !settings.hostApprovesDevices ? 'Your device is approved.' : 'Identity confirmed. The host can now admit your device.'); }); }}><label>Device code<input value={code} onChange={e => setCode(e.target.value)} required maxLength={16} autoComplete="off" spellCheck={false} /></label><button className="secondary" disabled={busy || code.trim().length !== 16}>Approve my device</button></form>
                 </details>
                 {!source.isLocal && <details ref={desktopPairing} className="browser-desktop-pairing"><summary>Use the desktop app</summary>
-                  <DesktopPairing rooms={[{ id: urlRoom, title }, ...recent.filter(r => r.id !== urlRoom)]} name={self?.name || name} device={deviceId} link={pairRoom} />
+                  <DesktopPairing rooms={[{ id: urlRoom, title }, ...recent.filter(r => r.id !== urlRoom)]} name={self?.name || name} device={deviceId} link={pairRoom} onActiveChange={setDesktopPairingActive} />
                 </details>}
                 <details className="browser-device-details"><summary>Manage your devices</summary>
                   {status.devices!.filter(d => d.memberId === status.memberId).map(d => <div key={d.id}><strong>{d.label} · {d.id.slice(-6).toUpperCase()}</strong><span>{d.id === status.deviceId ? 'This device' : connected.includes(d.id) ? 'Connected' : 'Offline'}</span>{d.id !== status.deviceId && <button className="browser-remove" aria-label={`Remove ${d.label} ${d.id.slice(-6).toUpperCase()}`} disabled={busy} onClick={() => void act(async () => { await source.command('remove', urlRoom, { deviceId: d.id }); })}>Remove device</button>}</div>)}

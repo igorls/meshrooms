@@ -74,6 +74,7 @@ export function wakeLabel(binding: AgentBinding) {
   if (binding.state === 'starting') return 'Starting a new session';
   if (binding.state === 'failed') return 'New session failed';
   if (binding.wakes === 'on' && binding.listening === false) return 'Starting…';
+  if (binding.wakes === 'on' && binding.delivery === 'desktop') return 'Messages arrive in Codex';
   return { unbound: 'No session yet', on: 'Wakes when addressed', off: 'Not waking', paused: 'Waking paused', halted: 'Waking stopped' }[binding.wakes];
 }
 /** The longer story of a binding, as plain sentences: what happens next, and why it stopped when it did. */
@@ -83,7 +84,7 @@ function bindingLines(binding: AgentBinding): string[] {
   const why = binding.offReason ? [binding.offReason] : [];
   switch (binding.wakes) {
     case 'unbound': return ['Not bound to a session yet, so nothing wakes it here.'];
-    case 'on': return [binding.kind === 'existing' ? 'Bound to one of your sessions. It wakes when someone addresses it.' : 'Bound to a new session. It wakes when someone addresses it.'];
+    case 'on': return [binding.delivery === 'desktop' ? 'Room messages arrive in your existing Codex desktop chat, using that chat’s tools and approval settings.' : binding.kind === 'existing' ? 'Bound to one of your sessions. It wakes when someone addresses it.' : 'Bound to a new session. It wakes when someone addresses it.'];
     case 'off': return ['Not waking. It stays in the room.', ...why];
     case 'paused': return ['Waking is paused.', ...why];
     case 'halted': return ['Waking stopped and needs your attention in the Meshrooms app.', ...why];
@@ -128,7 +129,7 @@ export function LocalAgentsSection({ api, state, roomId, selfName, focus }: { ap
 
   useEffect(() => {
     let stopped = false;
-    void api.harnesses().then(list => { if (stopped) return; setHarnesses(list); setHarness(current => current ?? list.find(h => h.detected && h.harness !== 'exec')?.harness); })
+    void api.harnesses().then(list => { if (stopped) return; setHarnesses(list); setHarness(current => current ?? list.find(h => h.detected && h.enabled !== false && h.harness !== 'exec')?.harness); })
       .catch(error => { if (!stopped) setHarnessProblem((error as Error).message); });
     return () => { stopped = true; };
   }, [api]);
@@ -194,7 +195,7 @@ export function LocalAgentsSection({ api, state, roomId, selfName, focus }: { ap
   });
 
   const exec = harnesses?.find(h => h.harness === 'exec');
-  const usable = harnesses?.filter(h => h.harness !== 'exec' && h.detected) ?? [];
+  const usable = harnesses?.filter(h => h.harness !== 'exec' && h.detected && h.enabled !== false) ?? [];
   return <section className="browser-agents browser-local-agents" aria-labelledby="browser-local-agents-title"><h3 id="browser-local-agents-title">Your agents {agents.length > 0 && <span>{agents.length}</span>}</h3>
     <p>Agents on this computer, with you as their operator{selfName ? <> (<strong>{selfName}</strong>)</> : null}. Only you and the host can remove one from this room.</p>
     {listProblem && !listing && <p role="alert" className="browser-agent-problem">{listProblem}</p>}
@@ -214,7 +215,7 @@ export function LocalAgentsSection({ api, state, roomId, selfName, focus }: { ap
           {waitingApproval && <p role="status" className="browser-agent-waiting">Approve this in the Meshrooms app. Waiting for your approval…</p>}
           {!here && <button className="secondary browser-local-agent-add" disabled={busy} onClick={() => void putIn(agent)}>Add to this room</button>}
           {inRoom && <div className="browser-local-agent-actions">
-            {here.binding.state !== 'starting' && <button className="secondary" disabled={busy} onClick={() => void bindNew(agent, here)}>Start a new session</button>}
+            {here.binding.state !== 'starting' && !(agent.harness === 'codex' && harnesses?.find(h => h.harness === 'codex')?.codexDelivery === 'desktop') && <button className="secondary" disabled={busy} onClick={() => void bindNew(agent, here)}>Start a new session</button>}
             {agent.harness !== 'exec' && here.binding.state !== 'starting' && <button className="browser-text-link" aria-expanded={!!list} disabled={busy && !list} onClick={() => showSessions(agent)}>Use an existing session</button>}
             {/* While a new session starts, the agent takes no other change (the daemon holds it until bound or failed). */}
             {here.binding.state !== 'starting' && (here.binding.wakes === 'on' || here.binding.wakes === 'paused' || here.binding.wakes === 'halted') && <button className="browser-text-link" disabled={busy} onClick={() => void stop(agent, here)}>Stop waking</button>}
@@ -244,13 +245,13 @@ export function LocalAgentsSection({ api, state, roomId, selfName, focus }: { ap
         <label className="browser-agent-harness">Harness<select value={harness ?? ''} onChange={e => setHarness(e.target.value as HarnessId)} disabled={!harnesses?.length}>
           {!harnesses && <option value="">{harnessProblem || 'Looking for harnesses on this computer…'}</option>}
           {harnesses && !usable.length && <option value="">None found on this computer</option>}
-          {harnesses?.map(h => <option key={h.harness} value={h.harness} disabled={h.harness === 'exec' || !h.detected}>{harnessOption(h)}</option>)}</select></label>
+          {harnesses?.map(h => <option key={h.harness} value={h.harness} disabled={h.harness === 'exec' || !h.detected || h.enabled === false}>{harnessOption(h)}</option>)}</select></label>
         {exec && <p>Custom command: Set up custom commands in the Meshrooms app.</p>}
         {harnesses && !usable.length && <p>Install Claude Code, Codex or Hermes on this computer to make an agent here.</p>}
         <label><span>Model <span className="browser-optional">(optional)</span></span><input value={model} onChange={e => setModel(e.target.value)} maxLength={100} placeholder="The harness’s default" autoComplete="off" spellCheck={false} /></label>
         <button className="secondary" disabled={busy || !name.trim() || !harness || !usable.some(h => h.harness === harness)}>Create agent</button>
       </form>
     </details>
-    <p>Or ask your agent to run <code>meshrooms agent request …</code>; you’ll approve it in the Meshrooms app.</p>
+    <p><a href="/agent-apps">Manage agent apps</a> on this computer. You can also ask your agent to run <code>meshrooms agent request …</code>; you’ll approve it in the Meshrooms app.</p>
   </section>;
 }

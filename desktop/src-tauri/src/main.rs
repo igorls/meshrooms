@@ -7,6 +7,7 @@
 
 mod approvals;
 mod bridge;
+mod home;
 mod join;
 mod links;
 mod pair;
@@ -51,9 +52,11 @@ struct Shell {
     notice: Mutex<Option<(Instant, String)>>,
     log_dir: Mutex<Option<PathBuf>>,
     rooms_shown: Mutex<Vec<String>>,
-    detail: Mutex<String>,
+    home: Mutex<home::Home>,
     status: MenuItem<Wry>,
     rooms: Submenu<Wry>,
+    personal_rooms: Submenu<Wry>,
+    personal_rooms_shown: Mutex<Option<String>>,
     /// "Approvals…", with the count of what waits, and the count it last showed.
     approvals: MenuItem<Wry>,
     approvals_shown: Mutex<Option<u64>>,
@@ -103,13 +106,10 @@ fn report(app: &AppHandle, running: Option<bool>, line: &str) {
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_tooltip(Some(format!("Meshrooms: {}", text::clean(line, 100))));
     }
-    let mut detail = lock(&shell.detail);
-    if *detail != line {
-        *detail = line.to_string();
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.navigate(page(app, line));
-        }
-    }
+    let mut home = lock(&shell.home);
+    home.running = running;
+    home.detail = text::clean(line, 120);
+    home.problem = notice.clone().or_else(|| running.is_none().then(|| text::clean(line, 300))).filter(|text| !text.is_empty());
 }
 
 /// One room per row of `bindings --json`: a submenu titled with the room and its wake state, holding the details.
@@ -174,6 +174,35 @@ fn show_rooms(app: &AppHandle, rows: Result<Vec<(String, Vec<String>)>, String>)
     *shown = signature;
 }
 
+fn show_personal_rooms(app: &AppHandle, result: Result<Vec<home::Room>, String>) {
+    let shell = app.state::<Shell>();
+    let signature = format!("{result:?}");
+    {
+        let mut home = lock(&shell.home);
+        home.rooms = result.as_ref().ok().cloned();
+        home.rooms_problem = result.as_ref().err().map(|error| text::clean(error, 160));
+    }
+    let mut shown = lock(&shell.personal_rooms_shown);
+    if shown.as_deref() == Some(&signature) { return; }
+    let menu = &shell.personal_rooms;
+    for item in menu.items().unwrap_or_default() { let _ = menu.remove(&item); }
+    match result {
+        Ok(rooms) if !rooms.is_empty() => for room in rooms {
+            let note = if room.waiting > 0 { format!(" · {} waiting to join", room.waiting) }
+                else if room.mentions > 0 { format!(" · {} unread, {} mentions", room.unread, room.mentions) }
+                else if room.unread > 0 { format!(" · {} unread", room.unread) }
+                else if room.state == "waiting" { " · awaiting approval".into() } else { String::new() };
+            if MenuItem::with_id(app, format!("room:{}", room.id), text::label(&format!("{}{note}", room.title), 110), true, None::<&str>)
+                .and_then(|item| menu.append(&item)).is_err() { return; }
+        },
+        result => {
+            let label = if result.is_ok() { "No rooms paired yet" } else { "Rooms unavailable — refresh desktop status" };
+            if MenuItem::new(app, label, false, None::<&str>).and_then(|item| menu.append(&item)).is_err() { return; }
+        }
+    }
+    *shown = Some(signature);
+}
+
 fn app_exe() -> Result<PathBuf, String> {
     env::current_exe().map_err(|error| format!("Cannot locate the Meshrooms app: {error}"))
 }
@@ -192,6 +221,10 @@ fn show_login(app: &AppHandle) {
     let _ = shell.login.set_checked(checked);
     let _ = shell.login.set_enabled(enabled);
     let _ = shell.login.set_text(text::label(&label, 90));
+    let mut home = lock(&shell.home);
+    home.login_on = checked;
+    home.login_enabled = enabled;
+    home.login_label = label;
 }
 
 /// One poll: starts the daemon when it should run, then shows its status, the rooms and the login item. Callers hold `work`.
@@ -201,6 +234,11 @@ fn refresh_locked(app: &AppHandle) {
     let stopped = matches!(&status, Ok(status) if status["running"] != Value::Bool(true));
     let waiting = lock(&shell.failed_start).is_some_and(|at| at.elapsed() < START_BACKOFF);
     if stopped && !shell.held.load(Ordering::Relaxed) && !waiting {
+        {
+            let mut home = lock(&shell.home);
+            home.pending += 1;
+            home.activity = "Starting the background connection…".into();
+        }
         report(app, Some(false), "Starting the daemon…");
         match cli(app, &DAEMON_START) {
             Ok(_) => {
@@ -213,6 +251,9 @@ fn refresh_locked(app: &AppHandle) {
                 status = cli(app, &["daemon", "status"]);
             }
         }
+        let mut home = lock(&shell.home);
+        home.pending -= 1;
+        if home.pending == 0 { home.activity.clear(); }
     }
     match &status {
         Ok(status) => {
@@ -235,12 +276,14 @@ fn refresh_locked(app: &AppHandle) {
         Err(error) => report(app, None, &text::clean(error, 120)),
     }
     show_rooms(app, cli(app, &["bindings", "--json"]).map(|list| room_rows(&list)));
+    show_personal_rooms(app, cli(app, &["person", "rooms", "--json"]).and_then(|list| home::rooms(&list)));
     show_login(app);
 }
 
 /// The tray's "Approvals…" item, with the count of requests waiting.
 fn show_approvals(app: &AppHandle, waiting: u64) {
     let shell = app.state::<Shell>();
+    lock(&shell.home).approvals = Some(waiting);
     let mut shown = lock(&shell.approvals_shown);
     if *shown == Some(waiting) {
         return;
@@ -253,7 +296,13 @@ fn show_approvals(app: &AppHandle, waiting: u64) {
 }
 
 /// Runs `action` off the main thread, after any poll or action in progress, then refreshes.
-fn act(app: &AppHandle, action: impl FnOnce(&AppHandle) -> Result<(), String> + Send + 'static) {
+fn act(app: &AppHandle, activity: &'static str, action: impl FnOnce(&AppHandle) -> Result<(), String> + Send + 'static) {
+    {
+        let shell = app.state::<Shell>();
+        let mut home = lock(&shell.home);
+        home.pending += 1;
+        home.activity = activity.into();
+    }
     let app = app.clone();
     thread::spawn(move || {
         let shell = app.state::<Shell>();
@@ -263,19 +312,27 @@ fn act(app: &AppHandle, action: impl FnOnce(&AppHandle) -> Result<(), String> + 
             notify(&app, &error);
         }
         refresh_locked(&app);
+        let mut home = lock(&shell.home);
+        home.pending -= 1;
+        if home.pending == 0 { home.activity.clear(); }
     });
 }
 
 fn start_daemon(app: &AppHandle) {
     app.state::<Shell>().held.store(false, Ordering::Relaxed);
     *lock(&app.state::<Shell>().failed_start) = None;
-    act(app, |app| cli(app, &DAEMON_START).map(drop));
+    act(app, "Starting the background connection…", |app| {
+        let result = cli(app, &DAEMON_START);
+        // A failed manual retry gets the same backoff as an automatic start; the refresh must not start it twice.
+        *lock(&app.state::<Shell>().failed_start) = result.is_err().then(Instant::now);
+        result.map(drop)
+    });
 }
 
 fn stop_daemon(app: &AppHandle) {
     // Held first, so a poll between now and the stop can't start it again.
     app.state::<Shell>().held.store(true, Ordering::Relaxed);
-    act(app, |app| {
+    act(app, "Stopping the background connection…", |app| {
         let result = cli(app, &["daemon", "stop"]);
         // Held only while the daemon really is down; otherwise polls keep it running as before.
         let down = result.as_ref().is_ok_and(|result| result["stopped"] == Value::Bool(true) || result["running"] == Value::Bool(false));
@@ -295,7 +352,7 @@ fn stop_daemon(app: &AppHandle) {
 /// is removed; if removing fails, `login::state` still reports Headless and the move is offered again. Off: remove the
 /// app's.
 fn toggle_login(app: &AppHandle) {
-    act(app, |app| {
+    act(app, "Updating start at login…", |app| {
         let exe = app_exe()?;
         let result = match login::state(&exe)? {
             LoginState::App => login::disable(),
@@ -316,10 +373,28 @@ fn open_meshrooms_at(app: &AppHandle, room: Option<String>) {
     open_meshrooms_then(app, room, |_| {});
 }
 
+/// Both the tray and bundled home can select only a cached personal room. `person open --room` then rechecks current
+/// membership, and `local_link` validates the exact loopback destination. A stale shortcut cannot join another room.
+fn open_owned_room(app: &AppHandle, room: &str) -> Result<(), String> {
+    let known = lock(&app.state::<Shell>().home).knows_room(room);
+    if !known { return Err("That room is no longer listed. Refresh desktop status and try again.".into()); }
+    open_meshrooms_at(app, Some(room.into()));
+    Ok(())
+}
+
 /// `open_meshrooms_at`, then `after` once the open is done or failed.
 fn open_meshrooms_then(app: &AppHandle, room: Option<String>, after: impl FnOnce(&AppHandle) + Send + 'static) {
-    act(app, move |app| {
+    act(app, "Opening your rooms in the browser…", move |app| {
         let opened = (|| {
+            // Choosing Open is an explicit request to run again, even after Stop from the tray. Do not make the
+            // person start the service separately just to get back to their rooms.
+            let shell = app.state::<Shell>();
+            shell.held.store(false, Ordering::Relaxed);
+            if cli(app, &["daemon", "status"])?["running"] != Value::Bool(true) {
+                let started = cli(app, &DAEMON_START);
+                *lock(&shell.failed_start) = started.is_err().then(Instant::now);
+                started?;
+            }
             let result = match &room {
                 Some(room) => cli(app, &["person", "open", "--room", room])?,
                 None => cli(app, &["person", "open"])?,
@@ -384,27 +459,16 @@ fn app_origin(app: &AppHandle) -> Url {
     Url::parse(if cfg!(windows) { "http://tauri.localhost/" } else { "tauri://localhost/" }).expect("static URL")
 }
 
-/// The bundled status page. The status is passed in the query, never evaluated in a page.
-fn page(app: &AppHandle, detail: &str) -> Url {
-    let mut url = app_origin(app).join("index.html").expect("static path");
-    url.query_pairs_mut().append_pair("detail", &text::clean(detail, 120));
-    url
-}
-
 fn show_window(app: &AppHandle) {
-    let detail = lock(&app.state::<Shell>().detail).clone();
     let window = match app.get_webview_window("main") {
         Some(window) => window,
         None => match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
             .title("Meshrooms")
-            .inner_size(440.0, 300.0)
-            .resizable(false)
+            .inner_size(500.0, 760.0)
+            .min_inner_size(400.0, 500.0)
             .build()
         {
-            Ok(window) => {
-                let _ = window.navigate(page(app, &detail));
-                window
-            }
+            Ok(window) => window,
             Err(error) => return eprintln!("Cannot open the Meshrooms window: {error}"),
         },
     };
@@ -439,8 +503,11 @@ fn menu_action(app: &AppHandle, id: &str) {
         "unpair" => pair::ask_unpair(app),
         "review" => review::show(app),
         "approvals" => approvals::show(app),
+        "refresh" => act(app, "Checking the background connection…", |_| Ok(())),
         "quit" => app.exit(0),
-        _ => {}
+        _ => if let Some(room) = id.strip_prefix("room:") {
+            if let Err(error) = open_owned_room(app, room) { notify(app, &error); }
+        },
     }
 }
 
@@ -535,12 +602,13 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri::plugin::Builder::<Wry, ()>::new("meshrooms-links").setup(|app, _| {
             use tauri_plugin_deep_link::DeepLinkExt;
-            let handle = app.clone();
+            let dispatcher = links::Dispatcher::new(app.clone());
+            let live = dispatcher.clone();
             app.deep_link().on_open_url(move |event| {
-                for url in event.urls() { links::route(&handle, url.as_str()); }
+                for url in event.urls() { live.offer(url.as_str()); }
             });
             if let Ok(Some(urls)) = app.deep_link().get_current() {
-                for url in urls { links::route(app, url.as_str()); }
+                for url in urls { dispatcher.offer(url.as_str()); }
             }
             Ok(())
         }).build())
@@ -556,7 +624,8 @@ fn main() {
         .manage(Mutex::new(approvals::Approving::default()))
         .manage(Mutex::new(notify::Posted::default()))
         .invoke_handler(tauri::generate_handler![
-            pair::pair_view, pair::pair_check, pair::pair_verify, pair::pair_confirm, pair::pair_reject, pair::pair_unpair, pair::pair_close, pair::pair_open,
+            home::home_view, home::home_action,
+            pair::pair_view, pair::pair_check, pair::pair_verify, pair::pair_confirm, pair::pair_reject, pair::pair_cancel, pair::pair_unpair, pair::pair_close, pair::pair_open,
             join::join_view, join::join_confirm, join::join_cancel, join::join_browse,
             review::review_view, review::review_pause, review::review_resume, review::review_close,
             approvals::approvals_view, approvals::approvals_approve, approvals::approvals_reject, approvals::approvals_custom_check, approvals::approvals_custom_make, approvals::approvals_custom_edit, approvals::approvals_close,
@@ -565,20 +634,22 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let status = MenuItem::with_id(app, "status", "Checking the daemon…", false, None::<&str>)?;
-            let rooms = Submenu::with_id(app, "rooms", "Rooms", true)?;
-            let start = MenuItem::with_id(app, "start", "Start daemon", false, None::<&str>)?;
-            let stop = MenuItem::with_id(app, "stop", "Stop daemon", false, None::<&str>)?;
+            let rooms = Submenu::with_id(app, "rooms", "Agent connections", true)?;
+            let personal_rooms = Submenu::with_id(app, "personal-rooms", "Your rooms", true)?;
+            let start = MenuItem::with_id(app, "start", "Start background service", false, None::<&str>)?;
+            let stop = MenuItem::with_id(app, "stop", "Stop background service", false, None::<&str>)?;
             let login = CheckMenuItem::with_id(app, "login", "Start at login", false, false, None::<&str>)?;
             let approvals_item = MenuItem::with_id(app, "approvals", approvals::tray_label(0), true, None::<&str>)?;
             let menu = Menu::with_items(app, &[
                 &status,
+                &personal_rooms,
                 &rooms,
                 &PredefinedMenuItem::separator(app)?,
                 &start,
                 &stop,
                 &login,
-                &MenuItem::with_id(app, "open", "Open Meshrooms", true, None::<&str>)?,
-                &MenuItem::with_id(app, "window", "Show Meshrooms", true, None::<&str>)?,
+                &MenuItem::with_id(app, "open", "Open rooms in browser", true, None::<&str>)?,
+                &MenuItem::with_id(app, "window", "Desktop status…", true, None::<&str>)?,
                 &MenuItem::with_id(app, "review", "Review your agents…", true, None::<&str>)?,
                 &approvals_item,
                 &MenuItem::with_id(app, "logs", "Open logs folder", true, None::<&str>)?,
@@ -594,9 +665,11 @@ fn main() {
                 notice: Mutex::new(None),
                 log_dir: Mutex::new(None),
                 rooms_shown: Mutex::new(Vec::new()),
-                detail: Mutex::new("Checking the daemon…".into()),
+                home: Mutex::new(home::Home::default()),
                 status,
                 rooms,
+                personal_rooms,
+                personal_rooms_shown: Mutex::new(None),
                 approvals: approvals_item,
                 approvals_shown: Mutex::new(None),
                 start,
@@ -657,18 +730,23 @@ fn main() {
                 }
                 api.prevent_close();
                 let _ = window.hide();
-                #[cfg(target_os = "macos")]
-                let _ = window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
+                tray_only(window);
             }
         })
         .build(tauri::generate_context!())
         .expect("Meshrooms desktop app failed to start")
-        .run(|_app, event| {
+        .run(|app, event| {
             // A tray app: closing its last window (a pairing or join window, when nothing else is open) must not quit it.
             // Only Quit (app.exit, with a code) does.
-            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
-                api.prevent_exit();
+            match event {
+                tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+                // Opening an already running macOS accessory app is a Reopen event rather than a second process.
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { has_visible_windows: false, .. } => show_window(app),
+                _ => {}
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
         });
 }
 

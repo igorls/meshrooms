@@ -26,7 +26,9 @@ export function openAdmission(path: string, now = Date.now()): Database {
     CREATE TABLE IF NOT EXISTS closed_rooms (id TEXT PRIMARY KEY, reason TEXT NOT NULL, at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS service_state (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS creation_invites (id TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, uses INTEGER NOT NULL,
-      remaining INTEGER NOT NULL, expires_at INTEGER NOT NULL, note TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER);`);
+      remaining INTEGER NOT NULL, expires_at INTEGER NOT NULL, note TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER);
+    CREATE TABLE IF NOT EXISTS beta_admissions (device TEXT PRIMARY KEY, person TEXT NOT NULL, admitted_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS beta_admissions_person ON beta_admissions(person);`);
   // Rooms from before idle expiry get a full idle window from the first start that tracks activity.
   db.query('INSERT OR IGNORE INTO room_activity (id, at) SELECT id, ? FROM rooms').run(now);
   return db;

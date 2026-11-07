@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { packageMacosDmg, runDmgCommand } from './package-macos-dmg';
@@ -7,7 +7,7 @@ import { packageMacosDmg, runDmgCommand } from './package-macos-dmg';
 type Run = NonNullable<Parameters<typeof packageMacosDmg>[1]>;
 const macTest = test.skipIf(process.platform !== 'darwin');
 function fixture(check: (f: { root: string; app: string; script: string; output: string }) => void) {
-  const root = mkdtempSync(join(tmpdir(), 'mr-image-input-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'mr-image-input-'));
   const app = join(root, 'Example.app'), script = join(root, 'bundle_dmg.sh');
   mkdirSync(join(app, 'Contents'), { recursive: true });
   writeFileSync(join(app, 'Contents', 'Info.plist'), '<plist/>');

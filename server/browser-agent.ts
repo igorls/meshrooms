@@ -13,6 +13,7 @@
  * record its activity (activity.json), which `run` announces to connected devices.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { tryLock } from './locks';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
@@ -31,6 +32,7 @@ import {
   foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody, withinReactionKeyCap,
   type ReactionBody, type ReactionEmoji, type ReactionPacket,
 } from '../src/browser/reactions';
+import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket, type RetractionSync } from '../src/browser/retractions';
 import { authorWakes, evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
 import { releaseIssueTask } from './github-issues';
@@ -42,14 +44,16 @@ import { QuotaDrops, ReceiveQuota, type QuotaKind } from '../src/browser/quota';
 type Identity = { id: string; publicKey: string; privateJwk: JsonWebKey };
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
-type Packet = { body: MessageBody | ReceiptBody | ReactionBody; signature: string };
-type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[] };
+type Packet = { body: MessageBody | ReceiptBody | ReactionBody | RetractBody; signature: string };
+export type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[]; retracted?: true };
 /** `online` (a person device's folders only): the device polled the room service within its presence window. */
 type Members = { memberId?: string; ownerId?: string; title?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string; online?: boolean }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
 /** A queued reaction toggle; `run` signs it against the current folded chips and revision. */
 type ReactionIntent = { type: 'reaction'; id: string; messageId: string; emoji: ReactionEmoji; blocked?: 'log-full' };
+/** A queued deletion of the member's own message; `run` signs it. */
+type RetractIntent = { type: 'retract'; id: string; messageId: string };
 /** A queued decision change; like tasks, `run` builds it against the decision as it stands when signing. */
 type DecisionIntent = { type: 'decision'; id: string; decisionId: string } & (
   | { action: 'open'; question: string; context: string; mode: DecisionMode; options: string[]; askAgents: boolean | string[]; closesAt: number | null; replyTo?: string }
@@ -235,12 +239,27 @@ export class BrowserAgent {
   /** Verified reaction operations this device holds (only for messages it also holds). */
   reactionOps(): ReactionPacket[] { return readJson(this.path('reactions.json'), []); }
   reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
+  /** Reactions on a deleted message are hidden and can't be taken back, so they don't count toward a member's cap. */
+  countedReactions(ops = this.reactionOps()) {
+    const gone = new Set(this.messages().filter(isRetracted).map(m => m.packet.body.id));
+    return ops.map(p => p.body).filter(op => !gone.has(op.messageId));
+  }
+  /** Verified retractions, including those of messages this device doesn't hold (yet, or any more). */
+  retractOps(): RetractPacket[] { return readJson(this.path('retractions.json'), []); }
   /** Where a plain `listen` continues from: the cursors the last `listen` returned. */
   listenCursor(): ListenCursor | undefined {
     const c = readJson<Partial<ListenCursor> | undefined>(this.live(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
     return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
   }
-  saveListenCursor(cursor: ListenCursor) { writeJson(join(this.dir, LIVE, LISTEN_CURSOR), cursor); }
+  saveListenCursor(cursor: ListenCursor, expected?: string) {
+    mkdirSync(join(this.dir, LIVE), { recursive: true, mode: 0o700 });
+    const lock = join(this.dir, LIVE, 'listen-cursor.lock');
+    if (!tryLock(lock, 'the listen cursor', undefined, { maxAgeMs: 30_000 })) throw new Error('The listen cursor is busy. Try again.');
+    try {
+      if (expected !== undefined && JSON.stringify(this.listenCursor() ?? null) !== expected) return false;
+      writeJson(join(this.dir, LIVE, LISTEN_CURSOR), cursor); return true;
+    } finally { try { unlinkSync(lock); } catch { /* Released already. */ } }
+  }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined { const a = readJson<unknown>(this.live('activity.json'), undefined); return validActivity(a) ? a : undefined; }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
@@ -268,13 +287,13 @@ export class BrowserAgent {
     const self = this.person ? 'human' as const : 'agent' as const;
     const participants: Participant[] = members.map(m => ({ id: m.id, name: m.name, role: m.id === memberId ? self : m.role ?? 'human',
       state: m.id === memberId ? 'local' : 'remote', detail: 'Browser room member', ...(m.operatorId ? { operatorId: m.operatorId } : {}) }));
-    const messages: Message[] = this.messages().map(({ packet: { body } }) => {
+    const messages: Message[] = this.messages().map(({ packet: { body }, retracted }) => {
       const author = participants.find(p => p.id === body.memberId);
-      const text = shownText(body), mentions = mentionedIds(text, participants);
+      const text = retracted ? 'Message deleted' : shownText(body), mentions = mentionedIds(text, participants);
       // `kind` follows the declared type here; `attachment` re-checks it against the verified bytes.
       const attachments = body.attachments?.map(ref => ({ ...ref, kind: IMAGE_TYPES.includes(ref.type) ? 'image' as const : 'file' as const }));
       return { id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human', text,
-        time: new Date(body.at).toISOString(), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(mentions.length ? { mentions } : {}), ...(attachments ? { attachments } : {}) };
+        time: new Date(body.at).toISOString(), ...(retracted ? { deleted: true } : {}), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(mentions.length ? { mentions } : {}), ...(attachments ? { attachments } : {}) };
     });
     const ops = this.taskOps();
     const settings = this.settings();
@@ -356,6 +375,11 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
   }
   if (it.type === 'task') return id(it.taskId) ? undefined : 'its task id is not a UUID';
   if (it.type === 'reaction') return id(it.messageId) ? undefined : 'its message id is not a UUID';
+  if (it.type === 'retract') {
+    if (!id(it.messageId)) return 'its message id is not a UUID';
+    const target = agent.messages().find(m => m.packet.body.id === it.messageId);
+    return target && target.packet.body.memberId !== memberId ? 'only its author can delete a message' : undefined;
+  }
   if (it.type !== undefined) return 'it is not a known kind';
   if (typeof it.text !== 'string' || it.text.length > 4000 || (!it.text.trim() && !(Array.isArray(it.attachments) && it.attachments.length)))
     return 'its text is empty or longer than 4,000 characters';
@@ -504,6 +528,43 @@ async function answerWithin<T>(work: Promise<T>, ms: number, what: string): Prom
 }
 
 /**
+ * This device's retractions (src/browser/retractions.ts). `save` writes the messages and `release` lets go of files only
+ * deleted messages named. The log is saved first, and `apply` works from the log whatever was just added, so one saved by
+ * a pass that then couldn't save the messages (a full disk) still takes effect the next time.
+ */
+export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | undefined, save: (messages: Stored[]) => void, release: (sha256: string[]) => void) {
+  const apply = (log = agent.retractOps()) => {
+    const { messages, changed, released } = applyRetractions(agent.messages(), log.map(op => op.body));
+    if (!changed.length) return;
+    save(messages);
+    release(released);
+  };
+  const add = (incoming: RetractPacket[]) => {
+    const { log, added } = addRetractions(agent.retractOps(), incoming, agent.messages());
+    if (added.length) writeJson(join(agent.dir, 'retractions.json'), log);
+    apply(log);
+  };
+  return {
+    apply, add,
+    /** Keep those signed by a current or former device of their author, whichever device relayed them. */
+    async accept(packets: unknown[]) {
+      const accepted: RetractPacket[] = [], known = new Set(agent.retractOps().map(p => p.body.id)), room = status();
+      for (const packet of packets as RetractPacket[]) {
+        const b = packet?.body;
+        if (!validRetractBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
+        const author = room?.devices?.find(d => d.id === b.deviceId) ?? room?.formerDevices?.find(d => d.id === b.deviceId);
+        if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
+        known.add(b.id);
+        accepted.push({ body: b, signature: packet.signature });
+      }
+      add(accepted);
+    },
+    /** A message arriving after its retraction is stored as a stub, so its content never reaches the disk. */
+    arriving: (stored: Stored): Stored => agent.retractOps().some(op => mayRetract(op.body, stored.packet.body)) ? retractedStub(stored) : stored,
+  };
+}
+
+/**
  * Long-running peer loop: presence, signaling, data channels, storage, and outbox delivery. `pause` is how it waits
  * between passes (tests shorten it; the deadlines are what bound a pass).
  */
@@ -611,7 +672,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       else if (mayHoldPending(pendingReactions, op)) pendingReactions.push(op);
     }
     // Each member keeps at most MAX_REACTION_KEYS_PER_MEMBER live reactions here too, not only when sending.
-    ready = withinReactionKeyCap(ops.map(p => p.body), ready);
+    ready = withinReactionKeyCap(agent.countedReactions(ops), ready);
     if (!ready.length) return true;
     return storeReactionOps(ops, ready);
   };
@@ -644,6 +705,15 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const transfers = new FileTransfers({ roomId: agent.roomId, store: agent.files, referenced: sha => referenced().get(sha),
     channel: id => peers.get(id)?.channel, changed: () => { transfersDirty = true; },
     peers: () => [...peers].filter(([id, p]) => p.channel?.readyState === 'open' && status?.devices?.some(d => d.id === id)).map(([id]) => id) });
+  const retractions = retractionLog(agent, () => status, save, released => {
+    const gone = new Set(released);
+    transfers.keep(sha => !gone.has(sha));
+    for (const sha of released) for (const path of [agent.files.path(sha), join(agent.dir, 'wants', sha)]) {
+      try { rmSync(path, { force: true }); } catch { /* In use: `prune` removes it, since no message names it now. */ }
+    }
+  });
+  // A runner that stopped between saving the log and the messages is finished here.
+  try { retractions.apply(); } catch (error) { log(`retractions: ${error instanceof Error ? error.message : String(error)}`); }
   /** `attachment` asks for a file by writing wants/<sha256>; the bridge fetches only what an agent asked for or sent. */
   let wanted = new Set<string>();
   const fetchWanted = () => {
@@ -710,7 +780,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     if (!peer.queue) return;
     peer.resync.sent();
     const chunks = [...syncChunks(agent.roomId, agent.taskOps().map(({ body, signature }) => ({ body, signature }))),
-      ...decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature }))), ...reactionSyncChunks(agent.roomId, agent.reactionOps())];
+      ...decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature }))), ...reactionSyncChunks(agent.roomId, agent.reactionOps()),
+      ...retractionSyncChunks(agent.roomId, agent.retractOps())];
     if (!peer.queue.push(chunks.map(chunk => JSON.stringify(chunk)))) log('sync queue full; state is exchanged again on the next request');
   };
   const resyncDue = (peer: Peer) => { if (peer.queue && peer.resync.due(peer.queue)) sendState(peer); };
@@ -787,6 +858,12 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         if (!fresh([...agent.reactionOps(), ...pendingReactions], packet) || allowed(device.memberId, 'reaction', id)) await acceptReactions([packet]);
         return;
       }
+      const retracted = packet as unknown as RetractionSync;
+      if (retracted?.kind === 'retractions') { if (retracted.roomId === agent.roomId && Array.isArray(retracted.ops)) await retractions.accept(retracted.ops); return; }
+      if ((packet?.body as { kind?: string })?.kind === 'retract') {
+        if (!fresh(agent.retractOps(), packet) || allowed(device.memberId, 'retract', id)) await retractions.accept([packet]);
+        return;
+      }
       const b = packet?.body;
       if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
         || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return;
@@ -795,11 +872,12 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !/^[a-f0-9-]{36}$/.test(b.replyTo))) return;
         if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
         const messages = agent.messages(); const existing = messages.find(m => m.packet.body.id === b.id);
-        if (existing && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
+        // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
+        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
         // Over quota: not stored and not confirmed, so its sender retries later.
         if (!existing && !allowed(device.memberId, 'message', id)) return;
         // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
-        if (!existing && store(messages, { packet: packet as Stored['packet'], targets: [], receipts: [] })) flushPendingReactions(b.id);
+        if (!existing && store(messages, retractions.arriving({ packet: packet as Stored['packet'], targets: [], receipts: [] }))) flushPendingReactions(b.id);
         const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: b.id, deviceId: identity.id };
         if (channel.readyState === 'open') channel.send(JSON.stringify({ body: receipt, signature: await agent.sign(receipt) }));
       } else if (b.kind === 'receipt') {
@@ -863,7 +941,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       try {
         // A harness sandbox can write the outbox: only regular files are read, and a planted link is removed, not followed.
         if (!lstatSync(join(outbox, file)).isFile()) { log(`outbox ${file}: not a regular file, removed`); unlinkSync(join(outbox, file)); continue; }
-        const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | null>(join(outbox, file), null);
+        const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | RetractIntent | null>(join(outbox, file), null);
         if (!item || !status?.memberId) continue;
         const problem = outboxProblem(agent, status.memberId, item);
         if (problem) {
@@ -913,11 +991,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         if ('type' in item && item.type === 'reaction') {
           const ops = agent.reactionOps();
           if (ops.some(p => p.body.id === item.id)) { unlinkSync(join(outbox, file)); continue; }
-          // Wait until the message is held; do not drop the outbox item forever.
-          if (!agent.messages().some(m => m.packet.body.id === item.messageId)) continue;
+          // Wait until the message is held; do not drop the outbox item forever. A deleted one takes no reactions.
+          const target = agent.messages().find(m => m.packet.body.id === item.messageId);
+          if (!target) continue;
+          if (isRetracted(target)) { unlinkSync(join(outbox, file)); continue; }
           const bodies = ops.map(p => p.body);
           const remove = memberReacted(agent.reactionChips(), item.messageId, item.emoji, status.memberId);
-          if (!remove && liveKeysForMember(bodies, status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
+          if (!remove && liveKeysForMember(agent.countedReactions(ops), status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
             unlinkSync(join(outbox, file)); continue;
           }
           const body: ReactionBody = {
@@ -933,6 +1013,19 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             writeJson(join(outbox, file), { ...item, blocked: 'log-full' });
             continue;
           }
+          broadcast(packet);
+          unlinkSync(join(outbox, file)); continue;
+        }
+        if ('type' in item && item.type === 'retract') {
+          // Already in the log: a pass signed it and failed before finishing, and this one finishes it.
+          let packet = agent.retractOps().find(p => p.body.id === item.id);
+          if (!packet) {
+            const target = agent.messages().find(m => m.packet.body.id === item.messageId);
+            if (!target || isRetracted(target)) { unlinkSync(join(outbox, file)); continue; }
+            const body: RetractBody = { kind: 'retract', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId, at: Date.now(), target: item.messageId };
+            packet = { body, signature: await agent.sign(body) };
+          }
+          retractions.add([packet]);
           broadcast(packet);
           unlinkSync(join(outbox, file)); continue;
         }
@@ -1354,11 +1447,10 @@ export async function taskBrowser(agent: BrowserAgent, input: { requestId: strin
 export async function reactBrowser(agent: BrowserAgent, input: { requestId: string; messageId: string; emoji: string }) {
   const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
   if (!isReactionEmoji(input.emoji)) throw new Error(`Use one of these emoji: ${REACTION_EMOJI.join(' ')}`);
-  if (!view.messages.some(m => m.id === input.messageId)) throw new Error('That message is not in this browser room.');
+  if (!view.messages.some(m => m.id === input.messageId && !m.deleted)) throw new Error('That message is not in this browser room.');
   const emoji = input.emoji;
-  const bodies = agent.reactionOps().map(p => p.body);
   const already = memberReacted(agent.reactionChips(), input.messageId, emoji, view.memberId);
-  if (!already && liveKeysForMember(bodies, view.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
+  if (!already && liveKeysForMember(agent.countedReactions(), view.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
     throw new Error('You have too many reactions in this room. Remove some before adding more.');
   }
   if (!agent.reactionOps().some(p => p.body.id === input.requestId)) {

@@ -103,7 +103,7 @@ async function page(viewport = { width: 1365, height: 1100 }) {
 }
 const flat = text => text.replace(/\s+/g, ' ').trim();
 const visibleMessage = (p, text) => p.waitForFunction(t => [...document.querySelectorAll('.message-text')].some(el => el.innerText.replace(/\s+/g, ' ').trim() === t), flat(text), { timeout: 90_000 });
-async function send(p, text) { await p.getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
+async function send(p, text) { await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
 /** The room details panel, as the person sees it. */
 async function shot(p, name, target = p.locator('#browser-room-details')) {
   const path = resolve(output, name); await target.screenshot({ path, animations: 'disabled' }); shots.push(path);
@@ -147,7 +147,9 @@ try {
     { text: `Claude Code ${FAKE_VERSION}`, disabled: false }, { text: 'Codex 0.159.0', disabled: false },
     { text: 'Hermes (not available)', disabled: true }, { text: 'Custom command (in the Meshrooms app)', disabled: true }]);
   await section.getByText('Custom command: Set up custom commands in the Meshrooms app.').waitFor();
-  await section.getByText(/Or ask your agent to run/).waitFor();
+  const manageApps = section.getByRole('link', { name: 'Manage agent apps', exact: true });
+  await manageApps.waitFor();
+  assert.equal(await manageApps.getAttribute('href'), '/agent-apps');
   assert.equal(await panel.getByRole('button', { name: 'Connect an agent' }).count(), 0, 'The local page makes no agent link.');
   await shot(local, 'local-agents-new.png');
 

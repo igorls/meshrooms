@@ -211,7 +211,9 @@ export class FileTransfers {
     if (item.received < item.ref.size) { this.skip(item, peer); this.pump(); return; }
     const bytes = item.bytes!;
     item.verifying = true; // Not handed to another peer while hashing and storing.
-    if (await sha256Hex(bytes) === sha) {
+    const matches = await sha256Hex(bytes) === sha;
+    if (this.incoming.get(sha) !== item) return; // Let go while hashing, as when its message was deleted.
+    if (matches) {
       try { await this.o.store.put(sha, bytes, sniff(bytes).type); this.incoming.delete(sha); }
       catch { item.retryAt = this.now() + RETRY_MS; item.tried.add(peer); }
     } else {

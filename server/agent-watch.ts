@@ -186,6 +186,8 @@ export const APPROVAL_WALL = /approval|timed out without user response|blocked/i
 
 export type WatchConfig = {
   roomId: string; harness: Harness;
+  /** Unset means the legacy CLI wake. New desktop bindings are explicit and never fall back to another writer. */
+  codexDelivery?: 'desktop' | 'headless';
   /** The folder the harness runs in: its project, where `--continue`/`--last` find the session to resume. */
   cwd: string;
   /** A session to resume; without it the harness continues the most recent one in `cwd`. */
@@ -280,6 +282,7 @@ export type WatchState = {
   recentRuns?: RecentRun[];
   /** What the live session's lease meant at the last change, and since when: wakes wait while it is attached or in pickup. */
   live?: { hold: LiveHold; since: number };
+  desktop?: import('./desktop-delivery').DeliveryStatus;
 };
 /** One piece of work a wake is offered: a message that addresses the agent, a task assigned to it, a decision asking it. */
 export type WorkItem = { id: string; kind: 'message' | 'task' | 'decision' };
@@ -530,6 +533,7 @@ const tomlPaths = (entries: [string, string][]) => `{ ${entries.map(([path, acce
  */
 export function harnessInvocation(config: WatchConfig, prompt: string, promptFile: string, find: (name: string) => Program = name => resolveProgram(name),
   context: WakeContext = { denyRead: [] }): Invocation {
+  if (config.harness === 'codex' && config.codexDelivery === 'desktop') throw new Error('Desktop bindings deliver through their owner; they never launch a CLI writer.');
   if (config.harness === 'claude') {
     const { file, prefix } = find(config.program ?? 'claude');
     const granted = (tool: string) => config.allowTools.some(rule => rule === tool || rule.startsWith(`${tool}(`));

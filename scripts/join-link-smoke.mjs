@@ -97,7 +97,7 @@ try {
   await robin.getByLabel('Your name', { exact: true }).fill('Robin');
   await robin.getByRole('button', { name: 'Ask to join', exact: true }).click();
   await alex.getByRole('button', { name: 'Admit', exact: true }).click();
-  await robin.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await robin.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
 
   // Before pairing: the room page offers only a hint, which opens Room details at "Use the desktop app".
   assert.equal(await robin.getByRole('link', { name: 'Open in Meshrooms' }).count(), 0);
@@ -182,7 +182,7 @@ try {
   await local.goto(firstLink);
   await local.waitForURL(u => !u.hash && u.pathname === `/r/${first}`);
   await local.getByRole('heading', { name: 'Join check' }).first().waitFor({ timeout: 45_000 });
-  await local.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await local.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
 
   await cooldown();
 
@@ -209,7 +209,7 @@ try {
   await local.goto(secondLink);
   await local.waitForURL(u => !u.hash && u.pathname === `/r/${second}`);
   await local.getByRole('heading', { name: 'Second room' }).first().waitFor({ timeout: 45_000 });
-  await local.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await local.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
   await snapshot(local, 'join-link-local-second.png');
   assert.equal((await view()).stage, 'done');
   hand('--dev-join-cancel');
@@ -224,6 +224,28 @@ try {
   hand('--dev-join-cancel');
   // The bridge refuses it too, whatever asks.
   assert.equal(bridge('person', 'rooms').length, 2);
+
+  // Open is also recovery from an intentional Stop: one click restarts the service and opens the existing rooms.
+  const openedBeforeRestart = openedLines().length;
+  hand('--dev-action=stop');
+  await until(() => !bridge('daemon', 'status').running, 'the background service to stop');
+  hand('--dev-action=open');
+  const reopened = new URL(await nextOpened(openedBeforeRestart, 'the existing rooms after restarting'));
+  assert.equal(reopened.hostname, '127.0.0.1');
+  assert.equal(reopened.pathname, '/');
+  assert.ok(reopened.hash.startsWith('#access='));
+  assert.equal(bridge('daemon', 'status').running, true);
+  assert.equal(bridge('person', 'rooms').length, 2);
+  const shortcutCount = openedLines().length;
+  hand(`--dev-action=room:${first}`);
+  const shortcutLink = new URL(await nextOpened(shortcutCount, 'a specific personal room from the tray'));
+  assert.equal(shortcutLink.pathname, `/r/${first}`);
+  assert.equal(shortcutLink.hostname, '127.0.0.1');
+  // A fabricated tray id can neither mint a browser ticket nor join a room.
+  from = mark();
+  hand(`--dev-action=room:${crypto.randomUUID()}`);
+  await heard('That room is no longer listed', from);
+  assert.equal(openedLines().length, shortcutCount + 1);
 
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ ok: true, rooms: [first, second].map(id => id.slice(0, 8)), opened: openedLines().length }));

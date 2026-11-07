@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { admissionPath, dataDirectory, openAdmission } from './store';
 
 /**
- * Room-creation invite codes for the invite-only beta. Joining a room through its link never needs one. Only a hash of
+ * Person-admission invite codes for the invite-only beta. Joining a room through its link never needs one. Only a hash of
  * each code is stored; the operator sees the code once, when it is minted.
  */
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -58,8 +58,16 @@ export function consumeInvite(db: Database, value: unknown, now: number): Invite
   return undefined;
 }
 
+/** Admission survives room deletion and code expiry. Only authenticated device linking shares it. */
+export function betaPerson(db: Database, device: string): string | undefined {
+  return (db.query('SELECT person FROM beta_admissions WHERE device=?').get(device) as { person: string } | null)?.person;
+}
+export function admitBetaDevice(db: Database, device: string, person = device, now = Date.now()) {
+  db.query('INSERT OR IGNORE INTO beta_admissions (device, person, admitted_at) VALUES (?,?,?)').run(device, person, now);
+}
+
 export const inviteMessages: Record<InviteFailure, string> = {
-  'invite-required': 'Creating rooms needs an invite code during the beta. Enter the code you were given.',
+  'invite-required': 'Enter your beta invite once to unlock room creation. After that, you can create more rooms without a code.',
   'invite-invalid': 'That invite code isn’t valid. Check it and try again.',
   'invite-used': 'That invite code has been used up. Ask for a new one.',
   'invite-expired': 'That invite code has expired. Ask for a new one.',
@@ -75,7 +83,7 @@ export function invitesCli(args: string[], db: Database, print: (line: string) =
   const flag = (name: string) => { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : undefined; };
   if (command === 'mint') {
     const invite = mintInvite(db, { uses: Number(flag('uses') ?? 1), days: Number(flag('days') ?? 14), note: flag('note') });
-    print(`Invite ${invite.id}: ${invite.uses} room${invite.uses === 1 ? '' : 's'}, until ${new Date(invite.expiresAt).toISOString()}${invite.note ? ` (${invite.note})` : ''}`);
+    print(`Invite ${invite.id}: ${invite.uses} user${invite.uses === 1 ? '' : 's'}, until ${new Date(invite.expiresAt).toISOString()}${invite.note ? ` (${invite.note})` : ''}`);
     print(`Code (shown only now): ${invite.code}`);
     return;
   }

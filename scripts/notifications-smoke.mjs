@@ -123,9 +123,9 @@ try {
   assert.deepEqual(start, { title: '1 agent live in 1 room', body: 'All listening. Click to review them.', target: { kind: 'review' } });
 
   // Alex chats, then mentions Robin. No local tab is open: the person device is the daemon's.
-  await alex.getByRole('combobox', { name: /^Message / }).fill('Morning, everyone.');
+  await alex.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill('Morning, everyone.');
   await alex.getByRole('button', { name: 'Send', exact: true }).click();
-  await alex.getByRole('combobox', { name: /^Message / }).fill('@Robin can you check the release notes?');
+  await alex.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill('@Robin can you check the release notes?');
   await alex.getByRole('button', { name: 'Send', exact: true }).click();
   const mention = await until(() => notices().find(n => n.target.kind === 'room'), 'the mention notification', 90_000);
   assert.deepEqual(mention, { title: 'Meshrooms · Notify check', body: 'Alex mentioned you: @Robin can you check the release notes?', target: { kind: 'room', roomId } });

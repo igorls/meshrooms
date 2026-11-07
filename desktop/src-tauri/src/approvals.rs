@@ -221,10 +221,12 @@ pub fn item(entry: &Value) -> Option<Value> {
             ("identity", "An agent asks for an identity", rows, IDENTITY_PROVENANCE)
         }
         Some("bind-existing") => {
+            let desktop = harness == "codex" && entry["codexDelivery"].as_str() == Some("desktop");
+            if !entry["codexDelivery"].is_null() && (harness != "codex" || !matches!(entry["codexDelivery"].as_str(), Some("desktop" | "headless"))) { whole.set(false); }
             // The identity's name and model (the bind runs it with that model) and the room's title, as the daemon looked
             // them up for this view; the digest covers them with the request, and the ids are shown beside them.
             let agent = label("identityName", 64, "An agent of yours that was not found");
-            let model = label("identityModel", 100, "The harness's default");
+            let model = if desktop { "The existing chat's model".to_string() } else { label("identityModel", 100, "The harness's default") };
             let room = label("roomTitle", 60, "A room of yours, untitled");
             let agent_id = shown(raw("identityId").filter(|id| id_like(id)), 36, "");
             let room_id = shown(raw("roomId").filter(|id| id_like(id)), 36, "");
@@ -235,6 +237,7 @@ pub fn item(entry: &Value) -> Option<Value> {
             let folder = shown(raw("folder"), 40, "None");
             let session = shown(raw("session"), 128, "");
             let cwd = match &entry["cwd"] {
+                Value::Null if desktop => "The existing chat's working folder".to_string(),
                 Value::Null if harness == "codex" => "The room's own folder (Codex always works there)".to_string(),
                 Value::String(cwd) => shown(Some(cwd), MAX_FOLDER, ""),
                 _ => {
@@ -245,8 +248,9 @@ pub fn item(entry: &Value) -> Option<Value> {
             if session.is_empty() || cwd.is_empty() {
                 whole.set(false);
             }
-            let rows = vec![("Agent", agent), ("Agent id", agent_id), ("Model", model), ("Room", room), ("Room id", room_id), ("Harness", harness_shown),
+            let mut rows = vec![("Agent", agent), ("Agent id", agent_id), ("Model", model), ("Room", room), ("Room id", room_id), ("Harness", harness_shown),
                 ("Session", title), ("Folder label", folder), ("Working folder", cwd), ("Session id", session)];
+            if harness == "codex" { rows.push(("Delivery", if desktop { "Into this desktop chat during work; its tools and approval settings apply." } else { "A separate, confined CLI wake." }.to_string())); }
             ("bind-existing", "Bind an agent to an existing session", rows, BIND_PROVENANCE)
         }
         _ => return None,
@@ -545,7 +549,7 @@ pub fn approve(app: &AppHandle, id: String, digest: String) -> Result<(), String
     trace("approving");
     let app = app.clone();
     std::thread::spawn(move || {
-        let answer = app_cli(&app, &["agent", "approve", "--id", &id, "--digest", &digest], &[]);
+        let answer = app_cli(&app, &["agent", "approve", "--id", &id, "--digest", &digest, "--delivery-review", "desktop-v1"], &[]);
         let relisted = app_cli(&app, &["agent", "approvals"], &[]).ok();
         let result = outcome(&id, &digest, &answer, relisted.as_ref());
         trace(&format!("approve came to {result:?}"));
@@ -776,6 +780,18 @@ mod tests {
     fn identity(digest: &str, model: &str) -> Value {
         json!({ "id": ID, "kind": "identity", "name": "Elm", "harness": "claude", "model": model, "requestedAt": "2026-10-05T06:40:55.687Z",
             "expiresAt": "2026-10-06T06:40:55.687Z", "digest": digest })
+    }
+    #[test]
+    fn desktop_binding_shows_the_existing_chats_permissions_and_refuses_unknown_delivery_modes() {
+        let mut entry = bind(Value::Null);
+        entry["harness"] = json!("codex"); entry["codexDelivery"] = json!("desktop");
+        let shown = item(&entry).unwrap();
+        assert_eq!(row(&shown, "Working folder"), "The existing chat's working folder");
+        assert_eq!(row(&shown, "Model"), "The existing chat's model");
+        assert!(row(&shown, "Delivery").contains("approval settings apply"));
+        assert_eq!(shown["canApprove"], true);
+        entry["codexDelivery"] = json!("unknown");
+        assert_eq!(item(&entry).unwrap()["canApprove"], false);
     }
     fn bind(cwd: Value) -> Value {
         json!({ "id": BIND, "kind": "bind-existing", "identityId": AGENT, "roomId": ROOM,

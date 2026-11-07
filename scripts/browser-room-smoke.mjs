@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
+import { checkRoomDraft } from './check-room-draft.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MESHROOMS_PLAYWRIGHT_MODULE || 'playwright');
 const origin = process.env.MESHROOMS_BROWSER_TEST_ORIGIN || 'http://127.0.0.1:14330';
@@ -37,7 +38,7 @@ async function visible(p, text) { await p.getByText(text, { exact: true }).waitF
 // Messages render as Markdown, so line breaks become elements; compare the rendered text instead.
 const flat = text => text.replace(/\s+/g, ' ').trim();
 async function visibleMessage(p, text) { await p.waitForFunction(t => [...document.querySelectorAll('.message-text')].some(el => el.innerText.replace(/\s+/g, ' ').trim() === t), flat(text)); }
-async function send(p, text) { await p.getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
+async function send(p, text) { await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
 async function snapshot(p, name) { await p.evaluate(() => window.scrollTo(0, 0)); await p.screenshot({ path: resolve(output, name), fullPage: true, animations: 'disabled' }); }
 try {
   const host = await page(), guest = await page({ width: 390, height: 844 }), companion = await page();
@@ -52,7 +53,7 @@ try {
   await guest.getByLabel('Your name', { exact: true }).fill('Sam');
   await guest.getByRole('button', { name: 'Ask to join', exact: true }).click();
   await host.getByRole('button', { name: 'Admit', exact: true }).waitFor();
-  assert.equal(await guest.getByRole('combobox', { name: /^Message / }).count(), 0);
+  assert.equal(await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).count(), 0);
   await snapshot(host, 'waiting-host.png'); await snapshot(guest, 'waiting-mobile.png');
   await host.getByRole('button', { name: 'Admit', exact: true }).click();
   await visible(guest, 'Connected to 1 other device');
@@ -78,6 +79,7 @@ try {
   }
   await guest.reload(); await visible(guest, first); await visible(guest, 'Connected to 1 other device');
   assert.equal(await guest.getByText(first, { exact: true }).count(), 1);
+  await checkRoomDraft(guest, 'Browser invitation check', first);
   const duplicate = await guest.context().newPage(); await duplicate.goto(invite);
   await duplicate.getByText(/already open in another tab/).waitFor(); await duplicate.close();
   await companion.goto(invite);
@@ -112,14 +114,14 @@ try {
   await host.getByRole('button', { name: 'Close room details', exact: true }).click();
   // Secondary context must preserve drafts and restore focus when closed.
   const draft = 'A draft that stays while checking people.';
-  await guest.getByRole('combobox', { name: /^Message / }).fill(draft);
+  await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(draft);
   await guest.getByRole('button', { name: 'Room details', exact: true }).click();
-  assert.equal(await guest.getByRole('combobox', { name: /^Message / }).isVisible(), false);
+  assert.equal(await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).isVisible(), false);
   await snapshot(guest, 'details-mobile.png');
   await guest.getByRole('heading', { name: 'Room details', exact: true }).press('Escape');
-  assert.equal(await guest.getByRole('combobox', { name: /^Message / }).inputValue(), draft);
+  assert.equal(await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).inputValue(), draft);
   assert.equal(await guest.getByRole('button', { name: 'Room details', exact: true }).evaluate(el => el === document.activeElement), true);
-  await guest.getByRole('combobox', { name: /^Message / }).fill('');
+  await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill('');
   // Tablet/zoom-sized layout and long names keep controls inside the viewport.
   await host.setViewportSize({ width: 820, height: 900 });
   await snapshot(host, 'tablet.png');
@@ -168,10 +170,10 @@ try {
   await host.getByText('Manage your devices', { exact: true }).click();
   await host.getByRole('button', { name: /^Remove (Windows |Mac )?browser [0-9A-F]{6}$/i }).click();
   await companion.getByText('This device no longer has access. Ask the host to admit it again.', { exact: true }).waitFor();
-  assert.equal(await companion.getByRole('combobox', { name: /^Message / }).count(), 0);
+  assert.equal(await companion.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).count(), 0);
   await host.getByRole('button', { name: 'Close room details', exact: true }).click();
   await send(host, 'The remaining device still works.'); await visible(guest, 'The remaining device still works.');
-  const compose = host.getByRole('combobox', { name: /^Message / });
+  const compose = host.locator('.browser-composer').getByRole('combobox', { name: /^Message / });
   await compose.fill('Keyboard first line'); await compose.press('Shift+Enter'); await compose.pressSequentially('Second line');
   assert.equal(await compose.inputValue(), 'Keyboard first line\nSecond line');
   await compose.press('Enter'); await visibleMessage(guest, 'Keyboard first line\nSecond line');
@@ -206,8 +208,8 @@ try {
   await visitor.setViewportSize({ width: 390, height: 844 }); await snapshot(visitor, 'expired-mobile.png');
   assert.deepEqual(errors, []);
   const result = { passed: true, browser: 'Chromium', scope: `Isolated browser contexts on one ${process.platform} machine`, origin, roomId: new URL(invite).pathname.split('/').at(-1), relayTransport: process.env.MESHROOMS_TEST_TURN_TRANSPORT || 'automatic', routes,
-    checks: ['pending admission isolation', 'live host admission', 'bidirectional Unicode messages and storage receipts', ...(restartGate ? ['live coordinator restart recovery'] : []), 'reload identity/history', 'duplicate tab ownership', 'companion identity and authorship', 'device removal', 'decline', 'cancel', 'mobile and tablet overflow', 'preserved reading position and unread feedback', 'anchored composer', 'room details draft and keyboard focus retention', 'Enter sends and Shift+Enter adds a line', 'live message announcement', 'expired request UI (simulated response)'],
-    notQualified: ['real macOS execution', 'different-network NAT traversal', ...(process.env.MESHROOMS_TEST_FORCE_RELAY === '1' ? [] : ['TURN relay']), 'native agent bridge', 'companion history backfill'] };
+    checks: ['pending admission isolation', 'live host admission', 'bidirectional Unicode messages and storage receipts', ...(restartGate ? ['live coordinator restart recovery'] : []), 'reload identity/history', 'draft text and reply across room navigation and reload', 'sent draft cleared', 'unsent attachment navigation warning', 'duplicate tab ownership', 'companion identity and authorship', 'device removal', 'decline', 'cancel', 'mobile and tablet overflow', 'preserved reading position and unread feedback', 'anchored composer', 'room details draft and keyboard focus retention', 'Enter sends and Shift+Enter adds a line', 'live message announcement', 'expired request UI (simulated response)'],
+    notQualified: [...(process.platform === 'darwin' ? [] : ['real macOS execution']), 'different-network NAT traversal', ...(process.env.MESHROOMS_TEST_FORCE_RELAY === '1' ? [] : ['TURN relay']), 'native agent bridge', 'companion history backfill'] };
   writeFileSync(resolve(output, 'browser-smoke.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify(result, null, 2));
 } catch (error) {

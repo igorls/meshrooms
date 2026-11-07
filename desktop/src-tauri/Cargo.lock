@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "meshrooms-desktop"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.7"
 dependencies = [
  "serde_json",
  "sha2",

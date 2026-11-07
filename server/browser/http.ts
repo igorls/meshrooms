@@ -27,7 +27,7 @@ export function addressKey(address: string): string {
   const groups = tail === undefined ? parts(head) : [...parts(head), ...Array(8 - width(parts(head)) - width(parts(tail))).fill('0'), ...parts(tail)];
   return `${groups.slice(0, 4).map(g => parseInt(g, 16).toString(16)).join(':')}::/64`;
 }
-const ACTIONS = new Set(['create', 'request', 'cancel', 'status', 'decide', 'link', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'repositories', 'close']);
+const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'repositories', 'close']);
 /** Route shape for logs: room and member ids are replaced, so a log line never names a room. */
 const route = (path: string) => path.replace(/[a-f0-9-]{36}/g, ':id').slice(0, 120);
 

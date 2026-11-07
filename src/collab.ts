@@ -99,7 +99,7 @@ function mayWake(room: RoomView, agentId: string, authorId: string | undefined):
  * message's author, so it wakes nobody else.
  */
 export function wakes(room: RoomView, message: Message, agentId: string): boolean {
-  if (message.authorId === agentId || !mayWake(room, agentId, message.authorId)) return false;
+  if (message.deleted || message.authorId === agentId || !mayWake(room, agentId, message.authorId)) return false;
   if ((room.floor ?? DEFAULT_FLOOR) === 'open' && message.role === 'human' && !message.mentions?.length && !message.replyTo) return true;
   if ((room.floor ?? DEFAULT_FLOOR) === 'humans-first' && message.role !== 'human') return false;
   return addresses(message, agentId, room.messages);

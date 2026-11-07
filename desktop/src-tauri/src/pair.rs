@@ -106,6 +106,9 @@ pub enum Stage {
     Sending,
     /// The requests are out: the person confirms in the browser.
     Waiting,
+    Cancelling,
+    CancelFailed(String),
+    Cancelled,
     Done,
     Failed(String),
 }
@@ -215,8 +218,9 @@ impl Pairing {
             Some(p) => match p.stage {
                 Stage::Asking | Stage::Reviewing => now.duration_since(p.opened) < PENDING_FOR,
                 // Under way, but never past the pairing's 15 minutes (the progress reader ends it then).
-                Stage::Sending | Stage::Waiting => now.duration_since(p.opened) < PENDING_FOR,
-                Stage::Done | Stage::Failed(_) => false,
+                Stage::Sending | Stage::Waiting | Stage::CancelFailed(_) => now.duration_since(p.opened) < PENDING_FOR,
+                Stage::Cancelling => true,
+                Stage::Done | Stage::Cancelled | Stage::Failed(_) => false,
             },
             None => false,
         }
@@ -308,6 +312,27 @@ impl Pairing {
         }
     }
 
+    /// Stop requests already sent, without unpairing rooms that the browser admitted meanwhile.
+    pub fn start_cancel(&mut self) -> Result<(u64, Vec<String>), Refused> {
+        let pending = self.pending.as_mut().ok_or(Refused::Nothing)?;
+        if !matches!(pending.stage, Stage::Waiting | Stage::CancelFailed(_)) { return Err(Refused::Nothing); }
+        pending.stage = Stage::Cancelling;
+        Ok((pending.id, vec!["person".into(), "cancel-pairing".into(), "--origin".into(), pending.origin.clone(),
+            "--rooms".into(), pending.rooms.join(","), "--device".into(), pending.device.clone()]))
+    }
+
+    pub fn cancelled(&mut self, id: u64, result: Result<Value, String>) {
+        let Some(pending) = self.current(id).filter(|p| p.stage == Stage::Cancelling) else { return };
+        match result {
+            Ok(answer) => {
+                pending.absorb(answer["rooms"].as_array().map(Vec::as_slice).unwrap_or_default(), true);
+                pending.stage = if answer["cancelled"] == Value::Bool(true) { Stage::Cancelled }
+                    else { Stage::CancelFailed("Some requests could not be cancelled. Try again when the room service is reachable.".into()) };
+            }
+            Err(error) => pending.stage = Stage::CancelFailed(crate::text::clean(&error, 160)),
+        }
+    }
+
     fn current(&mut self, id: u64) -> Option<&mut Pending> {
         self.pending.as_mut().filter(|p| p.id == id)
     }
@@ -352,6 +377,11 @@ impl Pairing {
     /// Whether `id` is still the pairing under way (the progress reader stops when it isn't).
     pub fn waiting(&self, id: u64) -> bool {
         self.pending.as_ref().is_some_and(|p| p.id == id && matches!(p.stage, Stage::Sending | Stage::Waiting))
+    }
+
+    /// Open a room that actually joined, rather than the new-room form after pairing.
+    pub fn opened_room(&self) -> Option<String> {
+        self.pending.as_ref()?.progress.iter().find(|(_, _, state)| state == "joined").map(|(room, _, _)| room.clone())
     }
 
     /// Unpairing was asked for from the tray. Refused while a pairing waits or runs.
@@ -416,6 +446,9 @@ impl Pairing {
             Stage::Reviewing => ("reviewing", None),
             Stage::Sending => ("sending", None),
             Stage::Waiting => ("waiting", None),
+            Stage::Cancelling => ("cancelling", None),
+            Stage::CancelFailed(problem) => ("cancel-failed", Some(problem.clone())),
+            Stage::Cancelled => ("cancelled", None),
             Stage::Done => ("done", None),
             Stage::Failed(problem) => ("failed", Some(problem.clone())),
         };
@@ -442,7 +475,7 @@ impl Pending {
             }
             entry.2 = match row["state"].as_str() {
                 Some("joined") => "joined",
-                Some("failed" | "declined" | "expired" | "closed" | "removed") => "failed",
+                Some("failed" | "cancelled" | "declined" | "expired" | "closed" | "removed") => "failed",
                 _ => "waiting",
             }
             .to_string();
@@ -513,7 +546,7 @@ pub fn closed(app: &AppHandle) {
     if pairing.pending.as_ref().is_some_and(|p| matches!(p.stage, Stage::Asking | Stage::Reviewing)) {
         trace("rejected (window closed)");
     }
-    let keep = pairing.pending.as_ref().is_some_and(|p| matches!(p.stage, Stage::Sending | Stage::Waiting));
+    let keep = pairing.pending.as_ref().is_some_and(|p| matches!(p.stage, Stage::Sending | Stage::Waiting | Stage::Cancelling | Stage::CancelFailed(_)));
     if !keep {
         pairing.reject();
     }
@@ -668,6 +701,20 @@ pub fn pair_reject(window: WebviewWindow) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn pair_cancel(window: WebviewWindow) -> Result<(), String> {
+    ours(&window)?;
+    let app = window.app_handle().clone();
+    let (id, args) = state(&app).start_cancel().map_err(refusal)?;
+    std::thread::spawn(move || {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = app_proof().and_then(|proof| crate::bridge(&app)
+            .and_then(|bridge| crate::bridge::cli_with_input(&bridge, &refs, Some(format!("{proof}\n").as_bytes()))));
+        state(&app).cancelled(id, result);
+    });
+    Ok(())
+}
+
+#[tauri::command]
 pub fn pair_unpair(window: WebviewWindow) -> Result<(), String> {
     ours(&window)?;
     unpair(window.app_handle())
@@ -685,7 +732,8 @@ pub fn pair_close(window: WebviewWindow) -> Result<(), String> {
 #[tauri::command]
 pub fn pair_open(window: WebviewWindow) -> Result<(), String> {
     ours(&window)?;
-    crate::open_meshrooms(window.app_handle());
+    let room = state(window.app_handle()).opened_room();
+    crate::open_meshrooms_at(window.app_handle(), room);
     let _ = window.close();
     Ok(())
 }
@@ -712,6 +760,60 @@ mod tests {
         assert_eq!(normal("  Coach  CLOCK\tcider-lake "), "coach clock cider lake");
         assert_eq!(encode(&[0; 32]), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(encode(&count()), "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+    }
+
+    #[test]
+    fn open_after_pairing_chooses_a_joined_room_and_never_a_failed_request() {
+        let (mut pairing, now) = (Pairing::default(), Instant::now());
+        assert_eq!(pairing.opened_room(), None);
+        let id = offer(&mut pairing, count(), now).unwrap();
+        assert_eq!(pairing.opened_room(), None);
+        pairing.verify("smoke raven whale hotel", now).unwrap();
+        pairing.titles(id, &json!({}));
+        pairing.confirm(now).unwrap();
+        pairing.sent(id, Ok(json!({ "rooms": [{ "roomId": ROOM, "state": "failed" }, { "roomId": ROOM2, "state": "waiting" }] })));
+        assert_eq!(pairing.opened_room(), None);
+        pairing.progress(id, &json!([{ "roomId": ROOM2, "state": "joined" }]));
+        assert_eq!(pairing.opened_room(), Some(ROOM2.to_string()));
+    }
+
+    #[test]
+    fn waiting_pairing_can_be_cancelled_and_a_new_link_opens_immediately() {
+        let (mut pairing, now) = (Pairing::default(), Instant::now());
+        let id = offer(&mut pairing, count(), now).unwrap();
+        pairing.verify("smoke raven whale hotel", now).unwrap();
+        pairing.titles(id, &json!({}));
+        pairing.confirm(now).unwrap();
+        assert_eq!(pairing.start_cancel().err(), Some(Refused::Nothing), "sending must finish before cancelling");
+        pairing.sent(id, Ok(json!({ "rooms": [{ "roomId": ROOM, "state": "waiting" }] })));
+        let (cancel_id, args) = pairing.start_cancel().unwrap();
+        assert_eq!(cancel_id, id);
+        assert_eq!(args[1], "cancel-pairing");
+        assert!(!pairing.waiting(id));
+        assert_eq!(offer(&mut pairing, [7; 32], now).err(), Some(Refused::Busy));
+        pairing.cancelled(id, Ok(json!({ "cancelled": true, "rooms": [{ "roomId": ROOM, "state": "cancelled" }, { "roomId": ROOM2, "state": "joined" }] })));
+        assert_eq!(pairing.view(now)["stage"], "cancelled");
+        pairing.progress(id, &json!([{ "roomId": ROOM, "state": "waiting" }]));
+        assert_eq!(pairing.view(now)["stage"], "cancelled", "late polling can't restore a cancelled pairing");
+        assert!(offer(&mut pairing, [7; 32], now).is_ok());
+        pairing.cancelled(id, Err("late failure".into()));
+        assert_eq!(pairing.view(now)["stage"], "asking", "an old cancellation cannot change the new link");
+    }
+
+    #[test]
+    fn cancellation_failure_offers_a_retry_instead_of_claiming_success() {
+        let (mut pairing, now) = (Pairing::default(), Instant::now());
+        let id = offer(&mut pairing, count(), now).unwrap();
+        pairing.verify("smoke raven whale hotel", now).unwrap();
+        pairing.titles(id, &json!({}));
+        pairing.confirm(now).unwrap();
+        pairing.sent(id, Ok(json!({})));
+        pairing.start_cancel().unwrap();
+        pairing.cancelled(id, Ok(json!({ "cancelled": false })));
+        assert_eq!(pairing.view(now)["stage"], "cancel-failed");
+        assert!(pairing.start_cancel().is_ok());
+        pairing.cancelled(id, Ok(json!({ "cancelled": true })));
+        assert_eq!(pairing.view(now)["stage"], "cancelled");
     }
 
     #[test]

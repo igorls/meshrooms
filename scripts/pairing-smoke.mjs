@@ -70,17 +70,20 @@ try {
   await robin.getByLabel('Your name', { exact: true }).fill('Robin');
   await robin.getByRole('button', { name: 'Ask to join', exact: true }).click();
   await alex.getByRole('button', { name: 'Admit', exact: true }).click();
-  await robin.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await robin.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
   const own = await createRoom(robin, 'Robin', 'Robin hosts');
-  await robin.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await robin.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
 
   // The app's side: the daemon in the foreground from this checkout.
   daemon = spawn(bun, ['server/agent-cli.ts', 'daemon', 'run'], { env, stdio: ['ignore', log, log], windowsHide: true });
   await until(() => { try { return JSON.parse(readFileSync(join(daemonDir, 'local-api.json'), 'utf8')); } catch { return undefined; } }, 'the daemon\'s local API');
 
-  // Robin's rooms list offers the desktop app; the page makes the link and shows the phrase.
-  await robin.goto(`${origin}/rooms`);
+  // Start from the room. Closing details keeps a visible way back to the confirmation controls.
+  await robin.getByRole('button', { name: 'Have the desktop app?', exact: true }).click();
   await robin.getByRole('button', { name: 'Use the desktop app', exact: true }).click();
+  await robin.getByRole('button', { name: 'Close room details', exact: true }).click();
+  await robin.getByRole('button', { name: 'Finish desktop pairing', exact: true }).click();
+  await robin.waitForFunction(() => { const button = document.querySelector('[data-desktop-pairing-confirm]'); if (!button) return false; const box = button.getBoundingClientRect(); return box.width > 0 && box.y >= 0 && box.bottom <= innerHeight; }, undefined, { timeout: 10_000 });
   const shown = (await robin.locator('.browser-pairing-phrase').innerText()).trim();
   const href = await robin.locator('a.browser-pairing-open').getAttribute('href');
   await snapshot(robin, 'pairing-browser-phrase.png');
@@ -112,6 +115,14 @@ try {
   const paired = cli(['person', 'pair', '--origin', origin, '--rooms', `${hosted},${own}`, '--name', 'Robin', '--device', device], `${proof}\n${n}\n`);
   assert.deepEqual(paired.rooms.map(r => r.state), ['waiting', 'waiting']);
 
+  // Cancel the app's pending requests and immediately try again, keeping its one identity key.
+  const identityBeforeCancel = readFileSync(join(person, 'identity.json'), 'utf8');
+  assert.throws(() => cli(['person', 'cancel-pairing', '--origin', origin, '--rooms', `${hosted},${own}`, '--device', device]), /from the Meshrooms app/);
+  assert.equal(cli(['person', 'cancel-pairing', '--origin', origin, '--rooms', `${hosted},${own}`, '--device', device], `${proof}\n`).cancelled, true);
+  assert.deepEqual(cli(['person', 'rooms']), []);
+  assert.equal(readFileSync(join(person, 'identity.json'), 'utf8'), identityBeforeCancel);
+  assert.deepEqual(cli(['person', 'pair', '--origin', origin, '--rooms', `${hosted},${own}`, '--name', 'Robin', '--device', device], `${proof}\n${n}\n`).rooms.map(r => r.state), ['waiting', 'waiting']);
+
   // Robin confirms in the browser: both rooms link, with no host approval (Alex hosts the first one).
   await robin.getByRole('button', { name: 'Confirm pairing', exact: true }).click();
   await robin.getByText('Paired. Open Meshrooms on this computer.').waitFor({ timeout: 45_000 });
@@ -136,11 +147,12 @@ try {
   await local.getByRole('link', { name: /Robin hosts/ }).first().waitFor();
   await local.getByRole('link', { name: /Pairing check/ }).first().click();
   await local.waitForURL(new RegExp(`/r/${hosted}$`));
-  await local.getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
+  await local.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
   await snapshot(local, 'pairing-local-room.png');
 
   // A new room from the local page: made and hosted by the person device.
-  await local.goto(`${new URL(url).origin}/rooms`);
+  await local.getByRole('link', { name: 'Create a room', exact: true }).click();
+  await local.waitForURL(u => !u.hash && u.pathname === '/rooms');
   await local.getByLabel('Your name', { exact: true }).fill('Robin');
   await local.getByLabel('Room name', { exact: true }).fill('Made in the app');
   // The form names the room service the room goes to, since it isn't the public one.
