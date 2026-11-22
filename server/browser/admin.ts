@@ -1,6 +1,8 @@
 import type { Database } from 'bun:sqlite';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { mintInvite, listInvites, revokeInvite } from './invites';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { listBetaPeople, listInvites, mintInvite, revokeBetaPerson, revokeInvite } from './invites';
 import { listRooms } from './store';
 
 const assets = {
@@ -9,6 +11,11 @@ const assets = {
   '/admin.css': new URL('./admin/admin.css', import.meta.url),
 };
 const sha = (value: string) => createHash('sha256').update(value).digest();
+function equalToken(actual: string | null, expected: string): boolean {
+  if (actual === null) return false;
+  const left = Buffer.from(actual, 'utf8'), right = Buffer.from(expected, 'utf8');
+  return left.length === right.length && timingSafeEqual(left, right);
+}
 const COOKIE = '__Host-meshrooms-admin';
 const TTL = 8 * 3_600_000;
 export function adminOrigin(value: string) {
@@ -23,10 +30,17 @@ export function adminHandler(db: Database, options: { origin: string; passwordHa
   const origin = adminOrigin(options.origin), host = new URL(origin).host;
   if (!/^[a-f0-9]{64}$/.test(options.passwordHash)) throw new Error('Set MESHROOMS_ADMIN_PASSWORD_HASH to the SHA-256 of a random 32-byte credential.');
   const expected = Buffer.from(options.passwordHash, 'hex'), now = options.now ?? Date.now;
+  // Preload the tiny static UI once at startup, so pruning an old release directory can never break asset reads.
+  const preloaded: Record<keyof typeof assets, { body: string; type: string }> = {
+    '/': { body: readFileSync(fileURLToPath(assets['/']), 'utf8'), type: 'text/html; charset=utf-8' },
+    '/admin.js': { body: readFileSync(fileURLToPath(assets['/admin.js']), 'utf8'), type: 'text/javascript; charset=utf-8' },
+    '/admin.css': { body: readFileSync(fileURLToPath(assets['/admin.css']), 'utf8'), type: 'text/css; charset=utf-8' },
+  };
   const sessions = new Map<string, { csrf: string; expires: number }>();
   let attempts = 0, windowAt = now();
   const headers = {
     'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': 'max-age=86400',
     'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   };
@@ -49,9 +63,9 @@ export function adminHandler(db: Database, options: { origin: string; passwordHa
     const path = new URL(request.url).pathname;
     const mutation = request.method !== 'GET';
     if (mutation && (request.method !== 'POST' || request.headers.get('origin') !== origin || request.headers.get('sec-fetch-site') === 'cross-site')) return json({ error: 'Use the admin panel.' }, 403);
-    if (!mutation && path in assets && Object.hasOwn(assets, path)) {
-      const file = Bun.file(assets[path as keyof typeof assets]);
-      return new Response(file, { headers: { ...headers, 'Content-Type': path === '/' ? 'text/html; charset=utf-8' : path.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8' } });
+    if (!mutation && path in preloaded && Object.hasOwn(preloaded, path)) {
+      const asset = preloaded[path as keyof typeof preloaded];
+      return new Response(asset.body, { headers: { ...headers, 'Content-Type': asset.type } });
     }
     for (const [id, session] of sessions) if (session.expires <= now()) sessions.delete(id);
     const cookie = request.headers.get('cookie')?.split(';').map(s => s.trim()).find(s => s.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1);
@@ -69,9 +83,8 @@ export function adminHandler(db: Database, options: { origin: string; passwordHa
         return json({ csrf }, 200, { 'Set-Cookie': `${COOKIE}=${id}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${TTL / 1000}` });
       }
       if (!session) return json({ error: 'Sign in to continue.' }, 401);
-      if (mutation && request.headers.get('x-csrf-token') !== session.csrf) return json({ error: 'Refresh the admin panel and try again.' }, 403);
-      if (path === '/api/state' && !mutation) return json({ csrf: session.csrf, invites: listInvites(db), rooms: listRooms(db),
-        people: db.query('SELECT person AS id, COUNT(*) AS devices, MIN(admitted_at) AS admittedAt FROM beta_admissions GROUP BY person ORDER BY admittedAt DESC').all() });
+      if (mutation && !equalToken(request.headers.get('x-csrf-token'), session.csrf)) return json({ error: 'Refresh the admin panel and try again.' }, 403);
+      if (path === '/api/state' && !mutation) return json({ csrf: session.csrf, invites: listInvites(db), rooms: listRooms(db), people: listBetaPeople(db) });
       if (path === '/api/logout' && mutation) { sessions.delete(cookie!); return json({ signedOut: true }, 200, { 'Set-Cookie': `${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0` }); }
       if (path === '/api/invites' && mutation) {
         const input = await body(request);
@@ -81,6 +94,13 @@ export function adminHandler(db: Database, options: { origin: string; passwordHa
       }
       const revoke = /^\/api\/invites\/([a-f0-9]{8})\/revoke$/.exec(path);
       if (revoke && mutation) { const revoked = revokeInvite(db, revoke[1], now()); if (revoked) audit('admin-invite-revoked', revoke[1]); return json({ revoked }, revoked ? 200 : 404); }
+      if (path === '/api/people/revoke' && mutation) {
+        const input = await body(request);
+        if (typeof input.person !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(input.person)) return json({ error: 'Enter a valid person ID.' }, 400);
+        const removed = revokeBetaPerson(db, input.person);
+        if (removed > 0) options.log?.({ time: new Date(now()).toISOString(), event: 'admin', action: 'revoke-person', person: input.person, removed });
+        return json({ revoked: removed > 0, removed }, removed > 0 ? 200 : 404);
+      }
       return json({ error: 'Not found.' }, 404);
     } catch (error) {
       // Validation errors carry no credential or code; unexpected database failures stay out of the browser.

@@ -11,8 +11,10 @@ import { HARNESS_IDS, HARNESS_LABELS, plainText, type HarnessId, type HarnessSca
 export type CodexDelivery = 'desktop' | 'headless';
 export type HarnessPreference = { enabled: boolean; codexDelivery?: CodexDelivery };
 export const HARNESS_APPS_FILE = 'harness-apps.json';
-export function harnessPreferences(home: string): Record<HarnessId, HarnessPreference> {
-  const defaults = Object.fromEntries(HARNESS_IDS.map(id => [id, { enabled: true, ...(id === 'codex' ? { codexDelivery: 'desktop' } : {}) }])) as Record<HarnessId, HarnessPreference>;
+/** Desktop IPC is currently macOS-first; Windows and Linux default to headless CLI wakes unless explicitly opted in. */
+export const defaultCodexDelivery = (platform: NodeJS.Platform = process.platform): CodexDelivery => platform === 'darwin' ? 'desktop' : 'headless';
+export function harnessPreferences(home: string, platform: NodeJS.Platform = process.platform): Record<HarnessId, HarnessPreference> {
+  const defaults = Object.fromEntries(HARNESS_IDS.map(id => [id, { enabled: true, ...(id === 'codex' ? { codexDelivery: defaultCodexDelivery(platform) } : {}) }])) as Record<HarnessId, HarnessPreference>;
   const file = join(home, HARNESS_APPS_FILE);
   if (!existsSync(file)) return defaults;
   let saved: any; try { saved = JSON.parse(readFileSync(file, 'utf8')); } catch { throw new Error('Agent app settings cannot be read. Restore them before making new bindings.'); }

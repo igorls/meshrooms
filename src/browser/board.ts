@@ -1,6 +1,7 @@
 import { TASK_STATUSES, type Task, type TaskStatus } from '../collab';
 import { issueNumberAt } from '../markdown';
 import { validRepository } from './protocol';
+import { newestPerMember } from './markers';
 
 /**
  * Browser-room task board. The room service never sees tasks: each change is a signed operation carrying the task's
@@ -20,7 +21,7 @@ export type TaskChange = { title?: string; notes?: string; status?: TaskStatus; 
 
 /** A GitHub issue or pull request link, the only kind of link a task carries. */
 export const validIssueLink = (v: unknown): v is string => {
-  const parts = typeof v === 'string' && v.length <= 200 && /^https:\/\/github\.com\/([^/]+\/[^/]+)\/(?:issues|pull)\/\d{1,9}$/.exec(v);
+  const parts = typeof v === 'string' && v.length <= 200 && /^https:\/\/github\.com\/([^/]+\/[^/]+)\/(?:issues|pull)\/[1-9]\d{0,8}$/.exec(v);
   return !!parts && validRepository(parts[1]);
 };
 const onGitHub = (url: URL) => url.protocol === 'https:' && ['github.com', 'www.github.com'].includes(url.hostname.toLowerCase());
@@ -29,7 +30,7 @@ const onGitHub = (url: URL) => url.protocol === 'https:' && ['github.com', 'www.
  * /files dropped) or `owner/name#42`, which GitHub forwards to the pull request when 42 is one.
  */
 export function issueLinkFrom(text: string): string | undefined {
-  const value = text.trim(), short = /^([^\s/#]+\/[^\s/#]+)#(\d{1,9})$/.exec(value);
+  const value = text.trim(), short = /^([^\s/#]+\/[^\s/#]+)#([1-9]\d{0,8})$/.exec(value);
   if (short) return validRepository(short[1]) ? `https://github.com/${short[1]}/issues/${short[2]}` : undefined;
   let url: URL; try { url = new URL(value); } catch { return undefined; }
   if (!onGitHub(url)) return undefined;
@@ -88,6 +89,11 @@ export function newIssueUrl(repository: string, title: string, body: string) {
   return `https://github.com/${repository}/issues/new?${query}`;
 }
 
+/**
+ * The latest time a Date can hold. A signed `at` past it is refused: `toISOString` throws on it, and one such
+ * operation, once stored, would stop the room from loading on every device.
+ */
+export const MAX_TIME = 8_640_000_000_000_000;
 export const MAX_TASK_OPS = 2000;
 /** Devices compact their board past this many operations, keeping it well under MAX_TASK_OPS. */
 export const COMPACT_AT = 1000;
@@ -98,7 +104,7 @@ const id = (value: unknown) => typeof value === 'string' && /^[a-f0-9-]{36}$/.te
 export function validTaskBody(b: any, roomId: string): b is TaskBody {
   return !!b && b.kind === 'task' && b.roomId === roomId && id(b.id) && id(b.taskId) && id(b.memberId)
     && typeof b.deviceId === 'string' && /^[a-f0-9]{64}$/.test(b.deviceId)
-    && Number.isSafeInteger(b.at) && b.at > 0 && Number.isSafeInteger(b.revision) && b.revision >= 1 && b.revision <= 1_000_000
+    && Number.isSafeInteger(b.at) && b.at > 0 && b.at <= MAX_TIME && Number.isSafeInteger(b.revision) && b.revision >= 1 && b.revision <= 1_000_000
     && typeof b.title === 'string' && !!b.title.trim() && b.title.length <= 120 && typeof b.notes === 'string' && b.notes.length <= 2000
     && TASK_STATUSES.includes(b.status) && (b.assigneeId === null || id(b.assigneeId)) && (b.removed === undefined || b.removed === true)
     && (b.issue === undefined || validIssueLink(b.issue));
@@ -142,7 +148,7 @@ export function foldBoard(ops: TaskBody[]): Task[] {
     const steps = chain(list), last = steps.at(-1)!, assigned = steps[assignmentIndex(steps)];
     tasks.push({ id: taskId, title: last.title, notes: last.notes, status: last.status, ...(last.issue ? { issue: last.issue } : {}),
       ...(last.assigneeId ? { assigneeId: last.assigneeId, assignedBy: assigned.memberId, assignedRevision: assigned.revision } : {}),
-      createdBy: steps[0].memberId, updatedBy: last.memberId, updatedAt: new Date(last.at).toISOString(), revision: last.revision, createdAt: steps[0].at });
+      createdBy: steps[0].memberId, updatedBy: last.memberId, updatedAt: new Date(Math.min(last.at, MAX_TIME)).toISOString(), revision: last.revision, createdAt: steps[0].at });
   }
   return tasks.sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1)).map(({ createdAt: _, ...task }) => task);
 }
@@ -204,45 +210,91 @@ export function taskTimeline(ops: TaskBody[]): TaskEvent[] {
 }
 
 /**
- * Drops operations no longer needed to fold the same board, so a busy room stays under MAX_TASK_OPS. Per task it keeps
- * the first chain step, the steps around the assignment and the last KEPT_TAIL steps; a removed task keeps one removal.
- * Operations are only dropped, never rewritten, so every signature still verifies. A late edit at a kept revision wins or
- * loses exactly as it would against the full history, so task content always converges; assignment credit converges
- * too unless an edit arrives more than KEPT_TAIL revisions late. Callers compact only when the board grows large.
+ * Removal markers each member keeps on a board after compaction (see markers.ts). A board holds at most MAX_TASK_OPS
+ * operations, so this is small enough that sixteen members at their share leave room for the live tasks.
  */
-export function compactBoard<T extends { body: TaskBody }>(packets: T[]): T[] {
-  const keep = new Set<string>();
+export const MAX_REMOVALS_PER_MEMBER = 100;
+
+/**
+ * Drops operations no longer needed to fold the same board, so a busy room stays under MAX_TASK_OPS. Per task it keeps
+ * the first chain step, the steps around the assignment and the last KEPT_TAIL steps; a removed task keeps those of its
+ * removals that are among their own members' newest `maxRemovals`, and goes with its last remembered removal. Operations are only dropped, never rewritten, so every signature still verifies. A late edit at a kept revision
+ * wins or loses exactly as it would against the full history, so task content always converges; assignment credit
+ * converges too unless an edit arrives more than KEPT_TAIL revisions late. Callers compact only when the board grows large.
+ */
+export function compactBoard<T extends { body: TaskBody }>(packets: T[], maxRemovals = MAX_REMOVALS_PER_MEMBER): T[] {
+  const keep = new Set<string>(), removals: TaskBody[] = [];
   for (const list of group(packets.map(p => p.body)).values()) {
-    const removal = [...list].sort(compare).find(op => op.removed);
-    if (removal) { keep.add(removal.id); continue; }
+    // Every removal of a task counts against the member who signed it. Keeping only one per task would let anyone sign
+    // another removal of someone else's removed task that sorts first, have it counted against their own share, and
+    // so make that person's removal forgettable on purpose.
+    const removed = list.filter(op => op.removed);
+    if (removed.length) { removals.push(...removed); continue; }
     const steps = chain(list), at = assignmentIndex(steps);
     for (const index of [0, at - 1, at]) if (index >= 0) keep.add(steps[index].id);
     for (let index = Math.max(at, steps.length - KEPT_TAIL); index < steps.length; index++) keep.add(steps[index].id);
   }
+  for (const id of newestPerMember(removals, maxRemovals)) keep.add(id);
   return packets.filter(p => keep.has(p.body.id));
 }
+
+/** Live (non-removed) tasks one member may hold on a board (see capLiveTasks). */
+export const MAX_LIVE_TASKS_PER_MEMBER = 200;
 
 /**
  * How far past the highest revision a device holds for a task an incoming operation may be. Revisions are capped at
  * 1,000,000 (validTaskBody), so an operation signed near the cap would freeze the task: nobody could sign the next one.
  * An honest device always signs its current revision + 1, so a receiver sees a larger step only across edits it missed
  * or that compaction dropped; compaction keeps each task's first step, its assignment and its last 32 steps, so a gap
- * over 1,000 needs a single task edited more than 1,000 times between kept steps. Past the bound, freezing a task takes
- * at least 1,000 accepted operations on it, which the live quota (60 a minute) stretches to over 16 minutes of edits.
+ * over 1,000 needs a single task edited more than 1,000 times between kept steps. Contiguous 1-step chains (`rev <= prev + 1`)
+ * in a batch are always allowed, while non-contiguous jumps are bounded against the pre-batch baseline so stepping
+ * +1,000 repeatedly inside a single sync envelope cannot freeze a task.
  */
 export const MAX_REVISION_JUMP = 1000;
 
-/** The incoming operations whose revisions stay within MAX_REVISION_JUMP of those held (or accepted before them). */
+/** The incoming operations whose revisions stay contiguous or within MAX_REVISION_JUMP of the pre-batch baseline. */
 export function withinRevisionJump<T extends { body: TaskBody }>(held: TaskBody[], incoming: T[]): T[] {
-  const highest = new Map<string, number>();
-  for (const op of held) highest.set(op.taskId, Math.max(highest.get(op.taskId) ?? 0, op.revision));
+  const baseHighest = new Map<string, number>();
+  for (const op of held) baseHighest.set(op.taskId, Math.max(baseHighest.get(op.taskId) ?? 0, op.revision));
+  const highest = new Map(baseHighest);
   const accepted = new Set<T>();
   for (const op of [...incoming].sort((a, b) => compare(a.body, b.body))) {
+    const base = baseHighest.get(op.body.taskId) ?? 0;
     const current = highest.get(op.body.taskId) ?? 0;
-    if (op.body.revision > current + MAX_REVISION_JUMP) continue;
+    if (op.body.revision > current + 1 && op.body.revision > base + MAX_REVISION_JUMP) continue;
     highest.set(op.body.taskId, Math.max(current, op.body.revision)); accepted.add(op);
   }
   return incoming.filter(op => accepted.has(op));
+}
+
+/**
+ * The operations of a board that keep each member to `cap` live (non-removed) tasks, so one member can't fill
+ * MAX_TASK_OPS alone. A live task counts against the member who signed its first chain step; each member keeps their
+ * oldest `cap` (by that step's time, then id) and the rest of their live tasks are dropped whole. The rule depends only
+ * on the operations, never on the order they arrived in, so devices holding the same operations keep the same tasks,
+ * and a task kept from a larger set is kept from every smaller one: a device that dropped a task gets it back from the
+ * next exchange if it is among its member's oldest after all. Anyone may remove any task, so whoever signs a task's
+ * first step gains nothing a removal wouldn't give them. Removed tasks don't count (MAX_REMOVALS_PER_MEMBER bounds them).
+ */
+export function capLiveTasks<T extends { body: TaskBody }>(ops: T[], cap = MAX_LIVE_TASKS_PER_MEMBER): T[] {
+  const byMember = new Map<string, { taskId: string; first: TaskBody }[]>();
+  for (const [taskId, list] of group(ops.map(op => op.body))) {
+    if (list.some(op => op.removed)) continue;
+    const first = chain(list)[0], tasks = byMember.get(first.memberId);
+    if (tasks) tasks.push({ taskId, first }); else byMember.set(first.memberId, [{ taskId, first }]);
+  }
+  const dropped = new Set<string>();
+  for (const tasks of byMember.values()) {
+    if (tasks.length <= cap) continue;
+    tasks.sort((a, b) => a.first.at - b.first.at || (a.first.id < b.first.id ? -1 : a.first.id > b.first.id ? 1 : 0));
+    for (const { taskId } of tasks.slice(cap)) dropped.add(taskId);
+  }
+  return dropped.size ? ops.filter(op => !dropped.has(op.body.taskId)) : ops;
+}
+
+/** Whether `body`, signed by this device, leaves its member within MAX_LIVE_TASKS_PER_MEMBER on the board `held`. */
+export function mayAddTask(held: TaskBody[], body: TaskBody, cap = MAX_LIVE_TASKS_PER_MEMBER): boolean {
+  return capLiveTasks([...held, body].map(b => ({ body: b })), cap).some(op => op.body === body);
 }
 
 /**

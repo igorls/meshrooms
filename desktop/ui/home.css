@@ -1,51 +1,110 @@
-.home { display: block; overflow-y: auto; }
-.home main { width: 100%; max-width: 36rem; margin: 0 auto; padding: 24px 30px 16px; text-align: left; }
-.home-brand { display: flex; gap: 10px; align-items: center; }
-.home-brand .mark { width: 34px; height: 34px; }
-.home-brand strong { font-size: 17px; letter-spacing: -.025em; }
-.home-brand span { display: block; font-size: 11px; color: var(--muted); }
-.home h1 { margin: 16px 0 12px; font-size: 22px; letter-spacing: -.025em; }
-.home-status { margin-bottom: 20px; }
-.home h2 { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; margin: 0 0 6px; }
-#status-dot { width: 8px; height: 8px; border: 1px solid currentColor; border-radius: 50%; color: var(--muted); flex-shrink: 0; }
-#status-dot.is-running { color: #358573; background: currentColor; }
-#status-dot.is-stopped { color: var(--muted); }
-.home-status p { font-size: 13px; }
-.home button { font: inherit; border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent); border-radius: 8px; background: transparent; color: var(--text); padding: 10px 12px; cursor: pointer; min-height: 44px; }
-.home button:hover:enabled { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+/* Home window — the "warm bento" direction, in the design system's own language
+   (DESIGN.md / src/style.css): Manrope, blue actions, paper cards, quiet borders.
+   The desktop shell has no light/dark split, so this window follows the system scheme. */
+
+@font-face {
+  font-family: 'Manrope Variable';
+  src: url('assets/manrope-latin.woff2') format('woff2');
+  font-weight: 400 800; font-display: swap;
+}
+
+.home { --live: #358573; display: block; overflow-y: auto; font-family: 'Manrope Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.home main { width: 100%; max-width: 36rem; margin: 0 auto; padding: 18px 26px 12px; text-align: left; }
+
+/* brand */
+.home-brand { display: flex; gap: 12px; align-items: center; }
+.home-brand .mark { width: 34px; height: 34px; color: var(--accent); }
+.home-brand strong { font-size: 17px; font-weight: 700; letter-spacing: -.02em; }
+.home-brand span { display: block; font-size: 11px; color: var(--muted); margin-top: 1px; }
+
+/* status card — paper on canvas, like the room surface; the green ring is state, not decoration */
+.home-status {
+  margin: 14px 0 12px; padding: 13px 16px 12px;
+  border: 1px solid color-mix(in srgb, var(--muted) 22%, transparent);
+  border-radius: 12px; background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.home-status.is-live { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--live) 30%, transparent); }
+.home-kicker { font-size: 10.5px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin: 0; }
+.home-status h2 { display: flex; align-items: center; gap: 10px; font-size: 15.5px; font-weight: 700; letter-spacing: -.01em; margin: 8px 0 0; }
+.home-status p { font-size: 12.5px; margin-top: 6px; line-height: 1.5; }
+
+/* running pings, stopped is an outline (DESIGN.md: offline), red is kept for a real failure */
+#status-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
+#status-dot.is-running { background: var(--live); animation: home-ping 2.4s ease-out infinite; }
+#status-dot.is-stopped { background: transparent; border: 1.5px solid var(--muted); }
+#status-dot.is-failed { background: var(--danger); }
+#status-dot.is-checking { animation: home-breathe 1.6s ease-in-out infinite; }
+@keyframes home-ping { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 40%, transparent); } 70%, 100% { box-shadow: 0 0 0 8px transparent; } }
+@keyframes home-breathe { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { #status-dot.is-running, #status-dot.is-checking { animation: none; } }
+
+/* primary action */
+.home button { font: inherit; border: 1px solid color-mix(in srgb, var(--muted) 28%, transparent); border-radius: 8px; background: transparent; color: var(--text); padding: 10px 14px; cursor: pointer; }
+.home button:hover:enabled { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .home button:disabled { opacity: .5; cursor: default; }
-.home :is(button,input):focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
-.home button.home-primary { display: flex; align-items: center; justify-content: space-between; width: 100%; background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-.home button.home-primary:hover:enabled { filter: brightness(.93); background: var(--accent); }
-.home-browser-note { margin: 7px 0 14px; font-size: 12px; }
-.home-rooms { margin-bottom: 12px; }
-.home .home-rooms h2 { margin-bottom: 6px; font-size: 13px; }
-.home-rooms ul { display: flex; flex-direction: column; gap: 6px; list-style: none; margin: 0; padding: 0; max-height: 110px; overflow-y: auto; }
+.home :is(button, input):focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.home button.home-primary {
+  display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 44px;
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; font-size: 14px; letter-spacing: -.01em;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 30%, transparent);
+  transition: filter .15s, transform .05s, box-shadow .18s;
+}
+.home button.home-primary:hover:enabled { filter: brightness(1.06); background: var(--accent); box-shadow: 0 8px 26px color-mix(in srgb, var(--accent) 42%, transparent); }
+.home button.home-primary:active:enabled { transform: scale(.985); }
+.home-arrow { font-size: 16px; transition: transform .18s; }
+.home button.home-primary:hover:enabled .home-arrow { transform: translate(2px, -2px); }
+.home-browser-note { margin: 8px 0 4px; font-size: 11.5px; text-align: center; }
+
+/* rooms */
+.home-rooms { margin: 12px 0 2px; }
+.home .home-rooms h2 { margin: 0 0 8px; font-size: 10.5px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+/* the list scrolls, so it would clip a row's focus ring; 5px of padding (3px outline + 2px offset) keeps it whole, and
+   one more at the top covers a hovered row's 1px lift */
+.home-rooms ul { display: flex; flex-direction: column; gap: 8px; list-style: none; margin: -6px -5px -5px; padding: 6px 5px 5px; max-height: 178px; overflow-y: auto; }
 .home-rooms li { flex-shrink: 0; }
-.home .home-room { width: 100%; display: flex; align-items: center; gap: 10px; justify-content: space-between; text-align: left; padding: 7px 10px; line-height: 1.35; }
-.home-room>span:first-child { min-width: 0; }
-.home-room strong,.home-room small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.home-room strong { font-size: 13px; font-weight: 600; }
-.home-room small { font-size: 11px; color: var(--muted); margin-top: 2px; }
-.home-room-count { background: color-mix(in srgb, var(--muted) 12%, transparent); padding: 2px 6px; border-radius: 5px; font-size: 11px; flex-shrink: 0; }
+.home .home-room {
+  width: 100%; display: flex; align-items: center; gap: 12px; text-align: left; padding: 9px 12px; border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  transition: transform .14s, border-color .14s, background .14s;
+}
+.home .home-room:hover:enabled { transform: translateY(-1px); border-color: color-mix(in srgb, var(--muted) 45%, transparent); background: color-mix(in srgb, var(--muted) 11%, transparent); }
+.home-room-tile { width: 28px; height: 28px; display: grid; grid-template-columns: 1fr 1fr; gap: 2.5px; flex-shrink: 0; }
+.home-room-tile i { border-radius: 3px; background: color-mix(in srgb, var(--accent) 78%, var(--text)); }
+.home-room-tile i:nth-child(2) { opacity: .55; } .home-room-tile i:nth-child(3) { opacity: .78; }
+.home-room > span:nth-child(2) { min-width: 0; flex: 1; }
+.home-room strong, .home-room small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-room strong { font-size: 13.5px; font-weight: 650; letter-spacing: -.01em; }
+.home-room small { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.home-room-count { background: color-mix(in srgb, var(--muted) 16%, transparent); padding: 2px 7px; border-radius: 99px; font-size: 11px; font-weight: 700; flex-shrink: 0; }
 .home-room.has-mentions .home-room-count { background: var(--accent); color: #fff; }
-#rooms-problem { font-size: 12px; color: var(--muted); }
-.home-tools { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
-.home-tools button { text-align: left; font-size: 13px; font-weight: 600; }
-.home-tools span { display: block; font-size: 12px; font-weight: 400; color: var(--muted); margin-top: 4px; }
-.home-tools .has-waiting { border-color: var(--accent); }
-.home-tools .has-waiting span { color: var(--accent); }
-.home-settings { border-top: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); padding-top: 14px; }
-.home-login { display: flex; gap: 10px; align-items: center; cursor: pointer; min-height: 44px; font-size: 13px; }
-.home-login input { width: 17px; height: 17px; accent-color: var(--accent); margin: 0; flex-shrink: 0; }
-.home-login small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
-.home-service { display: flex; flex-wrap: wrap; gap: 0 12px; margin-top: 8px; }
+#rooms-problem { font-size: 12px; color: var(--muted); margin: 4px 0 8px; }
+
+/* tool cards */
+.home-tools { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
+.home-tools button { text-align: left; font-size: 13px; font-weight: 700; letter-spacing: -.01em; background: color-mix(in srgb, var(--muted) 6%, transparent); transition: transform .14s, border-color .14s; }
+.home-tools button:hover:enabled { transform: translateY(-1px); border-color: color-mix(in srgb, var(--muted) 45%, transparent); background: color-mix(in srgb, var(--muted) 11%, transparent); }
+.home-tools span { display: block; font-size: 11.5px; font-weight: 400; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+.home-tools .has-waiting { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.home-tools .has-waiting span { color: var(--accent); font-weight: 600; }
+
+/* settings */
+.home-settings { border-top: 1px solid color-mix(in srgb, var(--muted) 22%, transparent); padding-top: 12px; }
+.home-login { display: flex; gap: 12px; align-items: center; cursor: pointer; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--muted) 28%, transparent); border-radius: 8px; background: color-mix(in srgb, var(--text) 4%, transparent); font-size: 13px; font-weight: 650; }
+.home-login input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; flex-shrink: 0; }
+.home-login small { display: block; color: var(--muted); font-size: 11.5px; font-weight: 400; margin-top: 2px; }
+.home-service { display: flex; flex-wrap: wrap; gap: 4px 16px; justify-content: center; margin-top: 8px; }
 .home-service button { border: 0; padding: 4px 0; font-size: 12px; color: var(--muted); }
 .home .home-service button:hover:enabled { background: transparent; color: var(--text); text-decoration: underline; }
-.home-activity { min-height: 16px; margin-top: 6px; font-size: 12px; }
-.home-problem { padding: 10px 12px; border-left: 3px solid var(--danger); background: color-mix(in srgb, var(--danger) 7%, transparent); color: var(--danger); font-size: 13px; overflow-wrap: anywhere; margin-bottom: 16px; }
-.home footer { border-top: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); padding-top: 12px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.home-activity { min-height: 16px; margin-top: 8px; font-size: 12px; text-align: center; }
+.home-problem { padding: 10px 12px; border-left: 3px solid var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); color: var(--danger); font-size: 13px; overflow-wrap: anywhere; margin-bottom: 14px; border-radius: 0 8px 8px 0; }
+
+.home footer { border-top: 1px solid color-mix(in srgb, var(--muted) 22%, transparent); margin-top: 6px; padding-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.6; text-align: center; }
 .home [hidden] { display: none !important; }
-@media (prefers-color-scheme: dark) { .home button.home-primary { color: #121419; } #status-dot.is-running { color: #67b5a3; } }
-@media (prefers-color-scheme: dark) { .home-room.has-mentions .home-room-count { color: #121419; } }
-@media (max-width: 420px) { .home main { padding: 22px; } .home-tools { grid-template-columns: 1fr; } }
+
+@media (prefers-color-scheme: dark) {
+  .home { --live: #45c4a0; }
+  .home button.home-primary { color: #12141d; }
+  .home-room.has-mentions .home-room-count { color: #12141d; }
+}
+@media (prefers-reduced-motion: reduce) { .home button, .home-arrow { transition: none; } }
+@media (max-width: 420px) { .home main { padding: 20px; } .home-tools { grid-template-columns: 1fr; } }

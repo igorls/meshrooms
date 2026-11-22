@@ -15,7 +15,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { closeSync, constants, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync, type Dirent } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync, type Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { LISTEN_HEARTBEAT_MS, validNote } from '../src/browser/activity';
@@ -25,8 +25,12 @@ import type { LiveGate, LiveHold, RecentRun } from './agent-live';
 import { terminalSafe } from './terminal-text';
 import { execFileSync } from 'node:child_process';
 
-export type Harness = 'claude' | 'codex' | 'hermes' | 'exec';
-export const HARNESSES: Harness[] = ['claude', 'codex', 'hermes', 'exec'];
+export type Harness = 'claude' | 'codex' | 'hermes' | 'dsh' | 'exec';
+export const HARNESSES: Harness[] = ['claude', 'codex', 'hermes', 'dsh', 'exec'];
+/** Default DeepSeek Harness (`dsh`) profile for headless wakes. */
+export const DEFAULT_DSH_PROFILE = 'headless';
+/** Safe profile name accepted by `watch --harness dsh --profile`. */
+export const DSH_PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 /** Files in the agent's room folder. */
 export const WATCH_CONFIG = 'watch.json', WATCH_STATE = 'watch-state.json', WATCH_LOG = 'watch.log', WATCH_PID = 'watch.pid', WATCH_PROMPT = 'watch-prompt.txt',
   /** Held while the room's watcher is looked at, stopped and started, by `watch` and by the machine's daemon. */
@@ -159,6 +163,39 @@ export function hermesWakeEnv(env: Record<string, string | undefined>): Record<s
   }
   return kept;
 }
+/** Words in a variable's name (between underscores) that mark a credential, and whole names that hold one. */
+const SECRET_WORDS = new Set(['TOKEN', 'TOKENS', 'SECRET', 'SECRETS', 'PASSWORD', 'PASSWD', 'PASSPHRASE', 'CREDENTIAL', 'CREDENTIALS', 'PAT', 'KEY', 'APIKEY', 'AUTH', 'DSN', 'COOKIE']);
+const SECRET_NAMES = new Set(['DATABASE_URL', 'REDIS_URL', 'MONGODB_URI', 'MONGO_URL', 'POSTGRES_URL', 'KUBECONFIG']);
+const secretName = (upper: string) => SECRET_NAMES.has(upper) || upper.endsWith('PASSWORD') || upper.split('_').some(word => SECRET_WORDS.has(word));
+/** A name `watch --pass-env` accepts. */
+export const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** Credentials a harness signs in with itself, which a wake of that harness keeps. */
+function harnessOwns(upper: string, harness: Harness, env: Record<string, string | undefined>) {
+  const set = (name: string) => Object.keys(env).some(key => key.toUpperCase() === name && !!env[key] && env[key] !== '0' && env[key]!.toLowerCase() !== 'false');
+  if (harness === 'claude') return upper.startsWith('ANTHROPIC_') || upper.startsWith('CLAUDE_')
+    || (upper.startsWith('AWS_') && set('CLAUDE_CODE_USE_BEDROCK')) || (upper.startsWith('GOOGLE_') && set('CLAUDE_CODE_USE_VERTEX'));
+  if (harness === 'codex') return upper.startsWith('OPENAI_') || upper.startsWith('CODEX_') || upper.startsWith('AZURE_OPENAI_');
+  if (harness === 'dsh') return upper.startsWith('DEEPSEEK_') || upper.startsWith('DSH_');
+  // Hermes reaches only the room's tools, and an exec command is the operator's own: both keep their model providers' keys.
+  return upper.startsWith('HERMES_') || upper.endsWith('_API_KEY');
+}
+/**
+ * The environment a wake runs in: the watcher's, minus the Hermes session variables (hermesWakeEnv) and minus every
+ * variable whose name marks a credential the harness doesn't sign in with. A wake acts on what people in the room
+ * write, so a token for GitHub, npm, a cloud or a database in the watcher's environment must not be there for it to
+ * use or repeat. `pass` names the ones the operator lets through (`watch --pass-env`). Names compare
+ * case-insensitively. `withheld` lists the names (never the values) that were dropped.
+ */
+export function wakeEnv(env: Record<string, string | undefined>, harness: Harness, pass: string[] = []): { env: Record<string, string | undefined>; withheld: string[] } {
+  const kept = hermesWakeEnv(env), withheld: string[] = [];
+  const asked = new Set(pass.map(name => name.toUpperCase()));
+  for (const key of Object.keys(kept)) {
+    const upper = key.toUpperCase();
+    if (!secretName(upper) || asked.has(upper) || harnessOwns(upper, harness, env)) continue;
+    delete kept[key]; withheld.push(key);
+  }
+  return { env: kept, withheld: withheld.sort() };
+}
 export const DEFAULT_HERMES_RUN_BUDGET_SECONDS = 240;
 export const DEFAULT_RUN_TIMEOUT_MINUTES = 20;
 /** Notes the watcher sets start with this, so it clears only its own. */
@@ -184,6 +221,8 @@ export const RECENT_RUNS = 5;
 /** Text that means the run stopped for a human who is not there. Fatal, never retried. */
 export const APPROVAL_WALL = /approval|timed out without user response|blocked/i;
 
+export const CLAUDE_SETTING_SOURCES = ['user', 'project', 'local'] as const;
+export type ClaudeSettingSource = (typeof CLAUDE_SETTING_SOURCES)[number];
 export type WatchConfig = {
   roomId: string; harness: Harness;
   /** Unset means the legacy CLI wake. New desktop bindings are explicit and never fall back to another writer. */
@@ -192,8 +231,10 @@ export type WatchConfig = {
   cwd: string;
   /** A session to resume; without it the harness continues the most recent one in `cwd`. */
   session?: string;
-  /** The harness program, when not `claude`, `codex` or `hermes` on PATH (e.g. the codex binary the Codex app ships). */
+  /** The harness program, when not `claude`, `codex`, `hermes` or `dsh` on PATH (e.g. the codex binary the Codex app ships). */
   program?: string;
+  /** `dsh` only: DeepSeek Harness profile name (default `'headless'`). */
+  profile?: string;
   /** `exec` only: the command template, with {prompt_file} and {room} placeholders. */
   command?: string;
   model?: string;
@@ -211,6 +252,14 @@ export type WatchConfig = {
   runTimeoutMinutes: number;
   /** `claude` only: tool rules added to the default, which allows the bridge's launcher alone. */
   allowTools: string[];
+  /**
+   * `claude` only: which of the operator's Claude Code settings files a wake loads (`user`, `project`, `local`). None
+   * unless the operator names them: an allow rule written for their own interactive work (`Bash(gh:*)`, say) would
+   * otherwise hold for a wake too, and a wake acts on what people in the room write.
+   */
+  claudeSettings?: ClaudeSettingSource[];
+  /** Credential-like environment variables the operator lets a wake have; every other one is withheld (wakeEnv). */
+  passEnv?: string[];
   /** Wakes allowed per hour across all of this agent's rooms (all watchers of one agent folder). */
   maxAgentWakesPerHour: number;
   /** The installed launcher the harness runs the bridge with, the agent's folder, and the bridge's code folder. */
@@ -231,7 +280,7 @@ export type WatchConfig = {
 /** Folders in a room folder that a wake may write: the agent's own state, what it queues, and the wake's own folder. */
 export const WAKE_WRITABLE = ['live', 'outbox', 'files', 'wants', 'wake'] as const;
 export const wakeDir = (config: Pick<WatchConfig, 'roomDir'>) => join(config.roomDir, 'wake');
-/** Tools a wake never gets in Claude Code, whatever the operator's settings allow (a deny beats an allow); --allow-tools can lift one. */
+/** Tools a wake never gets in Claude Code, whatever settings the operator lets it load allow (a deny beats an allow); --allow-tools can lift one. */
 export const CLAUDE_DENIED = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Task', 'Agent', 'PowerShell'];
 export const DEFAULT_MAX_AGENT_WAKES_PER_HOUR = 30;
 
@@ -410,7 +459,7 @@ export function splitTemplate(template: string): string[] {
   return words;
 }
 
-export type Invocation = { file: string; args: string[]; stdin?: string };
+export type Invocation = { file: string; args: string[]; stdin?: string; cwd?: string };
 
 /** A path to keep a wake from reading, and whether it is a folder. */
 export type ReadDeny = { path: string; dir: boolean };
@@ -422,8 +471,8 @@ export const CODEX_DISABLED = ['computer_use', 'browser_use', 'browser_use_exter
 /** The name of the permission profile a Codex wake runs under. */
 export const CODEX_PROFILE = 'meshrooms_wake';
 /** Credentials and transcripts under the home folder that no wake may read. */
-export const HOME_SECRETS = ['.ssh', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.git-credentials', '.netrc', '.npmrc', '.pypirc', join('.config', 'gh'), '.hermes', join('.config', 'hermes'),
-  join('.config', 'gcloud'), '.claude', '.claude.json'];
+export const HOME_SECRETS = ['.ssh', '.dsh', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.git-credentials', '.netrc', '.npmrc', '.pypirc', join('.config', 'gh'), '.hermes', join('.config', 'hermes'),
+  join('.config', 'gcloud'), '.claude', '.claude.json', join('.meshrooms', 'grok')];
 /** The same under Windows' roaming application data (%APPDATA%): the GitHub CLI's tokens and GnuPG's keys. */
 export const APPDATA_SECRETS = ['GitHub CLI', 'gnupg'];
 /**
@@ -458,7 +507,13 @@ const sameOrInside = (inner: string, outer: string) => {
 export function wakeReadDenies(config: Pick<WatchConfig, 'agentHome' | 'roomDir' | 'binDir'>, home = homedir(), codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'),
   options: { platform?: NodeJS.Platform; appData?: string; knownHomes?: string[]; extra?: string[] } = {}): ReadDeny[] {
   const found = new Map<string, ReadDeny>();
-  const add = (path: string) => { try { found.set(resolve(path), { path: resolve(path), dir: statSync(path).isDirectory() }); } catch { /* Not there. */ } };
+  const add = (path: string) => {
+    try {
+      const dir = statSync(path).isDirectory(), full = resolve(path);
+      found.set(full, { path: full, dir });
+      try { const real = realpathSync(full); if (real !== full) found.set(real, { path: real, dir }); } catch { /* Resolved path already added. */ }
+    } catch { /* Not there. */ }
+  };
   const list = (dir: string) => { try { return readdirSync(dir); } catch { return []; } };
   const keep = [config.roomDir, config.binDir];
   const walk = (dir: string, depth: number) => {
@@ -542,6 +597,9 @@ export function harnessInvocation(config: WatchConfig, prompt: string, promptFil
     // The prompt goes on stdin: the tool lists are variadic, and a trailing prompt argument could be read as one more tool.
     return { file, stdin: prompt, args: [...prefix, '-p', ...(config.session ? ['--resume', config.session] : ['--continue']),
       '--output-format', 'json', '--permission-mode', 'dontAsk', ...(config.model ? ['--model', config.model] : []), ...(mcp ? [] : ['--strict-mcp-config']),
+      // The operator's own settings files stay out unless named: their allow rules would hold for the wake too. An
+      // empty value loads none (checked against Claude Code 2.1.322; signing in doesn't depend on them).
+      '--setting-sources', (config.claudeSettings ?? []).join(','),
       // The wake folder holds attachments it downloads; it may read them there (writing stays denied).
       '--add-dir', wakeDir(config),
       '--disallowedTools', ...CLAUDE_DENIED.filter(tool => !granted(tool)), ...claudeReadRules(context.denyRead),
@@ -553,13 +611,14 @@ export function harnessInvocation(config: WatchConfig, prompt: string, promptFil
     // read-only, or on the operator's own profile, and never widens a read-only one (watch refuses). Writable: the room's
     // wake folders only. Unreadable: the signing key, other rooms and agents, credentials and transcripts. No network,
     // no web search, no MCP servers, and no computer or browser use, plugins, apps or subagents.
+    const tomlKey = (id: string) => /^[A-Za-z0-9_-]+$/.test(id) ? id : JSON.stringify(id);
     const filesystem: [string, string][] = [...context.denyRead.map(d => [d.path, 'deny'] as [string, string]), ...(context.codexEnvGlobs ?? []).map(glob => [glob, 'deny'] as [string, string]),
       ...WAKE_WRITABLE.map(sub => [join(config.roomDir, sub), 'write'] as [string, string])];
     return { file, stdin: prompt, args: [...prefix, 'exec', 'resume', ...(config.session ? [config.session] : ['--last']), '--skip-git-repo-check',
       '-c', `default_permissions="${CODEX_PROFILE}"`, '-c', `permissions.${CODEX_PROFILE}.extends=${JSON.stringify(context.codexExtends ?? ':read-only')}`,
       '-c', `permissions.${CODEX_PROFILE}.filesystem=${tomlPaths(filesystem)}`, '-c', `permissions.${CODEX_PROFILE}.network.enabled=false`,
       '-c', 'approval_policy="never"', '-c', 'web_search="disabled"',
-      ...(context.codexMcpServers ?? []).flatMap(id => ['-c', `mcp_servers.${id}.enabled=false`]), ...CODEX_DISABLED.flatMap(feature => ['--disable', feature]),
+      ...(context.codexMcpServers ?? []).flatMap(id => ['-c', `mcp_servers.${tomlKey(id)}.enabled=false`]), ...CODEX_DISABLED.flatMap(feature => ['--disable', feature]),
       ...(config.model ? ['-m', config.model] : []), '-'] };
   }
   if (config.harness === 'hermes') {
@@ -593,6 +652,13 @@ export function harnessInvocation(config: WatchConfig, prompt: string, promptFil
       ...(config.model ? ['--model', config.model] : []),
       '--max-turns', String(config.maxTurns ?? DEFAULT_HERMES_MAX_TURNS),
       '--run-budget', String(config.runBudgetSeconds ?? DEFAULT_HERMES_RUN_BUDGET_SECONDS)] };
+  }
+  if (config.harness === 'dsh') {
+    const { file, prefix } = find(config.program ?? 'dsh');
+    // Headless one-shot with the prompt as a single argv element (no shell). The prompt names the wake folder inside
+    // config.roomDir, so runFingerprint/sameRun orphan detection still recognizes the run. cwd is the room folder so
+    // DSH's workspace-write sandbox fences writes to the room.
+    return { file, args: [...prefix, '--profile', config.profile || DEFAULT_DSH_PROFILE, prompt], cwd: config.roomDir };
   }
   const [program, ...rest] = splitTemplate(config.command ?? '').map(word => word.replaceAll('{prompt_file}', promptFile).replaceAll('{room}', config.roomId));
   const { file, prefix } = find(program);
@@ -703,6 +769,15 @@ export function readHarnessOutput(harness: Harness, stdout: string, stderr: stri
       };
     } catch { return { error: (stderr.trim() || stdout.trim()).split('\n').filter(l => l.trim()).at(-1)?.slice(0, 300) ?? 'unparsable output' }; }
   }
+  if (harness === 'dsh') {
+    // DeepSeek Harness prints its final message to stdout, streams reasoning on stderr under `dsh: reasoning:`,
+    // and reports failures on stderr as `dsh: <code>: <message>`. No session id or busy signal in v1.
+    const lastLine = stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean).at(-1) ?? '';
+    const errorLine = stderr.split(/\r?\n/).map(l => l.trim())
+      .map(l => /^dsh: (?!reasoning:)[a-z0-9-]+: (.+)$/.exec(l)?.[1]?.trim())
+      .filter((msg): msg is string => !!msg).at(-1);
+    return { ...(errorLine ? { error: errorLine.slice(0, 300) } : {}), ...summary(lastLine) };
+  }
   // Codex prints its final message on stdout and the session header and errors on stderr.
   const sessionId = /session id:\s*([0-9a-f-]{36})/i.exec(`${stdout}\n${stderr}`)?.[1];
   const error = /^(?:ERROR|Error): (.*)$/m.exec(stderr)?.[1];
@@ -809,20 +884,46 @@ export function sameRun(run: RunIdentity, info: { command: string; started?: str
   if (!info || !run.fingerprint || !run.started || !info.started || !foldPath(info.command).includes(run.fingerprint)) return false;
   return run.started === info.started;
 }
-/** A process's command line and start time; undefined when it is gone or can't be seen. */
-export function processInfo(pid: number): { command: string; started?: string } | undefined {
+/** Parses `LC_ALL=C ps -ww -o lstart= -o command=`: fixed 24-char ASCII timestamp after trimming any leading spaces. */
+export function parsePsOutput(out: string): { command: string; started?: string } | undefined {
+  const trimmed = out.trimStart();
+  return trimmed.trim() ? { started: trimmed.slice(0, 24).trim(), command: trimmed.slice(24).trim() } : undefined;
+}
+/**
+ * A process's command line and start time, distinguishing "PID not visible yet" (`undefined`) from "the inspection tool
+ * itself is missing or denied in this sandbox" (`{ unavailable: true }`), so callers like `runnerStarted` can bail
+ * immediately instead of spinning synchronously.
+ */
+export function inspectProcess(pid: number): { command?: string; started?: string; unavailable?: boolean } | undefined {
   try {
     if (process.platform === 'win32') {
       const out = execFileSync('powershell', ['-NoProfile', '-Command',
-        `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o'); $p.CommandLine }`],
+        `$ErrorActionPreference = 'Stop'; $p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o'); $p.CommandLine }`],
         { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], timeout: INSPECT_TIMEOUT_MS });
       const [started, ...command] = out.split(/\r?\n/);
       return command.join('\n').trim() ? { started: started.trim(), command: command.join('\n').trim() } : undefined;
     }
-    // -ww: macOS cuts command lines to the terminal's width otherwise.
-    const out = execFileSync('ps', ['-ww', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: INSPECT_TIMEOUT_MS });
-    return out.trim() ? { started: out.slice(0, 24).trim(), command: out.slice(24).trim() } : undefined;
-  } catch { return undefined; }
+    // -ww: macOS cuts command lines to the terminal's width otherwise. LC_ALL=C keeps lstart fixed at 24 ASCII characters.
+    const out = execFileSync('ps', ['-ww', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'], timeout: INSPECT_TIMEOUT_MS });
+    return parsePsOutput(out);
+  } catch (error) {
+    const e = error as { code?: string; status?: number | null };
+    if (e.code === 'ENOENT' || e.code === 'EACCES' || e.code === 'EPERM') return { unavailable: true };
+    if (process.platform === 'win32' && typeof e.status === 'number' && e.status !== 0) return { unavailable: true };
+    if (process.platform !== 'win32') {
+      if (pid === process.pid) return { unavailable: true };
+      try {
+        const self = execFileSync('ps', ['-ww', '-o', 'lstart=', '-o', 'command=', '-p', String(process.pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'], timeout: INSPECT_TIMEOUT_MS });
+        if (!parsePsOutput(self)) return { unavailable: true };
+      } catch { return { unavailable: true }; }
+    }
+    return undefined;
+  }
+}
+/** A process's command line and start time; undefined when it is gone or can't be seen. */
+export function processInfo(pid: number): { command: string; started?: string } | undefined {
+  const info = inspectProcess(pid);
+  return info && !info.unavailable && info.command !== undefined ? { command: info.command, ...(info.started !== undefined ? { started: info.started } : {}) } : undefined;
 }
 
 /**
@@ -873,8 +974,9 @@ export function canonicalPath(path: string, platform = process.platform) {
  * A uuid-shaped id (Claude Code's, Codex's) is one id in either case. Read from a watch.json, so nothing is trusted to
  * be a string.
  */
-export const sessionKey = (config: Pick<WatchConfig, 'harness' | 'session' | 'cwd' | 'command'>, env: Record<string, string | undefined> = process.env, home = homedir()) => {
+export const sessionKey = (config: Pick<WatchConfig, 'harness' | 'session' | 'cwd' | 'command'> & Partial<Pick<WatchConfig, 'agentHome'>>, env: Record<string, string | undefined> = process.env, home = homedir()) => {
   const folder = typeof config.cwd === 'string' ? canonicalPath(config.cwd) : '';
+  if (config.harness === 'dsh') return `dsh:${typeof config.agentHome === 'string' ? canonicalPath(config.agentHome) : folder}`;
   if (config.harness === 'exec') return `exec:${folder}:${typeof config.command === 'string' ? config.command.trim() : ''}`;
   const store = canonicalPath(config.harness === 'claude' ? env.CLAUDE_CONFIG_DIR || join(home, '.claude') : config.harness === 'hermes' ? env.HERMES_HOME || join(home, '.hermes')
     : env.CODEX_HOME || join(home, '.codex'));
@@ -1063,7 +1165,16 @@ export function codexConfig(codexHome = process.env.CODEX_HOME || join(homedir()
   // Codex 0.159 reads only the top level here: a legacy `profile = "x"` line makes it refuse to start (profiles are now
   // x.config.toml files chosen with --profile, which a wake never passes), so such a config is reported, not overlaid.
   const top = sections.get(''), legacyProfile = value(top, 'profile');
-  const mcpServers = [...new Set([...sections.keys()].map(key => /^mcp_servers\.([A-Za-z0-9_-]+)$/.exec(key)?.[1]).filter((id): id is string => !!id))];
+  const parseMcpServer = (section: string): string | undefined => {
+    const rest = /^mcp_servers\s*\.\s*(.+)$/.exec(section)?.[1];
+    if (!rest) return undefined;
+    const double = /^"((?:[^"\\]|\\.)*)"(?:\s*\..+)?$/.exec(rest);
+    if (double) { try { const parsed = JSON.parse(`"${double[1]}"`); return typeof parsed === 'string' && parsed ? parsed : undefined; } catch { return undefined; } }
+    const single = /^'([^']*)'(?:\s*\..+)?$/.exec(rest);
+    if (single) return single[1] || undefined;
+    return /^([A-Za-z0-9_-]+)(?:\s*\..+)?$/.exec(rest)?.[1];
+  };
+  const mcpServers = [...new Set([...sections.keys()].map(parseMcpServer).filter((id): id is string => !!id))];
   return { sandboxMode: value(top, 'sandbox_mode'), defaultPermissions: value(top, 'default_permissions'), legacyProfile, mcpServers };
 }
 /**
@@ -1117,8 +1228,42 @@ export function newestCodexThread(cwd: string, codexHome = process.env.CODEX_HOM
   return best?.id;
 }
 
-/** The end of a file, at most `limit` characters. */
-const fileTail = (path: string, limit: number) => { try { return readFileSync(path, 'utf8').slice(-limit); } catch { return ''; } };
+/** Default stdout tail kept for logs, and the bounded upper limit when preserving an intact >64 KB JSON result line. */
+export const STDOUT_TAIL_BYTES = 64_000;
+export const STDOUT_MAX_BYTES = 2 * 1024 * 1024;
+/**
+ * Reads the end of a file (at least `limit` bytes), extending backward to the start of a line split across that boundary
+ * up to `maxLimit` bytes. That keeps multi-line log tails compact (~64 KB) while preventing a >64 KB single-line JSON
+ * result (Claude Code `--output-format json`, Hermes `result`) from losing its opening `{`, and stays strictly bounded
+ * against unbounded output.
+ */
+export function fileTail(path: string, limit: number, maxLimit = limit): string {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const size = fstatSync(fd).size;
+    if (size <= 0) return '';
+    const cap = Math.max(limit, maxLimit);
+    const readSize = Math.min(size, cap);
+    const offset = size - readSize;
+    const buf = Buffer.alloc(readSize);
+    let got = 0;
+    while (got < readSize) {
+      const n = readSync(fd, buf, got, readSize - got, offset + got);
+      if (n <= 0) break;
+      got += n;
+    }
+    const view = buf.subarray(0, got);
+    if (got <= limit) return view.toString('utf8');
+    let cut = got - limit;
+    if (offset + cut > 0) {
+      const nl = view.lastIndexOf(0x0a, cut - 1);
+      cut = nl >= 0 ? nl + 1 : 0;
+    }
+    return view.subarray(cut).toString('utf8');
+  } catch { return ''; }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ } }
+}
 
 /** The tool a stream-json line called, if it called one. */
 export const toolUseName = (line: string): string | undefined => {
@@ -1217,7 +1362,7 @@ export function runProgram(invocation: Invocation, options: { cwd: string; env: 
       scanStdout();
       const last = toolUseName(scan.carry);
       if (last) scan.tools.add(last);
-      done({ ...value, timedOut, stdout: fileTail(paths[1], 64_000), stderr: fileTail(paths[2], 16_000), tools: scan.tools.list() });
+      done({ ...value, timedOut, stdout: fileTail(paths[1], STDOUT_TAIL_BYTES, STDOUT_MAX_BYTES), stderr: fileTail(paths[2], 16_000), tools: scan.tools.list() });
     };
     let child: ReturnType<typeof spawn>;
     try { child = spawn(invocation.file, invocation.args, { cwd: options.cwd, env: options.env, stdio: fds, detached: true, windowsHide: true }); }
@@ -1395,7 +1540,7 @@ export async function watchLoop(config: Pick<WatchConfig, 'maxWakesPerHour' | 'm
   // Starting again resumes a paused watcher; the per-hour caps keep counting across restarts. A halt, or a pause on a
   // broken confinement, holds until the operator binds again (a new generation), not merely until a restart.
   const held = (generation: string | undefined) => generation !== undefined && generation === config.generation;
-  const hardPause = state.paused?.hard && held(state.paused.generation) ? { paused: state.paused, backoffUntil: state.backoffUntil } : { paused: undefined, backoffUntil: undefined };
+  const hardPause = state.paused?.hard && held(state.paused.generation) ? { paused: state.paused, backoffUntil: undefined } : { paused: undefined, backoffUntil: undefined };
   state = { ...state, ...(unknownOrphan ? {} : { activeRun: undefined }), ...hardPause, noProgress: 0, capped: false, busy: false, live: undefined,
     halted: state.halted && held(state.halted.generation) ? state.halted : undefined };
   save();
@@ -1432,7 +1577,7 @@ export async function watchLoop(config: Pick<WatchConfig, 'maxWakesPerHour' | 'm
       }
     }
     const peek = deps.peek();
-    if (!peek.work || (state.backoffUntil && now < state.backoffUntil)) { await standBy(); continue; }
+    if (!peek.work || state.paused?.hard || (state.backoffUntil && now < state.backoffUntil)) { await standBy(); continue; }
     state.wakes = state.wakes.filter(at => at > now - 3_600_000);
     const roomFull = state.wakes.length >= config.maxWakesPerHour, agentFull = deps.agentWakes.recent(now) >= config.maxAgentWakesPerHour;
     if (roomFull || agentFull) {
@@ -1544,9 +1689,9 @@ export async function watchLoop(config: Pick<WatchConfig, 'maxWakesPerHour' | 'm
       // Held across restarts of this binding (the daemon restarts a crashed watcher), until the operator binds again.
       state.paused = { reason: why, at: ended, hard: true, ...(config.generation ? { generation: config.generation } : {}) };
       settle(state.offer!, progress, true); state.offer = undefined;
-      // Held until the operator restarts the watcher (watchLoop clears the pause at start): a timed retry would wake the
-      // same session again, past the boundary that just failed.
-      state.backoffUntil = Number.MAX_SAFE_INTEGER; save();
+      // Held until the operator restarts or rebinds the watcher: watchLoop checks state.paused.hard directly, so no
+      // timed retry wakes the same session past the boundary that just failed.
+      state.backoffUntil = undefined; save();
       note(PAUSED_NOTE);
       deps.log(`paused: ${why}. This is not retried: fix the confinement (see the output above) and run watch again to resume now.`);
       continue;

@@ -29,10 +29,16 @@ ENV_FILE=/etc/meshrooms/browser.env
 DATA_DB=/var/lib/meshrooms-browser/admission.sqlite
 BACKUPS=/var/backups/meshrooms-browser
 SERVICE=meshrooms-browser
+ADMIN_SERVICE=meshrooms-admin
 LIVE_PORT=4320
 NGINX_SITE=/etc/nginx/sites-available/meshrooms
 NGINX_SNIPPET=/etc/nginx/snippets/meshrooms-browser.conf
+NGINX_LIMITS=/etc/nginx/conf.d/meshrooms-limits.conf
 UNIT_FILE=/etc/systemd/system/meshrooms-browser.service
+ADMIN_UNIT_FILE=/etc/systemd/system/meshrooms-admin.service
+BACKUP_UNIT_FILE=/etc/systemd/system/meshrooms-backup.service
+BACKUP_TIMER_FILE=/etc/systemd/system/meshrooms-backup.timer
+TURN_UNIT_FILE=/etc/systemd/system/meshrooms-turn.service
 STATE_DIR=/var/lib/meshrooms-deploy
 LEASE=$STATE_DIR/lease
 LEASE_MAX_AGE=7200
@@ -235,8 +241,12 @@ cmd_prepare() {
 }
 
 warn_drift() {
-  local live=$1 shipped=$2
-  if [[ ! -f $live ]]; then log "WARNING: $live does not exist (compare with $shipped)"; return 0; fi
+  local live=$1 shipped=$2 optional=${3:-0}
+  if [[ ! -f $shipped ]]; then return 0; fi
+  if [[ ! -f $live ]]; then
+    if [[ $optional != 1 ]]; then log "WARNING: $live does not exist (compare with $shipped)"; fi
+    return 0
+  fi
   if ! diff -q "$live" "$shipped" >/dev/null; then
     log "WARNING: $live differs from the release's $(basename "$shipped"); it was NOT changed:"
     diff -u "$live" "$shipped" >&2 || true
@@ -258,6 +268,10 @@ restore() {
   if [[ -n $app ]]; then point "$APP_LINK" "$app" || log "could not restore $APP_LINK"; fi
   if [[ -n $site ]]; then point "$SITE_LINK" "$site" || log "could not restore $SITE_LINK"; fi
   systemctl restart "$SERVICE" || log "restart of $SERVICE failed"
+  if systemctl is-active --quiet "$ADMIN_SERVICE" || systemctl is-failed --quiet "$ADMIN_SERVICE"; then
+    log "restarting $ADMIN_SERVICE"
+    systemctl restart "$ADMIN_SERVICE" || log "restart of $ADMIN_SERVICE failed"
+  fi
   if [[ -n $revision ]]; then
     wait_health "$LIVE_PORT" "$revision" || { log "ROLLBACK DID NOT RESTORE A HEALTHY $revision; intervene by hand"; return 1; }
   fi
@@ -335,7 +349,12 @@ cmd_activate() {
 
   warn_drift "$NGINX_SITE" "$release/deploy/nginx/meshrooms.conf"
   warn_drift "$NGINX_SNIPPET" "$release/deploy/nginx/meshrooms-browser.conf"
+  warn_drift "$NGINX_LIMITS" "$release/deploy/nginx/meshrooms-limits.conf"
   warn_drift "$UNIT_FILE" "$release/deploy/systemd/meshrooms-browser.service"
+  warn_drift "$ADMIN_UNIT_FILE" "$release/deploy/systemd/meshrooms-admin.service" 1
+  warn_drift "$BACKUP_UNIT_FILE" "$release/deploy/systemd/meshrooms-backup.service" 1
+  warn_drift "$BACKUP_TIMER_FILE" "$release/deploy/systemd/meshrooms-backup.timer" 1
+  warn_drift "$TURN_UNIT_FILE" "$release/deploy/systemd/meshrooms-turn.service" 1
 
   # From the first change on, any error or stop request restores the previous release.
   trap 'trap - ERR INT TERM; log "activation failed"; restore "$prev_app" "$prev_site" "$prev_revision"; exit 1' ERR
@@ -347,6 +366,11 @@ cmd_activate() {
   systemctl restart "$SERVICE"
   wait_health "$LIVE_PORT" "$sha"
   expect_status "$LIVE_PORT" /rooms 200
+  if systemctl is-active --quiet "$ADMIN_SERVICE"; then
+    log "restarting $ADMIN_SERVICE"
+    # The public service is already live and healthy: a failing admin panel is reported, never a reason to roll it back.
+    systemctl restart "$ADMIN_SERVICE" || log "WARNING: restart of $ADMIN_SERVICE failed; the public service stays on this release"
+  fi
   trap - ERR INT TERM
   log "activated $sha (previous: ${prev_revision:-unknown})"
 }

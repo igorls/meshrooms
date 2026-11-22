@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { fakeStorage, installFakeIndexedDB } from './test-indexeddb';
-import { WAITING_REFRESH_MS, WAITING_TTL_MS, badgeText, clearWaiting, countUnread, freshRequests, joinNotice, loadReadPosition, onCountsChanged, publishCount, publishedCounts, readPosition, saveReadPosition, tabTitle, unreadLabel, waitingLabel, waitingOf, type UnreadBody, type UnreadCount } from './unread';
+import { WAITING_REFRESH_MS, WAITING_TTL_MS, badgeText, clearWaiting, countUnread, freshRequests, hostJoinNotifications, joinNotice, loadReadPosition, onCountsChanged, publishCount, publishedCounts, readPosition, saveReadPosition, tabTitle, unreadLabel, waitingLabel, waitingOf, type UnreadBody, type UnreadCount } from './unread';
 import type { JoinRequest } from './protocol';
 import type { BrowserMember } from './protocol';
 
@@ -225,5 +225,39 @@ describe('people waiting to join rooms you host', () => {
     // The next write replaces it.
     publishCount('dev', R1, { unread: 1, mentions: 0 });
     expect(publishedCounts('dev')[R1]).toEqual({ unread: 1, mentions: 0 });
+  });
+
+  test('host join notifications deduplicate per (roomId, requestId) and never leak requester text (LIFE-6)', () => {
+    const seen = new Set<string>();
+    const rooms = [
+      {
+        roomId: R1,
+        roomTitle: 'Launch',
+        waiting: [
+          { id: 'req-1', name: 'SecretName <script>', kind: 'person' as const },
+          { id: 'req-2', name: 'SecretAgent', kind: 'agent' as const },
+          { id: 'req-3', name: 'MyLaptop', kind: 'companion' as const },
+        ],
+      },
+      {
+        roomId: R2,
+        roomTitle: '',
+        waiting: [{ id: 'req-1', name: 'Other', kind: 'person' as const }], // same request id in a different room
+      },
+    ];
+    const first = hostJoinNotifications(rooms, seen);
+    expect(first.map(n => [n.key, n.title, n.body])).toEqual([
+      [`${R1}:req-1`, 'Join request · Meshrooms', 'Someone asked to join Launch.'],
+      [`${R1}:req-2`, 'Join request · Meshrooms', 'An agent is waiting to join Launch.'],
+      [`${R1}:req-3`, 'Join request · Meshrooms', 'A device is waiting to join Launch.'],
+      [`${R2}:req-1`, 'Join request · Meshrooms', 'Someone asked to join your room.'],
+    ]);
+    // No untrusted requester-supplied text leaks into the notification body.
+    expect(first.map(n => n.body).join(' ')).not.toContain('SecretName');
+    expect(first.map(n => n.body).join(' ')).not.toContain('SecretAgent');
+    // Re-running with the same seen set emits nothing; a brand-new request fires once.
+    expect(hostJoinNotifications(rooms, seen)).toEqual([]);
+    const next = hostJoinNotifications([{ roomId: R1, roomTitle: 'Launch', waiting: [{ id: 'req-4', name: 'New', kind: 'person' }] }], seen);
+    expect(next.map(n => n.key)).toEqual([`${R1}:req-4`]);
   });
 });

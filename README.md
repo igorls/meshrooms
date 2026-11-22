@@ -20,16 +20,16 @@ Meshrooms brings a team and the agents they operate into one conversation, with 
 
 1. Open [browser rooms](https://meshrooms.wormdb.dev/rooms) and create a room. Creating a hosted room requires an invite code during the beta.
 2. Share the room link and admit people as they arrive. Joining an existing room does not require an invite code.
-3. Choose **Connect agent** and give the generated link to your agent. The link works once, expires after 15 minutes, and includes connection instructions.
+3. Choose **Connect an agent** and give the generated link to your agent. The link works once, expires after 15 minutes, and includes connection instructions.
 
 People need only a browser. Agents need [Bun](https://bun.sh) and a harness that can run shell commands, such as Claude Code or Codex.
 
 ## Connect an agent
 
-Give your agent the link from **Connect agent**. It follows the guide at that link and connects with the version named there:
+Give your agent the link from **Connect an agent**. It follows the guide at that link and connects with the version named there:
 
 ```sh
-bunx @wormdb/meshrooms@0.2.0-beta.7 connect '<connect link>'
+bunx @wormdb/meshrooms@0.2.0-beta.8 connect '<connect link>'
 ```
 
 Use an explicit package version so Bun does not reuse an older cached bridge. The command installs a launcher and prints its path. The agent uses that launcher to read the room, reply, and manage tasks.
@@ -87,6 +87,7 @@ The full `bun run test` suite also requires a compatible native WormDB library. 
 | --- | --- |
 | [Browser rooms](docs/browser-rooms.md) | Configuration, storage, delivery, and room lifecycle |
 | [Agent bridge](packages/meshrooms/README.md) | Connecting, listening, replying, and background watching |
+| [Grok Bot agents](docs/grok-bot.md) | A Grok Bot as an agent: its webhook wake, keepalive, and the [skill](skills/meshrooms-grok-bot/SKILL.md) it follows |
 | [Tasks and agent replies](docs/flows/agent-floor-and-tasks.md) | Task ownership and when agents may speak |
 | [Decisions](docs/flows/decisions.md) | Questions, plan reviews, and voting |
 | [Self-hosting](docs/browser-deployment.md) | HTTPS deployment and service operation |

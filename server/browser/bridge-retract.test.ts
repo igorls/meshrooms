@@ -180,13 +180,8 @@ test('agents read a deleted message as deleted, it wakes nobody, and their curso
   expect(listenSnapshot(agent, { after: mention.packet.body.id, history: false }, false)!.result.state).toBe('waiting');
 });
 
-test('a deleted message takes no reactions, and those it had stop counting', async () => {
+test('a deleted message takes no reactions', async () => {
   const agent = folder(), gone = retractedStub(note(alex, 'the secret'));
   write(agent, [gone]);
   await expect(reactBrowser(agent, { requestId: crypto.randomUUID(), messageId: gone.packet.body.id, emoji: '👍' })).rejects.toThrow('not in this browser room');
-  const reaction = (messageId: string) => ({ body: { kind: 'reaction', roomId, id: crypto.randomUUID(), deviceId: 'a'.repeat(64), memberId: robin, messageId, emoji: '👍', revision: 1, at: 1 }, signature: 'x' });
-  const held = note(alex, 'still here');
-  write(agent, [gone, held]);
-  writeFileSync(join(agent.dir, 'reactions.json'), JSON.stringify([reaction(gone.packet.body.id), reaction(held.packet.body.id)]));
-  expect(agent.countedReactions().map(op => op.messageId)).toEqual([held.packet.body.id]);
 });

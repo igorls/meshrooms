@@ -3,6 +3,7 @@ import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { BrowserLobby, LobbyError } from './lobby';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
+import { MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_VERSION, UPGRADE_REQUIRED } from '../../src/browser/protocol';
 
 const explainer = fileURLToPath(new URL('./agent-join.md', import.meta.url));
 const escape = (text: string) => text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -10,8 +11,11 @@ const escape = (text: string) => text.replace(/[&<>"']/g, c => ({ '&': '&amp;', 
 const explainerHtml = (markdown: string, roomId: string) => '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
   + `<meta name="robots" content="noindex"><title>Connect an agent · Meshrooms</title></head><body><main><p><a href="/agent/${roomId}.md">Plain Markdown</a></p><pre>${escape(markdown)}</pre></main></body></html>`;
 
-/** Addresses a rate map tracks at once. When full, the oldest entry makes room: a new address is never refused for it. */
-const RATE_KEYS = 4096;
+/**
+ * Addresses a rate map tracks at once. Sized well above one IPv6 /48's per-minute budget behind Nginx (6,000 /64s),
+ * so rotating /64s within a /48 cannot evict unrelated clients' counters. When full, the oldest entry makes room.
+ */
+export const RATE_KEYS = 32_768;
 /**
  * The quota key for a client address: IPv4 as is (also when IPv4-mapped), IPv6 by its /64, because one host or home
  * network is routinely given a whole /64 and could otherwise take a fresh quota per address.
@@ -27,33 +31,84 @@ export function addressKey(address: string): string {
   const groups = tail === undefined ? parts(head) : [...parts(head), ...Array(8 - width(parts(head)) - width(parts(tail))).fill('0'), ...parts(tail)];
   return `${groups.slice(0, 4).map(g => parseInt(g, 16).toString(16)).join(':')}::/64`;
 }
-const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'repositories', 'close']);
+/**
+ * The wider quota key of an IPv6 address: its /48, the block a site or a hosting customer is commonly given, which
+ * holds 65,536 separate /64 quotas. IPv4 has none. Takes a key from addressKey.
+ */
+export function wideKey(key: string): string | undefined {
+  const groups = /^([0-9a-f]+):([0-9a-f]+):([0-9a-f]+):[0-9a-f]+::\/64$/.exec(key);
+  return groups ? `${groups[1]}:${groups[2]}:${groups[3]}::/48` : undefined;
+}
+/**
+ * How many times one /64's quota a whole /48 gets: people of one network share a /48, so it is above one, while
+ * staying well under the site-wide Nginx ceiling (behind the proxy, 1,200/min * 5 = 6,000/min = 100 r/s vs 400 r/s).
+ */
+const WIDE_API = 5, WIDE_CREATE = 4;
+const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'repositories', 'transfer-host', 'close']);
 /** Route shape for logs: room and member ids are replaced, so a log line never names a room. */
 const route = (path: string) => path.replace(/[a-f0-9-]{36}/g, ':id').slice(0, 120);
 
 /** `log` receives one JSON line per lobby command (status polls answered 200 or 410 excepted) and per 5xx. */
-export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void };
+export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; rateKeys?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void };
 export function browserHandler(lobby: BrowserLobby, origin: string, distDir: string, options: BrowserHttpOptions = {}) {
   const allowed = new URL(origin);
   const root = resolve(distDir);
   const rates = new Map<string, { at: number; count: number }>();
   const creates = new Map<string, { at: number; count: number }>();
+  // The /48 counters have tables of their own: in a shared one, the many /64 keys of one /48 would push its own
+  // counter out before it filled.
+  const wideRates = new Map<string, { at: number; count: number }>(), wideCreates = new Map<string, { at: number; count: number }>();
   const now = options.now || Date.now;
+  const rateKeys = options.rateKeys || RATE_KEYS;
   const write = options.log || ((line: string) => console.log(line));
   /** Never payloads, SDP, keys, invite codes or addresses: only what is named here. */
   const log = (event: Record<string, string | number | undefined>) => write(JSON.stringify({ time: new Date(now()).toISOString(), ...event }));
-  function charge(map: typeof rates, key: string, window: number, limit: number) {
+  /** The live counter of `key` in `map`, started afresh when its window has passed. */
+  function counter(map: typeof rates, key: string, window: number) {
     const at = now();
     // Entries are never re-inserted, so the map is ordered oldest first: expired ones are all at the front.
     for (const [key, rate] of map) { if (at - rate.at < window) break; map.delete(key); }
     let rate = map.get(key);
     if (!rate) {
-      if (map.size >= RATE_KEYS) map.delete(map.keys().next().value!);
+      if (map.size >= rateKeys) map.delete(map.keys().next().value!);
       rate = { at, count: 0 };
       map.set(key, rate);
     }
-    return ++rate.count <= limit;
+    return rate;
   }
+  const charge = (map: typeof rates, key: string, window: number, limit: number) => ++counter(map, key, window).count <= limit;
+  const apiLimit = options.apiLimit || 240, createLimit = options.createLimit || 6;
+  /**
+   * Counts a request against its address and, for IPv6, against the /48 around it. Requests already refused by their
+   * own /64 do not charge the /48, so one noisy /64 cannot spend the /48 quota of its neighbours.
+   */
+  function chargeApi(key: string) {
+    if (!charge(rates, key, 60_000, apiLimit)) return false;
+    const wide = wideKey(key);
+    return wide === undefined || charge(wideRates, wide, 60_000, apiLimit * WIDE_API);
+  }
+  /**
+   * Reserves one room creation for `key` and, for IPv6, its /48, or returns undefined when either has none left. The
+   * check and the count happen together, right before the create runs (the lobby's `admit` step, after its device is
+   * authenticated): creates sent at the same time each take their own slot, so they can't all pass a check made while
+   * none of them had been counted yet, and an unsigned one never holds a slot.
+   */
+  function reserveCreate(key: string): { count: number }[] | undefined {
+    if (createsSpent(key)) return undefined;
+    const wide = wideKey(key);
+    const own = counter(creates, key, 3_600_000), wider = wide === undefined ? undefined : counter(wideCreates, wide, 3_600_000);
+    if (own.count >= createLimit || (wider && wider.count >= createLimit * WIDE_CREATE)) return undefined;
+    own.count++; if (wider) wider.count++;
+    return wider ? [own, wider] : [own];
+  }
+  /** Whether `key` or its /48 has no creation left, without counting this request or starting a counter. */
+  const createsSpent = (key: string) => {
+    const full = (map: typeof rates, key: string, limit: number) => { const rate = map.get(key); return !!rate && now() - rate.at < 3_600_000 && rate.count >= limit; };
+    const wide = wideKey(key);
+    return full(creates, key, createLimit) || (wide !== undefined && full(wideCreates, wide, createLimit * WIDE_CREATE));
+  };
+  /** Gives a reserved creation back. A counter whose window has since restarted is no longer in the map, so this is a no-op for it. */
+  const releaseCreate = (held: { count: number }[]) => { for (const rate of held) rate.count = Math.max(0, rate.count - 1); };
   const headers = {
     'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
     'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
@@ -65,6 +120,21 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
   /** A signed room command. Logged with its action and outcome; the body is never logged. */
   async function command(request: Request, address: string, requestId: string): Promise<Response> {
     if (request.headers.get('origin') !== origin || request.headers.get('content-type')?.split(';')[0] !== 'application/json') return json({ error: 'Use the room application to submit requests.' }, 403);
+    const minProtocolVersion = lobby.minProtocolVersion ?? MIN_PROTOCOL_VERSION;
+    const declaredProtocol = request.headers.get(PROTOCOL_HEADER);
+    if (declaredProtocol !== null) {
+      const trimmed = declaredProtocol.trim();
+      const version = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+      if (!Number.isSafeInteger(version) || version < minProtocolVersion) {
+        return json({
+          error: 'This page or bridge is outdated. Reload the page or update the agent bridge to continue.',
+          code: UPGRADE_REQUIRED,
+          minProtocolVersion,
+          protocolVersion: PROTOCOL_VERSION,
+          revision: options.revision || 'development',
+        }, 426);
+      }
+    }
     // Enforce the streamed limit, not only a client-supplied Content-Length.
     const reader = request.body?.getReader();
     if (!reader) return json({ error: 'Request body required.' }, 400);
@@ -78,10 +148,14 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     const action = typeof named === 'string' && ACTIONS.has(named) ? named : 'unknown';
     const started = performance.now();
     let status = 500;
+    // A retry of a create that already succeeded is answered from its receipt and isn't charged again.
+    const creating = action === 'create' && !await lobby.answered(input);
+    let held: { count: number }[] | undefined;
     try {
-      // A retry of a create that already succeeded is answered from its receipt and isn't charged again.
-      if (action === 'create' && !await lobby.answered(input) && !charge(creates, addressKey(address), 3_600_000, options.createLimit || 6)) { status = 429; return json({ error: 'Room creation limit reached. Try again in an hour.' }, 429); }
-      const response = json(await lobby.execute(input as Parameters<BrowserLobby['execute']>[0], addressKey(address)));
+      // Refused at once when nothing is left, before the signature is checked; the slot itself is taken in `admit`.
+      if (creating && createsSpent(addressKey(address))) { status = 429; return json({ error: 'Room creation limit reached. Try again in an hour.' }, 429); }
+      const admit = creating ? () => { if (!(held = reserveCreate(addressKey(address)))) throw new LobbyError(429, 'Room creation limit reached. Try again in an hour.'); } : undefined;
+      const response = json(await lobby.execute(input as Parameters<BrowserLobby['execute']>[0], addressKey(address), admit));
       status = 200;
       return response;
     } catch (error) {
@@ -89,6 +163,12 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
       status = error.status;
       return json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, error.status);
     } finally {
+      // A create is counted once its device is authenticated, before it runs (reserveCreate), and keeps its count
+      // whatever the outcome, so a refused invite counts and invite codes can't be guessed in parallel. A malformed or
+      // unsigned one (400, 401) never reaches the count, so anyone at a shared address can't use up the others' creates
+      // with requests that cost nothing to make; those are bounded by the request quota alone. One refused later as
+      // invalid (400), turned away by a full service (429) or failed on (5xx) gets its count back.
+      if (held && (status === 400 || status === 401 || status === 429 || status >= 500)) releaseCreate(held);
       // Status polls arrive every 1.5 s per device; only their failures are worth a line. A closed room (410) isn't a
       // failure: tabs and bridges from before its closing keep polling it until they are reloaded.
       if (action !== 'status' || (status !== 200 && status !== 410)) log({ event: 'lobby', request: requestId, action, status, ms: Math.round((performance.now() - started) * 10) / 10 });
@@ -108,13 +188,14 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     // Health answers before quotas, so a probe is never told to slow down. It stays cheap: one small read.
     if (url.pathname === '/api/lobby/health' && request.method === 'GET') {
       const body = { revision: options.revision || 'development', inviteRequired: lobby.inviteRequired, minAgentVersion: MIN_AGENT_VERSION,
-        currentAgentVersion: CURRENT_AGENT_VERSION, ...(options.backupFresh && { backupFresh: options.backupFresh() }) };
+        currentAgentVersion: CURRENT_AGENT_VERSION, protocolVersion: PROTOCOL_VERSION, minProtocolVersion: lobby.minProtocolVersion ?? MIN_PROTOCOL_VERSION,
+        ...(options.backupFresh && { backupFresh: options.backupFresh() }) };
       try { return json({ ok: lobby.healthy(), ...body }); }
       catch (error) { failure(error, 503, requestId, url.pathname); return json({ ok: false, ...body }, 503); }
     }
     try {
       if (url.pathname.startsWith('/api/lobby')) {
-        if (!charge(rates, addressKey(address), 60_000, options.apiLimit || 240)) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
         if (request.method === 'GET' && /^\/api\/lobby\/rooms\/[a-f0-9-]{36}$/.test(url.pathname)) return json(lobby.publicRoom(url.pathname.split('/').at(-1)!));
         // Member ids are only shown to admitted members, and the hash pins one picture, so the response can be cached forever.
         const avatar = /^\/api\/lobby\/rooms\/([a-f0-9-]{36})\/avatars\/([a-f0-9-]{36})$/.exec(url.pathname);
@@ -139,6 +220,8 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
       // The agent link's token lives in the URL fragment, so it never reaches this server or its logs.
       const agentPage = /^\/agent\/([a-f0-9-]{36})(\.md)?$/.exec(url.pathname);
       if (agentPage) {
+        // This page reads the room from the database, so it shares the request quota of the room commands.
+        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
         const room = lobby.publicRoom(agentPage[1]);
         const digest = Bun.file(resolve(root, 'agent', 'meshrooms-agent.js.sha256'));
         const sha256 = await digest.exists() ? (await digest.text()).split(/\s/)[0] : 'unavailable: the agent bridge is not built on this server';

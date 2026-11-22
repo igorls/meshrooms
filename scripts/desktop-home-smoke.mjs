@@ -6,11 +6,12 @@ import { resolve } from 'node:path';
 import { chromium } from 'playwright';
 
 const output = resolve('.impeccable/review'); mkdirSync(output, { recursive: true });
-const files = new Set(['index.html', 'main.js', 'style.css', 'home.css']);
+const files = new Set(['index.html', 'main.js', 'style.css', 'home.css', 'pair.css', 'notice.html', 'notice.js', 'assets/manrope-latin.woff2']);
 const server = createServer((request, response) => {
   const name = new URL(request.url, 'http://localhost').pathname.slice(1) || 'index.html';
   if (!files.has(name)) { response.writeHead(404).end(); return; }
-  response.setHeader('Content-Type', name.endsWith('.css') ? 'text/css' : name.endsWith('.js') ? 'text/javascript' : 'text/html');
+  response.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:");
+  response.setHeader('Content-Type', name.endsWith('.css') ? 'text/css' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.woff2') ? 'font/woff2' : 'text/html');
   response.end(readFileSync(resolve('desktop/ui', name)));
 });
 await new Promise(done => server.listen(0, '127.0.0.1', done));
@@ -37,6 +38,7 @@ try {
     await page.evaluate(patch => { Object.assign(window.fixture, patch); document.dispatchEvent(new Event('visibilitychange')); }, patch);
   };
   await page.getByText('Checking background service…', { exact: true }).waitFor();
+  await page.getByRole('heading', { level: 1, name: 'On this computer', exact: true }).waitFor();
   assert.equal(await page.getByRole('button', { name: /Open your rooms/ }).isEnabled(), false);
   await update({ running: false });
   await page.getByText('Background service stopped', { exact: true }).waitFor();
@@ -65,6 +67,7 @@ try {
   await update({ rooms: [{ ...rooms[0], unread: 4 }, rooms[1]] });
   await page.getByText('4 unread · 1 mention', { exact: true }).waitFor();
   assert.equal(await shortcut.evaluate(button => button === document.activeElement), true, 'Room counts preserve shortcut focus.');
+  assert.equal(await shortcut.evaluate(button => { const list = button.closest('ul').getBoundingClientRect(), row = button.getBoundingClientRect(); return Math.min(row.left - list.left, row.top - list.top, list.right - row.right) >= 5; }), true, 'The scrolling room list leaves space for a focus ring.');
   await page.getByRole('button', { name: /^Open Research room, Waiting for approval/ }).waitFor();
   const review = page.getByRole('button', { name: /^Review agents/ });
   await review.focus();
@@ -95,8 +98,22 @@ try {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   await page.getByRole('button', { name: 'Start background service', exact: true }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: resolve(output, 'desktop-home-recovery.png'), fullPage: true });
+  // Bundled link-notice window (`notice.html`): inert ?detail= text under strict CSP, no Tauri capability needed.
+  const notice = await browser.newPage({ viewport: { width: 520, height: 280 }, colorScheme: 'light' });
+  notice.on('pageerror', error => errors.push(error.message));
+  const detail = '<img src=x onerror="window.untrusted=true"> Unsupported or invalid Meshrooms link. No action was taken.';
+  await notice.goto(`http://127.0.0.1:${server.address().port}/notice.html?${new URLSearchParams({ detail })}`);
+  await notice.getByRole('heading', { level: 1, name: 'Meshrooms', exact: true }).waitFor();
+  assert.equal(await notice.locator('#detail').textContent(), detail);
+  assert.equal(await notice.locator('#detail img').count(), 0);
+  assert.equal(await notice.evaluate(() => window.untrusted), undefined);
+  assert.equal(await notice.getByRole('button', { name: 'Close', exact: true }).isEnabled(), true);
+  assert.equal(await notice.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  await notice.goto(`http://127.0.0.1:${server.address().port}/notice.html`);
+  assert.equal(await notice.locator('#detail').textContent(), 'No action was taken.');
+  await notice.close();
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, scope: 'Bundled desktop UI with an IPC fixture', checks: ['unknown and stopped status', 'start and open recovery', 'failed status reads discard stale running state', 'start progress and disabled duplicate actions', 'fixed action routing', 'login state', 'approval counts', 'focus retention', 'light and dark layout', 'small-window recovery', 'inert diagnostic text'] }));
+  console.log(JSON.stringify({ ok: true, scope: 'Bundled desktop UI with an IPC fixture', checks: ['unknown and stopped status', 'start and open recovery', 'failed status reads discard stale running state', 'start progress and disabled duplicate actions', 'fixed action routing', 'login state', 'approval counts', 'focus retention', 'light and dark layout', 'small-window recovery', 'inert diagnostic text', 'inert notice window under CSP'] }));
 } finally {
   await browser.close();
   server.close();

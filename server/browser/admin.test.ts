@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { adminHandler, adminOrigin } from './admin';
+import { admitBetaDevice } from './invites';
 import { openAdmission } from './store';
 
 const origin = 'https://meshrooms.example.ts.net:8443', password = 'test-only-32-byte-administrator-credential';
@@ -57,4 +58,57 @@ test('signing out invalidates the session and the credential is never put in a c
   const s = setup();
   try { const h = await s.login(); expect(h.cookie).not.toContain(password); await s.request('/api/logout', {}, h); expect((await s.request('/api/state', undefined, h)).status).toBe(401); }
   finally { s.db.close(); }
+});
+
+test('admin serves preloaded assets with HSTS, enforces constant-time CSRF lengths, and revokes beta people', async () => {
+  const s = setup();
+  try {
+    const html = await s.request('/');
+    expect(html.status).toBe(200);
+    expect(html.headers.get('content-type')).toContain('text/html');
+    expect(html.headers.get('strict-transport-security')).toBe('max-age=86400');
+    expect(await html.text()).toContain('id="people"');
+    const js = await s.request('/admin.js');
+    expect(js.status).toBe(200);
+    expect(js.headers.get('strict-transport-security')).toBe('max-age=86400');
+    const jsText = await js.text();
+    expect(jsText).toContain('response.json().catch');
+    expect(jsText).toContain('/api/people/revoke');
+    // Serving the same preloaded asset repeatedly stays healthy.
+    expect((await s.request('/admin.css')).status).toBe(200);
+    expect((await s.request('/admin.css')).status).toBe(200);
+
+    const personA = 'a'.repeat(64), devA2 = 'b'.repeat(64), personB = 'c'.repeat(64);
+    admitBetaDevice(s.db, personA, personA, 1000);
+    admitBetaDevice(s.db, devA2, personA, 2000);
+    admitBetaDevice(s.db, personB, personB, 3000);
+
+    const headers = await s.login();
+    const stateRes = await s.request('/api/state', undefined, headers);
+    expect(stateRes.headers.get('strict-transport-security')).toBe('max-age=86400');
+    const state = await stateRes.json();
+    expect(state.people).toEqual([
+      { id: personB, devices: 1, admittedAt: 3000 },
+      { id: personA, devices: 2, admittedAt: 1000 },
+    ]);
+
+    // Wrong-length and same-length wrong CSRF tokens are rejected cleanly without throwing.
+    expect((await s.request('/api/people/revoke', { person: personA }, { cookie: headers.cookie, 'x-csrf-token': 'short' })).status).toBe(403);
+    expect((await s.request('/api/people/revoke', { person: personA }, { cookie: headers.cookie, 'x-csrf-token': 'x'.repeat(headers['x-csrf-token'].length) })).status).toBe(403);
+
+    // Invalid person ids are rejected with 400; unknown person returns 404.
+    expect((await s.request('/api/people/revoke', { person: '' }, headers)).status).toBe(400);
+    expect((await s.request('/api/people/revoke', { person: '../bad id' }, headers)).status).toBe(400);
+    expect((await s.request('/api/people/revoke', { person: 'd'.repeat(64) }, headers)).status).toBe(404);
+
+    // Valid revocation removes all devices for personA and writes a secret-free audit log.
+    const revoked = await s.request('/api/people/revoke', { person: personA }, headers);
+    expect(revoked.status).toBe(200);
+    expect(await revoked.json()).toEqual({ revoked: true, removed: 2 });
+    expect((await (await s.request('/api/state', undefined, headers)).json()).people).toEqual([
+      { id: personB, devices: 1, admittedAt: 3000 },
+    ]);
+    expect(s.log).toContainEqual(expect.objectContaining({ event: 'admin', action: 'revoke-person', person: personA, removed: 2 }));
+    expect(JSON.stringify(s.log)).not.toContain(password);
+  } finally { s.db.close(); }
 });

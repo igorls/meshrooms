@@ -4,7 +4,7 @@ relay-ip=SERVER_PUBLIC_IPV4
 listening-port=3478
 tls-listening-port=5349
 min-port=49160
-max-port=49259
+max-port=49659
 realm=meshrooms.wormdb.dev
 server-name=meshrooms.wormdb.dev
 use-auth-secret
@@ -17,24 +17,28 @@ no-dtls
 no-cli
 no-tcp-relay
 no-multicast-peers
+no-loopback-peers
 no-software-attribute
 stale-nonce=600
 max-allocate-lifetime=3600
 # Relay capacity. Every allocation holds one UDP relay port from min-port..max-port
-# (no-tcp-relay), and that range has 49259 - 49160 + 1 = 100 ports, which is also what
+# (no-tcp-relay), and that range has 49659 - 49160 + 1 = 500 ports, which is also what
 # the firewall opens. total-quota must not exceed the port count, or coturn admits
-# allocations it has no port for. 96 leaves a small margin for ports that are briefly
-# unavailable. user-quota applies per TURN username: 96 / 16 = 6 usernames at full quota.
-# To grow, widen min-port/max-port and the firewall rule together, then raise total-quota
-# to at most the new port count.
+# allocations it has no port for. user-quota applies per TURN username: 500 / 16 = 31
+# rooms at full quota. max-bps=1000000 (8 Mbps) leaves headroom for multiple concurrent
+# browser/agent sessions and 10 MB attachments over TURN without stalling.
+# To grow further, widen min-port/max-port and the firewall rule together, then raise
+# total-quota to at most the new port count.
 user-quota=16
-total-quota=96
-max-bps=131072
+total-quota=500
+max-bps=1000000
 bps-capacity=8388608
 relay-threads=2
 log-file=stdout
 simple-log
-# Never let a room use the relay to reach private or special networks.
+# Never let a room use the relay to reach the host's own public IPv4 (preventing UDP pivots back to
+# co-located services like MeshGuard or Coturn itself) or private/special networks.
+denied-peer-ip=SERVER_PUBLIC_IPV4
 denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255
 denied-peer-ip=100.64.0.0-100.127.255.255
@@ -45,7 +49,7 @@ denied-peer-ip=192.0.0.0-192.0.0.255
 denied-peer-ip=192.168.0.0-192.168.255.255
 denied-peer-ip=198.18.0.0-198.19.255.255
 denied-peer-ip=224.0.0.0-255.255.255.255
-# Loopback peers are denied by Coturn's default policy. Do not add the
+# Loopback peers are also denied explicitly via no-loopback-peers above. Do not add the
 # unspecified address :: here: Coturn 4.6 treats it as a wildcard for IPv4 too.
 denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff

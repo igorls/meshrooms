@@ -43,6 +43,24 @@ describe('rolling message window', () => {
     expect(windowHistory(own, awaiting).kept).toHaveLength(MAX_STORED_MESSAGES);
   });
 
+  test("one member's flood evicts their own oldest messages, not everyone else's history", () => {
+    const from = (i: number, memberId: string) => ({ packet: { body: { id: `m${i}`, deviceId: peer, memberId } }, targets: [], receipts: [] });
+    // Four from Alex and Sam, then twelve from Mallory, in a window of ten: the six to evict are all Mallory's.
+    const list = [from(0, 'alex'), from(1, 'sam'), from(2, 'alex'), from(3, 'sam'), ...Array.from({ length: 12 }, (_, i) => from(4 + i, 'mallory'))];
+    const { kept, evicted } = windowMessages(list, () => false, 10);
+    expect(evicted.map(m => m.packet.body.id)).toEqual(['m4', 'm5', 'm6', 'm7', 'm8', 'm9']);
+    expect(kept.map(m => m.packet.body.id)).toEqual(['m0', 'm1', 'm2', 'm3', 'm10', 'm11', 'm12', 'm13', 'm14', 'm15']);
+    // Once nobody holds more than half, the oldest go, whoever wrote them.
+    const quiet = [from(0, 'alex'), from(1, 'mallory'), from(2, 'sam'), from(3, 'mallory'), from(4, 'alex'), from(5, 'sam')];
+    expect(windowMessages(quiet, () => false, 4).evicted.map(m => m.packet.body.id)).toEqual(['m0', 'm1']);
+    // Bringing the heaviest member down to half isn't always enough: the rest is oldest-first.
+    const mostly = [from(0, 'alex'), ...Array.from({ length: 5 }, (_, i) => from(1 + i, 'mallory')), from(6, 'sam'), from(7, 'alex')];
+    expect(windowMessages(mostly, () => false, 4).evicted.map(m => m.packet.body.id)).toEqual(['m0', 'm1', 'm2', 'm3']);
+    // A protected message of the heavy member stays; their next oldest goes.
+    const pinned = windowMessages(list, m => m.packet.body.id === 'm4', 10);
+    expect(pinned.evicted.map(m => m.packet.body.id)).toEqual(['m5', 'm6', 'm7', 'm8', 'm9', 'm10']);
+  });
+
   test('awaiting delivery: own messages with an unconfirmed target; without a device list every target counts', () => {
     expect(awaitingDelivery(message(0, self, [peer]), self)).toBe(true);
     expect(awaitingDelivery(message(0, self, [gone]), self)).toBe(true);

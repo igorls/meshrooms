@@ -1,32 +1,84 @@
 import { BrowserAgent, describeDecision, listenPlan, listenSnapshot, peekWork, type ListenCursor } from './browser-agent';
 import { DesktopError } from './codex-desktop';
-import { desktopDeliveryStep, readDesktopDelivery, saveDesktopDelivery, sendDesktopDelivery, type DeliveryStatus } from './desktop-delivery';
-import { replyKey, replyRequestId, wakeLedger, type SessionClaim, type SessionWait, type WatchConfig, type WatchState } from './agent-watch';
+import { desktopDeliveryStep, readDesktopDelivery, saveDesktopDelivery, sendDesktopDelivery, type DeliveryDeps, type DeliveryStatus, type DesktopDelivery } from './desktop-delivery';
+import { LIVE_NOTES, replyKey, replyRequestId, wakeLedger, type SessionClaim, type SessionWait, type WatchConfig, type WatchState } from './agent-watch';
+import type { LiveGate, LiveHold } from './agent-live';
 import { join } from 'node:path';
 
 export type DesktopWatchDeps = {
   now(): number; sleep(ms: number): Promise<unknown>; ready(): boolean; current(): boolean; ensureRunner(): Promise<unknown>;
   readState(): WatchState; writeState(state: WatchState): void; log(message: string): void;
   claim(): SessionClaim | SessionWait | undefined; withdraw(): void;
+  /** Live listener lease gate: skips desktop delivery while an interactive session owns the mailbox. */
+  live?: { check(): LiveGate; begin(): boolean; end(): void; restoreCursor(cursor: string): void };
+  /** Delivery transport override (defaults to sendDesktopDelivery; injectable for tests). */
+  send?: DeliveryDeps['send'];
 };
+const DESKTOP_NOTE_PREFIX = 'wakeup ';
 /** Machine-level event delivery. It never starts an agent process or waits for a model to finish. */
 export async function watchDesktop(agent: BrowserAgent, config: WatchConfig, deps: DesktopWatchDeps) {
   if (!config.session || !config.generation) throw new Error('Desktop delivery needs an explicitly bound thread and generation.');
-  const state = deps.readState(), key = replyKey(config.agentHome), budget = wakeLedger(join(config.agentHome, 'watch-wakes.json'));
+  let state: WatchState = { ...deps.readState(), activeRun: undefined, offer: undefined, live: undefined, busy: false };
+  if (state.halted && state.halted.generation !== config.generation) state.halted = undefined;
+  const key = replyKey(config.agentHome), budget = wakeLedger(join(config.agentHome, 'watch-wakes.json'));
   const save = () => deps.writeState(state);
   const cursor = () => JSON.stringify(agent.listenCursor() ?? null);
+  const send = deps.send ?? sendDesktopDelivery;
   let lastStatus = '', runnerAt = -Infinity, retryAt = 0;
-  state.activeRun = undefined; state.offer = undefined; state.live = undefined; state.busy = false;
+  agent.recordActivity('idle');
+  if (agent.activity()?.note?.startsWith(DESKTOP_NOTE_PREFIX)) agent.noteActivity('');
   const heartbeat = setInterval(() => { state.aliveAt = deps.now(); state.lastCheck = deps.now(); save(); agent.touchActivity(); }, 5_000);
   try {
     while (deps.current()) {
       const now = deps.now();
       if (now - runnerAt >= 60_000) { runnerAt = now; try { await deps.ensureRunner(); } catch { deps.log('The room connection is waiting to reconnect.'); } }
-      if (!deps.ready() || now < retryAt) { await deps.sleep(1_000); continue; }
-      const saved = readDesktopDelivery(agent.dir);
+      if (!deps.ready()) { await deps.sleep(1_000); continue; }
+      let saved: DesktopDelivery | undefined;
+      try { saved = readDesktopDelivery(agent.dir); } catch (error) {
+        if (!state.halted || state.halted.generation !== config.generation) {
+          const reason = error instanceof DesktopError ? error.message : 'The saved desktop delivery cannot be read safely. Its room work has not been discarded.';
+          state.desktop = { state: 'blocked', at: now, reason };
+          state.halted = { reason, at: now, generation: config.generation };
+          agent.noteActivity(`${DESKTOP_NOTE_PREFIX}room delivery needs attention in Agent apps`);
+          save();
+        }
+        deps.withdraw(); await deps.sleep(1_000); continue;
+      }
       if (saved?.state === 'accepted' && cursor() === saved.before) agent.saveListenCursor(saved.cursor, saved.before);
-      if (saved?.state === 'accepted' && state.desktop?.id === saved.id && state.desktop.state === 'uncertain') {
-        state.halted = undefined; state.desktop = { state: 'accepted', id: saved.id, at: saved.acceptedAt ?? now, ...(saved.turnId ? { turnId: saved.turnId } : {}) }; save();
+      if (state.desktop?.state === 'uncertain' && saved && saved.id === state.desktop.id) {
+        if (saved.state === 'accepted') {
+          state.halted = undefined; state.desktop = { state: 'accepted', id: saved.id, at: saved.acceptedAt ?? now, ...(saved.turnId ? { turnId: saved.turnId } : {}) };
+          agent.noteActivity(`${DESKTOP_NOTE_PREFIX}room event accepted by Codex desktop`);
+          save();
+        } else if (saved.state === 'pending') {
+          state.halted = undefined; state.desktop = { state: 'pending', id: saved.id, at: now };
+          retryAt = 0; save();
+        }
+      }
+      if (state.halted && state.halted.generation === config.generation) {
+        deps.withdraw(); await deps.sleep(1_000); continue;
+      }
+      if (now < retryAt) { await deps.sleep(1_000); continue; }
+      // The agent's own session listening live owns the mailbox: never deliver into desktop beside it.
+      if (deps.live) {
+        const gate = deps.live.check(), hold: LiveHold = gate.hold === 'headless' ? 'none' : gate.hold;
+        if (hold !== (state.live?.hold ?? 'none')) {
+          const said: Record<LiveHold, string> = { attached: 'live session attached; not waking', pickup: 'live session is handling what its listen returned; not waking during its pickup window',
+            headless: '', none: 'live session detached; wakes resume', stale: 'the live session stopped (no heartbeat); wakes resume',
+            expired: 'the live session did not listen again within its pickup window; wakes resume' };
+          deps.log(said[hold]); state.live = { hold, since: now }; save();
+        }
+        const liveNote = LIVE_NOTES[hold];
+        if (liveNote) {
+          const current = agent.activity()?.note;
+          if (!current || current.startsWith(DESKTOP_NOTE_PREFIX)) agent.noteActivity(liveNote);
+          deps.withdraw(); await deps.sleep(1_000); continue;
+        }
+        if (Object.values(LIVE_NOTES).includes(agent.activity()?.note ?? '')) agent.noteActivity('');
+        if (gate.reoffer !== undefined) {
+          deps.live.restoreCursor(gate.reoffer);
+          deps.log('the live session left the work its listen returned unhandled; it is offered to desktop delivery');
+        }
       }
       if ((!saved || saved.state === 'accepted') && !peekWork(agent).work) {
         if (state.desktop?.state === 'blocked' || state.desktop?.state === 'pending') { state.halted = undefined; state.desktop = { state: 'waiting', at: now }; save(); }
@@ -39,11 +91,16 @@ export async function watchDesktop(agent: BrowserAgent, config: WatchConfig, dep
       state.capped = false;
       const claim = deps.claim();
       if (!claim || 'wait' in claim) { await deps.sleep(1_000); continue; }
+      if (deps.live) {
+        let began = false;
+        try { began = deps.live.begin(); } finally { if (!began) claim.release(); }
+        if (!began) { deps.withdraw(); await deps.sleep(1_000); continue; }
+      }
       let status: DeliveryStatus;
       try {
         status = await desktopDeliveryStep({ threadId: config.session, generation: config.generation, roomId: agent.roomId, cwd: config.cwd }, {
           read: () => readDesktopDelivery(agent.dir), save: d => saveDesktopDelivery(agent.dir, d), cursor,
-          commit: (next, expected) => { agent.saveListenCursor(next, expected); }, current: deps.current, now: deps.now, send: sendDesktopDelivery,
+          commit: (next, expected) => { agent.saveListenCursor(next, expected); }, current: deps.current, now: deps.now, send,
           beforeSend: () => { const at = deps.now(); state.wakes.push(at); state.lastWake = at; budget.add(at); save(); },
           snapshot: async id => {
             const { plan } = listenPlan(agent);
@@ -66,14 +123,14 @@ export async function watchDesktop(agent: BrowserAgent, config: WatchConfig, dep
         });
       } catch (error) {
         status = { state: 'blocked', at: deps.now(), reason: error instanceof DesktopError ? error.message : 'The desktop delivery record could not be saved. Pending room work is retained.' };
-      } finally { claim.release(); deps.withdraw(); }
+      } finally { deps.live?.end(); claim.release(); deps.withdraw(); }
       state.desktop = status;
       state.halted = ['uncertain', 'blocked'].includes(status.state) ? { reason: status.reason ?? 'Desktop delivery needs attention.', at: deps.now(), generation: config.generation } : undefined;
       if (status.state === 'accepted') {
         state.lastResult = { at: status.at, durationMs: deps.now() - now, exitCode: 0, progress: true, replied: false, sessionId: config.session };
-        agent.noteActivity('room event accepted by Codex desktop');
-      } else if (status.state === 'pending') agent.noteActivity('room delivery waiting for Codex desktop');
-      else if (status.state === 'uncertain' || status.state === 'blocked') agent.noteActivity('room delivery needs attention in Agent apps');
+        agent.noteActivity(`${DESKTOP_NOTE_PREFIX}room event accepted by Codex desktop`);
+      } else if (status.state === 'pending') agent.noteActivity(`${DESKTOP_NOTE_PREFIX}room delivery waiting for Codex desktop`);
+      else if (status.state === 'uncertain' || status.state === 'blocked') agent.noteActivity(`${DESKTOP_NOTE_PREFIX}room delivery needs attention in Agent apps`);
       const changed = `${status.state}:${status.id ?? ''}:${status.reason ?? ''}`;
       if (changed !== lastStatus) { if (status.state !== 'waiting') deps.log(`desktop delivery ${status.state}${status.id ? ` (${status.id})` : ''}${status.reason ? `: ${status.reason}` : ''}`); lastStatus = changed; }
       state.aliveAt = deps.now(); save();

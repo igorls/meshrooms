@@ -39,7 +39,7 @@ test('the room service never rejects the bridge this repository ships', () => {
 
 test('docs and the site name the bridge by the exact version this repository ships', () => {
   const root = join(import.meta.dir, '../..');
-  for (const file of ['README.md', 'skills/meshrooms/SKILL.md', 'packages/meshrooms/README.md', 'packages/meshrooms/package.json', 'website/index.html', 'website/site.js']) {
+  for (const file of ['README.md', 'skills/meshrooms/SKILL.md', 'skills/meshrooms-grok-bot/SKILL.md', 'packages/meshrooms/README.md', 'packages/meshrooms/package.json', 'website/index.html', 'website/site.js']) {
     const text = readFileSync(join(root, file), 'utf8');
     const versions = [...text.matchAll(/@wormdb\/meshrooms@(\d[^\s'"`<]*)/g)].map(m => m[1]);
     expect(versions.length, file).toBeGreaterThan(0);

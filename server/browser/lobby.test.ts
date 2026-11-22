@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
-import { base64, type RoomStatus } from '../../src/browser/protocol';
-import { BrowserLobby, DEVICES_PER_MEMBER, LINK_FAILURES, LINK_FAILURE_WINDOW, PRESENCE_MS } from './lobby';
+import { base64, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, type RoomStatus } from '../../src/browser/protocol';
+import { BrowserLobby, DECLINE_COOLDOWN_MS, DEVICES_PER_MEMBER, LINK_FAILURES, LINK_FAILURE_WINDOW, MAX_BLOCKED_DEVICES, MAX_SIGNALS_PER_DEVICE, MAX_SIGNALS_PER_SENDER, PRESENCE_MS, SIGNAL_TTL_MS } from './lobby';
 import { browserHandler } from './http';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import { testDirectory } from '../test-directory';
@@ -29,7 +29,7 @@ test('proxy quotas isolate real clients and ignore forged forwarding from direct
     expect((await health('192.0.2.1')).status).toBe(404);
     // The health check is answered before quotas, so a probe never sees 429.
     for (let i = 0; i < 4; i++) expect(await (await handler(new Request(`${origin}/api/lobby/health`, { headers: { 'x-real-ip': '192.0.2.1' } }), '127.0.0.1')).json())
-      .toEqual({ ok: true, revision: 'test-revision', inviteRequired: false, minAgentVersion: MIN_AGENT_VERSION, currentAgentVersion: CURRENT_AGENT_VERSION });
+      .toEqual({ ok: true, revision: 'test-revision', inviteRequired: false, minAgentVersion: MIN_AGENT_VERSION, currentAgentVersion: CURRENT_AGENT_VERSION, protocolVersion: PROTOCOL_VERSION, minProtocolVersion: MIN_PROTOCOL_VERSION });
   } finally { lobby.close(); }
 });
 
@@ -43,6 +43,12 @@ test('creation quotas leave existing-room access available and bound rooms per h
     expect((await send(crypto.randomUUID())).status).toBe(429);
     expect((await handler(new Request(`${origin}/api/lobby/rooms/${room}`), '192.0.2.1')).status).toBe(200);
     for (let i = 1; i < 8; i++) await host.send('create', crypto.randomUUID(), { title: 'QA', name: 'Host', label: 'Browser' });
+    await expect(host.send('create', crypto.randomUUID(), { title: 'QA', name: 'Host', label: 'Browser' })).rejects.toThrow('eight rooms');
+    // Linking a companion into one of the eight rooms and removing the host device from it still keeps the host at eight.
+    const companion = await client(lobby);
+    await companion.send('request', room, { kind: 'companion', name: 'Host', label: 'Desktop' });
+    await host.send('link', room, { code: (await companion.status(room)).request!.code });
+    await companion.send('remove', room, { deviceId: (await host.status(room)).deviceId });
     await expect(host.send('create', crypto.randomUUID(), { title: 'QA', name: 'Host', label: 'Browser' })).rejects.toThrow('eight rooms');
   } finally { lobby.close(); }
 });
@@ -74,7 +80,9 @@ test('companion enrollment binds to the approving identity; same display name cr
     const host = await client(lobby), second = await client(lobby), impostor = await client(lobby);
     const room = crypto.randomUUID();
     await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
-    await impostor.send('request', room, { name: 'Alex', label: 'Other', kind: 'person' });
+    // SEC-8: a distinct person cannot join with an existing member's name; a companion request using the same name still creates no link.
+    await expect(impostor.send('request', room, { name: 'Alex', label: 'Other', kind: 'person' })).rejects.toMatchObject({ status: 409, message: expect.stringContaining('already uses that name') });
+    await impostor.send('request', room, { name: 'Alex', label: 'Other', kind: 'companion' });
     await second.send('request', room, { name: 'My device', label: 'Laptop', kind: 'companion' });
     const pending = (await second.status(room)).request!;
     const hostBefore = await host.status(room);
@@ -303,6 +311,42 @@ test('wrong device codes are limited per device and room, so codes can\'t be gue
   } finally { lobby.close(); }
 });
 
+test('queued connection offers are bounded across all rooms, and the bound frees on expiry or room close without waiting for a poll', async () => {
+  let now = Date.now();
+  const lobby = new BrowserLobby(':memory:', { origin, now: () => now, maxSignalChars: 2500 });
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID(), other = crypto.randomUUID();
+    await host.send('create', room, { title: 'A', name: 'Alex', label: 'Desktop' });
+    const guest = await admitPerson(lobby, host, room, 'Sam', () => now);
+    const second = await admitPerson(lobby, host, room, 'Pat', () => now);
+    const h = await host.status(room), g = await guest.status(room);
+    await second.status(room);
+    const send = (from: typeof host, type: 'offer' | 'answer', sdp: string) =>
+      from.send('signal', room, { to: g.deviceId, session: from.session, targetSession: guest.session, description: { type, sdp, extra: 'x'.repeat(5000) } });
+    await send(host, 'offer', 'a'.repeat(1000));
+    await send(second, 'offer', 'b'.repeat(1000));
+    // The third would pass 2,500 characters held; fields other than type and sdp are never kept or counted.
+    await expect(send(host, 'answer', 'c'.repeat(1000))).rejects.toMatchObject({ status: 429, message: expect.stringContaining('busy') });
+    await send(host, 'answer', 'd'.repeat(400));
+    expect((await guest.status(room)).signals!.map(s => Object.keys(s.description).sort())).toEqual([['sdp', 'type'], ['sdp', 'type'], ['sdp', 'type']]);
+    // Refresh presence at +15s while offers from t=0 are still active, then cross the 30s offer TTL while presence is
+    // still live: the next signal recounts and accepts without needing another status poll first.
+    now += 15_000;
+    await host.status(room); await guest.status(room);
+    now += 16_000;
+    await send(host, 'offer', 'e'.repeat(2000));
+    // Closing the room that holds the queued offers also frees the global budget immediately for another room's signal.
+    await host.send('create', other, { title: 'B', name: 'Alex', label: 'Desktop' });
+    const peer = await admitPerson(lobby, host, other, 'Pat', () => now);
+    await host.status(other); const p = await peer.status(other);
+    const otherOffer = (sdp: string) => host.send('signal', other, { to: p.deviceId, session: host.session, targetSession: peer.session, description: { type: 'offer', sdp } });
+    await expect(otherOffer('f'.repeat(1000))).rejects.toMatchObject({ status: 429, message: expect.stringContaining('busy') });
+    await host.send('close', room);
+    await otherOffer('f'.repeat(1000));
+    expect(h.deviceId).not.toBe(g.deviceId);
+  } finally { lobby.close(); }
+});
+
 test('signaling is scoped to admitted devices, current sessions and the coordinator epoch', async () => {
   const lobby = new BrowserLobby(':memory:', { origin });
   try {
@@ -320,12 +364,136 @@ test('signaling is scoped to admitted devices, current sessions and the coordina
     const received = await guest.status(room);
     expect(received.signals).toHaveLength(1);
     expect(received.signals![0].from).toBe(h.deviceId);
-    const drained = await guest.send('status', room, { session: guest.session, cursor: received.signals![0].seq, epoch: received.epoch }) as RoomStatus;
-    expect(drained.signals).toHaveLength(0);
+    // A stale coordinator epoch ignores any old high cursor so signals from the current process are still delivered.
     const restarted = await guest.send('status', room, { session: guest.session, cursor: 999, epoch: 'previous-process' }) as RoomStatus;
     expect(restarted.signals).toHaveLength(1);
+    // Once acknowledged with the current epoch and cursor, the signal is drained from the queue.
+    const drained = await guest.send('status', room, { session: guest.session, cursor: received.signals![0].seq, epoch: received.epoch }) as RoomStatus;
+    expect(drained.signals).toHaveLength(0);
+    expect((await guest.status(room)).signals).toHaveLength(0);
     await host.send('remove', room, { deviceId: target.deviceId });
     await expect(guest.send('signal', room, { ...payload, to: h.deviceId, session: guest.session, targetSession: host.session })).rejects.toThrow('admission');
+  } finally { lobby.close(); }
+});
+
+test('signal queue deduplicates superseded offers/answers, enforces per-sender fairness, and keeps signalChars strictly invariant', async () => {
+  let now = Date.now();
+  const lobby = new BrowserLobby(':memory:', { origin, now: () => now, maxSignalChars: 1500 });
+  const chars = () => (lobby as unknown as { signalChars: number }).signalChars;
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Signaling', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam', () => now);
+    const pat = await admitPerson(lobby, host, room, 'Pat', () => now);
+    const h = await host.status(room), s = await sam.status(room), p = await pat.status(room);
+    const send = (from: typeof host, to: string, targetSession: string, type: 'offer' | 'answer', sdp: string) =>
+      from.send('signal', room, { to, session: from.session, targetSession, description: { type, sdp } });
+
+    expect(chars()).toBe(0);
+    // 1. Newer offer from the same sender replaces the older unpolled offer and adjusts signalChars accurately.
+    await send(host, s.deviceId, sam.session, 'offer', 'o1'.repeat(500)); // 1000 chars
+    expect(chars()).toBe(1000);
+    // Replacement that exceeds maxSignalChars is refused without mutating the queued offer or signalChars.
+    await expect(send(host, s.deviceId, sam.session, 'offer', 'x'.repeat(1600))).rejects.toMatchObject({ status: 429 });
+    expect(chars()).toBe(1000);
+    // Replacement that fits once the superseded offer is freed succeeds and updates signalChars to the new length.
+    await send(host, s.deviceId, sam.session, 'offer', 'o2'.repeat(750)); // 1500 chars
+    expect(chars()).toBe(1500);
+    // Shrink back via replacement, then queue a separate answer from the same sender (offer + answer coexist).
+    await send(host, s.deviceId, sam.session, 'offer', 'o3'.repeat(200)); // 400 chars
+    await send(host, s.deviceId, sam.session, 'answer', 'a1'.repeat(150)); // +300 = 700
+    await send(host, s.deviceId, sam.session, 'answer', 'a2'.repeat(100)); // replaces a1 -> 400 + 200 = 600
+    expect(chars()).toBe(600);
+    const polled = await sam.status(room);
+    expect(polled.signals!.map(sig => [sig.description.type, sig.description.sdp])).toEqual([
+      ['offer', 'o3'.repeat(200)],
+      ['answer', 'a2'.repeat(100)],
+    ]);
+    // 2. Draining via matching epoch + cursor frees queued signals and returns signalChars to 0.
+    const maxSeq = Math.max(...polled.signals!.map(sig => sig.seq));
+    const drained = await sam.send('status', room, { session: sam.session, cursor: maxSeq, epoch: polled.epoch }) as RoomStatus;
+    expect(drained.signals).toHaveLength(0);
+    expect(chars()).toBe(0);
+
+    // 3. Expiry (30 s TTL) returns signalChars to 0 without blocking valid reconnects.
+    await send(host, s.deviceId, sam.session, 'offer', 'e'.repeat(1400));
+    expect(chars()).toBe(1400);
+    now += 15_000;
+    await host.status(room); await sam.status(room); await pat.status(room);
+    now += SIGNAL_TTL_MS - 14_000; // +31 s total since offer, while presence is still fresh (+16 s)
+    await send(pat, s.deviceId, sam.session, 'offer', 'p'.repeat(500));
+    expect(chars()).toBe(500);
+    // Reconnecting with a brand-new session drops signals addressed to the old session and zeros signalChars.
+    const freshSession = crypto.randomUUID();
+    const reconnected = await sam.send('status', room, { session: freshSession }) as RoomStatus;
+    expect(reconnected.signals).toHaveLength(0);
+    expect(chars()).toBe(0);
+    sam.session = freshSession;
+
+    // 4. Removing a device clears both signals addressed to it and signals sent by it, returning signalChars to 0.
+    await send(host, p.deviceId, pat.session, 'offer', 'h'.repeat(300));
+    await send(pat, h.deviceId, host.session, 'offer', 'q'.repeat(250));
+    expect(chars()).toBe(550);
+    await host.send('remove', room, { deviceId: p.deviceId });
+    expect(chars()).toBe(0);
+
+    // 5. Closing the room clears all remaining signals and returns signalChars to 0.
+    await send(host, s.deviceId, sam.session, 'offer', 'z'.repeat(600));
+    expect(chars()).toBe(600);
+    await host.send('close', room);
+    expect(chars()).toBe(0);
+  } finally { lobby.close(); }
+});
+
+test('signal queue enforces fair per-sender cap and 32-slot per-device cap while allowing offer replacement', async () => {
+  let now = Date.now();
+  const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  const internalSignals = (lobby as unknown as { signals: Map<string, { seq: number; from: string; session: string; targetSession: string; description: RTCSessionDescriptionInit; at: number }[]> }).signals;
+  const setChars = (delta: number) => { (lobby as unknown as { signalChars: number }).signalChars += delta; };
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Fairness', name: 'Alex', label: 'Desktop' });
+    const target = await admitPerson(lobby, host, room, 'Sam', () => now);
+    const peer = await admitPerson(lobby, host, room, 'Pat', () => now);
+    const h = await host.status(room), t = await target.status(room), p = await peer.status(room);
+    const key = `${room}:${t.deviceId}`;
+
+    // One noisy peer flooding offers/answers cannot starve other room members because offers/answers supersede in place.
+    for (let i = 0; i < 40; i++) {
+      await host.send('signal', room, { to: t.deviceId, session: host.session, targetSession: target.session, description: { type: 'offer', sdp: `offer-${i}` } });
+    }
+    expect(internalSignals.get(key)).toHaveLength(1);
+    await peer.send('signal', room, { to: t.deviceId, session: peer.session, targetSession: target.session, description: { type: 'offer', sdp: 'peer-offer' } });
+    expect(internalSignals.get(key)).toHaveLength(2);
+
+    // Explicit per-sender cap (MAX_SIGNALS_PER_SENDER = 8): a sender already holding 8 non-offer slots cannot add a 9th,
+    // while another sender can still enqueue into the same recipient's queue.
+    const seeded = internalSignals.get(key)!;
+    seeded.length = 0;
+    (lobby as unknown as { signalChars: number }).signalChars = 0;
+    for (let i = 0; i < MAX_SIGNALS_PER_SENDER; i++) {
+      seeded.push({ seq: i + 1, from: h.deviceId, session: host.session, targetSession: target.session, description: { type: 'pranswer', sdp: 'x' }, at: now });
+      setChars(1);
+    }
+    await expect(host.send('signal', room, { to: t.deviceId, session: host.session, targetSession: target.session, description: { type: 'offer', sdp: 'blocked' } }))
+      .rejects.toMatchObject({ status: 429 });
+    // Another peer is unaffected by the noisy sender's cap.
+    await peer.send('signal', room, { to: t.deviceId, session: peer.session, targetSession: target.session, description: { type: 'offer', sdp: 'peer-ok' } });
+    expect(internalSignals.get(key)!.some(s => s.from === p.deviceId)).toBe(true);
+
+    // At the 32-slot per-device cap, a brand-new signal is rejected with 429, while replacing an existing offer succeeds.
+    const live = internalSignals.get(key)!;
+    while (live.length < MAX_SIGNALS_PER_DEVICE) {
+      live.push({ seq: live.length + 100, from: `other-${live.length}`, session: 's', targetSession: target.session, description: { type: 'pranswer', sdp: 'y' }, at: now });
+      setChars(1);
+    }
+    expect(live).toHaveLength(MAX_SIGNALS_PER_DEVICE);
+    await expect(peer.send('signal', room, { to: t.deviceId, session: peer.session, targetSession: target.session, description: { type: 'answer', sdp: 'full' } }))
+      .rejects.toMatchObject({ status: 429 });
+    await peer.send('signal', room, { to: t.deviceId, session: peer.session, targetSession: target.session, description: { type: 'offer', sdp: 'peer-replaced' } });
+    const afterReplace = internalSignals.get(key)!;
+    expect(afterReplace).toHaveLength(MAX_SIGNALS_PER_DEVICE);
+    expect(afterReplace.find(s => s.from === p.deviceId && s.description.type === 'offer')?.description.sdp).toBe('peer-replaced');
   } finally { lobby.close(); }
 });
 
@@ -485,18 +653,51 @@ test('a member leaves by removing their own device, and their agents leave with 
   } finally { lobby.close(); }
 });
 
-test('keys of devices that left stay available to members, so their task changes still verify', async () => {
+test('keys of devices that left stay available to members, stamped with when they left and whether they were revoked', async () => {
+  let now = Date.now(); const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    const sam = await admitPerson(lobby, host, room, 'Sam'), kim = await admitPerson(lobby, host, room, 'Kim');
+    const samStatus = await sam.status(room), kimStatus = await kim.status(room);
+    const key = (id: string) => samStatus.devices!.find(d => d.id === id)!.publicKey;
+    expect((await host.status(room)).formerDevices).toBeUndefined();
+    // Sam leaves from Sam's own device: trusted up to when it left.
+    now += 1000; await sam.send('remove', room, { deviceId: samStatus.deviceId });
+    // The host removes Kim's device: revoked, nothing more it signs is accepted.
+    now += 1000; await host.send('remove', room, { deviceId: kimStatus.deviceId });
+    const after = await host.status(room);
+    expect(after.formerDevices).toEqual([
+      { id: samStatus.deviceId, publicKey: key(samStatus.deviceId), memberId: samStatus.memberId!, role: 'human', retiredAt: now - 1000 },
+      { id: kimStatus.deviceId, publicKey: key(kimStatus.deviceId), memberId: kimStatus.memberId!, role: 'human', retiredAt: now, revoked: true },
+    ]);
+    expect((await sam.status(room)).formerDevices).toBeUndefined(); // not shown outside the room
+  } finally { lobby.close(); }
+});
+
+test('a device that left from itself can be revoked afterwards, by the host or its own member only', async () => {
   const lobby = new BrowserLobby(':memory:', { origin });
   try {
     const host = await client(lobby), room = crypto.randomUUID();
     await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
-    const sam = await admitPerson(lobby, host, room, 'Sam');
-    const samStatus = await sam.status(room);
-    expect((await host.status(room)).formerDevices).toBeUndefined();
-    await sam.send('remove', room, { deviceId: samStatus.deviceId });
-    const after = await host.status(room);
-    expect(after.formerDevices).toEqual([{ id: samStatus.deviceId, publicKey: samStatus.devices!.find(d => d.id === samStatus.deviceId)!.publicKey, memberId: samStatus.memberId!, role: 'human' }]);
-    expect((await sam.status(room)).formerDevices).toBeUndefined(); // not shown outside the room
+    const sam = await admitPerson(lobby, host, room, 'Sam'), kim = await admitPerson(lobby, host, room, 'Kim');
+    const samId = (await sam.status(room)).deviceId, kimId = (await kim.status(room)).deviceId;
+    // Sam's laptop leaves on its own (say, it was stolen), so it is not revoked yet.
+    await sam.send('remove', room, { deviceId: samId });
+    const former = async () => (await host.status(room)).formerDevices!.find(d => d.id === samId)!;
+    expect((await former()).revoked).toBeUndefined();
+    await expect(kim.send('remove', room, { deviceId: samId })).rejects.toThrow('cannot remove this device');
+    await expect(sam.send('remove', room, { deviceId: samId })).rejects.toThrow();
+    await host.send('remove', room, { deviceId: samId });
+    expect((await former()).revoked).toBe(true);
+    // Kim's own device can revoke Kim's departed device.
+    const kimPhone = await client(lobby);
+    await kimPhone.send('request', room, { name: 'Companion', label: 'Phone', kind: 'companion' });
+    await kim.send('link', room, { code: (await kimPhone.status(room)).request!.code });
+    await kim.send('remove', room, { deviceId: kimId });
+    await kimPhone.send('remove', room, { deviceId: kimId });
+    expect((await host.status(room)).formerDevices!.find(d => d.id === kimId)!.revoked).toBe(true);
+    await expect(host.send('remove', room, { deviceId: crypto.randomUUID() })).rejects.toThrow('Device not found');
   } finally { lobby.close(); }
 });
 
@@ -651,5 +852,176 @@ test('people pin repositories one at a time; agents and strangers cannot', async
     for (const r of (await host.status(room)).repositories!) await host.send('repositories', room, { unpin: r });
     expect((await host.status(room)).repositories).toBeUndefined();
     expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Work' }); // never shown outside the room
+  } finally { lobby.close(); }
+});
+
+test('SEC-8: display names and titles normalize NFKC/control chars and enforce case-folded uniqueness across people and agents', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    // Control-only / zero-width-only names and room titles are refused.
+    await expect(host.send('create', room, { title: '\u200b\u202e\t  ', name: 'Alex', label: 'Desktop' })).rejects.toMatchObject({ status: 400 });
+    await expect(host.send('create', room, { title: 'Work', name: '\u200b\u202e\u0000 ', label: 'Desktop' })).rejects.toMatchObject({ status: 400 });
+    await expect(host.send('create', room, { title: 'Work', name: 'Ａｇｅｎｔｓ', label: 'Desktop' })).rejects.toThrow('reserved');
+    // Normalized titles and display names strip invisible/bidi chars and collapse whitespace.
+    await host.send('create', room, { title: '  \u202eProject   Room\u200b ', name: '  Ａｌｅｘ   M.\u200b ', label: 'Desktop' });
+    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Project Room' });
+    expect((await host.status(room)).members![0].name).toBe('Alex M.');
+
+    // Lookalike person requests collide via NFKC + case-folding.
+    for (const spoof of ['alex m.', 'ALEX  M.', 'Ａｌｅｘ M.', 'A\u200blex M.', '\u202eAlex M.\u202c']) {
+      await expect((await client(lobby)).send('request', room, { name: spoof, label: 'Browser', kind: 'person' }))
+        .rejects.toMatchObject({ status: 409, message: 'Someone in this room already uses that name. Choose a different name.' });
+    }
+    // Companion requests may carry the existing member's name without colliding.
+    const companion = await client(lobby);
+    await companion.send('request', room, { name: 'Alex M.', label: 'Tablet', kind: 'companion' });
+    await host.send('link', room, { code: (await companion.status(room)).request!.code });
+    expect((await companion.status(room)).memberId).toBe((await host.status(room)).memberId);
+
+    // Two pending person requests with the same folded name: admitting the first blocks admitting the second.
+    const first = await client(lobby), second = await client(lobby);
+    await first.send('request', room, { name: 'Jordan', label: 'Laptop', kind: 'person' });
+    await second.send('request', room, { name: 'Ｊｏｒｄａｎ\u200b', label: 'Phone', kind: 'person' });
+    const reqs = (await host.status(room)).requests!;
+    expect(reqs).toHaveLength(2);
+    const firstReq = reqs.find(r => r.device.label === 'Laptop')!, secondReq = reqs.find(r => r.device.label === 'Phone')!;
+    await host.send('decide', room, { requestId: firstReq.id, admit: true });
+    await expect(host.send('decide', room, { requestId: secondReq.id, admit: true }))
+      .rejects.toMatchObject({ status: 409, message: 'Someone in this room already uses that name. Choose a different name.' });
+
+    // Agent invites and redemptions enforce NFKC+case-folded uniqueness against both people and open invites.
+    await expect(host.send('agent-invite', room, { name: 'ｊｏｒｄａｎ' })).rejects.toMatchObject({ status: 409 });
+    await expect(host.send('agent-invite', room, { name: 'A\u200bgents' })).rejects.toThrow('reserved');
+    const { token } = await host.send('agent-invite', room, { name: 'Wren' }) as { token: string };
+    // An active unused agent invite also blocks a person requesting that name.
+    await expect((await client(lobby)).send('request', room, { name: 'ＷＲＥＮ', label: 'Browser', kind: 'person' })).rejects.toMatchObject({ status: 409 });
+    const agent = await client(lobby);
+    await agent.send('agent-redeem', room, { token, label: 'Bridge' });
+    expect((await agent.status(room)).memberId).toBeDefined();
+
+    // If a person was waiting with a name before an agent invite wasn't there yet, and joins first, a racing agent-redeem fails with 409.
+    const { token: racingToken } = await host.send('agent-invite', room, { name: 'Scout' }) as { token: string };
+    // Create a racing person request by waiting before invite? Invite already exists so test opposite order:
+    const pendingPerson = await client(lobby);
+    await pendingPerson.send('request', room, { name: 'Casey', label: 'Desktop', kind: 'person' });
+    const { token: caseyToken } = await host.send('agent-invite', room, { name: 'Ｃａｓｅｙ' }) as { token: string };
+    const caseyReq = (await host.status(room)).requests!.find(r => r.name === 'Casey')!;
+    // Active invite for 'Casey' blocks admitting the earlier pending person request.
+    await expect(host.send('decide', room, { requestId: caseyReq.id, admit: true })).rejects.toMatchObject({ status: 409 });
+    const scoutAgent = await client(lobby);
+    await scoutAgent.send('agent-redeem', room, { token: racingToken, label: 'Node' });
+    expect((await scoutAgent.status(room)).memberId).toBeDefined();
+    // Redeeming the Casey invite succeeds cleanly once it's the invite holder.
+    const caseyAgent = await client(lobby);
+    await caseyAgent.send('agent-redeem', room, { token: caseyToken, label: 'Node' });
+    expect((await caseyAgent.status(room)).memberId).toBeDefined();
+  } finally { lobby.close(); }
+});
+
+test('SEC-13: atomic remove { memberId } removes all member devices and operated agents with SEC-7 revocation semantics', async () => {
+  let now = Date.now();
+  const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  try {
+    const host = await client(lobby, () => now), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const sam = await admitPerson(lobby, host, room, 'Sam', () => now);
+    const pat = await admitPerson(lobby, host, room, 'Pat', () => now);
+    const samPhone = await client(lobby, () => now), patPhone = await client(lobby, () => now);
+    await samPhone.send('request', room, { name: 'Sam', label: 'Phone', kind: 'companion' });
+    await sam.send('link', room, { code: (await samPhone.status(room)).request!.code });
+    await patPhone.send('request', room, { name: 'Pat', label: 'Phone', kind: 'companion' });
+    await pat.send('link', room, { code: (await patPhone.status(room)).request!.code });
+
+    const { token: t1 } = await sam.send('agent-invite', room, { name: 'SamBot' }) as { token: string };
+    const samAgent = await client(lobby, () => now);
+    await samAgent.send('agent-redeem', room, { token: t1, label: 'Bridge' });
+    const { token: unusedSam } = await sam.send('agent-invite', room, { name: 'SamBot2' }) as { token: string };
+    const { token: t2 } = await pat.send('agent-invite', room, { name: 'PatBot' }) as { token: string };
+    const patAgent = await client(lobby, () => now);
+    await patAgent.send('agent-redeem', room, { token: t2, label: 'Bridge' });
+
+    const hostStatus = await host.status(room);
+    const samId = (await sam.status(room)).memberId!, patId = (await pat.status(room)).memberId!;
+    const samDeviceId = (await sam.status(room)).deviceId, samPhoneId = (await samPhone.status(room)).deviceId, samAgentDevId = (await samAgent.status(room)).deviceId;
+    const patDeviceId = (await pat.status(room)).deviceId, patPhoneId = (await patPhone.status(room)).deviceId, patAgentDevId = (await patAgent.status(room)).deviceId;
+
+    // Validation & permission checks.
+    await expect(host.send('remove', room, {})).rejects.toMatchObject({ status: 400 });
+    await expect(host.send('remove', room, { deviceId: samDeviceId, memberId: samId })).rejects.toMatchObject({ status: 400 });
+    await expect(host.send('remove', room, { memberId: hostStatus.memberId })).rejects.toMatchObject({ status: 409 });
+    await expect(pat.send('remove', room, { memberId: samId })).rejects.toMatchObject({ status: 403 });
+
+    // Host atomically removes Sam (2 devices + 1 agent + 1 unused invite): every removed device is revoked.
+    now += 1000;
+    await host.send('remove', room, { memberId: samId });
+    expect((await sam.status(room)).memberId).toBeUndefined();
+    expect((await samPhone.status(room)).memberId).toBeUndefined();
+    expect((await samAgent.status(room)).memberId).toBeUndefined();
+    await expect((await client(lobby, () => now)).send('agent-redeem', room, { token: unusedSam, label: 'Late' })).rejects.toMatchObject({ status: 410 });
+    const afterHostRemove = await host.status(room);
+    for (const devId of [samDeviceId, samPhoneId, samAgentDevId]) {
+      expect(afterHostRemove.formerDevices!.find(d => d.id === devId)).toMatchObject({ id: devId, retiredAt: now, revoked: true });
+    }
+
+    // Pat self-leaves via atomic remove { memberId: patId } from Pat's primary device:
+    // primary device (actor.id) is self-left (not revoked), while Pat's other companion & agent are revoked.
+    now += 1000;
+    await pat.send('remove', room, { memberId: patId });
+    expect((await pat.status(room)).memberId).toBeUndefined();
+    expect((await patPhone.status(room)).memberId).toBeUndefined();
+    expect((await patAgent.status(room)).memberId).toBeUndefined();
+    const afterSelfLeave = await host.status(room);
+    expect(afterSelfLeave.members!.map(m => m.name)).toEqual(['Alex']);
+    expect(afterSelfLeave.formerDevices!.find(d => d.id === patDeviceId)?.revoked).toBeUndefined();
+    expect(afterSelfLeave.formerDevices!.find(d => d.id === patPhoneId)?.revoked).toBe(true);
+    expect(afterSelfLeave.formerDevices!.find(d => d.id === patAgentDevId)?.revoked).toBe(true);
+  } finally { lobby.close(); }
+});
+
+test('SEC-13: declining a request enforces a 5-minute cooldown; decline & block permanently blocks the device', async () => {
+  let now = Date.now();
+  const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  try {
+    const host = await client(lobby, () => now), visitor = await client(lobby, () => now), banned = await client(lobby, () => now), other = await client(lobby, () => now);
+    const room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+
+    // Temporary decline cooldown via { admit: false }.
+    await visitor.send('request', room, { name: 'Visitor', label: 'Browser', kind: 'person' });
+    const req1 = (await host.status(room)).requests![0];
+    await host.send('decide', room, { requestId: req1.id, admit: false });
+    expect((await visitor.status(room)).request?.state).toBe('declined');
+    await expect(visitor.send('request', room, { name: 'Visitor', label: 'Browser', kind: 'person' }))
+      .rejects.toMatchObject({ status: 429, message: 'Your join request was declined. Wait a few minutes before asking again.' });
+    // Unrelated device is unaffected.
+    await other.send('request', room, { name: 'Other', label: 'Laptop', kind: 'person' });
+    // Still blocked 1 ms before cooldown expires; allowed once cooldown elapses.
+    now += DECLINE_COOLDOWN_MS - 1;
+    await expect(visitor.send('request', room, { name: 'Visitor', label: 'Browser', kind: 'person' })).rejects.toMatchObject({ status: 429 });
+    now += 2;
+    await visitor.send('request', room, { name: 'Visitor', label: 'Browser', kind: 'person' });
+    expect((await visitor.status(room)).request?.state).toBe('pending');
+
+    // Permanent block via { decision: 'decline', block: true }.
+    await banned.send('request', room, { name: 'Spammer', label: 'Browser', kind: 'person' });
+    const bannedReq = (await host.status(room)).requests!.find(r => r.name === 'Spammer')!;
+    await host.send('decide', room, { requestId: bannedReq.id, decision: 'decline', block: true });
+    await expect(banned.send('request', room, { name: 'Spammer', label: 'Browser', kind: 'person' })).rejects.toMatchObject({ status: 403 });
+    // Even days later and even with an agent invite token, a permanently blocked device cannot join.
+    now += 7 * 86_400_000;
+    await expect(banned.send('request', room, { name: 'New Name', label: 'Browser', kind: 'person' })).rejects.toMatchObject({ status: 403 });
+    const { token } = await host.send('agent-invite', room, { name: 'Bot' }) as { token: string };
+    await expect(banned.send('agent-redeem', room, { token, label: 'Bridge' })).rejects.toMatchObject({ status: 403 });
+    // Permanent block survives > MAX_BLOCKED_DEVICES temporary cooldowns.
+    expect(MAX_BLOCKED_DEVICES).toBe(256);
+    for (let i = 0; i < MAX_BLOCKED_DEVICES + 5; i++) {
+      const churn = await client(lobby, () => now);
+      await churn.send('request', room, { name: `Guest ${i}`, label: 'Browser', kind: 'person' });
+      const pending = (await host.status(room)).requests!.find(r => r.name === `Guest ${i}`)!;
+      await host.send('decide', room, { requestId: pending.id, admit: false });
+    }
+    await expect(banned.send('request', room, { name: 'Still Blocked', label: 'Browser', kind: 'person' })).rejects.toMatchObject({ status: 403 });
   } finally { lobby.close(); }
 });

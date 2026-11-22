@@ -160,10 +160,10 @@ const code = (error: unknown) => (error as { code?: string }).code;
 export const busyOnWindows = (error: unknown, platform = process.platform) =>
   platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(code(error) ?? '');
 /** Retries `action` while Windows reports the file busy, for up to `ms`; then the last error stands. */
-export function whileBusy<T>(action: () => T, ms = 2_000): T {
+export function whileBusy<T>(action: () => T, ms = 2_000, platform = process.platform): T {
   const deadline = Date.now() + ms;
   while (true) {
-    try { return action(); } catch (error) { if (!busyOnWindows(error) || Date.now() > deadline) throw error; }
+    try { return action(); } catch (error) { if (!busyOnWindows(error, platform) || Date.now() > deadline) throw error; }
     Bun.sleepSync(10);
   }
 }

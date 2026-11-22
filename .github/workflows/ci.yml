@@ -199,6 +199,9 @@ jobs:
       - name: Build the development app
         working-directory: desktop/src-tauri
         run: cargo build --locked
+      - name: Run desktop Rust tests
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun run build:agent

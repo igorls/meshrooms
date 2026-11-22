@@ -629,6 +629,7 @@ fn main() {
             join::join_view, join::join_confirm, join::join_cancel, join::join_browse,
             review::review_view, review::review_pause, review::review_resume, review::review_close,
             approvals::approvals_view, approvals::approvals_approve, approvals::approvals_reject, approvals::approvals_custom_check, approvals::approvals_custom_make, approvals::approvals_custom_edit, approvals::approvals_close,
+            links::notice_close,
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -725,6 +726,11 @@ fn main() {
                 // Closing the Approvals window stops its refresher; whatever waits stays waiting, for the next time.
                 if window.label() == approvals::WINDOW {
                     approvals::closed(window.app_handle());
+                    tray_only(window);
+                    return;
+                }
+                // Closing a notice window destroys it instead of hiding it in the background.
+                if window.label() == links::NOTICE_WINDOW {
                     tray_only(window);
                     return;
                 }

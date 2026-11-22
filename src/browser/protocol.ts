@@ -1,8 +1,16 @@
 /** Browser-room v1 is independent of the native node's credentials and grants. */
 export const browserProtocol = 'meshrooms-browser-v1';
+/** Numeric wire protocol version advertised on `/api/lobby/health` and optionally sent via `PROTOCOL_HEADER`. */
+export const PROTOCOL_VERSION = 1;
+/** Oldest numeric wire protocol version this coordinator accepts before answering HTTP 426. */
+export const MIN_PROTOCOL_VERSION = 1;
+/** Optional HTTP header clients send to declare their numeric wire protocol version. */
+export const PROTOCOL_HEADER = 'x-meshrooms-protocol';
+/** Error `code` returned with HTTP 426 when a client's declared protocol version is below `MIN_PROTOCOL_VERSION`. */
+export const UPGRADE_REQUIRED = 'upgrade-required';
 export type Command = {
   protocol: typeof browserProtocol; origin: string; id: string; at: number;
-  action: 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'repositories' | 'close';
+  action: 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'repositories' | 'transfer-host' | 'close';
   roomId: string; payload: Record<string, unknown>;
 };
 export type SignedCommand = { command: Command; publicKey: string; signature: string };
@@ -49,7 +57,7 @@ export type RoomStatus = {
   deviceId: string; request?: JoinRequest; requests?: JoinRequest[];
   members?: BrowserMember[]; devices?: (BrowserDevice & { session?: string })[];
   signals?: Signal[]; iceServers?: RTCIceServer[]; agentInvites?: AgentInvite[];
-  /** Keys of devices that have left, so their earlier signed task changes still verify for people who join later. */
+  /** Keys of devices that have left, so their earlier signed records still verify for people who join later (see signerOf). */
   formerDevices?: FormerDevice[];
   settings?: RoomSettings;
   /** GitHub `owner/name` repositories people pinned for this room; tasks open issues in them. */
@@ -66,8 +74,42 @@ export const MAX_REPOSITORIES = 8;
 /** `owner/name` of a GitHub repository. `.` and `..` are not names, so a link built from one stays on that repository. */
 export const validRepository = (v: unknown): v is string =>
   typeof v === 'string' && /^[A-Za-z0-9-]{1,39}\/[\w.-]{1,100}$/.test(v) && !/\/\.{1,2}$/.test(v);
-/** `role` is the member's role when the device left, so a departed agent's signed votes can never pass as a person's. */
-export type FormerDevice = { id: string; publicKey: string; memberId: string; role?: 'human' | 'agent' };
+/**
+ * `role` is the member's role when the device left, so a departed agent's signed votes can never pass as a person's.
+ * `retiredAt` is the room service's clock when the device left; `revoked` marks a device someone else removed (the host,
+ * or its own member removing a lost device) rather than one that left from itself. Entries kept before these existed
+ * carry neither.
+ */
+export type FormerDevice = { id: string; publicKey: string; memberId: string; role?: 'human' | 'agent'; retiredAt?: number; revoked?: true };
+/**
+ * The device whose key verifies a signed record that reached this device in an exchange (relayed by anyone), dated `at`
+ * by its signer: a device in the room, or a former one that may still have signed it. A revoked device signs nothing
+ * more: a member willing to relay for it would otherwise keep it writing tasks, votes, reactions and retractions in its
+ * member's name, and the time it signs is its own to pick. Records already held stay. A device that left from itself is
+ * trusted up to when it left (it could backdate, but it could have signed the same before leaving). The cost of revoking:
+ * a device that joins later, or was offline, never receives the revoked device's records that nobody else holds in a
+ * newer form.
+ */
+export function signerOf(status: Pick<RoomStatus, 'devices' | 'formerDevices'> | undefined, deviceId: unknown, at: unknown): { publicKey: string; memberId: string } | undefined {
+  const current = status?.devices?.find(d => d.id === deviceId);
+  if (current) return current;
+  const former = status?.formerDevices?.find(d => d.id === deviceId);
+  if (!former || former.revoked) return undefined;
+  return former.retiredAt === undefined || (typeof at === 'number' && at <= former.retiredAt) ? former : undefined;
+}
+/** Normalizes a display name or room title via NFKC, stripping Unicode control/format chars (bidi overrides, zero-width chars), collapsing whitespace and trimming. */
+export function cleanDisplayName(raw: string): string {
+  return raw.normalize('NFKC').replace(/[\p{Cc}\p{Cf}]/gu, '').replace(/\s+/g, ' ').trim();
+}
+/** Case-folded NFKC key for display-name uniqueness checks so lookalike spacing, casing, fullwidth or bidi/zero-width tricks collide. */
+export function foldDisplayName(raw: string): string {
+  return cleanDisplayName(raw).toLocaleLowerCase('en-US');
+}
+/** Deterministic 8-hex visual fingerprint (`XXXX-XXXX`) derived from a device's SHA-256 hex id. */
+export function deviceFingerprint(id: string): string {
+  const hex = id.replace(/[^a-fA-F0-9]/g, '').slice(0, 8).toUpperCase();
+  return hex.length > 4 ? `${hex.slice(0, 4)}-${hex.slice(4)}` : hex;
+}
 export const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 export function base64(bytes: ArrayBuffer) { return btoa(String.fromCharCode(...new Uint8Array(bytes))); }
 export function unbase64(value: string) { return Uint8Array.from(atob(value), c => c.charCodeAt(0)); }

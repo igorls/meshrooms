@@ -117,10 +117,13 @@ try {
   await until(async () => (await call('GET', '/api/local/agents')).body.agents[0].rooms[0].binding.listening, 'the agent\'s watcher to listen', 120_000);
 
   // The app starts: once its first read of the feed answers, one notice says who is live.
+  const summaryBody = process.platform === 'win32'
+    ? 'All listening. Click to review them.'
+    : 'All listening. Choose Review your agents… in the tray.';
   shell = spawn(app, ['--background'], { env: appEnv, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   for (const stream of [shell.stdout, shell.stderr]) stream.on('data', chunk => { said += chunk.toString(); writeSync(appLog, chunk); });
   const start = await until(() => notices()[0], 'the agents live notice', 120_000);
-  assert.deepEqual(start, { title: '1 agent live in 1 room', body: 'All listening. Click to review them.', target: { kind: 'review' } });
+  assert.deepEqual(start, { title: '1 agent live in 1 room', body: summaryBody, target: { kind: 'review' } });
 
   // Alex chats, then mentions Robin. No local tab is open: the person device is the daemon's.
   await alex.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill('Morning, everyone.');
@@ -159,7 +162,7 @@ try {
   bridge('daemon', 'stop');
   daemon = undefined;
   const back = await until(() => notices().slice(before).find(n => n.target.kind === 'review'), 'the notice after the daemon came back', 240_000);
-  assert.deepEqual(back, { title: '1 agent live in 1 room', body: 'All listening. Click to review them.', target: { kind: 'review' } });
+  assert.deepEqual(back, { title: '1 agent live in 1 room', body: summaryBody, target: { kind: 'review' } });
   api = endpoint();
 
   // With MESHROOMS_SMOKE_REAL_TOAST=1: the last notice once more as a real one, through the real path (one toast on

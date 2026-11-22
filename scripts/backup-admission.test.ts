@@ -20,7 +20,12 @@ test('backs up a live WAL admission database into a verified standalone copy', (
     writer.query('INSERT INTO rooms (id, body) VALUES (?, ?)').run('room-1', '{}');
     const file = backup({ db, out, keepDays: 14, keepMin: 3, now: new Date('2026-09-29T03:15:00Z') });
     expect(file.endsWith('admission-20260929T031500Z.sqlite')).toBe(true);
-    expect(verify(file).counts).toEqual({ rooms: 1, receipts: 0, avatars: 0 });
+    const checked = verify(file);
+    expect(checked.schemaVersion).toBe(2);
+    expect(checked.counts).toEqual({
+      rooms: 1, receipts: 0, avatars: 0, room_activity: 0, closed_rooms: 0, service_state: 1, creation_invites: 0, beta_admissions: 0,
+      room_devices: 0, retired_devices: 0, beta_revocations: 0,
+    });
     expect(readdirSync(out).filter(name => name.endsWith('.partial'))).toEqual([]);
     if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600);
     // The copy is standalone: no WAL of its own.
@@ -42,9 +47,35 @@ test('refuses a file that is not a healthy admission database', () => {
     const other = join(dir, 'other.sqlite');
     const db = new Database(other); db.exec('CREATE TABLE unrelated (a)'); db.close();
     expect(() => verify(other)).toThrow(/no rooms table/);
+    const incomplete = join(dir, 'incomplete.sqlite');
+    const partial = new Database(incomplete);
+    partial.exec('CREATE TABLE rooms (id TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE receipts (id TEXT); CREATE TABLE avatars (id TEXT);');
+    partial.close();
+    expect(() => verify(incomplete)).toThrow(/no room_activity table/);
     const junk = join(dir, 'junk.sqlite');
     writeFileSync(junk, 'SQLite format 3\0' + 'x'.repeat(200));
     expect(() => verify(junk)).toThrow();
+    // A schema v2 backup missing migrated tables (`room_devices` or `retired_devices`) is refused.
+    const missingRetired = join(dir, 'missing-retired.sqlite');
+    const lobby = new BrowserLobby(missingRetired, { origin: 'http://127.0.0.1:4320' });
+    lobby.close();
+    const edit = new Database(missingRetired);
+    edit.exec('DROP TABLE retired_devices');
+    edit.close();
+    expect(() => verify(missingRetired)).toThrow(/no retired_devices table/);
+    const missingRoomDevices = join(dir, 'missing-room-devices.sqlite');
+    const lobby2 = new BrowserLobby(missingRoomDevices, { origin: 'http://127.0.0.1:4320' });
+    lobby2.close();
+    const edit2 = new Database(missingRoomDevices);
+    edit2.exec('DROP TABLE room_devices');
+    edit2.close();
+    expect(() => verify(missingRoomDevices)).toThrow(/no room_devices table/);
+    // Pre-migration v0 backups (all base tables, user_version=0) still pass pre-deploy backup verification.
+    const legacyV0 = join(dir, 'legacy-v0.sqlite');
+    const v0 = new Database(legacyV0);
+    v0.exec('CREATE TABLE rooms (id TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE receipts (id TEXT); CREATE TABLE avatars (id TEXT); CREATE TABLE room_activity (id TEXT); CREATE TABLE closed_rooms (id TEXT); CREATE TABLE service_state (key TEXT); CREATE TABLE creation_invites (id TEXT); CREATE TABLE beta_admissions (device TEXT);');
+    v0.close();
+    expect(verify(legacyV0).schemaVersion).toBe(0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

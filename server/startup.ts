@@ -45,7 +45,7 @@ export function runKeyManager(entry: { valueName: string; scriptPath: string; sc
     apply(enabled) { if (enabled) throw new Error(host.message); return this.status(); } };
   const { valueName, scriptPath, script } = entry, run = options.run ?? exec;
   const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const command = `"${powershell}" -NoProfile -NonInteractive -WindowStyle Hidden -File "${scriptPath}"`;
+  const command = `"${powershell}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${scriptPath}"`;
   const reg = (args: string[]) => run('reg.exe', args);
   const status = (): StartupState => {
     const result = reg(['query', key, '/v', valueName]);

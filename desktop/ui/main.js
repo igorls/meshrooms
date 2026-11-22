@@ -17,9 +17,11 @@ function renderRooms(busy, running) {
     let row = roomRows.get(room.id);
     if (!row) {
       const item = document.createElement('li'), button = document.createElement('button');
-      const label = document.createElement('strong'), detail = document.createElement('small'), badge = document.createElement('span');
-      button.className = 'home-room'; badge.className = 'home-room-count'; badge.setAttribute('aria-hidden', 'true');
-      const copy = document.createElement('span'); copy.append(label, detail); button.append(copy, badge); item.append(button);
+      const tile = document.createElement('span'), label = document.createElement('strong'), detail = document.createElement('small'), badge = document.createElement('span');
+      button.className = 'home-room'; tile.className = 'home-room-tile'; tile.setAttribute('aria-hidden', 'true');
+      for (let n = 0; n < 4; n++) tile.append(document.createElement('i'));
+      badge.className = 'home-room-count'; badge.setAttribute('aria-hidden', 'true');
+      const copy = document.createElement('span'); copy.append(label, detail); button.append(tile, copy, badge); item.append(button);
       button.addEventListener('click', () => act('room', room.id));
       row = { item, button, label, detail, badge }; roomRows.set(room.id, row);
     }
@@ -50,7 +52,8 @@ function render() {
   const failed = !!(problem || readProblem || view?.problem);
   text('connection', running === true ? 'Background service running'
     : running === false ? 'Background service stopped' : failed ? 'Status unavailable' : 'Checking background service…');
-  $('status-dot').className = running === true ? 'is-running' : running === false || failed ? 'is-stopped' : 'is-checking';
+  $('status-dot').className = running === true ? 'is-running' : failed ? 'is-failed' : running === false ? 'is-stopped' : 'is-checking';
+  $('home-status').classList.toggle('is-live', running === true);
   text('detail', running === true ? 'Rooms and agents can stay connected while you work.'
     : running === false ? 'Start the service to open your rooms. Existing room connections keep running.' : view?.detail || 'Reading this computer’s status.');
   $('detail').title = view?.detail || '';

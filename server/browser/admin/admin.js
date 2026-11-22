@@ -5,8 +5,8 @@ function error(message) { $('error').textContent = message; $('error').hidden = 
 function auth(signedIn) { $('login').hidden = signedIn; $('panel').hidden = !signedIn; $('logout').hidden = !signedIn; }
 async function api(path, data) {
   const response = await fetch(path, { method: data === undefined ? 'GET' : 'POST', credentials: 'same-origin', headers: data === undefined ? {} : { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: data === undefined ? undefined : JSON.stringify(data) });
-  const result = await response.json();
-  if (!response.ok) { if (response.status === 401) { auth(false); clearCode(); } throw new Error(result.error || 'Request failed.'); }
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) { if (response.status === 401) { auth(false); clearCode(); } throw new Error(result.error || `Request failed (${response.status}).`); }
   return result;
 }
 async function act(button, work) { error(''); button.disabled = true; try { await work(); } catch (e) { error(e.message); } finally { button.disabled = false; } }
@@ -18,7 +18,8 @@ async function refresh() {
   $('people-count').textContent = state.people.length;
   $('room-count').textContent = state.rooms.length;
   $('invite-count').textContent = state.invites.reduce((sum, i) => sum + (!i.revokedAt && i.expiresAt > Date.now() ? i.remaining : 0), 0);
-  $('invites').replaceChildren(); $('rooms').replaceChildren(); $('no-invites').hidden = state.invites.length > 0;
+  $('invites').replaceChildren(); $('people').replaceChildren(); $('rooms').replaceChildren();
+  $('no-invites').hidden = state.invites.length > 0; $('no-people').hidden = state.people.length > 0;
   for (const invite of [...state.invites].reverse()) {
     const row = document.createElement('tr'), label = cell(row, invite.note || 'Untitled invitation'), id = document.createElement('small'); id.textContent = invite.id; label.append(id);
     const status = invite.revokedAt ? 'Revoked' : invite.expiresAt <= Date.now() ? 'Expired' : invite.remaining ? 'Active' : 'Used';
@@ -26,6 +27,14 @@ async function refresh() {
     cell(row, `${invite.uses - invite.remaining} / ${invite.uses}`); cell(row, date(invite.expiresAt)); const action = cell(row, '');
     if (status === 'Active') { const button = document.createElement('button'); button.textContent = 'Revoke'; button.className = 'quiet'; button.setAttribute('aria-label', `Revoke ${invite.note || invite.id}`); button.onclick = () => { if (confirm(`Revoke ${invite.note || invite.id}? People already admitted keep access.`)) void act(button, async () => { await api(`/api/invites/${invite.id}/revoke`, {}); await refresh(); }); }; action.append(button); }
     $('invites').append(row);
+  }
+  for (const person of state.people) {
+    const row = document.createElement('tr'), shortId = person.id.slice(0, 12);
+    const idCell = cell(row, shortId); idCell.title = person.id;
+    cell(row, person.devices); cell(row, date(person.admittedAt)); const action = cell(row, '');
+    const button = document.createElement('button'); button.textContent = 'Revoke'; button.className = 'quiet'; button.setAttribute('aria-label', `Revoke person ${shortId}`);
+    button.onclick = () => { if (confirm(`Revoke beta room creation for ${shortId} (${person.devices} device${person.devices === 1 ? '' : 's'})?`)) void act(button, async () => { await api('/api/people/revoke', { person: person.id }); await refresh(); }); };
+    action.append(button); $('people').append(row);
   }
   for (const room of state.rooms) { const row = document.createElement('tr'); cell(row, room.title); cell(row, room.members); cell(row, room.devices); cell(row, date(room.lastActiveAt)); $('rooms').append(row); }
 }

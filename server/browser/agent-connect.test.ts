@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agentCli, connectConflict } from '../agent-cli';
+import { agentCli, connectConflict, readConnectLink } from '../agent-cli';
 import { deviceId } from '../../src/browser/protocol';
 
 const opus = crypto.randomUUID();
@@ -112,5 +112,38 @@ test("a connect's lock is taken over only once its process is gone, and only by 
     expect(existsSync(lock) || existsSync(`${lock}.reclaim`)).toBe(false);
     // No draft files are left next to the lock.
     expect(readdirSync(dir).filter(f => f.startsWith('connect.lock'))).toEqual([]);
+  } finally { server.stop(true); }
+}));
+
+test('connect reads the secret link from stdin via positional - or --link -, trimming BOM and whitespace, without breaking positional or --link arguments', () => inFreshHome(async folder => {
+  const server = fakeRoom({ status: 'room', redeem: 403 });
+  try {
+    const room = crypto.randomUUID();
+    const link = `http://127.0.0.1:${server.port}/agent/${room}#${token}`;
+    expect(await readConnectLink(link)).toBe(link);
+    expect(await readConnectLink('-', async () => `\uFEFF  ${link}\r\n`)).toBe(link);
+    await expect(readConnectLink('-', async () => '  \r\n')).rejects.toThrow('on stdin');
+
+    // Positional `-` and `--link -` both parse the link from stdin and reach the room redeem step (here 403).
+    await expect(agentCli(['connect', '-'], async () => `\uFEFF${link}\r\n`)).rejects.toThrow('redeem failed (403)');
+    await expect(agentCli(['connect', '--link', '-'], async () => `  ${link}  \n`)).rejects.toThrow('redeem failed (403)');
+    // Direct `--link <url>` keeps working as before.
+    await expect(agentCli(['connect', '--link', link])).rejects.toThrow('redeem failed (403)');
+    // Conflicting stdin `-` with a text option is rejected cleanly.
+    await expect(agentCli(['connect', '-', '--text', '-'], async () => link)).rejects.toThrow('Only one option can read from stdin');
+
+    // End-to-end subprocess check: piping the link on stdin never exposes #token in argv, and structured HTTP error JSON comes back on stderr.
+    const cli = join(import.meta.dir, '..', 'agent-cli.ts');
+    for (const argv of [['connect', '-'], ['connect', '--link', '-']]) {
+      const child = Bun.spawn([process.execPath, cli, ...argv], {
+        stdin: new Blob([`\uFEFF${link}\r\n`]),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: { ...process.env, MESHROOMS_AGENT_HOME: folder, MESHROOMS_AGENT_REGISTRY: join(folder, 'agent-homes.json') },
+      });
+      const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(stderr.trim())).toEqual({ error: 'redeem failed (403)', status: 403 });
+    }
   } finally { server.stop(true); }
 }));

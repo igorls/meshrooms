@@ -90,7 +90,10 @@ holder, including after the author has gone.
 
 10 MB per file and 4 per message, as in native rooms. Each device keeps the
 files of the newest messages up to 256 MB and 512 files per room; older files
-are evicted and not fetched again (the message says so). Browsers keep verified
+are evicted and not fetched again (the message says so). Once more than one
+member has files in the room, each member's files take at most half of the
+bytes and half of the count on a device: a member past their half loses their
+own older files, never someone else's. Browsers keep verified
 files as Blobs in IndexedDB (`file:<device>:<room>:<sha256>`, with an index at
 `files:<device>:<room>`), and display them through `blob:` URLs. The bridge keeps
 content-addressed files in `<home>/browser-agents/<room>/files/<sha256>`,

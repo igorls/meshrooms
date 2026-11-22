@@ -69,3 +69,47 @@ FFI library, refuses an existing `libwormdb_ffi.so`, and writes
 qualified Ubuntu x86_64 artifact; it does not replace the Windows pin in
 `wormdb.lock.json`. A new compiler, source commit, or binary hash needs a new
 reviewed Linux lockfile entry after the persistence suite passes.
+
+## macOS arm64
+
+The same script builds `libwormdb_ffi.dylib` on Apple Silicon, from the source
+commits, Zig version and required symbols in
+[native/darwin-arm64.lock.json](../native/darwin-arm64.lock.json) only. It also
+passes `-Dcrypto-backend=std`; the library links `libSystem` and nothing else.
+
+```sh
+./scripts/build-native.sh --source <wormdb-checkout> --out <fresh-output-directory>
+./scripts/build-native.sh --verify-only --out <qualified-output-directory>
+WORMDB_LIBRARY_PATH=<fresh-output-directory>/libwormdb_ffi.dylib bun test ./server/persistence
+```
+
+`WORMDB_LIBRARY_PATH` makes the tests load the library that was just built, not
+one found by the default lookup. Requires macOS arm64, Zig 0.16.0, `python3` and the Xcode command line tools
+(`nm`). The script runs under the system's bash 3.2. It writes
+`wormdb.darwin-arm64.provenance.json` next to the candidate. With no `--out`,
+the library lands in `.local/native`, where the daemon and the persistence
+tests look first, before a sibling `wormdb` checkout's own `zig-out`. Build
+here instead of in that checkout: a library built from WormDB source older
+than the pins lacks `wormdb_open_sync`, and the adapter refuses it with a
+message naming this page.
+
+Two builds from the same inputs do not produce the same hash, and the linker's
+ad hoc signature is part of the hashed file. The pin therefore records the one
+artifact that was qualified with the persistence suite; `--verify-only` passes
+for that file and fails for a rebuild. A rebuild is a new candidate: run the
+suite against it before relying on it. Signing the library for a release
+changes its hash as well.
+
+## A first candidate for a platform without a pin
+
+A platform the script can build for but that has no lockfile yet takes its
+source pins from another platform's reviewed lockfile:
+
+```sh
+./scripts/build-native.sh --source <wormdb-checkout> --pins-from native/linux-x64.lock.json
+```
+
+It writes `<platform>-<arch>.lock.draft.json` next to the candidate and never
+into `native/`. Run the persistence suite against the candidate, fill in the
+draft's notes, and record it as that platform's lockfile through review. Once
+the lockfile exists it alone decides the inputs, and `--pins-from` is refused.

@@ -7,6 +7,7 @@ import { checkRoomDraft } from './check-room-draft.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MESHROOMS_PLAYWRIGHT_MODULE || 'playwright');
 const origin = process.env.MESHROOMS_BROWSER_TEST_ORIGIN || 'http://127.0.0.1:14330';
+const keepRoom = process.argv.includes('--keep-room');
 if (!['127.0.0.1', 'localhost'].includes(new URL(origin).hostname) && !(origin === 'https://meshrooms.wormdb.dev' && process.env.MESHROOMS_BROWSER_ALLOW_PRODUCTION === '1')) throw new Error('Use loopback, or explicitly opt in to the Meshrooms production smoke test.');
 const output = resolve('.impeccable/review'); mkdirSync(output, { recursive: true });
 const browser = await chromium.launch({ headless: true });
@@ -40,15 +41,16 @@ const flat = text => text.replace(/\s+/g, ' ').trim();
 async function visibleMessage(p, text) { await p.waitForFunction(t => [...document.querySelectorAll('.message-text')].some(el => el.innerText.replace(/\s+/g, ' ').trim() === t), flat(text)); }
 async function send(p, text) { await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
 async function snapshot(p, name) { await p.evaluate(() => window.scrollTo(0, 0)); await p.screenshot({ path: resolve(output, name), fullPage: true, animations: 'disabled' }); }
+let host, createdRoom = false, testFailed = false;
 try {
-  const host = await page(), guest = await page({ width: 390, height: 844 }), companion = await page();
+  host = await page(); const guest = await page({ width: 390, height: 844 }), companion = await page();
   await host.goto(`${origin}/rooms`);
   await host.getByLabel('Your name', { exact: true }).fill('Alex');
   await host.getByLabel('Room name', { exact: true }).fill('Browser invitation check');
   // A service that requires invite codes for room creation (the hosted beta) needs one minted for this run.
   if (process.env.MESHROOMS_TEST_INVITE) await host.getByLabel('Invite code', { exact: true }).fill(process.env.MESHROOMS_TEST_INVITE);
   await host.getByRole('button', { name: 'Create room', exact: true }).click();
-  await host.waitForURL(/\/r\//); const invite = host.url();
+  await host.waitForURL(/\/r\//); createdRoom = true; const invite = host.url();
   await guest.goto(invite);
   await guest.getByLabel('Your name', { exact: true }).fill('Sam');
   await guest.getByRole('button', { name: 'Ask to join', exact: true }).click();
@@ -183,14 +185,18 @@ try {
   await host.getByRole('button', { name: 'Decline', exact: true }).click();
   await visible(visitor, 'The host declined your request.');
   await visitor.getByRole('button', { name: 'Ask to join', exact: true }).click();
-  await visitor.getByRole('button', { name: 'Cancel request', exact: true }).click();
-  await visible(visitor, 'Join request canceled.');
-  await visitor.getByRole('button', { name: 'Ask to join', exact: true }).click();
+  await visitor.getByRole('alert').filter({ hasText: 'Your join request was declined. Wait a few minutes before asking again.' }).waitFor();
+  const visitor2 = await page(); await visitor2.goto(invite);
+  await visitor2.getByLabel('Your name', { exact: true }).fill('Visitor Two');
+  await visitor2.getByRole('button', { name: 'Ask to join', exact: true }).click();
+  await visitor2.getByRole('button', { name: 'Cancel request', exact: true }).click();
+  await visible(visitor2, 'Join request canceled.');
+  await visitor2.getByRole('button', { name: 'Ask to join', exact: true }).click();
   // Backend expiry is covered with a controlled clock in lobby.test.ts; exercise its UI response here.
   let expiryPolls = 0;
   let observedPruning;
   const pruning = new Promise(resolve => { observedPruning = resolve; });
-  await visitor.route('**/api/lobby', async route => {
+  await visitor2.route('**/api/lobby', async route => {
     const response = await route.fetch();
     const data = await response.json();
     if (data.request?.state === 'pending') {
@@ -200,12 +206,12 @@ try {
     await route.fulfill({ response, json: data });
     if (expiryPolls >= 3) observedPruning();
   });
-  await visible(visitor, 'Your request expired. Ask to join again when you’re ready.');
+  await visible(visitor2, 'Your request expired. Ask to join again when you’re ready.');
   let deadline;
   await Promise.race([pruning, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('Expiry pruning was not observed.')), 12_000); })]).finally(() => clearTimeout(deadline));
-  await visible(visitor, 'Your request expired. Ask to join again when you’re ready.');
-  assert.equal(await visitor.getByText('Request sent.', { exact: true }).count(), 0);
-  await visitor.setViewportSize({ width: 390, height: 844 }); await snapshot(visitor, 'expired-mobile.png');
+  await visible(visitor2, 'Your request expired. Ask to join again when you’re ready.');
+  assert.equal(await visitor2.getByText('Request sent.', { exact: true }).count(), 0);
+  await visitor2.setViewportSize({ width: 390, height: 844 }); await snapshot(visitor2, 'expired-mobile.png');
   assert.deepEqual(errors, []);
   const result = { passed: true, browser: 'Chromium', scope: `Isolated browser contexts on one ${process.platform} machine`, origin, roomId: new URL(invite).pathname.split('/').at(-1), relayTransport: process.env.MESHROOMS_TEST_TURN_TRANSPORT || 'automatic', routes,
     checks: ['pending admission isolation', 'live host admission', 'bidirectional Unicode messages and storage receipts', ...(restartGate ? ['live coordinator restart recovery'] : []), 'reload identity/history', 'draft text and reply across room navigation and reload', 'sent draft cleared', 'unsent attachment navigation warning', 'duplicate tab ownership', 'companion identity and authorship', 'device removal', 'decline', 'cancel', 'mobile and tablet overflow', 'preserved reading position and unread feedback', 'anchored composer', 'room details draft and keyboard focus retention', 'Enter sends and Shift+Enter adds a line', 'live message announcement', 'expired request UI (simulated response)'],
@@ -213,6 +219,7 @@ try {
   writeFileSync(resolve(output, 'browser-smoke.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify(result, null, 2));
 } catch (error) {
+  testFailed = true;
   // Keep failure diagnostics bounded and exclude SDP, device keys, and credentials.
   for (const context of contexts) for (const p of context.pages()) {
     console.error(JSON.stringify(await p.evaluate(() => ({
@@ -222,4 +229,24 @@ try {
     })).catch(() => ({ closed: true }))));
   }
   throw error;
-} finally { for (const context of contexts) await context.close(); await browser.close(); }
+} finally {
+  let cleanupError;
+  // Delete the synthetic smoke room so repeated runs (especially against production) never leak toward the 256-room cap.
+  if (createdRoom && !keepRoom && host && !host.isClosed()) {
+    try {
+      const details = host.locator('#browser-room-details');
+      if (await details.isHidden()) await host.getByRole('button', { name: 'Room details', exact: true }).click();
+      const section = host.locator('.browser-delete-room');
+      const confirm = section.getByRole('group', { name: 'Confirm deleting the room' });
+      if (!(await confirm.isVisible())) await section.getByRole('button', { name: 'Delete room', exact: true }).click();
+      await confirm.getByRole('button', { name: 'Delete room', exact: true }).click();
+      await host.getByText('You deleted this room. Its link no longer works.', { exact: true }).waitFor({ timeout: 15_000 });
+    } catch (error) {
+      cleanupError = error;
+      console.error('Room cleanup failed:', error?.message || error);
+    }
+  }
+  for (const context of contexts) await context.close();
+  await browser.close();
+  if (cleanupError && !testFailed) throw cleanupError;
+}

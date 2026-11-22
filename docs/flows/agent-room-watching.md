@@ -38,7 +38,7 @@ The machine watcher keeps the room runner alive and restores bindings through th
 The sections below describe the retained listener and headless modes used by the other harnesses and legacy bindings.
 
 Status: implemented in the agent bridge (0.2.0-beta.3) as `meshrooms watch`, for Claude Code, Codex (the CLI and the
-Codex app's threads), Hermes and any other harness through a command template. A security review (below) confined what a
+Codex app's threads), Hermes, DeepSeek Harness (`dsh`) and any other harness through a command template. A security review (below) confined what a
 wake can do before release. Verified end to end on Windows against a loopback coordinator. The Windows Codex plus
 Linux agent acceptance below has not been run yet.
 
@@ -67,9 +67,13 @@ and one mailbox has one reader at a time:
   Looping short listens on a timer is wrong: every return costs a turn.
   - Exit codes: `0` work, the same JSON as `listen` with its cursors, plus `pickupUntil` and `wokenRuns`; also `0` with
     `state: timeout` after the upper bound (24 h, `--max-wait-hours`, so a forgotten listener can't live forever).
-    `3` the room closed (410). `4` the agent was removed from the room (the runner's proof of life says
-    `removedSince`). `5` the runner stopped and wasn't running again within 10 minutes.
-  - Internally it waits in one-minute slices without returning. A slice that reports the runner stopped is followed by
+    `3` the room closed (410). `4` the agent was removed from the room (a fresh runner proof of life from this listener
+    session says `removedSince`), or its pending join request was declined/expired. `5` the runner stopped and wasn't
+    running again within 10 minutes. `6` the parent process named by `--parent <pid>` exited (`state: parent-exited`;
+    the lease is released cleanly so orphaned listeners never linger).
+  - Internally it waits in one-minute slices without returning (capped to the heartbeat interval when `--parent` is set
+    so parent exit is noticed promptly). While admission is pending (`waiting-for-host`), it keeps the runner alive and
+    waits cleanly until admitted, closed (`3`), or rejected (`4`). A slice that reports the runner stopped is followed by
     a repair under today's rules (outside a wake and with no watcher owning the runner, `repairRunner`; otherwise it
     waits for the owner), so a brief gap never ends the wait. A first listen's history with nothing for the agent is
     caught up silently. Never in a wake: a wake's own listen takes no lease and works as before.
@@ -124,7 +128,7 @@ the roster shows it hasn't checked in, and mentions go unanswered. A live listen
 open; the watcher closes it for an unattended agent, without keeping a model running.
 
 - **Operator-run and opt-in.** The operator starts it, for one agent in one room, from their own terminal:
-  `bun "<launcher>" watch --room R --harness claude|codex|exec`. It is a detached background process, like the runner.
+  `bun "<launcher>" watch --room R --harness claude|codex|hermes|dsh|exec`. It is a detached background process, like the runner.
   Its files sit in the agent's room folder: `watch.pid`, `watch.json` (its settings), `watch-state.json`, `watch.log`,
   and `watch-run.*`, the last run's stdin, stdout and stderr. It outlives the terminal. `watch-status` and `watch-stop`
   look after it. `stop` stops the watcher along with the runner, because the watcher would otherwise start the runner
@@ -368,10 +372,11 @@ no longer goes deaf when a runner or a hand-started watcher dies, or when its op
 
 | Harness | Runs | Session | Permissions |
 | --- | --- | --- | --- |
-| `claude` | `claude -p --output-format json` in `--cwd`, prompt on stdin | `--resume <id>` with `--session` or the session `connect --session` recorded; otherwise `--continue` (the most recent conversation in `--cwd`), refused when the folder has more than one recent session unless `--last` | `--permission-mode dontAsk`; `--allowedTools` with one `Bash(bun "<launcher>" <subcommand> *)` rule per wake subcommand; `--disallowedTools Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent PowerShell`, plus `Read(...)` denies (which cover Grep and Glob) for the secrets listed below and `Read(**/.env*)`; `--strict-mcp-config`; `--add-dir` for the wake folder; `--allow-tools` adds rules and can lift a deny; `watch` refuses a `--cwd` that contains the agent folder, the bridge, or those secrets |
+| `claude` | `claude -p --output-format json` in `--cwd`, prompt on stdin | `--resume <id>` with `--session` or the session `connect --session` recorded; otherwise `--continue` (the most recent conversation in `--cwd`), refused when the folder has more than one recent session unless `--last` | `--permission-mode dontAsk`; `--allowedTools` with one `Bash(bun "<launcher>" <subcommand> *)` rule per wake subcommand; `--disallowedTools Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent PowerShell`, plus `Read(...)` denies (which cover Grep and Glob) for the secrets listed below and `Read(**/.env*)`; `--strict-mcp-config`; `--setting-sources ""`, so none of the operator's settings files load (`--claude-settings user,project,local` names the ones that should); `--add-dir` for the wake folder; `--allow-tools` adds rules and can lift a deny; `watch` refuses a `--cwd` that contains the agent folder, the bridge, or those secrets |
 | `codex` | `codex exec resume <id> - --skip-git-repo-check` from the room's wake folder, prompt on stdin | `--session <thread id>` (a CLI or Codex app thread), or `--last --cwd <folder>`, which pins the newest thread working there when the watcher starts; one of them is required | `default_permissions="meshrooms_wake"`, a permission profile that `extends` read-only (or the operator's own named profile), with `write` for `live/ outbox/ files/ wants/ wake/` of the room, `deny` for the secrets and `.env` globs listed below, and `network.enabled=false`; `approval_policy="never"`, `web_search="disabled"`, each configured MCP server `enabled=false`, and `--disable` for computer and browser use, plugins, apps, image generation and multi-agent; never the bypass flag; `watch` refuses when the operator's top-level config is read-only, or has a legacy `profile` line Codex 0.159 rejects |
 | `exec` | the `--command` template, split into arguments without a shell; `{prompt_file}` and `{room}` are filled in per argument | up to the command | the command's own, plus the bridge's wake mode |
 | `hermes` | `hermes chat --query-file <prompt file> --oneshot --resume <id> --no-restore-cwd --source tool --pass-session-id --ignore-rules --format stream-json --toolsets meshrooms-<first 8 of the room id> --max-turns 12 --run-budget 240` | `--session <id>`, **required**: Hermes has no `--continue`, and a wake never resumes "whatever ran last" | Hermes has no per-invocation tool allowlist, so the **toolset list is the boundary**: the wake runs with its room's MCP server's tools (plus Hermes's own three-tool catalog, see below) and nothing else, so it has no terminal, file or code-execution tool |
+| `dsh` | `dsh --profile <profile> "<prompt>"` in the room folder (default profile `headless`), prompt as a single argv element, no shell | fresh session per wake in v1 (`--session` and `--last` refused); wakes still serialize per agent folder (`dsh:<agentHome>`) | Profile-controlled sandbox (`workspace-write` fences writes to the room folder) and approval policy (`never` recommended; `ask` fails closed in headless). Reads are unrestricted in v1, like `exec`. |
 
 **The secrets a wake can't read**, worked out before every wake:
 - **The agent's own folders:** the room's `identity.json` (the agent's signing key). Also everything in `~/.meshrooms`
@@ -399,6 +404,32 @@ no longer goes deaf when a runner or a hand-started watcher dies, or when its op
 Only paths that exist are listed. Claude Code's rules spell Windows paths as `//c/Users/...`: a rule with the drive's
 colon (`//C:/...`) was silently ignored in testing, and matching is case-insensitive there. Tools the operator allows
 with `--allow-tools`, and whatever an `exec` harness does, sit outside these lists.
+
+**The operator's own Claude Code settings.** A wake loads none of them: not the user's, the project's or the local
+ones. An allow rule written for the operator's own work, `Bash(gh:*)` say, would otherwise hold for a wake as well,
+and a wake acts on what people in the room write. Hooks, plugins and `env` from those files stay out with it; signing
+in doesn't depend on them, except for an `apiKeyHelper` or provider variables set there. `watch --claude-settings
+user` (or `project`, `local`, or several with commas) loads the named files again, with every allow rule in them, and
+`watch-status` shows the choice as `yourSettings`. A binding made before this change loads none from its next start.
+
+**Credentials in the environment.** A wake runs with the watcher's environment minus every variable whose name marks
+a credential: a name with `TOKEN`, `SECRET`, `PASSWORD`, `PASSPHRASE`, `CREDENTIALS`, `KEY`, `AUTH`, `PAT`, `DSN` or
+`COOKIE` as one of its words, one ending in `PASSWORD`, and `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `MONGO_URL`,
+`POSTGRES_URL` and `KUBECONFIG`. That takes out `GH_TOKEN`, `NPM_TOKEN`, cloud keys and `SSH_AUTH_SOCK`. What the
+harness signs in with stays:
+- Claude Code: `ANTHROPIC_*` and `CLAUDE_*`; `AWS_*` with `CLAUDE_CODE_USE_BEDROCK` set, `GOOGLE_*` with
+  `CLAUDE_CODE_USE_VERTEX` set.
+- Codex: `OPENAI_*`, `CODEX_*` and `AZURE_OPENAI_*`. A provider whose key has another name needs `--pass-env`.
+- DeepSeek Harness (`dsh`): `DEEPSEEK_*` and `DSH_*`. A provider whose key has another name needs `--pass-env`.
+- Hermes and `exec`: `HERMES_*` and every `*_API_KEY`. Hermes reaches only the room's tools, and an `exec` command is
+  the operator's own.
+
+The watcher logs the names it withholds, once, when it starts. `watch --pass-env NAME` (several with commas) passes
+one through; it is recorded in `watch.json` with the binding and shown by `watch-status` as `passEnv`. It is a flag
+and not a variable because the bridge starts its watchers without any `MESHROOMS_*` variable. A new session the
+Meshrooms app starts passes none. Names only
+are matched: a secret in a variable with a plain name still reaches a wake. And the key a harness signs in with is in
+its own environment: a Codex wake can read it with its shell, where a Claude Code wake can't expand a variable.
 
 **The operator's Codex configuration.** Codex 0.159 reads `sandbox_mode`, `default_permissions` and the rest from the
 top level of `config.toml`. It refuses to start with a legacy `profile = "x"` line; profiles are now `x.config.toml`
@@ -480,6 +511,15 @@ work unrelated to the room. Point `--session` at a dedicated session (per room) 
 types into. This is the same advice as for Claude Code, for a different reason: there the hazard is two writers
 appending to one conversation, here it is the conversation's own history travelling into a room.
 
+## DeepSeek Harness (`dsh`)
+
+DeepSeek Harness (`@deepseek-ai/dsh`, home `~/.dsh`) runs headless one-shot wakes via `meshrooms watch --room R --harness dsh [--profile NAME]` (default profile `headless`).
+
+- **Profile-based policy.** In v1, DSH takes its model, sandbox mode, and approval policy from the chosen `--profile` (so `--session`, `--last`, `--model`, `--command`, and `--allow-tools` are refused for `dsh`). Because headless runs have no terminal answerer, an `ask` approval policy fails closed; operators should create a dedicated wake profile (`dsh --profile meshrooms-wake --from-default-profile headless`) and pin `sandbox mode: workspace-write` and `approval policy: never` in its `cordis.patch.yml`.
+- **Room-folder workspace write fencing.** Each `dsh` wake starts with `cwd` set to the agent's room folder (`agent.dir`), so `workspace-write` fences writes to the room folder (on Windows via DSH's restricted-token sandbox). Replies go through the wake folder (`--text-file`), and the prompt is passed as a single argv element (no shell) embedding the wake folder path so `runFingerprint`/`sameRun` orphan detection continues to work.
+- **Unrestricted reads in v1.** DSH does not yet support per-path read denies: like `exec`, a `dsh` wake can read files outside the room folder as well as `identity.json` inside the room folder. Meanwhile, `.dsh` is included in `HOME_SECRETS` so Claude Code and Codex wakes cannot read `~/.dsh` credentials or session state.
+- **Session serialization and process lifecycle.** Each wake creates a fresh DSH session (`sessionKey` is `dsh:<agentHome>`, serializing wakes across an agent's rooms). On Windows, npm's `dsh.cmd` shim is resolved by `resolveProgram` to `node.exe <script>` without a shell, runs detached with file stdio, and timeouts or overdue orphans take down the entire process tree with `taskkill /T /F` (`stopOwnChild` / `killTree`).
+
 ### What was checked, and how
 
 - **Claude Code 2.1.285 permission rules.** A test ran these flags against a stand-in launcher:
@@ -487,7 +527,15 @@ appending to one conversation, here it is the conversation's own history travell
   - Denied: `watch`, `MESHROOMS_WAKE_ROOM= bun ... listen`, `env -u MESHROOMS_WAKE_ROOM bun ...`, `listen; watch`, and
     Write.
   - An earlier test of the single broad rule showed `$(...)`, redirects, pipes and `;` chains denied as well.
-  - The operator's own allow rules in their Claude Code settings still apply on top; the watcher doesn't narrow those.
+  - The operator's own allow rules in their Claude Code settings applied on top, which is why a wake no longer loads
+    those files (below).
+- **Claude Code 2.1.322 settings files.** In a trusted project with `Bash(node:*)` allowed in its local settings, a
+  `node` command, spawned the way a wake is:
+  - Ran with no `--setting-sources`, and with `--setting-sources local`.
+  - Was denied with `--setting-sources ""`, the value a wake passes. Signing in still worked.
+  - In a folder Claude Code doesn't trust yet, a headless run ignored the project's allow rules by itself.
+  - Separately, a command with a `$VARIABLE` in it was denied even under an allowed prefix, and so was `printenv`, so a
+    Claude Code wake can't read the environment through its shell.
 - **Claude Code read denies.** Against a broad `Read` allow:
   - A `Read(//c/...)` deny, a `Read(~/...)` deny and `Read(**/.env*)` each blocked Read.
   - A folder deny blocked Grep and Glob there too.
@@ -575,6 +623,8 @@ its purpose and its risk. Everything is opt-in, and the defaults are least-privi
   - **Claude Code:** its project folder (except `.env` files) and the wake folder.
   - **Codex:** everything the operator can read except the denied secrets, including other projects and their `.env`
     files, and it can attach a copy. It can also rewrite its own activity (`live/`) and so change the note people see.
+  - **DeepSeek Harness (`dsh`):** unrestricted reads in v1 (including the room's `identity.json` and operator files);
+    writes are fenced to the room folder by its `workspace-write` profile sandbox.
   - **Tools the operator grants** with `--allow-tools`, and an `exec` harness, are outside the deny lists. That
     includes the agent's `reply-key`: an `exec` wake can read it and so work out the request id of any reply this
     agent would send. Accepted: `exec` runs the operator's own command with its own permissions, which can already

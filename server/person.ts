@@ -12,14 +12,14 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { ADMISSION_FILE, BrowserAgent, PERSON_STATUS_FILE, RUNNER_ALIVE, parseRoomUrl, pickDecision, replaceFile, roomClosed, type PersonStatus } from './browser-agent';
+import { ADMISSION_FILE, BrowserAgent, PERSON_STATUS_FILE, RUNNER_ALIVE, parseRoomUrl, pickDecision, replaceFile, roomClosed, safeIso, type PersonStatus } from './browser-agent';
 import { agentHomesFile } from './agent-watch';
 import { MAX_MESSAGE_ATTACHMENTS, attachmentRef, isSha256, shownText, type AttachmentRef } from '../src/browser/files';
 import { MAX_PENDING_ATTACHMENTS } from '../src/attachments';
 import { foldBoard, taskBody, validTaskBody, type TaskChange } from '../src/browser/board';
 import type { TaskStatus } from '../src/collab';
 import { castVote, openDecision, reviseDecision, type DecisionMode } from '../src/browser/decisions';
-import { MAX_REACTION_KEYS_PER_MEMBER, isReactionEmoji, liveKeysForMember, memberReacted } from '../src/browser/reactions';
+import { isReactionEmoji } from '../src/browser/reactions';
 import { isRetracted } from '../src/browser/retractions';
 import { countUnread } from '../src/browser/unread';
 import { DEVICE_ID, PAIRING_MAX_ROOMS, decodeSecret, pairingMessage, pairingName } from '../src/browser/pairing';
@@ -497,7 +497,7 @@ export function localMessages(agent: BrowserAgent, stored = agent.messages()): L
   return stored.map(({ packet: { body }, retracted }) => {
     const author = names.get(body.memberId);
     return { id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human', own: body.memberId === memberId,
-      text: shownText(body), at: new Date(body.at).toISOString(), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(retracted ? { deleted: true as const } : {}),
+      text: shownText(body), at: safeIso(body.at), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(retracted ? { deleted: true as const } : {}),
       ...(body.attachments?.length ? { attachments: body.attachments.map(({ id, name, type, size }) => ({ id, name, type, size })) } : {}) };
   });
 }
@@ -524,10 +524,12 @@ export function roomSummary(room: PersonRoom, agent: BrowserAgent, now = Date.no
   const counted = memberId ? countUnread(bodies, position, memberId, members) : { unread: 0, mentions: 0 };
   const status = memberId ? personRoomStatus(agent) : undefined;
   const waiting = status?.ownerId === memberId ? (status?.requests ?? []).filter(r => r.state === 'pending').map(r => ({ id: r.id, name: r.name, kind: r.kind })) : [];
+  let latest = 0;
+  for (const m of messages) if (Number.isFinite(m.packet.body.at)) latest = Math.max(latest, m.packet.body.at);
   return { roomId: room.roomId, origin: room.origin, kind: room.kind, title: title ?? null, ...state,
     connected: typeof proof?.at === 'number' && now - proof.at < 15_000,
     unread: counted.unread, mentions: counted.mentions, ...(waiting.length ? { waiting } : {}),
-    lastMessageAt: messages.length ? new Date(Math.max(...messages.map(m => m.packet.body.at))).toISOString() : null,
+    lastMessageAt: messages.length ? safeIso(latest) : null,
     members: roomMembers(agent) };
 }
 /**
@@ -661,9 +663,6 @@ export async function queueReaction(agent: BrowserAgent, input: { requestId?: un
   if (typeof input.messageId !== 'string' || !agent.messages().some(m => m.packet.body.id === input.messageId && !isRetracted(m))) throw httpError(404, 'That message is not in this room.');
   const done = () => agent.reactionOps().some(p => p.body.id === id);
   if (!done()) {
-    const already = memberReacted(agent.reactionChips(), input.messageId, input.emoji, memberId);
-    if (!already && liveKeysForMember(agent.countedReactions(), memberId) >= MAX_REACTION_KEYS_PER_MEMBER)
-      throw httpError(409, 'You have too many reactions in this room. Remove some before adding more.');
     enqueue(agent, id, { type: 'reaction', id, messageId: input.messageId, emoji: input.emoji });
   }
   return { messageId: input.messageId, status: await signed(agent, id, done) };
@@ -692,7 +691,13 @@ export async function queueDecision(agent: BrowserAgent, input: Record<string, u
     if (action === 'open') {
       const mode: DecisionMode = input.mode === 'plan-review' ? 'plan-review' : 'choice';
       const options = Array.isArray(input.options) && input.options.every(o => typeof o === 'string') ? input.options as string[] : [];
-      const askAgents = typeof input.askAgents === 'boolean' ? input.askAgents : false;
+      let askAgents: boolean | string[] = false;
+      if (typeof input.askAgents === 'boolean') askAgents = input.askAgents;
+      else if (Array.isArray(input.askAgents)) {
+        if (input.askAgents.length > 16 || !input.askAgents.every(v => typeof v === 'string' && UUID.test(v)))
+          throw new Error('Choose up to 16 agents from this room.');
+        askAgents = [...new Set(input.askAgents)];
+      } else if (input.askAgents !== undefined) throw new Error('Choose whether to ask agents for advice.');
       const closesAt = typeof input.closesAt === 'number' && Number.isSafeInteger(input.closesAt) ? input.closesAt : null;
       if (typeof input.question !== 'string' || (input.context !== undefined && typeof input.context !== 'string')) throw new Error('Ask a question.');
       const decisionId = randomUUID(), context = (input.context as string | undefined) ?? '';

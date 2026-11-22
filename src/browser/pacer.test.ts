@@ -6,7 +6,7 @@ function channel() {
   return { readyState: 'open', bufferedAmount: 0, sent: [] as string[], send(text: string) { this.sent.push(text); this.bufferedAmount += text.length; } };
 }
 
-describe('paced sync (SYNC-3)', () => {
+describe('paced sync', () => {
   test('sends only while the send buffer is under the high-water mark, and the rest when it drains', () => {
     const c = channel(), queue = new SendQueue(c);
     const chunks = Array.from({ length: 20 }, (_, i) => `${i}`.padEnd(15_000, 'x'));

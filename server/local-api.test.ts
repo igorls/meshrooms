@@ -397,15 +397,17 @@ test('a command the page asks for is signed for the room in its path, by the per
   const elsewhere = crypto.randomUUID();
   expect((await command('settings', { floor: 'open', roomId: elsewhere })).status).toBe(200);
   expect((await command('request', { kind: 'person', name: 'Robin', label: 'Totally not the app' })).status).toBe(200);
-  const [settings, request] = service.commands;
+  expect((await command('transfer-host', { memberId: elsewhere })).status).toBe(200);
+  const [settings, request, transfer] = service.commands;
   const identity = personIdentity(home)!;
-  for (const signed of [settings, request]) {
+  for (const signed of [settings, request, transfer]) {
     expect(signed.command.roomId).toBe(roomId);
     expect(signed.command.origin).toBe(service.origin);
     expect(signed.publicKey).toBe(identity.publicKey);
   }
   expect(settings.command).toMatchObject({ action: 'settings', payload: { floor: 'open', roomId: elsewhere } });
   expect(request.command).toMatchObject({ action: 'request', payload: { kind: 'person', name: 'Robin', label: 'Meshrooms app' } });
+  expect(transfer.command).toMatchObject({ action: 'transfer-host', payload: { memberId: elsewhere } });
 });
 
 test('the events long poll reports new messages and member changes in order, and a stale cursor resets', async () => {

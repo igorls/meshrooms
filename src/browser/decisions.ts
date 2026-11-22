@@ -65,11 +65,13 @@ export const MAX_OPTIONS = 8;
 export const PLAN_REVIEW_OPTIONS: Omit<DecisionOption, 'addedBy'>[] = [
   { id: 'approve', label: 'Approve' }, { id: 'changes', label: 'Request changes' }, { id: 'reject', label: 'Reject' }];
 const SYNC_CHUNK_CHARS = 15_000;
+/** The latest time a Date can hold; a signed time past it is refused (formatting it throws). */
+const MAX_TIME = 8_640_000_000_000_000;
 const uuid = (v: unknown) => typeof v === 'string' && /^[a-f0-9-]{36}$/.test(v);
 const optionId = (v: unknown) => typeof v === 'string' && /^[a-z0-9-]{1,36}$/.test(v);
 const text = (v: unknown, max: number, required = false) => typeof v === 'string' && v.length <= max && (!required || !!v.trim());
 const stamp = (b: any, roomId: string) => !!b && b.roomId === roomId && uuid(b.id) && uuid(b.decisionId) && uuid(b.memberId) && uuid(b.createdBy)
-  && typeof b.deviceId === 'string' && /^[a-f0-9]{64}$/.test(b.deviceId) && Number.isSafeInteger(b.at) && b.at > 0
+  && typeof b.deviceId === 'string' && /^[a-f0-9]{64}$/.test(b.deviceId) && Number.isSafeInteger(b.at) && b.at > 0 && b.at <= MAX_TIME
   && Number.isSafeInteger(b.revision) && b.revision >= 1 && b.revision <= 1_000_000;
 
 function validOutcome(o: any) {
@@ -77,6 +79,13 @@ function validOutcome(o: any) {
     && !!o.tally && typeof o.tally === 'object' && Object.entries(o.tally).length <= MAX_OPTIONS
     && Object.entries(o.tally).every(([k, n]) => optionId(k) && Number.isSafeInteger(n) && (n as number) >= 0)
     && Number.isSafeInteger(o.voters) && o.voters >= 0 && Number.isSafeInteger(o.people) && o.people >= 0;
+}
+function outcomeMatchesCounted(options: DecisionOption[], counted: Counted[], outcome: Outcome) {
+  if (outcome.people < counted.length) return false;
+  if (!counted.every(c => options.some(o => o.id === c.optionId))) return false;
+  const expected = tallyVotes(options, counted.map(c => ({ op: c.vote, memberId: c.memberId, optionId: c.optionId, comment: '', at: 0, counts: true })), outcome.people).tally;
+  return JSON.stringify(expected.tally) === JSON.stringify(outcome.tally) && expected.voters === outcome.voters && expected.result === outcome.result
+    && JSON.stringify([...expected.optionIds].sort()) === JSON.stringify([...outcome.optionIds].sort());
 }
 export function validDecisionBody(b: any, roomId: string): b is DecisionBody {
   return stamp(b, roomId) && b.kind === 'decision' && text(b.question, 200, true) && text(b.context, 4000) && ['choice', 'plan-review'].includes(b.mode)
@@ -86,8 +95,8 @@ export function validDecisionBody(b: any, roomId: string): b is DecisionBody {
     && (b.mode !== 'plan-review' || (b.options.length === PLAN_REVIEW_OPTIONS.length
       && PLAN_REVIEW_OPTIONS.every((o, i) => b.options[i].id === o.id && b.options[i].label === o.label)))
     && (typeof b.askAgents === 'boolean' || (Array.isArray(b.askAgents) && b.askAgents.length <= 16 && b.askAgents.every(uuid)))
-    && (b.closesAt === null || (Number.isSafeInteger(b.closesAt) && b.closesAt > 0)) && ['open', 'closed', 'withdrawn'].includes(b.state)
-    && (b.state === 'closed' ? validOutcome(b.outcome) && validCounted(b.counted) : b.outcome === undefined && b.counted === undefined)
+    && (b.closesAt === null || (Number.isSafeInteger(b.closesAt) && b.closesAt > 0 && b.closesAt <= MAX_TIME)) && ['open', 'closed', 'withdrawn'].includes(b.state)
+    && (b.state === 'closed' ? validOutcome(b.outcome) && validCounted(b.counted) && outcomeMatchesCounted(b.options, b.counted, b.outcome) : b.outcome === undefined && b.counted === undefined)
     && (b.revision !== 1 || b.memberId === b.createdBy);
 }
 function validCounted(c: any) {
@@ -115,6 +124,15 @@ function steward(room: RoomMembers, creator: string, memberId: string) {
 function honestClose(next: DecisionBody, held: Map<string, VoteBody>, latest: Map<string, VoteBody>, room: RoomMembers) {
   const counted = next.counted!, outcome = next.outcome!;
   if (outcome.people < counted.length) return false;
+  // COL-3: A close claiming zero votes (`counted: []`) cannot silently drop held human votes as uncounted.
+  if (counted.length === 0) {
+    const prefix = `${next.createdBy}:${next.decisionId}:`;
+    for (const [ballotKey, vote] of latest) {
+      if (!ballotKey.startsWith(prefix)) continue;
+      if (vote.optionId === null || !next.options.some(o => o.id === vote.optionId)) continue;
+      if (room.members.some(m => m.id === vote.memberId && (m.role ?? 'human') === 'human')) return false;
+    }
+  }
   for (const c of counted) {
     const vote = held.get(c.vote);
     if (vote && (vote.memberId !== c.memberId || vote.optionId !== c.optionId || vote.decisionId !== next.decisionId || vote.createdBy !== next.createdBy)) return false;
@@ -124,9 +142,7 @@ function honestClose(next: DecisionBody, held: Map<string, VoteBody>, latest: Ma
     if (room.members.some(m => m.id === c.memberId && m.role === 'agent') || room.former?.some(m => m.id === c.memberId && m.role === 'agent')) return false;
     if (!next.options.some(o => o.id === c.optionId)) return false;
   }
-  const expected = tallyVotes(next.options, counted.map(c => ({ op: c.vote, memberId: c.memberId, optionId: c.optionId, comment: '', at: 0, counts: true })), outcome.people).tally;
-  return JSON.stringify(expected.tally) === JSON.stringify(outcome.tally) && expected.voters === outcome.voters && expected.result === outcome.result
-    && JSON.stringify([...expected.optionIds].sort()) === JSON.stringify([...outcome.optionIds].sort());
+  return outcomeMatchesCounted(next.options, counted, outcome);
 }
 
 /** Whether `next` may follow `current`: options only grow, only stewards change the terms or close, and closing is final and honest. */
@@ -138,6 +154,8 @@ function extends_(current: DecisionBody, next: DecisionBody, room: RoomMembers, 
   if (added.length && (current.mode === 'plan-review' || added.some(o => o.addedBy !== next.memberId))) return false;
   const terms = next.question !== current.question || next.context !== current.context || next.closesAt !== current.closesAt
     || JSON.stringify(next.askAgents) !== JSON.stringify(current.askAgents) || next.state !== 'open';
+  // COL-2: Reject no-op revisions that neither add an option nor change terms/state.
+  if (!added.length && !terms) return false;
   // Stewardship follows the creator, never whoever signed the latest revision (e.g. by adding an option).
   return !terms || steward(room, current.createdBy, next.memberId);
 }
@@ -178,11 +196,12 @@ export function foldDecisions(ops: (DecisionBody | VoteBody)[], room: RoomMember
       .map(v => ({ op: v.id, memberId: v.memberId, optionId: v.optionId, comment: v.comment, at: v.at, counts: roleOf(v.memberId) === 'human' }));
     const live = tallyVotes(current.options, votes, people.length);
     const pinned = new Set((current.counted || []).map(c => c.vote));
+    const uncounted = current.state === 'closed' ? votes.filter(v => v.counts && v.optionId !== null && !pinned.has(v.op)).length : 0;
+    const verified = [...pinned].every(op => held.has(op)) && !(current.state === 'closed' && pinned.size === 0 && uncounted > 0);
     decisions.push({ key, id: first.decisionId, question: current.question, context: current.context, mode: current.mode, options: current.options, askAgents: current.askAgents,
       closesAt: current.closesAt, state: current.state, ...(current.outcome ? { outcome: current.outcome } : {}), createdBy: first.memberId, createdAt: first.at,
       updatedAt: current.at, revision: current.revision, votes, tally: current.outcome ?? live.tally, settled: current.state !== 'open' || live.settled,
-      verified: [...pinned].every(op => held.has(op)),
-      uncounted: current.state === 'closed' ? votes.filter(v => v.counts && v.optionId !== null && !pinned.has(v.op)).length : 0 });
+      verified, uncounted });
   }
   return decisions.sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
 }
@@ -204,14 +223,28 @@ export function openDecision(a: Author & { question: string; context?: string; m
 }
 /** The next revision of a decision: an added option, or closing it with the tally as this device sees it. */
 export function reviseDecision(a: Author, current: Decision, change: { addOption?: string; close?: boolean; withdraw?: boolean }): DecisionBody {
-  if (change.addOption !== undefined && current.mode === 'plan-review') throw new Error('Plan reviews keep Approve / Request changes / Reject.');
-  const options = change.addOption ? [...current.options, { id: crypto.randomUUID().slice(0, 8), label: change.addOption.trim(), addedBy: a.memberId }] : current.options;
+  const hasAdd = change.addOption !== undefined;
+  const label = hasAdd ? change.addOption!.trim() : '';
+  if (hasAdd && current.mode === 'plan-review') throw new Error('Plan reviews keep Approve / Request changes / Reject.');
+  if (hasAdd && !label) throw new Error('Give the new option a label.');
+  if (change.close && change.withdraw) throw new Error('Choose either close or withdraw, not both.');
+  if (!hasAdd && !change.close && !change.withdraw) throw new Error('Specify a change: add an option, close, or withdraw the decision.');
+  const options = hasAdd ? [...current.options, { id: crypto.randomUUID().slice(0, 8), label, addedBy: a.memberId }] : current.options;
   const state: DecisionState = change.withdraw ? 'withdrawn' : change.close ? 'closed' : 'open';
-  // A close pins the people's votes it counted, so every device can check the outcome adds up.
-  const counted: Counted[] = current.votes.filter(v => v.counts && v.optionId !== null).map(v => ({ vote: v.op, memberId: v.memberId, optionId: v.optionId! }));
+  // COL-3: A close pins every held human vote for a valid option (one per member) and computes the outcome directly from them.
+  const byMember = new Map<string, Counted>();
+  for (const v of current.votes) {
+    if (v.counts && v.optionId !== null && options.some(o => o.id === v.optionId)) {
+      byMember.set(v.memberId, { vote: v.op, memberId: v.memberId, optionId: v.optionId });
+    }
+  }
+  const counted: Counted[] = [...byMember.values()];
+  const outcome = state === 'closed'
+    ? tallyVotes(options, counted.map(c => ({ op: c.vote, memberId: c.memberId, optionId: c.optionId, comment: '', at: 0, counts: true })), Math.max(current.tally.people, counted.length)).tally
+    : undefined;
   const body: DecisionBody = { kind: 'decision', ...stampOf(a), createdBy: current.createdBy, decisionId: current.id, revision: current.revision + 1, question: current.question,
     context: current.context, mode: current.mode, options, askAgents: current.askAgents, closesAt: current.closesAt, state,
-    ...(state === 'closed' ? { outcome: current.tally, counted } : {}) };
+    ...(state === 'closed' ? { outcome, counted } : {}) };
   if (!validDecisionBody(body, a.roomId)) throw new Error('Options have up to 120 characters, and a decision has at most 8.');
   return body;
 }
@@ -288,4 +321,19 @@ export function compactDecisions<T extends { body: DecisionBody | VoteBody }>(pa
   }
   const keep = new Set([...latest.values()].map(v => v.id));
   return packets.filter(({ body }) => body.kind === 'decision' || keep.has(body.id) || pinned.has(body.id));
+}
+
+/**
+ * Format a task title from a closed decision (`Question → Chosen`), budgeting space for ` → Chosen` first so
+ * truncation to `max` characters never cuts off the chosen outcome.
+ */
+export function decisionTaskTitle(question: string, chosen: string, max = 120): string {
+  const q = question.trim().replace(/\s*\?\s*$/, '');
+  const c = chosen.trim();
+  if (!c) return q.length > max ? `${q.slice(0, max - 1).trimEnd()}…` : q;
+  const suffix = ` → ${c}`;
+  if (q.length + suffix.length <= max) return `${q}${suffix}`;
+  const budget = max - suffix.length;
+  if (budget <= 1) return c.length > max ? `${c.slice(0, max - 1).trimEnd()}…` : c;
+  return `${q.slice(0, budget - 1).trimEnd()}…${suffix}`;
 }

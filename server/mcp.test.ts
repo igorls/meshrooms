@@ -119,6 +119,108 @@ describe('MCP server — the wake folder is the only place files may come from',
   });
 });
 
+describe('MCP server — vote and task-update parameters, and unsafe/extra inputs', () => {
+  const REQ = '3f2a9c1e-0000-4000-8000-000000000010';
+  const DEC = '3f2a9c1e-0000-4000-8000-000000000020';
+  const MSG = '3f2a9c1e-0000-4000-8000-000000000030';
+  const TASK = '3f2a9c1e-0000-4000-8000-000000000040';
+
+  test('vote advertises optional reply_to and wires --reply-to through toolArgv and tools/call', async () => {
+    const schema = TOOL_SCHEMAS.vote.schema;
+    expect(schema.properties).toHaveProperty('reply_to');
+    expect(schema.required).not.toContain('reply_to');
+    expect(schema.additionalProperties).toBe(false);
+
+    expect(toolArgv('vote', { request_id: REQ, decision: DEC, option: 'opt-1', comment: 'looks good', reply_to: MSG }, ROOM))
+      .toEqual(['vote', '--room', ROOM, '--request-id', REQ, '--decision', DEC, '--option', 'opt-1', '--comment', 'looks good', '--reply-to', MSG]);
+    expect(toolArgv('vote', { request_id: REQ, decision: DEC, option: 'opt-1' }, ROOM)).not.toContain('--reply-to');
+
+    const rec = recorder();
+    const out: any = await handleMessage({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'vote', arguments: { request_id: REQ, decision: DEC, option: 'opt-1', reply_to: MSG } },
+    }, { room: ROOM, call: rec.call });
+    expect(out.error).toBeUndefined();
+    expect(out.result.isError).toBeUndefined();
+    expect(rec.calls).toEqual([['vote', '--room', ROOM, '--request-id', REQ, '--decision', DEC, '--option', 'opt-1', '--reply-to', MSG]]);
+  });
+
+  test('task-update advertises optional issue and wires --issue for linking and unlinking', async () => {
+    const schema = TOOL_SCHEMAS['task-update'].schema;
+    expect(schema.properties).toHaveProperty('issue');
+    expect(schema.required).not.toContain('issue');
+    expect(schema.additionalProperties).toBe(false);
+
+    expect(toolArgv('task-update', { request_id: REQ, task: TASK, revision: 2, status: 'doing', issue: 'owner/repo#42' }, ROOM))
+      .toEqual(['task-update', '--room', ROOM, '--request-id', REQ, '--task', TASK, '--revision', '2', '--status', 'doing', '--issue', 'owner/repo#42']);
+    expect(toolArgv('task-update', { request_id: REQ, task: TASK, issue: 'https://github.com/owner/repo/issues/42' }, ROOM))
+      .toEqual(['task-update', '--room', ROOM, '--request-id', REQ, '--task', TASK, '--issue', 'https://github.com/owner/repo/issues/42']);
+    expect(toolArgv('task-update', { request_id: REQ, task: TASK, issue: 'none' }, ROOM))
+      .toEqual(['task-update', '--room', ROOM, '--request-id', REQ, '--task', TASK, '--issue', 'none']);
+    expect(toolArgv('task-update', { request_id: REQ, task: TASK, status: 'done' }, ROOM)).not.toContain('--issue');
+
+    const rec = recorder();
+    for (const issue of ['owner/repo#42', 'none']) {
+      const out: any = await handleMessage({
+        jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name: 'task-update', arguments: { request_id: REQ, task: TASK, issue } },
+      }, { room: ROOM, call: rec.call });
+      expect(out.error).toBeUndefined();
+      expect(out.result.isError).toBeUndefined();
+    }
+    expect(rec.calls).toEqual([
+      ['task-update', '--room', ROOM, '--request-id', REQ, '--task', TASK, '--issue', 'owner/repo#42'],
+      ['task-update', '--room', ROOM, '--request-id', REQ, '--task', TASK, '--issue', 'none'],
+    ]);
+  });
+
+  test('additional/unknown properties are never forwarded to argv', () => {
+    expect(toolArgv('vote', { request_id: REQ, decision: DEC, option: 'opt-1', room: 'other', comment_file: '/etc/passwd', extra: 'x' }, ROOM))
+      .toEqual(['vote', '--room', ROOM, '--request-id', REQ, '--decision', DEC, '--option', 'opt-1']);
+    expect(toolArgv('task-update', { request_id: REQ, task: TASK, room: 'other', notes_file: '/etc/passwd', extra: 'x' }, ROOM))
+      .toEqual(['task-update', '--room', ROOM, '--request-id', REQ, '--task', TASK]);
+    // tasks and status do not accept --all (only decisions does).
+    expect(toolArgv('tasks', { all: true }, ROOM)).toEqual(['tasks', '--room', ROOM]);
+    expect(toolArgv('status', { all: true, note: 'hi' }, ROOM)).toEqual(['status', '--room', ROOM]);
+    expect(toolArgv('decisions', { all: true }, ROOM)).toEqual(['decisions', '--room', ROOM, '--all']);
+    expect(toolArgv('decisions', { all: 'false' }, ROOM)).toEqual(['decisions', '--room', ROOM]);
+    expect(toolArgv('listen', { peek: 'false' }, ROOM)).toEqual(['listen', '--room', ROOM]);
+    expect(toolArgv('attachment', { id: 'a1', out: '/tmp/escape' }, ROOM)).toEqual(['attachment', '--room', ROOM, '--id', 'a1']);
+  });
+
+  test('stdin "-" is refused on every TEXT_OPTIONS field, and non-array options or non-object arguments are rejected', async () => {
+    const stdinCases: [Parameters<typeof toolArgv>[0], Record<string, unknown>][] = [
+      ['send', { request_id: REQ, text: '-' }],
+      ['send', { request_id: REQ, text: ' - ' }],
+      ['task-add', { request_id: REQ, title: 't', notes: '-' }],
+      ['task-update', { request_id: REQ, task: TASK, notes: '-' }],
+      ['vote', { request_id: REQ, decision: DEC, option: 'opt-1', comment: '-' }],
+      ['ask', { request_id: REQ, question: '-', options: ['a', 'b'] }],
+      ['ask', { request_id: REQ, question: 'q', options: ['a', 'b'], context: ' - ' }],
+    ];
+    for (const [tool, args] of stdinCases) {
+      expect(() => toolArgv(tool, args, ROOM)).toThrow('stdin');
+      const out: any = await handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: tool, arguments: args } }, { room: ROOM, call: recorder().call });
+      expect(out.error).toBeUndefined();
+      expect(out.result.isError).toBe(true);
+      expect(out.result.content[0].text).toContain('stdin');
+    }
+
+    const badOptions: any = await handleMessage({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'ask', arguments: { request_id: REQ, question: 'q', options: 'ab' } },
+    }, { room: ROOM, call: recorder().call });
+    expect(badOptions.result.isError).toBe(true);
+    expect(badOptions.result.content[0].text).toContain('--option');
+
+    const badArgs: any = await handleMessage({
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'status', arguments: ['--room', 'other'] },
+    }, { room: ROOM, call: recorder().call });
+    expect(badArgs.error.code).toBe(-32602);
+  });
+});
+
 describe('MCP server — the transport', () => {
   test('an unknown tool is refused and the refusal names the available ones', async () => {
     const out: any = await handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'run', arguments: {} } }, { room: ROOM, call: recorder().call });

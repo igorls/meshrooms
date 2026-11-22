@@ -39,6 +39,7 @@ describe('browser reactions', () => {
     expect(isReactionEmoji('🚀')).toBe(false);
     expect(validReactionBody(op({ id: '44444444-4444-4444-8444-444444444444', memberId: alice, emoji: '👍', revision: 1, at: 1 }), room)).toBe(true);
     expect(validReactionBody(op({ id: '44444444-4444-4444-8444-444444444444', memberId: alice, emoji: '👍', revision: 0, at: 1 }), room)).toBe(false);
+    expect(validReactionBody(op({ id: '44444444-4444-4444-8444-444444444444', memberId: alice, emoji: '👍', revision: 1, at: Number.MAX_SAFE_INTEGER }), room)).toBe(false);
   });
 
   test('folds by revision, not wall clock, so a corrected clock cannot resurrect a removal', () => {
@@ -101,5 +102,56 @@ describe('browser reactions', () => {
     }
     expect(chunks.flatMap(c => c.ops)).toEqual(packets);
     expect(reactionSyncChunks(room, [])).toEqual([]);
+  });
+});
+
+describe('forgotten reaction removals', () => {
+  const msg = (i: number) => `44444444-4444-4444-8444-${String(i).padStart(12, '0')}`;
+  const id = (n: number) => `55555555-5555-4555-8555-${String(n).padStart(12, '0')}`;
+  let next = 0;
+  const packet = (body: Omit<ReactionBody, 'kind' | 'roomId' | 'deviceId' | 'id'>): ReactionPacket => ({ body: { kind: 'reaction', roomId: room, deviceId: device, id: id(++next), ...body }, signature: 's' });
+  /** A reaction given at `at` and taken back a moment later. */
+  const takenBack = (memberId: string, i: number, at: number) => [
+    packet({ memberId, messageId: msg(i), emoji: '👀', revision: 1, at }), packet({ memberId, messageId: msg(i), emoji: '👀', revision: 2, removed: true, at: at + 1 })];
+
+  test('each member keeps their newest removals; live reactions and other members are untouched', () => {
+    const bobs = Array.from({ length: 30 }, (_, i) => takenBack(bob, i, 1000 + i * 10)).flat();
+    const alices = takenBack(alice, 0, 5000);
+    const live = packet({ memberId: alice, messageId: msg(1), emoji: '👍', revision: 1, at: 6000 });
+    const all = [...bobs, ...alices, live];
+    const compacted = compactReactions(all, 10);
+    const removed = compacted.filter(p => p.body.removed);
+    expect(removed.filter(p => p.body.memberId === bob).map(p => p.body.messageId)).toEqual(Array.from({ length: 10 }, (_, i) => msg(20 + i)));
+    expect(removed.filter(p => p.body.memberId === alice)).toHaveLength(1);
+    // The chips are the same: forgetting a removal leaves its reaction not given.
+    expect(foldReactions(compacted.map(p => p.body))).toEqual(foldReactions(all.map(p => p.body)));
+    expect(compactReactions([...all].reverse(), 10).map(p => p.body.id).sort()).toEqual(compacted.map(p => p.body.id).sort());
+  });
+
+  test('a reaction given again after its removal was forgotten shows on every device', () => {
+    const [given, removal] = takenBack(bob, 0, 1000);
+    const newer = Array.from({ length: 3 }, (_, i) => takenBack(bob, 10 + i, 2000 + i * 10)).flat();
+    // Bob's own device has forgotten the removal and signs revision 1 again; another device still holds it.
+    const again = packet({ memberId: bob, messageId: msg(0), emoji: '👀', revision: 1, at: 9000 });
+    const remembering = [given, removal, ...newer, again];
+    expect(memberReacted(foldReactions(remembering.map(p => p.body)), msg(0), '👀', bob)).toBe(false);
+    // Once that device compacts and forgets the removal too, the newer reaction stands, as on Bob's device.
+    expect(memberReacted(foldReactions(compactReactions(remembering, 3).map(p => p.body)), msg(0), '👀', bob)).toBe(true);
+    // The reaction given before the removal does not come back.
+    expect(memberReacted(foldReactions(compactReactions([given, removal, ...newer], 3).map(p => p.body)), msg(0), '👀', bob)).toBe(false);
+    // Taken back again after that: still not given.
+    const backAgain = packet({ memberId: bob, messageId: msg(0), emoji: '👀', revision: 2, removed: true, at: 9500 });
+    expect(memberReacted(foldReactions(compactReactions([...remembering, backAgain], 3).map(p => p.body)), msg(0), '👀', bob)).toBe(false);
+  });
+
+  test('one member reacting and taking it back on every message cannot fill the log', () => {
+    let log: ReactionPacket[] = [];
+    for (let i = 0; i < 5000; i++) {
+      log = [...log, ...takenBack(bob, i, i * 10)];
+      if (log.length > 1000) log = compactReactions(log);
+      expect(log.length).toBeLessThanOrEqual(4000);
+    }
+    // Between compactions the log grows to the compaction point; compacted, it is the 200 removals Bob keeps.
+    expect(compactReactions(log)).toHaveLength(200);
   });
 });

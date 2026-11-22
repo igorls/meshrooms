@@ -34,6 +34,8 @@ test('terms match case-insensitively on word boundaries, with quoted and prefix 
   expect(hits('tok_20260929 and tok_ and mytok_1')).toEqual(['tok_', 'tok_']);
   expect(hits('win:box:project')).toEqual(['win:box']);
   expect(hits('axb')).toEqual([]); // regex characters in a term are literal
+  // A hard wrap between the words of a term doesn't hide it, and it is reported once, at the line it starts on.
+  expect(scanText('f', 'first\nin the blue\r\n  room today\n', terms)).toEqual([{ file: 'f', line: 2, kind: 'private-term', match: 'blue room' }]);
 });
 
 test('a prefix term catches suffixed and camel-case variants of a name', () => {

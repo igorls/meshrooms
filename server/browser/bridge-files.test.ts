@@ -52,3 +52,22 @@ test('a damaged local copy is never returned, and listen shows files instead of 
   await expect(attachmentBrowser(agent, ref.id, home, 1)).rejects.toThrow('No connected device');
   await expect(attachmentBrowser(agent, crypto.randomUUID(), home, 1)).rejects.toThrow('No message');
 });
+
+test('SYNC-14: FileStore.has() verifies SHA-256 on disk, caches clean hits, and deletes corrupt files before get() is called', async () => {
+  const bytes = png(); const ref = await attachmentRef(bytes, 'shot.png');
+  const { agent } = room([ref]);
+  const sha = agent.files.add(bytes);
+  // First has() verifies and caches; second has() uses cache.
+  expect(agent.files.has(sha)).toBe(true);
+  expect(agent.files.has(sha)).toBe(true);
+  // Corrupt the file on disk (different size guarantees stat change on any filesystem).
+  writeFileSync(agent.files.path(sha), new Uint8Array([...bytes, 0xff]));
+  expect(agent.files.has(sha)).toBe(false);
+  expect(existsSync(agent.files.path(sha))).toBe(false);
+  // Same-size tamper immediately after add() is also caught and deleted by has().
+  agent.files.add(bytes);
+  const flipped = bytes.slice(); flipped[42] ^= 1;
+  writeFileSync(agent.files.path(sha), flipped);
+  expect(agent.files.has(sha)).toBe(false);
+  expect(existsSync(agent.files.path(sha))).toBe(false);
+});

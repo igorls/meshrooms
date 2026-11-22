@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectHermes, HERMES_MAX_OUTPUT_BYTES, HERMES_VERIFIED_BUILD, parseHermesSessions, parseHermesVersion, runHermesCommand, type HermesCommandResult, type HermesRunner } from './hermes';
+import { detectHermes, HERMES_MAX_OUTPUT_BYTES, HERMES_MIN_VERSION, HERMES_VERIFIED_BUILD, hermesVersionSupported, parseHermesSessions, parseHermesVersion, runHermesCommand, type HermesCommandResult, type HermesRunner } from './hermes';
 import { cappedFixture, headerFixture, listingFixture, rowFixture, versionFixture } from './fixtures/hermes-fixtures';
 
 const good = (stdout: string): HermesCommandResult => ({ ok: true, stdout });
@@ -13,13 +13,20 @@ function stub(results: HermesCommandResult[]) {
 }
 
 describe('Hermes version and fixed-width schema gates', () => {
-  test('version excludes installation diagnostics and admits only the measured build', async () => {
+  test('version excludes installation diagnostics and admits semver >= 0.21.5 while still gating on the strict schema parser', async () => {
+    expect(HERMES_MIN_VERSION).toBe('0.21.5');
     expect(parseHermesVersion(versionFixture)).toBe(HERMES_VERIFIED_BUILD);
-    for (const version of ['0.21.5', '0.21.6', '0.22.0', '0.21.5+6489.gffffff', 'garbage']) {
+    for (const version of ['0.21.4', '0.20.9', '0.21.4+9999.gabcdef', 'garbage']) {
       const s = stub([good(`Hermes Agent v${version}\n`)]);
       const result = await detectHermes(s.runner);
-      expect(result.sessionsAvailable).toBe(false);
+      expect(result).toMatchObject({ sessionsAvailable: false, reason: 'unsupported-version' });
       expect(s.calls).toEqual([['--version']]);
+    }
+    for (const version of ['0.21.5', '0.21.5+6489.gffffff', '0.21.6', '0.22.0', '1.0.0']) {
+      const s = stub([good(`Hermes Agent v${version}\n`), good(listingFixture)]);
+      const result = await detectHermes(s.runner);
+      expect(result.sessionsAvailable).toBe(true);
+      expect(s.calls).toEqual([['--version'], ['sessions', 'list', '--limit', '20']]);
     }
     expect(parseHermesVersion('warning\n' + versionFixture)).toBeNull();
     expect(parseHermesVersion('x'.repeat(HERMES_MAX_OUTPUT_BYTES + 1))).toBeNull();
@@ -141,7 +148,7 @@ test('transport enforces stdout/stderr bounds, errors, missing binary and hard t
 test.skipIf(process.env.HERMES_DETECTOR_INTEGRATION !== '1')('installed Hermes read-only integration (sanitized assertions)', async () => {
   const result = await detectHermes();
   if (!result.detected || !result.sessionsAvailable) throw new Error('Installed Hermes detector did not provide the verified schema');
-  expect(result.version === HERMES_VERIFIED_BUILD).toBe(true);
+  expect(hermesVersionSupported(result.version)).toBe(true);
   expect(result.sessions.length <= 20).toBe(true);
   expect(result.sessions.every(s => Object.keys(s).sort().join(',') === 'harness,id,lastActiveLabel,title,workspaceLabel')).toBe(true);
   expect(result.sessions.every(s => s.workspaceLabel === null || !/[\/\\:]/.test(s.workspaceLabel))).toBe(true);

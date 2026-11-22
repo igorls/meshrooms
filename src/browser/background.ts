@@ -149,6 +149,8 @@ export type RoomEvents = { gone(reason: 'closed' | 'removed'): void; ended(): vo
 /** One room held in the background: its own session, status polls every BACKGROUND_POLL_MS, and its unread count. */
 export class BackgroundRoom {
   private stopping = false;
+  private abort = new AbortController();
+  private timer?: ReturnType<typeof setTimeout>;
   private wake?: () => void;
   private halted: Promise<void>;
   private halt!: () => void;
@@ -163,7 +165,12 @@ export class BackgroundRoom {
   constructor(private api: Pick<BrowserApi, 'command'>, private deviceId: string, readonly roomId: string, private events: RoomEvents) {
     let granted!: (value: boolean) => void;
     this.started = new Promise(resolve => { granted = resolve; });
-    this.halted = new Promise(resolve => { this.halt = () => { this.stopping = true; this.engine?.stop(); this.wake?.(); resolve(); }; });
+    this.halted = new Promise(resolve => {
+      this.halt = () => {
+        this.stopping = true; this.abort.abort(); clearTimeout(this.timer); this.timer = undefined;
+        this.engine?.stop(); this.wake?.(); resolve();
+      };
+    });
     this.done = navigator.locks.request(connectionLock(roomId), { ifAvailable: true }, async lock => {
       if (!lock) { granted(false); return; }
       granted(true);
@@ -201,7 +208,7 @@ export class BackgroundRoom {
     while (!this.stopping && !engine.isStopped()) {
       const started = Date.now();
       try {
-        const next = await this.api.command('status', this.roomId, { session, cursor, epoch });
+        const next = await this.api.command('status', this.roomId, { session, cursor, epoch }, this.abort.signal);
         if (this.stopping) break;
         if (next.epoch !== epoch) cursor = 0;
         epoch = next.epoch;
@@ -213,6 +220,7 @@ export class BackgroundRoom {
         this.recount(); backoff = 0;
         if (!healthy) { healthy = true; this.events.healthy(); }
       } catch (e) {
+        if (this.stopping || this.abort.signal.aborted) break;
         if (closedError(e)) { this.events.gone('closed'); break; }
         // Over the service's rate limit: back off, and keep backing off while it lasts.
         if ((e as ApiError).status === 429) backoff = Math.min(60_000, (backoff || 15_000) * 2);
@@ -220,7 +228,10 @@ export class BackgroundRoom {
       if (this.stopping) break;
       // Polls are spaced from start to start: a slow connection setup must not stretch the gap past the service's
       // 10 s presence window.
-      await new Promise<void>(resolve => { this.wake = resolve; setTimeout(resolve, Math.max(0, BACKGROUND_POLL_MS - (Date.now() - started)) + backoff); });
+      await new Promise<void>(resolve => {
+        this.wake = resolve;
+        this.timer = setTimeout(() => { this.timer = undefined; resolve(); }, Math.max(0, BACKGROUND_POLL_MS - (Date.now() - started)) + backoff);
+      });
     }
   }
   /** Stop, and resolve once every write finished and the connection lock is released. */

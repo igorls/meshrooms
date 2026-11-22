@@ -30,6 +30,12 @@ test('a forged decision cannot carry a genuine vote in with it', async () => {
   // Forged votes and duplicates are dropped.
   expect(await admitDecisionPackets([real], [{ body: vote, signature: 'bad' }], roomId, genuine)).toEqual([]);
   expect((await admitDecisionPackets([real], [{ body: vote, signature: 'ok' }, { body: vote, signature: 'ok' }], roomId, genuine)).length).toBe(1);
+  // COL-1: vote arriving before its decision in the batch still admits the decision first, and at cap - 1 admits the decision rather than an orphaned vote.
+  expect((await admitDecisionPackets([], [{ body: vote, signature: 'ok' }, { body: real, signature: 'ok' }], roomId, genuine)).map(p => p.body.kind)).toEqual(['decision', 'vote']);
+  const { MAX_DECISION_OPS } = await import('../../src/browser/decisions');
+  const filler = Array.from({ length: MAX_DECISION_OPS - 1 }, (_, i) => openDecision({ roomId, deviceId, memberId: crypto.randomUUID(), question: `Q${i}`, options: ['A', 'B'] }));
+  const atCap = await admitDecisionPackets(filler, [{ body: vote, signature: 'ok' }, { body: real, signature: 'ok' }], roomId, genuine);
+  expect(atCap.map(p => p.body.id)).toEqual([real.id]);
 });
 
 test('retrying a request whose vote compaction dropped reports it superseded and never overwrites the current vote', async () => {
@@ -93,4 +99,17 @@ test('a change run could not sign reports why, not a guess', async () => {
   noteDropped(outbox, id, reason); unlinkSync(join(outbox, queued));
   expect(await result).toEqual({ status: 'dropped', reason: 'Keep the reason to 500 characters.' });
   expect(readdirSync(outbox)).toEqual([]);
+});
+
+test('COL-2: blank option labels are rejected by outboxProblem and decisionBrowser', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
+  const { BrowserAgent, decisionBrowser, outboxProblem } = await import('../browser-agent');
+  const roomId = crypto.randomUUID(), me = crypto.randomUUID(), host = crypto.randomUUID(), deviceId = 'f'.repeat(64);
+  const agent = new BrowserAgent(mkdtempSync(join(tmpdir(), 'mr-col2-')), 'http://127.0.0.1:1', roomId);
+  writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: me, ownerId: host, members: [{ id: me, name: 'Wren', role: 'agent', operatorId: host }, { id: host, name: 'Alex' }], devices: [] }));
+  const open = openDecision({ roomId, deviceId, memberId: host, question: 'Q', options: ['A', 'B'] });
+  writeFileSync(join(agent.dir, 'decisions.json'), JSON.stringify([{ body: open, signature: 's', seq: 1 }]));
+  expect(outboxProblem(agent, me, { type: 'decision', id: crypto.randomUUID(), decisionId: open.decisionId, action: 'option', label: '   ' })).toContain('label');
+  await expect(decisionBrowser(agent, { id: crypto.randomUUID(), decisionId: open.decisionId, action: 'option', label: '   ' }, 1)).rejects.toThrow('label');
 });

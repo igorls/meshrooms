@@ -285,23 +285,39 @@ pub fn notice_limited(app: &tauri::AppHandle, detail: &str) -> bool {
     due
 }
 
+/// The notice window's label: inert page whose only capability is closing itself (capabilities/notice.json).
+pub const NOTICE_WINDOW: &str = "link-approval";
+
+/// Close button of the notice window. WebView2 and WKWebView may ignore `window.close()` on a window no script opened,
+/// so the page asks the app; any other window calling this is refused.
+#[tauri::command]
+pub fn notice_close(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != NOTICE_WINDOW { return Err("Not available here.".into()); }
+    let _ = window.close();
+    Ok(())
+}
+const NOTICE_PAGE: &str = "notice.html";
+
+fn notice_url(origin: &tauri::Url, detail: &str) -> tauri::Url {
+    let mut page = origin.join(NOTICE_PAGE).expect("static path");
+    page.query_pairs_mut().append_pair("detail", detail);
+    page
+}
+
 /// A short, inert notice in its own window. The bundled page renders `detail` as text, not markup; never pass a URL.
 pub fn notice(app: &tauri::AppHandle, detail: &str) {
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-    // Separate from the polling tray status, which would overwrite an approval notice.
-    let mut page = super::app_origin(app)
-        .join("index.html")
-        .expect("static path");
-    page.query_pairs_mut().append_pair("detail", detail);
-    let window = match app.get_webview_window("link-approval") {
+    // Separate from the polling tray status (`index.html`), which holds the home capability and ignores `?detail=`.
+    let page = notice_url(&super::app_origin(app), detail);
+    let window = match app.get_webview_window(NOTICE_WINDOW) {
         Some(window) => window,
         None => match WebviewWindowBuilder::new(
             app,
-            "link-approval",
-            WebviewUrl::App("index.html".into()),
+            NOTICE_WINDOW,
+            WebviewUrl::App(NOTICE_PAGE.into()),
         )
-        .title("Meshrooms — approval needed")
-        .inner_size(560.0, 300.0)
+        .title("Meshrooms")
+        .inner_size(520.0, 280.0)
         .build()
         {
             Ok(window) => window,
@@ -401,6 +417,42 @@ mod tests {
         }
         assert!(notice_due(&mut last, now + NOTICE_EVERY));
         assert!(!notice_due(&mut last, now + NOTICE_EVERY));
+    }
+    #[test]
+    fn notice_uses_its_own_inert_page_never_index_html() {
+        let origin = tauri::Url::parse("tauri://localhost/").unwrap();
+        let url = notice_url(&origin, "Unsupported link & <b>ignored</b>.");
+        assert_eq!(url.path(), "/notice.html");
+        assert_ne!(url.path(), "/index.html");
+        let detail = url.query_pairs().find(|(k, _)| k == "detail").map(|(_, v)| v.into_owned());
+        assert_eq!(detail.as_deref(), Some("Unsupported link & <b>ignored</b>."));
+        let html = include_str!("../../ui/notice.html");
+        let js = include_str!("../../ui/notice.js");
+        assert!(html.contains("style.css") && html.contains("notice.js"));
+        assert!(!html.contains("style="), "notice.html must stay free of inline styles");
+        assert!(!html.contains("<script>"), "notice.html must stay free of inline scripts");
+        assert!(js.contains("URLSearchParams") && js.contains("textContent"));
+        assert!(!js.contains("innerHTML"));
+        // The page's only native call is closing itself.
+        assert_eq!(js.matches("invoke(").count(), 1);
+        assert!(js.contains("invoke('notice_close')"));
+    }
+    #[test]
+    fn the_notice_window_may_close_itself_and_nothing_else() {
+        let capability: serde_json::Value = serde_json::from_str(include_str!("../capabilities/notice.json")).unwrap();
+        assert_eq!(capability["windows"], serde_json::json!([NOTICE_WINDOW]));
+        assert_eq!(capability["permissions"], serde_json::json!(["allow-notice-close"]));
+        for other in ["main", "pair", "join", "review", "approvals"] {
+            let text = match other {
+                "main" => include_str!("../capabilities/home.json"),
+                "pair" => include_str!("../capabilities/pair.json"),
+                "join" => include_str!("../capabilities/join.json"),
+                "review" => include_str!("../capabilities/review.json"),
+                _ => include_str!("../capabilities/approvals.json"),
+            };
+            let capability: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert!(!capability["windows"].as_array().unwrap().iter().any(|w| w == NOTICE_WINDOW), "{other}");
+        }
     }
     #[test]
     fn join_is_typed() {

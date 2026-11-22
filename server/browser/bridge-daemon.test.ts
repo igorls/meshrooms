@@ -516,7 +516,7 @@ test('the daemon starts at login on every system, from files written only where 
   };
   const windows = loginItemManager(item, { platform: 'win32', home: dir, run: reg, host: { supported: true } });
   expect(windows.apply(true).installed).toBe(true);
-  expect(values.get('meshrooms-daemon')).toContain(`-WindowStyle Hidden -File "${windows.where}"`);
+  expect(values.get('meshrooms-daemon')).toContain(`-WindowStyle Hidden -ExecutionPolicy Bypass -File "${windows.where}"`);
   expect(readFileSync(windows.where, 'utf8')).toBe("$ErrorActionPreference = 'Stop'\n$env:PATH = '/usr/bin:/opt/100%$x'\n& 'C:\\bun\\bun.exe' 'C:\\Tools\\o''k\\meshrooms.js' 'daemon' 'start'\nexit $LASTEXITCODE\n");
   // PowerShell ends a single-quoted string at a typographic single quote too (U+2018 to U+201B): each is doubled.
   for (const quote of ['\u2018', '\u2019', '\u201a', '\u201b']) expect(quotePS(`a${quote}b`)).toBe(`'a${quote}${quote}b'`);

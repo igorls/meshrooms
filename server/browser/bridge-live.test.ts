@@ -3,11 +3,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BrowserAgent, RUNNER_ALIVE, listenRemembering, peekWork } from '../browser-agent';
-import { EXIT_CODE, agentCli, main } from '../agent-cli';
+import { RunnerWedged } from '../browser-agent';
+import { CliError, EXIT_CODE, agentCli, formatCliError, freshRemoval, main } from '../agent-cli';
+import { BridgeTooOld } from '../agent-install';
 import {
   LIVE_EXIT, LIVE_FILES, LIVE_LEASE, LIVE_TIMING, PICKUP_CAP_MS, PICKUP_LIFE_MS, WOKEN_SEEN, attachLive, recordedSessionFor, writeWokenSeen, beatLive, beginHeadless, claudeProjectDir, endHeadless, headlessStarted, liveGate, liveHold, liveListen, pickupLive, pinClaudeSession,
-  readLease, recentClaudeSessions, releaseLive, sessionHarness, sessionProblem, sliceHasWork, wokenRuns, type LeaseIdentity, type LiveDeps, type LiveListenDeps, type SliceResult,
+  readLease, recentClaudeSessions, releaseLive, sessionHarness, sessionProblem, sliceHasWork, wokenRuns, type AdmissionState, type LeaseIdentity, type LiveDeps, type LiveListenDeps, type SliceResult,
 } from '../agent-live';
+import { deviceId as deviceIdOf } from '../../src/browser/protocol';
 import { LIVE_NOTES, WAKE_WRITABLE, emptyState, sessionLedger, watchLogger, watchLoop, type WatchConfig, type WatchDeps, type WatchState } from '../agent-watch';
 import { terminalSafe } from '../terminal-text';
 import { fakeRunner } from './fake-runner';
@@ -578,4 +581,169 @@ test('watch for legacy Codex and Hermes resumes the session connect recorded for
     });
   } finally { if (savedCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = savedCodex; }
   expect(existsSync(join(r.agent.dir, 'watch.json'))).toBe(false);
+});
+
+test('until-addressed waits cleanly during pending admission, transitions to work once admitted, and exits 3/4/5 on closed/rejected/runner-down', async () => {
+  // Pending -> admitted -> returns work with lease in pickup.
+  const clock = { now: 0 };
+  const states: AdmissionState[] = ['pending', 'pending', 'admitted'];
+  let idx = 0;
+  const admitted = listenDeps(clock, [work], { admission: () => states[Math.min(idx++, states.length - 1)] });
+  expect(await liveListen(admitted.deps, { maxWaitMs: 3_600_000, graceMs: minutes(10) })).toEqual({ exitCode: 0, result: work });
+  expect(admitted.calls.logs).toEqual(['waiting for the host to admit this agent']);
+  expect(admitted.calls.slices).toBe(1);
+  expect(admitted.calls.pickups).toHaveLength(1);
+  expect(admitted.calls.released).toBe(0);
+
+  // Pending -> closed (exit 3), lease released.
+  const closed = listenDeps({ now: 0 }, [work], { admission: () => ({ state: 'closed', error: 'Room closed.' }) });
+  expect(await liveListen(closed.deps, { maxWaitMs: 3_600_000, graceMs: 1 })).toEqual({ exitCode: LIVE_EXIT.closed, result: { state: 'closed', error: 'Room closed.' } });
+  expect(closed.calls.slices).toBe(0);
+  expect(closed.calls.released).toBe(1);
+
+  // Pending -> rejected (exit 4), lease released.
+  const rejected = listenDeps({ now: 0 }, [work], { admission: () => ({ state: 'rejected', error: 'Host declined.' }) });
+  expect(await liveListen(rejected.deps, { maxWaitMs: 3_600_000, graceMs: 1 })).toEqual({ exitCode: LIVE_EXIT.removed, result: { state: 'rejected', error: 'Host declined.' } });
+  expect(rejected.calls.slices).toBe(0);
+  expect(rejected.calls.released).toBe(1);
+
+  // Pending -> brief runner-stopped -> repaired -> admitted -> work.
+  const repairStates: AdmissionState[] = [{ state: 'runner-stopped' }, 'pending', 'admitted'];
+  let rIdx = 0;
+  const repaired = listenDeps({ now: 0 }, [work], { admission: () => repairStates[Math.min(rIdx++, repairStates.length - 1)] });
+  expect(await liveListen(repaired.deps, { maxWaitMs: 3_600_000, graceMs: 1 })).toEqual({ exitCode: 0, result: work });
+  expect(repaired.calls.repairs).toBe(1);
+
+  // Pending -> runner stays down past runnerTroubleMs -> exit 5, lease released.
+  const downClock = { now: 0 };
+  const down = listenDeps(downClock, [work], { admission: () => ({ state: 'runner-stopped' }) });
+  expect(await liveListen(down.deps, { maxWaitMs: 3_600_000, graceMs: 1 })).toMatchObject({ exitCode: LIVE_EXIT.runner, result: { state: 'runner-stopped' } });
+  expect(downClock.now).toBeGreaterThanOrEqual(LIVE_TIMING.runnerTroubleMs);
+  expect(down.calls.released).toBe(1);
+});
+
+test('until-addressed --parent orphan protection releases the lease and exits 6 (parent-exited) when the parent exits', async () => {
+  // Parent already gone before attaching: exits 6 without even attaching.
+  const alreadyGone = listenDeps({ now: 0 }, [work], { parentAlive: () => false });
+  expect(await liveListen(alreadyGone.deps, { maxWaitMs: 3_600_000, graceMs: 1 })).toEqual({ exitCode: LIVE_EXIT.parentExited, result: { state: 'parent-exited' } });
+  expect(alreadyGone.calls.attach).toBe(0);
+  expect(alreadyGone.calls.slices).toBe(0);
+
+  // Parent dies during a quiet slice: short slice cap detects it promptly, releases the lease, and exits 6.
+  const clock = { now: 0 };
+  const sliceLengths: number[] = [];
+  let alive = true;
+  const watched = listenDeps(clock, [() => { alive = false; return idle; }], {
+    parentAlive: () => alive,
+    listen: async seconds => {
+      sliceLengths.push(seconds);
+      clock.now += seconds * 1000;
+      alive = false;
+      return idle;
+    },
+  });
+  expect(await liveListen(watched.deps, { maxWaitMs: 3_600_000, graceMs: 1 })).toMatchObject({ exitCode: LIVE_EXIT.parentExited, result: { state: 'parent-exited' } });
+  expect(sliceLengths).toEqual([Math.ceil(LIVE_TIMING.heartbeatMs / 1000)]);
+  expect(watched.calls.released).toBe(1);
+  expect(watched.calls.pickups).toEqual([]);
+});
+
+test('freshRemoval ignores stale removedSince proofs from older runners before a rejoin/restart', () => {
+  const startedAt = 1_000_000;
+  expect(freshRemoval(undefined, startedAt)).toBe(false);
+  expect(freshRemoval({ removedSince: startedAt - 5_000 }, startedAt)).toBe(false);
+  expect(freshRemoval({ at: startedAt - 1, removedSince: startedAt - 5_000 }, startedAt)).toBe(false);
+  expect(freshRemoval({ at: startedAt, removedSince: startedAt - 5_000 }, startedAt)).toBe(true);
+  expect(freshRemoval({ at: startedAt + 1_000, removedSince: startedAt + 500 }, startedAt)).toBe(true);
+  expect(freshRemoval({ at: startedAt + 1_000 }, startedAt)).toBe(false);
+});
+
+test('listen --until-addressed through the CLI handles waiting-for-host admission, declined requests, stale removedSince, and --parent validation', async () => {
+  const home = tempDir(), roomId = crypto.randomUUID();
+  let mode: 'pending' | 'declined' = 'pending';
+  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
+    if (request.method === 'GET') return Response.json({ ok: true });
+    const { command, publicKey } = await request.json() as any;
+    return Response.json({ roomId: command.roomId, deviceId: await deviceIdOf(publicKey), title: 'Room', epoch: 'e', hostOnline: true,
+      request: { state: mode, kind: 'agent', expiresAt: Date.now() + 60_000 } });
+  } });
+  const agent = new BrowserAgent(home, `http://127.0.0.1:${server.port}`, roomId);
+  await agent.ensureIdentity();
+  writeFileSync(join(agent.dir, 'settings.json'), JSON.stringify({ floor: 'humans-first' }));
+  writeFileSync(join(agent.dir, 'room.json'), JSON.stringify({ origin: `http://127.0.0.1:${server.port}`, roomId }));
+  const fakes: { kill: () => void }[] = [];
+  try {
+    const runner = await fakeRunner(join(home, 'fake'), roomId, { proofFile: join(agent.dir, RUNNER_ALIVE) });
+    fakes.push(runner);
+    writeFileSync(join(agent.dir, 'runner.pid'), String(runner.pid));
+    writeFileSync(join(agent.dir, 'runner.json'), JSON.stringify({ pid: runner.pid, version: null, started: runner.started }));
+    await inHome(home, async () => {
+      // Invalid --parent values are rejected cleanly.
+      for (const bad of ['0', '-5', 'abc', '1.5']) {
+        await expect(agentCli(['listen', '--room', roomId, '--until-addressed', '--parent', bad])).rejects.toThrow('--parent');
+      }
+      // Dead parent PID exits 6 (parent-exited) immediately and leaves no lease behind.
+      const parentGone = await agentCli(['listen', '--room', roomId, '--until-addressed', '--parent', '2147483000']) as Record<string | symbol, unknown>;
+      expect(parentGone).toMatchObject({ state: 'parent-exited', roomId });
+      expect(parentGone[EXIT_CODE]).toBe(LIVE_EXIT.parentExited);
+      expect(readLease(agent.dir)).toBeUndefined();
+
+      // Declined join request while waiting-for-host exits 4 (rejected).
+      mode = 'declined';
+      const declined = await agentCli(['listen', '--room', roomId, '--until-addressed']) as Record<string | symbol, unknown>;
+      expect(declined).toMatchObject({ state: 'rejected', roomId });
+      expect(declined[EXIT_CODE]).toBe(LIVE_EXIT.removed);
+      expect(readLease(agent.dir)).toBeUndefined();
+
+      // Pending admission waits cleanly until members.json gets memberId, even if an older runner left a stale removedSince.
+      mode = 'pending';
+      writeFileSync(join(agent.dir, RUNNER_ALIVE), JSON.stringify({ pid: runner.pid, at: Date.now() - 10_000, loopAt: Date.now(), removedSince: Date.now() - 20_000 }));
+      const mentionId = crypto.randomUUID();
+      setTimeout(() => {
+        writeFileSync(join(agent.dir, 'members.json'), JSON.stringify(roster));
+        const body = { kind: 'message', roomId, id: mentionId, deviceId, memberId: alex, text: '@Wren welcome!', at: Date.now() };
+        writeFileSync(join(agent.dir, 'messages.json'), JSON.stringify([{ packet: { body, signature: '' }, targets: [], receipts: [] }]));
+      }, 600);
+      const admitted = await agentCli(['listen', '--room', roomId, '--until-addressed']) as Record<string | symbol, unknown>;
+      expect(admitted).toMatchObject({ state: 'history', addressed: [mentionId], roomId });
+      expect(admitted[EXIT_CODE]).toBe(0);
+    });
+  } finally {
+    server.stop(true);
+    for (const fake of fakes) fake.kill();
+  }
+}, 90_000);
+
+test('structured CLI errors preserve code and status as JSON on stderr while plain errors stay plain terminal-safe text', async () => {
+  expect(formatCliError(new Error('plain\x1b[31m fail'))).toBe('plain fail');
+  expect(JSON.parse(formatCliError(new BridgeTooOld('0.1.0', '0.2.0', 'connect', '0.2.1')))).toMatchObject({
+    code: 'BRIDGE_TOO_OLD',
+    version: '0.1.0',
+    minimum: '0.2.0',
+    current: '0.2.1',
+    error: expect.stringContaining('0.2.1'),
+  });
+  expect(JSON.parse(formatCliError(new RunnerWedged('wedged step')))).toEqual({ error: 'wedged step', code: 'RUNNER_WEDGED' });
+  expect(JSON.parse(formatCliError(Object.assign(new Error('expired\u202E link'), { status: 410, code: 'LINK_EXPIRED' })))).toEqual({
+    error: 'expired link',
+    code: 'LINK_EXPIRED',
+    status: 410,
+  });
+  expect(JSON.parse(formatCliError(new CliError('conflict', 'CONNECT_CONFLICT', 409)))).toEqual({
+    error: 'conflict',
+    code: 'CONNECT_CONFLICT',
+    status: 409,
+  });
+
+  // Through main(): unknown room prints structured JSON with code ROOM_NOT_FOUND and sets exitCode 1.
+  const home = tempDir(), printed: string[] = [], saved = console.error, code = process.exitCode;
+  console.error = (...parts: unknown[]) => { printed.push(parts.join(' ')); };
+  try {
+    await inHome(home, async () => {
+      await main(['status', '--room', crypto.randomUUID()]);
+    });
+    expect(process.exitCode).toBe(1);
+    expect(printed).toHaveLength(1);
+    expect(JSON.parse(printed[0])).toMatchObject({ code: 'ROOM_NOT_FOUND', error: expect.stringContaining('not connected') });
+  } finally { console.error = saved; process.exitCode = code ?? 0; }
 });

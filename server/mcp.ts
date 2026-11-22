@@ -60,11 +60,11 @@ export const TOOL_SCHEMAS: Record<McpTool, { title: string; description: string;
   'task-add': { title: 'Add a task', description: 'Add a task to the board.',
     schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), title: str('Up to 120 characters.'), notes: str('Up to 2000 characters.'), assignee: str('me, or a member id from tasks.'), issue: str('owner/name#42 to link an issue.') }, required: ['request_id', 'title'], additionalProperties: false } },
   'task-update': { title: 'Update a task', description: 'Move a task along. Pass revision as read from tasks; a stale revision is rejected.',
-    schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), task: str('The task id from tasks.'), revision: num('The revision you last read.'), status: { type: 'string', enum: ['todo', 'doing', 'done'], description: 'The new status.' }, title: str('A new title.'), notes: str('New notes.'), assignee: str('me, none, or a member id.') }, required: ['request_id', 'task'], additionalProperties: false } },
+    schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), task: str('The task id from tasks.'), revision: num('The revision you last read.'), status: { type: 'string', enum: ['todo', 'doing', 'done'], description: 'The new status.' }, title: str('A new title.'), notes: str('New notes.'), assignee: str('me, none, or a member id.'), issue: str('owner/name#42, a GitHub issue/PR URL, or "none" to unlink.') }, required: ['request_id', 'task'], additionalProperties: false } },
   decisions: { title: 'List decisions', description: 'List the open questions in the room.',
     schema: { type: 'object', properties: { all: { type: 'boolean', description: 'Include closed and withdrawn ones.' } }, additionalProperties: false } },
   vote: { title: 'Advise on a decision', description: 'Give your advice on a decision. Agent votes are shown but never counted; only people decide. Use option "none" to take your advice back.',
-    schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), decision: str('The decision id.'), option: str('An option id from the decision, or "none".'), comment: str('Why, up to 500 characters.') }, required: ['request_id', 'decision', 'option'], additionalProperties: false } },
+    schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), decision: str('The decision id.'), option: str('An option id from the decision, or "none".'), comment: str('Why, up to 500 characters.'), reply_to: str('The id of the message that addressed you, when the decision did not ask agents directly.') }, required: ['request_id', 'decision', 'option'], additionalProperties: false } },
   ask: { title: 'Ask the room', description: 'Open a decision for people to vote on.',
     schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), question: str('Up to 200 characters.'), options: arr('Two to eight distinct options, up to 120 characters each.', str('label')), context: str('Up to 4000 characters.'), ask_agents: str('all, or a comma-separated list of agent names.'), closes: str('30m, 2h, or an ISO time.'), reply_to: str('The message id you are answering.') }, required: ['request_id', 'question', 'options'], additionalProperties: false } },
   'decision-wait': { title: 'Wait for a decision', description: 'Wait until people have decided. A draw is an outcome.',
@@ -93,15 +93,20 @@ export function toolArgv(tool: McpTool, args: Record<string, unknown>, room: str
     }
     argv.push(flag, text);
   };
-  const pushList = (flag: string, value: unknown) => { for (const item of (value as unknown[] | undefined) ?? []) argv.push(flag, String(item)); };
+  const pushList = (flag: string, value: unknown) => {
+    if (value === undefined || value === null) return;
+    if (!Array.isArray(value)) throw new Error(`${flag} expects a list of values.`);
+    for (const item of value) argv.push(flag, String(item));
+  };
   switch (tool) {
-    case 'listen': push('--wait-seconds', args.wait_seconds); if (args.peek) argv.push('--peek'); break;
+    case 'listen': push('--wait-seconds', args.wait_seconds); if (args.peek === true) argv.push('--peek'); break;
     case 'send': push('--request-id', args.request_id); push('--text', args.text); push('--reply-to', args.reply_to); break;
     case 'react': push('--request-id', args.request_id); push('--message', args.message); push('--emoji', args.emoji); break;
-    case 'tasks': case 'decisions': case 'status': if (args.all) argv.push('--all'); break;
+    case 'decisions': if (args.all === true) argv.push('--all'); break;
+    case 'tasks': case 'status': break;
     case 'task-add': push('--request-id', args.request_id); push('--title', args.title); push('--notes', args.notes); push('--assignee', args.assignee); push('--issue', args.issue); break;
-    case 'task-update': push('--request-id', args.request_id); push('--task', args.task); push('--revision', args.revision); push('--status', args.status); push('--title', args.title); push('--notes', args.notes); push('--assignee', args.assignee); break;
-    case 'vote': push('--request-id', args.request_id); push('--decision', args.decision); push('--option', args.option); push('--comment', args.comment); break;
+    case 'task-update': push('--request-id', args.request_id); push('--task', args.task); push('--revision', args.revision); push('--status', args.status); push('--title', args.title); push('--notes', args.notes); push('--assignee', args.assignee); push('--issue', args.issue); break;
+    case 'vote': push('--request-id', args.request_id); push('--decision', args.decision); push('--option', args.option); push('--comment', args.comment); push('--reply-to', args.reply_to); break;
     case 'ask': push('--request-id', args.request_id); push('--question', args.question); pushList('--option', args.options); push('--context', args.context); push('--ask-agents', args.ask_agents); push('--closes', args.closes); push('--reply-to', args.reply_to); break;
     case 'decision-wait': push('--decision', args.decision); push('--wait-seconds', args.wait_seconds); break;
     case 'attachment': push('--id', args.id); push('--wait-seconds', args.wait_seconds); break;
@@ -134,7 +139,11 @@ export async function handleMessage(message: any, deps: McpDeps): Promise<object
     case 'tools/call': {
       const name = params?.name as McpTool;
       if (!MCP_TOOLS.includes(name)) return fail(-32602, `Unknown tool ${String(name)}. This server exposes: ${MCP_TOOLS.join(', ')}.`);
-      const args = (params?.arguments ?? {}) as Record<string, unknown>;
+      const rawArgs = params?.arguments;
+      if (rawArgs !== undefined && (typeof rawArgs !== 'object' || rawArgs === null || Array.isArray(rawArgs))) {
+        return fail(-32602, 'Tool arguments must be an object.');
+      }
+      const args = (rawArgs ?? {}) as Record<string, unknown>;
       try {
         const argv = toolArgv(name, args, deps.room);
         deps.log?.(`call ${argv.join(' ')}`);

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  CLAUDE_VERIFIED, CODEX_VERIFIED, SESSION_LIMIT, TITLE_CODE_POINTS, claudeSessionFolder, folderLabel, freshClaudeSession, freshCodexThread, harnessScanner, headLines, hermesIdFresh,
+  CLAUDE_VERIFIED, CODEX_MIN_VERSION, SESSION_LIMIT, TITLE_CODE_POINTS, claudeSessionFolder, codexVersionSupported, folderLabel, freshClaudeSession, freshCodexThread, harnessScanner, headLines, hermesIdFresh,
   listClaudeSessions, listCodexThreads, listSessions,
   parseClaudeVersion, parseCodexVersion, plainText, promptTitle, resolveHarnessProgram, runBounded, scanHarnesses, type CommandResult, type ScanDeps,
 } from './harnesses';
@@ -52,16 +52,16 @@ function claudeFixture() {
   return { dir, first, second, third, noTitle };
 }
 
-test('versions: only the version is kept, and only measured ones open the sessions', () => {
+test('versions: only the version is kept, and semver minimums open the sessions', () => {
   expect(parseClaudeVersion('2.1.289 (Claude Code)\n')).toBe('2.1.289');
   expect(parseClaudeVersion('Claude Code 2.1.289')).toBeNull();
   expect(parseCodexVersion('codex-cli 0.159.2\n')).toBe('0.159.2');
   expect(parseCodexVersion('codex 0.159.2')).toBeNull();
   expect(CLAUDE_VERIFIED.test('2.1.289')).toBe(true);
   expect(CLAUDE_VERIFIED.test('3.0.0')).toBe(false);
-  expect(CODEX_VERIFIED.test('0.159.2')).toBe(true);
-  expect(CODEX_VERIFIED.test('0.163.0-alpha.10.2')).toBe(true);
-  expect(CODEX_VERIFIED.test('0.160.0')).toBe(false);
+  expect(CODEX_MIN_VERSION).toBe('0.159.0');
+  for (const ok of ['0.159.0', '0.159.2', '0.160.0', '0.163.0-alpha.10.2', '0.170.0', '1.0.0']) expect(codexVersionSupported(ok)).toBe(true);
+  for (const old of ['0.158.9', '0.159.0-alpha.1', '0.1.0', null]) expect(codexVersionSupported(old)).toBe(false);
 });
 
 test('titles and folder labels are plain capped text: no markup, control, format or bidi characters, never a path', () => {
@@ -144,17 +144,20 @@ function machine(answers: Partial<Record<'claude' | 'codex' | 'hermes', CommandR
   return { deps, asked };
 }
 
-test('the scan: what is installed and which sessions can be listed, failing closed on what it doesn\'t know', async () => {
+test('the scan: what is installed and which sessions can be listed, failing closed on versions below minimum', async () => {
   const f = claudeFixture();
   const ok = (stdout: string): CommandResult => ({ ok: true, stdout });
-  const { deps, asked } = machine({ claude: ok('2.1.289 (Claude Code)\n'), codex: ok('codex-cli 0.170.0\n'), hermes: ok(`Hermes Agent v${HERMES_VERIFIED_BUILD} (2026.1.1)\n`) }, { claudeDir: f.dir });
+  const { deps, asked } = machine({ claude: ok('2.1.289 (Claude Code)\n'), codex: ok('codex-cli 0.158.0\n'), hermes: ok(`Hermes Agent v${HERMES_VERIFIED_BUILD} (2026.1.1)\n`) }, { claudeDir: f.dir });
   const scan = await scanHarnesses(deps);
   expect(scan).toEqual([
     { harness: 'claude', label: 'Claude Code', detected: true, version: '2.1.289', sessionsAvailable: true },
-    { harness: 'codex', label: 'Codex', detected: true, version: '0.170.0', sessionsAvailable: false, reason: 'unsupported-version' },
+    { harness: 'codex', label: 'Codex', detected: true, version: '0.158.0', sessionsAvailable: false, reason: 'unsupported-version' },
     { harness: 'hermes', label: 'Hermes', detected: true, version: HERMES_VERIFIED_BUILD, sessionsAvailable: true },
     { harness: 'exec', label: 'Custom command', detected: true, sessionsAvailable: false, reason: 'custom-command' },
   ]);
+  // Newer Codex versions >= 0.159.0 are supported without needing narrow allowlist bumps.
+  const newerCodex = machine({ codex: ok('codex-cli 0.170.0\n') });
+  expect((await scanHarnesses(newerCodex.deps)).find(s => s.harness === 'codex')).toEqual({ harness: 'codex', label: 'Codex', detected: true, version: '0.170.0', sessionsAvailable: true });
   // Only --version, with a fixed argv.
   expect(asked.sort()).toEqual(['/bin/claude --version', '/bin/codex --version']);
   expect((await listSessions('claude', deps)).sessions.map(s => s.id)).toEqual([f.first, f.second, f.third, f.noTitle]);

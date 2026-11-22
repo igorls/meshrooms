@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "notice-window",
+  "description": "The inert link notice window may close itself and nothing else: no core or plugin permissions, and no other window's commands. Its page shows ?detail= as text only.",
+  "windows": ["link-approval"],
+  "permissions": ["allow-notice-close"]
+}

@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "dependency": "wormdb",
+  "repository": "https://github.com/igorls/wormdb.git",
+  "candidateCommit": "f96b1aa794904585aaacd9a3c83ff688a031f743",
+  "meshguardCommit": "fdbfd51bdbc643bae0aff8cb7b11e9372f6a23a8",
+  "toolchain": {
+    "compiler": "zig",
+    "version": "0.16.0",
+    "target": "aarch64-macos",
+    "optimize": "ReleaseFast",
+    "cryptoBackend": "std",
+    "command": "zig build ffi -Doptimize=ReleaseFast -Dcrypto-backend=std"
+  },
+  "artifact": {
+    "name": "libwormdb_ffi.dylib",
+    "platform": "darwin",
+    "arch": "arm64",
+    "size": 1472480,
+    "sha256": "c8acc20fbd1148de7a60bb118b623f1d1f198799e9305515f66ae50454c4144f",
+    "requiredSymbols": [
+      "wormdb_open",
+      "wormdb_open_sync",
+      "wormdb_close",
+      "wormdb_set",
+      "wormdb_get",
+      "wormdb_free",
+      "wormdb_delete"
+    ]
+  },
+  "notes": "macOS arm64 candidate built with std.crypto from the same source commits as the Windows and Linux pins; it links libSystem only. Qualified on macOS 27.3 with bun test ./server/persistence (20 pass, 2 skip, 0 fail). The linker's ad hoc signature is part of the hashed file, and signing it for release changes the hash. A second build from the same inputs produced a different hash, so this pin records the qualified artifact and does not promise bit-identical rebuilding. Does not replace the Windows artifact in wormdb.lock.json or the Linux one in linux-x64.lock.json."
+}

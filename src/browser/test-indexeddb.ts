@@ -14,6 +14,8 @@ export const fakeStorage = {
   opens: 0,
   /** When set, read-write transactions abort with a DOMException of this name (e.g. QuotaExceededError). */
   failWith: undefined as string | undefined,
+  /** When true, failWith bubbles via tx.onerror(event.target.error) while tx.error stays null on error and abort. */
+  failOnRequestOnly: false,
   db: undefined as FakeDatabase | undefined,
 };
 
@@ -25,7 +27,7 @@ class FakeRequest<T> {
 /** Settles when the last transaction created so far has finished; the next one starts after it. */
 let tail: Promise<void> = Promise.resolve();
 class FakeTransaction {
-  oncomplete?: () => void; onabort?: () => void; onerror?: () => void;
+  oncomplete?: () => void; onabort?: () => void; onerror?: (event: { target: { error: DOMException | null } }) => void;
   error: DOMException | null = null;
   private aborted = false;
   private changes: (() => void)[] = [];
@@ -56,7 +58,14 @@ class FakeTransaction {
     if (this.pending) { setTimeout(() => this.finish(), 0); return; }
     try {
       if (this.mode === 'readwrite' && (fakeStorage.failWith || this.aborted)) {
-        this.error = new DOMException('The transaction was aborted.', fakeStorage.failWith ?? 'AbortError');
+        const err = new DOMException('The transaction was aborted.', fakeStorage.failWith ?? 'AbortError');
+        if (fakeStorage.failWith) {
+          this.error = null;
+          this.onerror?.({ target: { error: err } });
+          this.error = fakeStorage.failOnRequestOnly ? null : err;
+        } else {
+          this.error = err;
+        }
         this.onabort?.(); return;
       }
       if (this.mode === 'readwrite') { for (const change of this.changes) change(); fakeStorage.writes++; }
@@ -109,7 +118,12 @@ export const fakeLocks = new FakeLocks();
 export class FakeDatabase {
   closed = false;
   onclose?: () => void; onversionchange?: () => void;
-  createObjectStore() {}
+  private stores = new Set<string>();
+  objectStoreNames = { contains: (name: string) => this.stores.has(name) };
+  createObjectStore(name: string) {
+    if (this.stores.has(name)) throw new DOMException('Object store already exists.', 'ConstraintError');
+    this.stores.add(name);
+  }
   close() { this.closed = true; }
   transaction(_store: string, mode = 'readonly') {
     if (this.closed) throw new DOMException('The database connection is closing.', 'InvalidStateError');

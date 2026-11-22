@@ -29,7 +29,9 @@ function db() {
     // A failed, closed or upgraded database is opened again by the next read or write, without a reload.
     const forget = () => { if (database === opening) database = undefined; };
     const open = indexedDB.open('meshrooms-browser-v1', 1);
-    open.onupgradeneeded = () => open.result.createObjectStore('records');
+    open.onupgradeneeded = () => {
+      if (!open.result.objectStoreNames.contains('records')) open.result.createObjectStore('records');
+    };
     open.onsuccess = () => {
       const handle = open.result;
       handle.onclose = forget; // The browser closed it (storage cleared or evicted).
@@ -49,9 +51,43 @@ async function transaction(mode: IDBTransactionMode) {
     return (await db()).transaction('records', mode);
   }
 }
-export async function read<T>(key: string): Promise<T | undefined> {
+export const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+
+export async function read<T>(key: string, validate?: (value: unknown) => value is T): Promise<T | undefined> {
   const store = (await transaction('readonly')).objectStore('records');
-  return new Promise((resolve, reject) => { const r = store.get(key); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+  const raw = await new Promise<unknown>((resolve, reject) => {
+    const r = store.get(key);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+  if (raw === undefined) return undefined;
+  if (validate) {
+    try { return validate(raw) ? raw : undefined; } catch { return undefined; }
+  }
+  return raw as T;
+}
+
+/** Read a stored array, returning `[]` if missing or non-array and dropping corrupted elements. */
+export async function readArray<T>(key: string, valid: (item: unknown) => item is T): Promise<T[]> {
+  const list = await read<unknown[]>(key, Array.isArray);
+  if (!list) return [];
+  const clean: T[] = [];
+  for (const item of list) {
+    try { if (valid(item)) clean.push(item); } catch { /* Drop corrupted entry. */ }
+  }
+  return clean;
+}
+
+/** Read a stored plain-object map, returning `{}` if missing or invalid and dropping corrupted entries. */
+export async function readRecord<T>(key: string, valid: (value: unknown, entryKey: string) => value is T): Promise<Record<string, T>> {
+  const record = await read<Record<string, unknown>>(key, isPlainObject);
+  if (!record) return {};
+  const clean: Record<string, T> = {};
+  for (const [entryKey, value] of Object.entries(record)) {
+    try { if (valid(value, entryKey)) clean[entryKey] = value; } catch { /* Drop corrupted entry. */ }
+  }
+  return clean;
 }
 /**
  * Ownership of a room's records in this browser. Whoever takes a room's connection increments the room's epoch
@@ -68,12 +104,19 @@ async function save(puts: [string, unknown][], deletes: string[] = [], fence?: F
   try { tx = await transaction('readwrite'); } catch { const error = failure(undefined); report(error.message); throw error; }
   let fenced = false;
   return new Promise<void>((resolve, reject) => {
-    tx.oncomplete = () => { report(undefined); resolve(); };
-    tx.onabort = tx.onerror = () => {
+    let capturedError: DOMException | null | undefined;
+    let settled = false;
+    const fail = () => {
+      if (settled) return;
+      settled = true;
       // Losing the room is not a storage problem: the new owner saves.
       if (fenced) { reject(new FenceError('This room was opened in another tab of this browser.')); return; }
-      const error = failure(tx.error); report(error.message); reject(error);
+      const error = failure(tx.error ?? capturedError); report(error.message); reject(error);
     };
+    tx.oncomplete = () => { if (settled) return; settled = true; report(undefined); resolve(); };
+    // Request errors bubble to tx.onerror while tx.error is still null; capture them and settle once on tx.onabort.
+    tx.onerror = event => { capturedError ??= (event.target as IDBRequest | null)?.error ?? tx.error; };
+    tx.onabort = fail;
     try {
       const store = tx.objectStore('records');
       const apply = () => {
@@ -98,8 +141,10 @@ export async function claimFence(key: string): Promise<Fence> {
   const tx = await transaction('readwrite');
   return new Promise<Fence>((resolve, reject) => {
     let epoch = 0;
+    let capturedError: DOMException | null | undefined;
     tx.oncomplete = () => resolve({ key, epoch });
-    tx.onabort = tx.onerror = () => reject(failure(tx.error));
+    tx.onerror = event => { capturedError ??= (event.target as IDBRequest | null)?.error ?? tx.error; };
+    tx.onabort = () => reject(failure(tx.error ?? capturedError));
     const store = tx.objectStore('records');
     const current = store.get(key);
     current.onsuccess = () => { epoch = (typeof current.result === 'number' ? current.result : 0) + 1; store.put(epoch, key); };
@@ -112,12 +157,15 @@ export async function claimFence(key: string): Promise<Fence> {
 export function persistStorage() {
   try { void navigator.storage?.persist?.().catch(() => {}); } catch { /* Not offered here. */ }
 }
+const isIdentity = (value: unknown): value is Identity =>
+  isPlainObject(value) && typeof value.id === 'string' && typeof value.publicKey === 'string'
+  && isPlainObject(value.keys) && 'privateKey' in value.keys && 'publicKey' in value.keys;
 let current: Promise<Identity> | undefined;
 export function identity() {
   return current ||= (async () => {
     if (!crypto.subtle || !navigator.locks) throw new Error('Open this room over HTTPS in a browser with Web Crypto and Web Locks support.');
     return navigator.locks.request('meshrooms-identity', async () => {
-      const existing = await read<Identity>('identity'); if (existing) return existing;
+      const existing = await read<Identity>('identity', isIdentity); if (existing) return existing;
       const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
       const publicKey = base64(await crypto.subtle.exportKey('raw', keys.publicKey));
       const created = { id: await deviceId(publicKey), publicKey, keys };

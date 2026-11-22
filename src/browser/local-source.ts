@@ -9,6 +9,7 @@
 import { foldBoard, type TaskBody } from './board';
 import type { DecisionBody, VoteBody } from './decisions';
 import type { ActivityRecord } from './activity';
+import { autoFetchFiles, retainedFiles } from './files';
 import type { FileView, SavedMessage } from './peers';
 import type { ReactionChip } from './reactions';
 import { retractedStub } from './retractions';
@@ -64,6 +65,7 @@ export class LocalSource implements RoomSource {
   private listeners = new Set<{ change(events: LocalEvent[], reset: boolean): void; failed?(error: ApiFailure): void }>();
   private polling = false;
   private avatars = new Map<string, string | Promise<void>>();
+  private avatarRoomGen = new Map<string, number>();
   /** `ticket`: the one-time ticket from the link the app opened (#access=…), exchanged once for a session token. */
   constructor(ticket?: string | null) {
     if (ticket) this.signIn = this.exchange(ticket);
@@ -173,7 +175,7 @@ export class LocalSource implements RoomSource {
     if (action === 'status') throw new Error('The person device on this computer polls its rooms itself.');
     return this.call<Record<string, unknown>>(`/api/local/rooms/${roomId}/command`, { method: 'POST', json: { action, payload } });
   }
-  async forget(roomId: string) { await this.loadRooms().catch(() => {}); return this.recent().filter(r => r.id !== roomId); }
+  async forget(roomId: string) { this.revokeRoomAvatars(roomId); await this.loadRooms().catch(() => {}); return this.recent().filter(r => r.id !== roomId); }
   counts() {
     return Object.fromEntries(this.rooms.map(r => [r.roomId, { unread: r.unread, mentions: r.mentions, ...(r.waiting?.length ? { waiting: r.waiting } : {}) } satisfies UnreadCount]));
   }
@@ -191,11 +193,39 @@ export class LocalSource implements RoomSource {
   /** The daemon holds the rooms: nothing to hand over. */
   leave() {}
   roomOrigin(roomId: string) { return this.rooms.find(r => r.roomId === roomId)?.origin ?? location.origin; }
+  private revokeRoomAvatars(roomId: string) {
+    this.avatarRoomGen.set(roomId, (this.avatarRoomGen.get(roomId) ?? 0) + 1);
+    const prefix = `${roomId}:`;
+    for (const [key, value] of [...this.avatars]) {
+      if (!key.startsWith(prefix)) continue;
+      if (typeof value === 'string') URL.revokeObjectURL(value);
+      this.avatars.delete(key);
+    }
+  }
   avatar(roomId: string, memberId: string, hash: string, loaded: () => void) {
     const key = `${roomId}:${memberId}:${hash}`, known = this.avatars.get(key);
     if (typeof known === 'string') return known;
-    if (!known) this.avatars.set(key, this.blob(`/api/local/rooms/${roomId}/avatars/${memberId}?h=${hash}`)
-      .then(blob => { this.avatars.set(key, URL.createObjectURL(blob)); loaded(); }, () => { /* Shown as the initial; tried again on the next load. */ }));
+    if (!known) {
+      const gen = this.avatarRoomGen.get(roomId) ?? 0;
+      const memberPrefix = `${roomId}:${memberId}:`;
+      const pending = this.blob(`/api/local/rooms/${roomId}/avatars/${memberId}?h=${hash}`).then(blob => {
+        if ((this.avatarRoomGen.get(roomId) ?? 0) !== gen) return;
+        for (const [k, value] of [...this.avatars]) {
+          if (k.startsWith(memberPrefix) && k !== key) {
+            if (typeof value === 'string') URL.revokeObjectURL(value);
+            this.avatars.delete(k);
+          }
+        }
+        const prev = this.avatars.get(key);
+        if (typeof prev === 'string') URL.revokeObjectURL(prev);
+        this.avatars.set(key, URL.createObjectURL(blob));
+        loaded();
+      }, () => {
+        if (this.avatars.get(key) === pending) this.avatars.delete(key);
+        /* Shown as the initial; tried again on the next load. */
+      });
+      this.avatars.set(key, pending);
+    }
     return undefined;
   }
   async readPref<T>(key: string) { try { const value = localStorage.getItem(`meshrooms:pref:${key}`); return value === null ? undefined : JSON.parse(value) as T; } catch { return undefined; } }
@@ -209,20 +239,65 @@ export class LocalSource implements RoomSource {
     const files = new Map<string, FileView>(), wanted = new Set<string>(), base = `/api/local/rooms/${roomId}`;
     let resolveDone!: () => void;
     const done = new Promise<void>(resolve => { resolveDone = resolve; });
-    const fileViews = (view: View) => {
-      for (const [sha, state] of Object.entries(view.files)) {
+    const referencedShas = () => {
+      const shas = new Set<string>();
+      for (const list of [older, current]) {
+        for (const m of list) for (const ref of m.packet.body.attachments || []) shas.add(ref.sha256);
+      }
+      return shas;
+    };
+    const revokeFile = (sha: string) => {
+      const existing = files.get(sha);
+      if (existing?.url) URL.revokeObjectURL(existing.url);
+    };
+    const revokeAllFiles = () => {
+      for (const view of files.values()) if (view.url) URL.revokeObjectURL(view.url);
+      files.clear();
+      wanted.clear();
+    };
+    const pruneFiles = (referenced: Set<string>) => {
+      for (const sha of [...files.keys()]) {
+        if (referenced.has(sha)) continue;
+        revokeFile(sha);
+        files.delete(sha);
+        wanted.delete(sha);
+        wanted.delete(`get:${sha}`);
+      }
+    };
+    const autoFetchSet = () => {
+      const seen = new Set<string>(), ordered: SavedMessage[] = [];
+      for (const m of [...older, ...current]) {
+        const id = m.packet.body.id;
+        if (seen.has(id)) continue;
+        seen.add(id); ordered.push(m);
+      }
+      const lists = ordered.map(m => m.packet.body.attachments);
+      const owners = ordered.map(m => m.packet.body.memberId);
+      return autoFetchFiles(lists, owners, retainedFiles(lists, undefined, undefined, owners));
+    };
+    const mergeFiles = (entries: View['files']) => {
+      const auto = autoFetchSet();
+      for (const [sha, state] of Object.entries(entries)) {
         const known = files.get(sha);
         if (state.held) {
+          wanted.delete(sha);
           if (known?.url || wanted.has(`get:${sha}`)) continue;
           wanted.add(`get:${sha}`);
           void this.blob(`${base}/files/${sha}`).then(blob => {
+            if (disposed || !referencedShas().has(sha)) { wanted.delete(`get:${sha}`); return; }
+            revokeFile(sha);
             files.set(sha, { url: URL.createObjectURL(blob), type: blob.type });
-            if (!disposed) events.files(Object.fromEntries(files));
+            events.files(Object.fromEntries(files));
           }, () => wanted.delete(`get:${sha}`));
         } else {
-          files.set(sha, state.transfer ? { transfer: state.transfer } : {});
-          // Like a browser, the person device fetches what the room shows: asked once per file while this page is open.
-          if (!wanted.has(sha)) { wanted.add(sha); void this.call(`${base}/files/${sha}/want`, { method: 'POST', json: {} }).catch(() => wanted.delete(sha)); }
+          if (known?.url) { revokeFile(sha); wanted.delete(`get:${sha}`); }
+          const transfer = state.transfer ?? (wanted.has(sha) ? { state: 'waiting' as const } : undefined);
+          files.set(sha, transfer ? { transfer } : {});
+          // Auto-fetch only raster images within per-sender budget (SEC-11); non-images fetch on demand via requestFile().
+          if (auto.has(sha) && !wanted.has(sha)) {
+            wanted.add(sha);
+            void this.call(`${base}/files/${sha}/want`, { method: 'POST', json: {} }).catch(() => wanted.delete(sha));
+          }
         }
       }
       return Object.fromEntries(files);
@@ -245,15 +320,34 @@ export class LocalSource implements RoomSource {
       try {
         const view = await this.call<View>(`${base}/view`);
         if (disposed) return;
-        if (view.state === 'closed') { closed = true; events.closed(view.reason || 'The host closed this room.'); void this.forget(roomId).then(rooms => { if (!disposed) events.recent(rooms); }); resolveDone(); return; }
+        if (view.state === 'closed') {
+          closed = true; revokeAllFiles(); this.revokeRoomAvatars(roomId);
+          events.closed(view.reason || 'The host closed this room.');
+          void this.forget(roomId).then(rooms => { if (!disposed) events.recent(rooms); });
+          resolveDone(); return;
+        }
         const next = status(view);
         if (!next) { events.network('Meshrooms on this computer is still connecting to this room.'); return; }
         events.status(next);
         events.network('');
+        // When the sliding window advances past the end of `older`, merge any displaced messages from `current` into
+        // `older` so the conversation stays contiguous; if the window jumped completely past `current`, reset to avoid a gap.
+        const viewIds = new Set(view.messages.map(v => v.packet.body.id));
+        if (!first && current.length && view.messages.length) {
+          const overlap = current.findIndex(m => viewIds.has(m.packet.body.id));
+          if (overlap > 0) {
+            const olderIds = new Set(older.map(m => m.packet.body.id));
+            const displaced = current.slice(0, overlap).filter(m => !olderIds.has(m.packet.body.id));
+            if (displaced.length) older = [...older, ...displaced];
+          } else if (overlap < 0) {
+            older = [];
+            more = view.more;
+          }
+        }
         const deleted = new Set(view.deleted);
-        older = older.map(m => deleted.has(m.packet.body.id) ? retractedStub(m) : m);
-        const messages = [...older.filter(m => !view.messages.some(v => v.packet.body.id === m.packet.body.id)), ...view.messages];
-        if (first) more = view.more;
+        older = older.filter(m => !viewIds.has(m.packet.body.id)).map(m => deleted.has(m.packet.body.id) ? retractedStub(m) : m);
+        const messages = [...older, ...view.messages];
+        if (first || (!older.length && view.more)) more = view.more;
         // Only the newest window brings arrivals: an older page loaded on request is history, never announced as new.
         const added = first ? undefined : view.messages.filter(m => !shown.has(m.packet.body.id)).at(-1);
         shown = new Set(messages.map(m => m.packet.body.id)); current = messages;
@@ -261,7 +355,8 @@ export class LocalSource implements RoomSource {
         events.board(foldBoard(view.taskOps), view.taskOps);
         events.decisions(view.decisionOps);
         events.reactions(view.reactions);
-        events.files(fileViews(view));
+        pruneFiles(referencedShas());
+        events.files(mergeFiles(view.files));
         events.activity(view.status?.activity ?? {});
         if (first) {
           first = false;
@@ -281,6 +376,16 @@ export class LocalSource implements RoomSource {
       return reading = (async () => { do { again = false; await readOnce(); } while (again && !disposed); })().finally(() => { reading = undefined; });
     };
     const soon = () => { clearTimeout(timer); timer = setTimeout(() => void read(), 120); };
+    let stopEvents: () => void = () => {};
+    const cleanup = () => {
+      if (disposed) return;
+      disposed = true;
+      clearTimeout(timer);
+      stopEvents();
+      revokeAllFiles();
+      this.revokeRoomAvatars(roomId);
+      resolveDone();
+    };
     const session: RoomSession = {
       send: async (text, replyTo, chosen = []) => {
         const attachments = [];
@@ -305,6 +410,20 @@ export class LocalSource implements RoomSource {
       vote: async (decision, optionId, comment = '') => { await this.changed(`${base}/decision`, { requestId: crypto.randomUUID(), decisionId: decision.id, action: 'vote', optionId, comment }); soon(); },
       // The person device keeps the room's newest files, as a browser does; what it let go is fetched again on request.
       evicted: () => false,
+      requestFile: sha => {
+        if (disposed || files.get(sha)?.url) return;
+        if (!files.get(sha)?.transfer) {
+          files.set(sha, { transfer: { state: 'waiting' } });
+          events.files(Object.fromEntries(files));
+        }
+        if (!wanted.has(sha)) {
+          wanted.add(sha);
+          void this.call(`${base}/files/${sha}/want`, { method: 'POST', json: {} }).then(() => soon(), () => {
+            wanted.delete(sha);
+            if (!disposed && !files.get(sha)?.url) { files.set(sha, {}); events.files(Object.fromEntries(files)); }
+          });
+        }
+      },
       markRead: async messageId => {
         if (messageId === lastRead) return;
         lastRead = messageId;
@@ -316,18 +435,20 @@ export class LocalSource implements RoomSource {
         const oldest = current[0]?.packet.body.id;
         if (!more || !oldest) return false;
         const page = await this.call<View>(`${base}/view?before=${oldest}&limit=200`);
+        if (disposed) return false;
         older = [...page.messages, ...older]; more = page.more;
+        if (page.files) events.files(mergeFiles(page.files));
         await read();
         return more;
       },
       hasOlder: () => more,
-      stop: () => { disposed = true; resolveDone(); },
+      stop: cleanup,
     };
     events.ready(session);
-    const stop = this.subscribe((list, reset) => { if (reset || list.some(e => e.type === 'rooms' || ('roomId' in e && e.roomId === roomId))) soon(); },
+    stopEvents = this.subscribe((list, reset) => { if (reset || list.some(e => e.type === 'rooms' || ('roomId' in e && e.roomId === roomId))) soon(); },
       error => { if (!disposed) events.network(error.message, error.status === 401); });
     void read();
-    return { done, dispose() { disposed = true; clearTimeout(timer); stop(); resolveDone(); } };
+    return { done, dispose: cleanup };
   }
   /** A change the person device signs: its answer says whether it was made (`dropped`: it no longer applied). */
   private async changed(path: string, json: Record<string, unknown>) {

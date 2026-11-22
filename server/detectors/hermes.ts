@@ -1,13 +1,20 @@
 import { spawn } from 'node:child_process';
+import { compareVersions, isVersion } from '../agent-install';
 import type { Program } from '../agent-watch';
 
 /** Read-only CLI adapter; no storage fallback, resume, config changes, logging or persistence.
- * Only this measured build is admitted: version 0.21.5 alone does not prove the CLI is read-only.
- * Its list command opens SessionDB(read_only=True). New builds require a fresh schema/RO probe.
+ * Admits Hermes >= 0.21.5 (where `sessions list` opens SessionDB read-only), backed by the
+ * strict fixed-width schema parser below so any layout drift still fails closed.
  * Metadata is private: callers must send it only over the paired person's ephemeral channel,
  * never log it, and render title/workspaceLabel as plain text (not HTML/Markdown).
  */
+export const HERMES_MIN_VERSION = '0.21.5';
 export const HERMES_VERIFIED_BUILD = '0.21.5+6489.gf4d3e62';
+export function hermesVersionSupported(version: string | null): version is string {
+  if (!version) return false;
+  const core = version.split('+', 1)[0];
+  return isVersion(core) && compareVersions(core, HERMES_MIN_VERSION) >= 0;
+}
 export const HERMES_SESSION_LIMIT = 20;
 export const HERMES_TIMEOUT_MS = 30_000;
 export const HERMES_MAX_OUTPUT_BYTES = 128 * 1024;
@@ -139,7 +146,7 @@ export async function detectHermes(runner: HermesRunner = args => runHermesComma
   if (!probe.ok) return { harness: 'hermes', detected: false, sessionsAvailable: false,
     reason: probe.reason === 'not-found' ? 'not-found' : 'version-command-failed' };
   const version = parseHermesVersion(probe.stdout);
-  if (version !== HERMES_VERIFIED_BUILD) return { harness: 'hermes', detected: true, version, sessionsAvailable: false, reason: 'unsupported-version' };
+  if (!hermesVersionSupported(version)) return { harness: 'hermes', detected: true, version, sessionsAvailable: false, reason: 'unsupported-version' };
   let list: HermesCommandResult;
   try { list = await runner(['sessions', 'list', '--limit', String(HERMES_SESSION_LIMIT)]); }
   catch { return { harness: 'hermes', detected: true, version, sessionsAvailable: false, reason: 'listing-command-failed' }; }

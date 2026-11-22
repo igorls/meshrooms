@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.8) and the desktop app (0.1.0-alpha.8):
+  - **Revoked devices stay revoked.** A device removed by the host, or a lost device removed by its member, can no
+    longer keep writing through a relaying peer. A device that left from itself is trusted for what it signed up to
+    when it left, until revoked afterwards.
+  - **Abuse limits, admission lifecycle, and Nginx/TURN hardening.**
+    - The room service bounds requests and room creations per IPv6 `/48` as well as `/64`, counts creations only after
+      authentication (reserving slots before running), caps connection offers globally, enforces the 8-room hosting and
+      8-device companion limits per admitted beta person across linked and removed devices, and supports revoking a beta
+      person across all linked devices (`invites.ts revoke-person`, persisted in `beta_revocations` across restarts
+      until a new invite is redeemed).
+    - Nginx limits requests per canonical IPv6 `/64`, per IPv4, and globally (without a shared `/api/lobby/health` zone
+      so one address cannot stall health probes), returns JSON 429s on `/api/lobby`, redacts query strings and room /
+      member UUIDs in access logs and `Referer` headers (`meshrooms_redacted`), sends 180-day HSTS and security headers
+      with `always` across 2xx/4xx/5xx responses, and serves `/favicon.ico` as 204 (`deploy/nginx/`; see
+      [browser deployment](docs/browser-deployment.md)). Browser clients preserve non-JSON proxy status codes and back
+      off cleanly on 429s.
+    - TURN deployment config blocks loopback and public server self-relay (`no-loopback-peers`, `denied-peer-ip`), and
+      the deploy script verifies the published `@wormdb/meshrooms` npm version, checks systemd/nginx drift, restarts
+      `meshrooms-admin` when active without rolling back a healthy public deploy, and validates versioned admission
+      backup tables.
+    - Ordered SQLite `PRAGMA user_version = 2` schema migrations move retired device keys into an unbounded
+      `retired_devices` table (clearing stale rows on re-join and room close), refuse database downgrades, enforce
+      NFKC/case-folded display-name uniqueness (stripping control/bidi/zero-width characters) with `XXXX-XXXX` device
+      key fingerprints in approval queues, add atomic member removal (`remove { memberId }`), 5-minute decline cooldowns
+      and permanent room blocks (`block: true`), atomic host transfer (`transfer-host`), and explicit wire-protocol
+      compatibility enforcement (`X-Meshrooms-Protocol: 1` / HTTP 426 with an in-app reload banner and bridge backoff).
+  - **Board, reaction, decision, file, and history integrity.**
+    - One member can no longer push everyone else's history or files off a device, or fill the task board or reaction
+      log with create/remove churn, excessive live tasks, or multi-op revision jumps. Devices that receive task changes
+      or reactions in different orders converge deterministically (each member keeps their oldest 200 live tasks and
+      newest 200 live reactions in both browser and bridge), a 201st reaction evicts the member's oldest rather than
+      failing, and a deleted message's reactions are removed with it.
+    - Incoming bridge sync envelopes are capped at 500 ops, live single ops must match their sending peer, `file-want`
+      requests are rate-limited per peer using an in-memory attachment reference cache, and `FileStore.has()` verifies
+      on-disk SHA-256 hashes (removing damaged files).
+    - Browser IndexedDB reads validate/sanitize stored shapes, task issue parsing rejects `#0`, decision revisions reject
+      blank/no-op updates, decision closes pin held human votes and refuse empty tallies when human votes exist, and
+      pending out-of-order reactions expire after 5 minutes or FIFO-evict per member.
+  - **Agent bridge, watchers, and confinement.**
+    - Claude Code wakes no longer load operator settings files by default (`watch --claude-settings` opts back in), and
+      wakes withhold credential-like environment variables (`watch --pass-env` opts back in), deny reading `.dsh` and
+      symlinked secret targets, parse quoted Codex TOML MCP server keys, and refuse blank `--note` clears.
+    - Bridge JSON readers retry transient Windows file locks (`EBUSY`/`EPERM`/`EACCES`), and state writers fail closed
+      instead of overwriting room history with an empty fallback on read errors.
+    - Codex bindings default to headless CLI wakes on Windows and Linux (desktop IPC remains the default on macOS and
+      fails fast on Windows with `--codex-delivery headless` guidance), `watchDesktop` respects halts and interactive
+      live-listener leases, and Codex/Hermes harness detectors accept semver ranges (`>= 0.159.0` / `>= 0.21.5`).
+    - Fixed `watch-status` hard-pause timestamp serialization, POSIX `ps` `LC_ALL=C` parsing, Windows startup Run-key
+      `-ExecutionPolicy Bypass`, immediate bailout in `runnerStarted()` when process inspection is unavailable, lock
+      fallback/reclaim/expiry hardening, monotonic listen cursor saving, and duplicate `task-update` outbox queuing.
+  - **Browser rooms, desktop app, and website.**
+    - Browser rooms show open-room waiting requests and hidden-tab unread counts in the tab title with opt-in desktop
+      notifications for host join requests, fix `LocalSource` pagination/older-message files/Blob URL cleanup, guard
+      IndexedDB upgrades and `QuotaExceededError` preservation, abort in-flight polls cleanly, bound pending command
+      retries, and clarify peer-to-peer history/storage and pairing copy.
+    - The desktop status window has a clearer layout with intact focus rings, deep-link notices open in a dedicated
+      CSP-clean window with a scoped Close capability (`capabilities/notice.json`), non-Windows notification permission
+      checks recover cleanly when granted later and name the tray item *Review your agents*, and website poll vote bars
+      render under strict CSP without inline `style` attributes.
+    - Native WormDB library builds on macOS arm64 from its own pin (`native/darwin-arm64.lock.json`) with
+      `scripts/build-native.sh`.
+    - Hardening: out-of-range timestamps (`< 0` or `> MAX_TIME`) are refused on messages, tasks, decisions, and
+      reactions and clamped safely before ISO formatting; queued connection offers keep only type and SDP; the legacy
+      local node refuses cross-port requests; the privacy gate catches multi-word terms across line breaks.
+  - **Coordinator concurrency, long-session WAN/TURN durability, and file transfers.**
+    - Routine `status` and `creation-status` polls run outside SQLite `BEGIN IMMEDIATE` write locks, indexed room
+      metadata and `room_devices` tables eliminate full-table room JSON scans on create/prune/startup, signal queues
+      deduplicate superseded offers/answers and enforce fair per-sender limits, and Coturn config widens relay capacity
+      to 500 UDP ports (`49160–49659`), `total-quota=500`, and `max-bps=1000000` (8 Mbps).
+    - Live open WebRTC peer channels stay connected across coordinator restarts/epoch changes; peer health tracks
+      `unhealthySince` separately from connection start time (dropping zombie closed-channel connections and failed
+      signals promptly), validates SDP answers against retired ufrags/`a=mid` sections, refreshes TURN credentials past
+      1 hour, and applies `Retry-After` / exponential 429 poll backoff in both browser and bridge.
+    - Bulk file transfers use a backward-compatible dedicated `'files'` DataChannel (`HIGH_WATER = 256 KB` with
+      `bufferedamountlow` wakeups), cap concurrent partial download RAM at 32 MB with lazy chunk buffers, and restrict
+      automatic fetching to raster images (24 MB per sender) with on-demand `Download` buttons for non-image files.
+  - **Live listener ergonomics, DeepSeek Harness (`dsh`), Grok Bot, and Hermes MCP fixes.**
+    - `listen --until-addressed` waits cleanly during pending admission (`waiting-for-host`), ignores stale
+      `removedSince` proofs from older runners, and supports `--parent <pid>` orphan protection (exiting `6` when the
+      parent exits); `connect -` / `connect --link -` reads the secret link from stdin; CLI failures with structured
+      metadata emit single-line JSON `{ error, code?, status? }` on stderr.
+    - Added DeepSeek Harness (`--harness dsh`, optional `--profile <name>`) watcher support, connect-prompt option, and
+      `dsh` auto-selection; increased bounded stdout tail capture (`fileTail`) to preserve >64 KB single-line JSON
+      harness results.
+    - Added Grok Bot webhook wake support (`grok setup`, `grok check [--ping]`, `grok wake`), the
+      [meshrooms-grok-bot skill](skills/meshrooms-grok-bot/SKILL.md), and [Grok Bot agents](docs/grok-bot.md).
+    - Added `reply_to` on MCP `vote` and `issue` on MCP `task-update`, enforced strict MCP boolean/tool-branch checks,
+      and fixed Hermes binding Windows path normalization, YAML 1.1/1.2 quoting, and BOM/CRLF duplicate-key detection.
+
 - The agent bridge (0.2.0-beta.7) and the desktop app (0.1.0-alpha.7):
   - **Delete your own messages.** Delete, on a message you wrote, removes it for everyone in the room: on hosted
     pages, in the desktop app and in agents' folders. It stays in place as "Message deleted", with its text and files

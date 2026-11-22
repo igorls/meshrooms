@@ -266,3 +266,148 @@ describe('I6: anchors, merges and mixed types behave predictably', () => {
     expect(readMcpServerArgs(config, roomToolsetName(ROOM_A)).problem).toContain('not a list of strings');
   });
 });
+
+describe('Windows paths, YAML quoting and CRLF robustness', () => {
+  test('hermesBindingSnippet round-trips Windows paths with spaces, backslashes, colons and YAML metacharacters', () => {
+    const serverName = roomToolsetName(ROOM_A);
+    const launcher = 'C:\\Users\\Jane Doe\\.meshrooms\\bin\\meshrooms.js';
+    const agentHome = 'C:\\Users\\Jane Doe\\.meshrooms\\agents';
+    const wakeDir = `C:\\Users\\Jane Doe\\.meshrooms\\agents\\browser-agents\\${ROOM_A}\\wake`;
+    const snippet = hermesBindingSnippet(serverName, ROOM_A, agentHome, launcher, wakeDir);
+
+    const parsed = Bun.YAML.parse(snippet) as { mcp_servers: Record<string, { args: string[] }> };
+    expect(parsed.mcp_servers[serverName].args).toEqual([
+      launcher, 'mcp', '--room', ROOM_A, '--agent-home', agentHome, '--wake-dir', wakeDir,
+    ]);
+
+    const read = readMcpServerArgs(snippet, serverName);
+    expect(read.problem).toBeUndefined();
+    expect(hermesBindingProblem(read.args, ROOM_A, agentHome, wakeDir, 'win32')).toBeUndefined();
+
+    // Special YAML flow/scalar characters (colons, hashes, brackets, braces, quotes, commas) also survive intact.
+    const trickyWake = 'C:\\Users\\Jane Doe\\dir #1 [a], {b}: "q" \'s\'\\wake';
+    const trickySnippet = hermesBindingSnippet(serverName, ROOM_A, agentHome, launcher, trickyWake);
+    const trickyRead = readMcpServerArgs(trickySnippet, serverName);
+    expect(trickyRead.problem).toBeUndefined();
+    expect(trickyRead.args).toContain(trickyWake);
+    expect(hermesBindingProblem(trickyRead.args, ROOM_A, agentHome, trickyWake, 'win32')).toBeUndefined();
+  });
+
+  test('hermesBindingProblem normalizes Windows slashes, trailing separators and casing on win32', () => {
+    const args = [
+      'C:\\Users\\Jane\\.meshrooms\\bin\\meshrooms.js', 'mcp',
+      '--room', ROOM_A,
+      '--agent-home', 'C:/Users/Jane/.meshrooms/agents',
+      '--wake-dir', 'C:/Users/Jane/.meshrooms/agents/wake/',
+    ];
+    expect(hermesBindingProblem(args, ROOM_A, 'c:\\users\\jane\\.meshrooms\\agents\\', 'c:\\USERS\\JANE\\.meshrooms\\agents\\wake', 'win32')).toBeUndefined();
+    // Redundant dot segments resolve to the same directory.
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', 'C:\\Users\\Jane\\sub\\..\\agents'],
+      ROOM_A, 'c:/users/jane/agents', undefined, 'win32',
+    )).toBeUndefined();
+    // UNC paths normalize separators and casing too.
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', '//FILESRV/Share/Agents/'],
+      ROOM_A, '\\\\filesrv\\share\\agents', undefined, 'win32',
+    )).toBeUndefined();
+  });
+
+  test('hermesBindingProblem stays case-sensitive on POSIX and strictly refuses mismatched directories', () => {
+    // Trailing slash on POSIX resolves to the same directory.
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', '/x/Users/Jane/agents/', '--wake-dir', '/x/wake/'],
+      ROOM_A, '/x/Users/Jane/agents', '/x/wake', 'linux',
+    )).toBeUndefined();
+    // Different casing on POSIX is refused.
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', '/x/Users/jane/agents'],
+      ROOM_A, '/x/Users/Jane/agents', undefined, 'linux',
+    )).toContain('--agent-home');
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', '/x/Users/Jane/agents', '--wake-dir', '/x/Wake'],
+      ROOM_A, '/x/Users/Jane/agents', '/x/wake', 'darwin',
+    )).toContain('--wake-dir');
+
+    // Different folders or drives on win32 are still refused.
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', 'C:\\Users\\Jane\\other'],
+      ROOM_A, 'C:\\Users\\Jane\\agents', undefined, 'win32',
+    )).toContain('--agent-home');
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', 'D:\\Users\\Jane\\agents'],
+      ROOM_A, 'C:\\Users\\Jane\\agents', undefined, 'win32',
+    )).toContain('--agent-home');
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', 'C:\\Users\\Jane\\agents', '--wake-dir', 'C:\\Users\\Jane\\other-wake'],
+      ROOM_A, 'C:\\Users\\Jane\\agents', 'C:\\Users\\Jane\\wake', 'win32',
+    )).toContain('--wake-dir');
+    // Relative, drive-relative or empty values never match an absolute drive path.
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', '/Users/Jane/agents'],
+      ROOM_A, 'C:\\Users\\Jane\\agents', undefined, 'win32',
+    )).toContain('--agent-home');
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', ''],
+      ROOM_A, 'C:\\Users\\Jane\\agents', undefined, 'win32',
+    )).toContain('--agent-home');
+  });
+
+  test('duplicateMcpServerKey handles CRLF line endings, BOM, quoted keys, colons and inline values', () => {
+    const serverName = roomToolsetName(ROOM_A);
+    const crlfDup = [
+      'agent:',
+      '  max_turns: 200',
+      'mcp_servers: # windows config',
+      `  ${serverName}:`,
+      '    args: ["a"]',
+      `  "${serverName}":`,
+      '    args: ["b"]',
+      '',
+    ].join('\r\n');
+    expect(duplicateMcpServerKey(crlfDup, serverName)).toBe(true);
+    expect(readMcpServerArgs(crlfDup, serverName).problem).toContain('more than once');
+
+    const crlfSingle = [
+      '\uFEFFmcp_servers:',
+      `  '${serverName}':`,
+      '    command: bun',
+      `    args: ["C:\\\\Users\\\\Jane\\\\bin\\\\meshrooms.js", "mcp", "--room", "${ROOM_A}", "--agent-home", "C:\\\\Users\\\\Jane\\\\agents"]`,
+      '    enabled: true',
+      '',
+    ].join('\r\n');
+    expect(duplicateMcpServerKey(crlfSingle, serverName)).toBe(false);
+    const parsedSingle = readMcpServerArgs(crlfSingle, serverName);
+    expect(parsedSingle.problem).toBeUndefined();
+    expect(hermesBindingProblem(parsedSingle.args, ROOM_A, 'c:/users/jane/agents', undefined, 'win32')).toBeUndefined();
+
+    // Quoted keys containing colons or quotes: duplicates are caught, single valid entries pass.
+    const colonDup = [
+      'mcp_servers:',
+      '  "srv:one":',
+      '    args: ["a"]',
+      "  'srv:one':",
+      '    args: ["b"]',
+      '',
+    ].join('\r\n');
+    expect(duplicateMcpServerKey(colonDup, 'srv:one')).toBe(true);
+    expect(readMcpServerArgs(colonDup, 'srv:one').problem).toContain('more than once');
+
+    const colonSingle = [
+      'mcp_servers:',
+      '  "srv:one":',
+      '    args: ["a"]',
+      '  "srv:two": { args: ["b"] }',
+      '',
+    ].join('\r\n');
+    expect(duplicateMcpServerKey(colonSingle, 'srv:one')).toBe(false);
+    expect(readMcpServerArgs(colonSingle, 'srv:one').args).toEqual(['a']);
+
+    // Inline flow entries and escaped quotes in keys are detected when duplicated.
+    const inlineDup = `mcp_servers:\r\n  ${serverName}: { args: ["a"] }\r\n  ${serverName}: { args: ["b"] }\r\n`;
+    expect(duplicateMcpServerKey(inlineDup, serverName)).toBe(true);
+
+    const escapedQuoteDup = 'mcp_servers:\r\n  "a\\"b":\r\n    args: ["x"]\r\n  \'a"b\':\r\n    args: ["y"]\r\n';
+    expect(duplicateMcpServerKey(escapedQuoteDup, 'a"b')).toBe(true);
+  });
+});

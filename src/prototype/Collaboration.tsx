@@ -413,10 +413,10 @@ export function PendingFiles({ files, onRemove, onRetry }: { files: PendingFile[
   </li>)}</ul>;
 }
 
-/** Where an attachment's bytes are: a URL, or a note while they are not on this device yet (browser rooms fetch them from peers). */
-export type AttachmentSource = (attachment: Attachment) => { url?: string; note?: string };
+/** Where an attachment's bytes are: a URL, a note while they are fetching/unavailable, or an on-demand fetch callback (SEC-11). */
+export type AttachmentSource = (attachment: Attachment) => { url?: string; note?: string; onFetch?: () => void };
 
-/** Images render inline and open full size; other files are downloads. */
+/** Images render inline and open full size; other files are downloads (fetched on demand when `onFetch` is supplied). */
 export function MessageAttachments({ roomId, attachments, author, source }: { roomId: string; attachments: Attachment[]; author: string; source?: AttachmentSource }) {
   const [open, setOpen] = useState<Attachment | null>(null);
   const locate: AttachmentSource = source || (a => ({ url: attachmentUrl(roomId, a.id) }));
@@ -424,16 +424,22 @@ export function MessageAttachments({ roomId, attachments, author, source }: { ro
   const viewing = open && locate(open).url;
   return <div className="message-attachments">
     {images.length > 0 && <div className={`attachment-images count-${Math.min(images.length, 4)}`}>{images.map(image => {
-      const { url, note } = locate(image);
+      const { url, note, onFetch } = locate(image);
       return url ? <button key={image.id} className="attachment-image" onClick={() => setOpen(image)} aria-label={`Open ${image.name} from ${author}`}>
         <img src={url} alt={image.name} width={image.width} height={image.height} loading="lazy" decoding="async" />
+      </button> : onFetch ? <button key={image.id} type="button" className="attachment-image attachment-waiting" onClick={onFetch} aria-label={`Load ${image.name} from ${author}`} style={image.width && image.height ? { aspectRatio: `${image.width} / ${image.height}` } : undefined}>
+        <span><strong>{image.name}</strong><small>{note || `Load image · ${formatBytes(image.size)}`}</small></span>
       </button> : <div key={image.id} className="attachment-image attachment-waiting" role="img" aria-label={`${image.name}: ${note}`} style={image.width && image.height ? { aspectRatio: `${image.width} / ${image.height}` } : undefined}>
         <span><strong>{image.name}</strong><small>{note}</small></span></div>;
     })}</div>}
     {files.map(file => {
-      const { url, note } = locate(file);
-      const label = <><FileIcon /><span><strong>{file.name}</strong><small>{note || `${file.type === 'application/pdf' ? 'PDF' : file.type === 'text/plain' ? 'Text' : 'File'} · ${formatBytes(file.size)}`}</small></span></>;
-      return url ? <a key={file.id} className="attachment-file" href={url} download={file.name}>{label}</a> : <span key={file.id} className="attachment-file attachment-waiting">{label}</span>;
+      const { url, note, onFetch } = locate(file);
+      const kind = file.type === 'application/pdf' ? 'PDF' : file.type === 'text/plain' ? 'Text' : 'File';
+      const meta = `${kind} · ${formatBytes(file.size)}`;
+      const label = <><FileIcon /><span><strong>{file.name}</strong><small>{note || (onFetch ? `Download · ${meta}` : meta)}</small></span></>;
+      return url ? <a key={file.id} className="attachment-file" href={url} download={file.name}>{label}</a>
+        : onFetch ? <button key={file.id} className="attachment-file" type="button" onClick={onFetch} style={{ textAlign: 'left' }}>{label}</button>
+        : <span key={file.id} className="attachment-file attachment-waiting">{label}</span>;
     })}
     {open && viewing && <ImageViewer url={viewing} image={open} author={author} onClose={() => setOpen(null)} />}
   </div>;

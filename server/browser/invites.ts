@@ -11,6 +11,9 @@ const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const DAY = 86_400_000;
 export type InviteFailure = 'invite-required' | 'invite-invalid' | 'invite-used' | 'invite-expired';
 export type InviteRow = { id: string; uses: number; remaining: number; expiresAt: number; note: string; createdAt: number; revokedAt: number | null };
+export type BetaPersonRow = { id: string; devices: number; admittedAt: number };
+/** Maximum beta-admitted devices one invite holder may link, so one code cannot mint unlimited creator keys. */
+export const BETA_DEVICES_PER_PERSON = 8;
 
 /** Codes are typed by people: case, spaces and dashes don't matter. */
 export function normalizeInvite(value: unknown): string | undefined {
@@ -62,8 +65,37 @@ export function consumeInvite(db: Database, value: unknown, now: number): Invite
 export function betaPerson(db: Database, device: string): string | undefined {
   return (db.query('SELECT person FROM beta_admissions WHERE device=?').get(device) as { person: string } | null)?.person;
 }
-export function admitBetaDevice(db: Database, device: string, person = device, now = Date.now()) {
-  db.query('INSERT OR IGNORE INTO beta_admissions (device, person, admitted_at) VALUES (?,?,?)').run(device, person, now);
+/** Every device currently admitted under a beta person. */
+export function betaDevices(db: Database, person: string): string[] {
+  return (db.query('SELECT device FROM beta_admissions WHERE person=?').all(person) as { device: string }[]).map(row => row.device);
+}
+/**
+ * Admits one device under `person`, up to `BETA_DEVICES_PER_PERSON` distinct rows per person so a single invite
+ * holder cannot mint unlimited creator keys. Existing rows stay untouched.
+ */
+export function admitBetaDevice(db: Database, device: string, person = device, now = Date.now()): boolean {
+  if (betaPerson(db, device)) return false;
+  return db.query('INSERT OR IGNORE INTO beta_admissions (device, person, admitted_at) SELECT ?, ?, ? WHERE (SELECT COUNT(*) FROM beta_admissions WHERE person=?) < ?')
+    .run(device, person, now, person, BETA_DEVICES_PER_PERSON).changes > 0;
+}
+/** Admitted beta people for operators: person id, linked device count, earliest admission time (no secrets). */
+export function listBetaPeople(db: Database): BetaPersonRow[] {
+  return db.query('SELECT person AS id, COUNT(*) AS devices, MIN(admitted_at) AS admittedAt FROM beta_admissions GROUP BY person ORDER BY admittedAt DESC').all() as BetaPersonRow[];
+}
+/**
+ * Removes all beta-admission rows for `person` and remembers the devices as revoked, so the service's start (which
+ * re-admits the hosts of existing rooms from before invites) doesn't give them back. Redeeming a new invite clears it.
+ * Returns the number of device rows deleted.
+ */
+export function revokeBetaPerson(db: Database, person: string, now = Date.now()): number {
+  return db.transaction(() => {
+    db.query('INSERT OR REPLACE INTO beta_revocations (device, person, revoked_at) SELECT device, person, ? FROM beta_admissions WHERE person=?').run(now, person);
+    return db.query('DELETE FROM beta_admissions WHERE person=?').run(person).changes;
+  }).immediate();
+}
+/** Whether the operator revoked this device's creation admission and no new invite has been redeemed since. */
+export function betaRevoked(db: Database, device: string): boolean {
+  return !!db.query('SELECT 1 FROM beta_revocations WHERE device=?').get(device);
 }
 
 export const inviteMessages: Record<InviteFailure, string> = {
@@ -76,7 +108,9 @@ export const inviteMessages: Record<InviteFailure, string> = {
 const usage = `Usage (run as the service account, with MESHROOMS_BROWSER_DATA set to the service's data directory):
   bun run server/browser/invites.ts mint --uses <n> --days <d> [--note "<who it is for>"]
   bun run server/browser/invites.ts list
-  bun run server/browser/invites.ts revoke <id>`;
+  bun run server/browser/invites.ts revoke <id>
+  bun run server/browser/invites.ts people
+  bun run server/browser/invites.ts revoke-person <person>`;
 
 export function invitesCli(args: string[], db: Database, print: (line: string) => void = console.log) {
   const [command, ...rest] = args;
@@ -99,6 +133,20 @@ export function invitesCli(args: string[], db: Database, print: (line: string) =
   if (command === 'revoke' && rest[0]) {
     if (!revokeInvite(db, rest[0])) throw new Error(`No active invite ${rest[0]}.`);
     print(`Revoked ${rest[0]}.`);
+    return;
+  }
+  if (command === 'people') {
+    const rows = listBetaPeople(db);
+    if (!rows.length) { print('No admitted people.'); return; }
+    for (const r of rows) {
+      print([r.id, `${r.devices} device${r.devices === 1 ? '' : 's'}`, `admitted ${new Date(r.admittedAt).toISOString()}`].join('\t'));
+    }
+    return;
+  }
+  if (command === 'revoke-person' && rest[0]) {
+    const removed = revokeBetaPerson(db, rest[0]);
+    if (!removed) throw new Error(`No admitted person ${rest[0]}.`);
+    print(`Revoked ${rest[0]} (${removed} device${removed === 1 ? '' : 's'}).`);
     return;
   }
   throw new Error(usage);

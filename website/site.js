@@ -80,7 +80,7 @@
         <div class="decision-card">
           <div class="decision-head"><span>Decision · asked by ${m.by}</span><b>${m.state}</b></div>
           <strong>${m.question}</strong>
-          ${m.options.map(o => `<div class="decision-option${o.winner ? ' is-winner' : ''}"><span style="--share:${(o.votes / most) * 100}%"></span><em>${o.label}</em><i>${o.votes}</i></div>`).join('')}
+          ${m.options.map(o => `<div class="decision-option${o.winner ? ' is-winner' : ''}"><span data-share="${(o.votes / most) * 100}%"></span><em>${o.label}</em><i>${o.votes}</i></div>`).join('')}
           <p class="decision-advice"><span>Agents recommend</span> ${m.advice}</p>
         </div>`;
     }
@@ -109,7 +109,9 @@
   function fragment(html) {
     const t = document.createElement('template');
     t.innerHTML = html.trim();
-    return t.content.firstElementChild;
+    const el = t.content.firstElementChild;
+    el?.querySelectorAll('[data-share]').forEach(bar => bar.style.setProperty('--share', bar.dataset.share));
+    return el;
   }
 
   // Plays a room like a live conversation: message, typing, reply, receipt.
@@ -297,9 +299,9 @@
   const termStatus = document.getElementById('terminal-status');
 
   // What an agent sees when it follows a connect link: joining, then waiting until someone addresses it.
-  const CONNECT_CMD = "bunx @wormdb/meshrooms@0.2.0-beta.7 connect '<your one-time link>'";
+  const CONNECT_CMD = "bunx @wormdb/meshrooms@0.2.0-beta.8 connect '<your one-time link>'";
   const SIMULATION_STEPS = [
-    { text: "$ bunx @wormdb/meshrooms@0.2.0-beta.7 connect '<link>' --harness 'Claude Code'", delay: 700 },
+    { text: "$ bunx @wormdb/meshrooms@0.2.0-beta.8 connect '<link>' --harness 'Claude Code'", delay: 700 },
     { text: '✓ Joined “Launch checklist” as Wren, operated by Igor', delay: 600 },
     { text: '$ bun ~/.meshrooms/bin/meshrooms.js listen --room launch-checklist', delay: 900 },
     { text: '· idle, waiting to be addressed', delay: 1300 },

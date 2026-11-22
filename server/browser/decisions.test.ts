@@ -45,7 +45,7 @@ test('closing records the tally; only the creator, its operator, or the host may
   expect(closed).toMatchObject({ state: 'closed', outcome: { result: 'decided', optionIds: ['approve'], voters: 1, people: 3 } });
   // Later votes and revisions never change a closed outcome.
   const late = castVote(as(lee), d, 'reject');
-  expect(fold([open, vote, byOperator, late, reviseDecision(as(wren), closed, {})])[0].outcome).toEqual(closed.outcome);
+  expect(fold([open, vote, byOperator, late, reviseDecision(as(wren), closed, { withdraw: true })])[0].outcome).toEqual(closed.outcome);
 });
 
 test('anyone adds options while open; concurrent revisions settle by operation id, not clocks', () => {
@@ -56,7 +56,7 @@ test('anyone adds options while open; concurrent revisions settle by operation i
   expect(fold([open, x, y])[0].options.map(o => o.label)).toEqual(['A', 'B', 'D']);
   expect(fold([y, open, x])[0].options.map(o => o.label)).toEqual(['A', 'B', 'D']);
   // Options only grow: a revision that renames an option is ignored.
-  const rename = { ...reviseDecision(as(igor), d, {}), options: [{ ...d.options[0], label: 'Z' }, d.options[1]] };
+  const rename = { ...reviseDecision(as(igor), d, { addOption: 'C' }), options: [{ ...d.options[0], label: 'Z' }, d.options[1]] };
   expect(fold([open, rename])[0].options[0].label).toBe('A');
 });
 
@@ -82,6 +82,8 @@ test('validation rejects malformed operations, and sync chunks stay small', () =
   expect(validDecisionBody({ ...open, options: [...open.options, open.options[0]] }, roomId)).toBe(false);
   expect(validDecisionBody({ ...open, state: 'closed' }, roomId)).toBe(false);
   expect(validDecisionBody({ ...open, question: 'x'.repeat(201) }, roomId)).toBe(false);
+  expect(validDecisionBody({ ...open, at: Number.MAX_SAFE_INTEGER }, roomId)).toBe(false);
+  expect(validDecisionBody({ ...open, closesAt: Number.MAX_SAFE_INTEGER }, roomId)).toBe(false);
   expect(validVoteBody({ ...castVote(as(igor), fold([open])[0], 'o1'), comment: 'x'.repeat(501) }, roomId)).toBe(false);
   const packets = Array.from({ length: 60 }, () => ({ body: openDecision({ ...as(igor), question: 'Q'.repeat(200), context: 'c'.repeat(1000), options: ['A', 'B'] }), signature: 's' }));
   const chunks = decisionChunks(roomId, packets);
@@ -150,7 +152,7 @@ test('stewardship stays with the creator after someone else adds an option', () 
   const byDom = reviseDecision(as(lee), fold([open])[0], { addOption: 'Never' });
   const domOps = [open, byDom];
   const withdraw = reviseDecision(as(lee), fold(domOps)[0], { withdraw: true });
-  const retitled = { ...reviseDecision(as(lee), fold(domOps)[0], {}), question: 'Something else' };
+  const retitled = { ...reviseDecision(as(lee), fold(domOps)[0], { addOption: 'Maybe' }), options: fold(domOps)[0].options, question: 'Something else' };
   expect(fold([...domOps, withdraw])[0]).toMatchObject({ state: 'open', revision: 2 });
   expect(fold([...domOps, retitled])[0].question).toBe('Ship today?');
   expect(fold([...domOps, reviseDecision(as(sam), fold(domOps)[0], { withdraw: true })])[0].state).toBe('withdrawn');

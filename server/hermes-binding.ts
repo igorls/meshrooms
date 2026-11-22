@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix, win32 } from 'node:path';
 
 /**
  * The per-room Hermes binding: which MCP server a room's wake is confined to, and the check that the
@@ -54,7 +54,7 @@ export function readMcpServerArgs(configText: string, serverName: string): { arg
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return { problem: 'the config did not parse to a mapping' };
   // I6: a duplicate entry is refused, because the parser last-wins silently and Hermes' own
   // parser does the same — so neither can tell us which one was meant.
-  if (duplicateMcpServerKey(configText, serverName)) return { problem: `the config declares \\\`mcp_servers.${serverName}\\\` more than once` };
+  if (duplicateMcpServerKey(configText, serverName)) return { problem: `the config declares \`mcp_servers.${serverName}\` more than once` };
   // Top-level `mcp_servers` ONLY. A nested `mcp_servers` elsewhere is not the one Hermes reads.
   const servers = (doc as Record<string, unknown>).mcp_servers;
   if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return { problem: 'the config has no top-level `mcp_servers:` section' };
@@ -94,6 +94,34 @@ export function parseArgs(args: readonly string[]): { values: Map<string, string
   return { values, repeated };
 }
 
+type BindingPathKind = 'drive' | 'unc' | 'rooted' | 'absolute' | 'relative';
+
+function bindingPathKind(value: string, platform: NodeJS.Platform): BindingPathKind {
+  if (platform === 'win32') {
+    if (/^[A-Za-z]:[\\/]/.test(value)) return 'drive';
+    if (/^[\\/]{2}[^\\/]/.test(value)) return 'unc';
+    if (/^[\\/]/.test(value)) return 'rooted';
+    return 'relative';
+  }
+  return value.startsWith('/') ? 'absolute' : 'relative';
+}
+
+function normalizeBindingPath(value: string, platform: NodeJS.Platform): string {
+  if (!value) return '';
+  return platform === 'win32' ? win32.resolve(value).toLowerCase() : posix.resolve(value);
+}
+
+/**
+ * Compare two binding directory paths without false refusals on Windows separator, trailing-slash,
+ * or drive/path casing differences, while failing closed when path kinds (e.g. relative vs drive)
+ * or resolved targets differ.
+ */
+function sameBindingPath(a: string, b: string, platform: NodeJS.Platform): boolean {
+  if (!a || !b) return false;
+  if (bindingPathKind(a, platform) !== bindingPathKind(b, platform)) return false;
+  return normalizeBindingPath(a, platform) === normalizeBindingPath(b, platform);
+}
+
 /**
  * Why this server entry cannot serve a wake for `roomId`, or undefined when it is correct.
  *
@@ -102,7 +130,13 @@ export function parseArgs(args: readonly string[]): { values: Map<string, string
  * filters the environment it passes to a stdio server, so the home must travel in the args; without it
  * the server reads the shared agents folder and refuses every file the wake was told to attach.
  */
-export function hermesBindingProblem(args: readonly string[] | undefined, roomId: string, agentHome: string, wakeDir?: string): string | undefined {
+export function hermesBindingProblem(
+  args: readonly string[] | undefined,
+  roomId: string,
+  agentHome: string,
+  wakeDir?: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
   if (!args) return 'its entry could not be read';
   if (!args.length) return 'its entry has no args';
   // I1: a repeated flag is refused rather than interpreted. The check and the server could otherwise
@@ -115,12 +149,12 @@ export function hermesBindingProblem(args: readonly string[] | undefined, roomId
   if (room !== roomId) return `its args pass --room ${room}, but this watcher serves room ${roomId}`;
   const home = values.get('--agent-home');
   if (home === undefined) return 'its args do not pass --agent-home, so the server would read the shared agents folder instead of this agent\'s';
-  if (home !== agentHome) return `its args pass --agent-home ${home}, but this agent\'s home is ${agentHome}`;
+  if (!sameBindingPath(home, agentHome, platform)) return `its args pass --agent-home ${home}, but this agent\'s home is ${agentHome}`;
   // The wake folder is part of the binding too: a server pointed at another wake folder refuses every
   // file this wake's harness was told to write there.
   if (wakeDir !== undefined) {
     const dir = values.get('--wake-dir');
-    if (dir !== undefined && dir !== wakeDir) return `its args pass --wake-dir ${dir}, but this watcher's wake folder is ${wakeDir}`;
+    if (dir !== undefined && !sameBindingPath(dir, wakeDir, platform)) return `its args pass --wake-dir ${dir}, but this watcher's wake folder is ${wakeDir}`;
   }
   return undefined;
 }
@@ -138,6 +172,43 @@ export function hermesConfigPath(env: Record<string, string | undefined> = proce
   return join(base, 'config.yaml');
 }
 
+/** Extract the mapping key from a trimmed YAML line (plain, single-quoted, or double-quoted), or undefined. */
+function parseYamlMappingKey(trimmed: string): string | undefined {
+  if (!trimmed || trimmed.startsWith('#')) return undefined;
+  if (trimmed[0] === '"') {
+    for (let i = 1; i < trimmed.length; i++) {
+      if (trimmed[i] === '\\') { i++; continue; }
+      if (trimmed[i] === '"') {
+        if (!/^\s*:(?:\s|$)/.test(trimmed.slice(i + 1))) return undefined;
+        try {
+          const parsed = Bun.YAML.parse(trimmed.slice(0, i + 1));
+          return typeof parsed === 'string' ? parsed : undefined;
+        } catch { return undefined; }
+      }
+    }
+    return undefined;
+  }
+  if (trimmed[0] === "'") {
+    for (let i = 1; i < trimmed.length; i++) {
+      if (trimmed[i] === "'") {
+        if (trimmed[i + 1] === "'") { i++; continue; }
+        if (!/^\s*:(?:\s|$)/.test(trimmed.slice(i + 1))) return undefined;
+        return trimmed.slice(1, i).replace(/''/g, "'");
+      }
+    }
+    return undefined;
+  }
+  if (/^(?:[-?:](?:\s|$)|[\[\]{},#&*!|>%@`])/.test(trimmed)) return undefined;
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === '#' && i > 0 && /\s/.test(trimmed[i - 1])) return undefined;
+    if (trimmed[i] === ':' && (i + 1 === trimmed.length || /\s/.test(trimmed[i + 1]))) {
+      const key = trimmed.slice(0, i).trim();
+      return key.length > 0 ? key : undefined;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Whether `mcp_servers.<serverName>` is declared MORE THAN ONCE in the raw text.
  *
@@ -153,32 +224,49 @@ export function hermesConfigPath(env: Record<string, string | undefined> = proce
  * parser cannot report. An unparsable config is caught earlier, so a miss here cannot become a bypass.
  */
 export function duplicateMcpServerKey(configText: string, serverName: string): boolean {
-  const lines = configText.split('\n');
-  const top = lines.findIndex(l => /^mcp_servers:\s*(#.*)?$/.test(l));
-  if (top < 0) return false;
-  let childIndent = -1, seen = 0;
-  for (let i = top + 1; i < lines.length; i++) {
+  const lines = configText.replace(/^\uFEFF/, '').split(/\r?\n/);
+  let seen = 0;
+  for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (!line.trim() || line.trim().startsWith('#')) continue;
-    const indent = line.length - line.trimStart().length;
-    if (indent === 0) break;                       // the section ended
-    if (childIndent === -1) childIndent = indent;  // the first direct child sets the level
-    if (indent !== childIndent) continue;          // a nested key, not a direct child
-    const key = /^\s*([^\s:#][^:#]*):\s*(#.*)?$/.exec(line)?.[1]?.trim();
-    if (key === undefined) continue;
-    // Quote-stripped comparison, since YAML allows a quoted key.
-    if (key.replace(/^["']|["']$/g, '') === serverName) seen++;
+    const trimmedTop = line.trimStart();
+    if (!trimmedTop || trimmedTop.startsWith('#')) continue;
+    if (line.length !== trimmedTop.length) continue; // only top-level `mcp_servers:`
+    if (parseYamlMappingKey(trimmedTop) !== 'mcp_servers') continue;
+    let childIndent = -1;
+    for (i = i + 1; i < lines.length; i++) {
+      const child = lines[i];
+      const trimmed = child.trimStart();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const indent = child.length - trimmed.length;
+      if (indent === 0) { i--; break; }              // the section ended; re-check this top-level line
+      if (childIndent === -1) childIndent = indent;  // the first direct child sets the level
+      if (indent !== childIndent) continue;          // a nested key, not a direct child
+      if (parseYamlMappingKey(trimmed) === serverName) seen++;
+    }
   }
   return seen > 1;
 }
 
+/** Double-quote a scalar so it round-trips identically in YAML 1.1 (PyYAML) and YAML 1.2 (Bun.YAML). */
+function yamlQuote(value: string): string {
+  return JSON.stringify(value).replace(/[\u0085\u2028\u2029]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+const PLAIN_YAML_KEY = /^[A-Za-z0-9_-]+$/;
+const YAML_KEYWORD = /^(?:true|false|yes|no|on|off|y|n|null|~)$/i;
+
+function yamlKey(key: string): string {
+  return PLAIN_YAML_KEY.test(key) && !YAML_KEYWORD.test(key) ? key : yamlQuote(key);
+}
+
 /** The exact config block to print when the entry is missing or wrong. Never written automatically. */
 export function hermesBindingSnippet(serverName: string, roomId: string, agentHome: string, launcher: string, wakeDir: string): string {
+  const args = [launcher, 'mcp', '--room', roomId, '--agent-home', agentHome, '--wake-dir', wakeDir].map(yamlQuote).join(', ');
   return [
     'mcp_servers:',
-    `  ${serverName}:`,
+    `  ${yamlKey(serverName)}:`,
     '    command: bun',
-    `    args: [${launcher}, mcp, --room, ${roomId}, --agent-home, ${agentHome}, --wake-dir, ${wakeDir}]`,
+    `    args: [${args}]`,
     '    enabled: true',
   ].join('\n');
 }

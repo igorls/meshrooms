@@ -71,6 +71,19 @@ fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Only Windows shows toasts with a click callback (`show()` below); macOS and Linux use the notification plugin
+/// without click activation, so their summary copy directs the person to the tray instead of asking for a click.
+const CLICKABLE_NOTIFICATIONS: bool = cfg!(windows);
+
+fn summary_body(parts: &[String], clickable: bool) -> String {
+    let action = if clickable {
+        if parts.is_empty() { "Click to review them." } else { "Click to review." }
+    } else {
+        "Choose Review your agents… in the tray."
+    };
+    if parts.is_empty() { format!("All listening. {action}") } else { format!("{} {action}", parts.join(" ")) }
+}
+
 /// The "agents live" notice from `agent review`: how many are live and listening, in how many rooms, and every agent that
 /// isn't, by name and room (failed, paused, waiting or still starting). None when no agent is bound.
 pub fn summary(review: &Value) -> Option<Notice> {
@@ -98,7 +111,7 @@ pub fn summary(review: &Value) -> Option<Notice> {
             parts.push(format!("{words}: {}.", names.join(", ")));
         }
     }
-    let body = if parts.is_empty() { "All listening. Click to review them.".to_string() } else { format!("{} Click to review.", parts.join(" ")) };
+    let body = summary_body(&parts, CLICKABLE_NOTIFICATIONS);
     Some(Notice { title: crate::text::clean(&title, 80), body: crate::text::clean(&body, 240), target: Target::Review })
 }
 
@@ -283,23 +296,42 @@ fn post(app: &AppHandle, notice: Notice) {
     show(app, notice);
 }
 
-/// Asks for permission the first time anything is posted, and remembers the answer.
+/// Tracks OS notification permission: grants are cached, while a denied state re-checks `permission_state()` on
+/// demand without re-prompting so granting permission in System Settings takes effect without restarting the app.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionCache {
+    #[default]
+    Unchecked,
+    DeniedOnce,
+    Granted,
+}
+
+impl PermissionCache {
+    fn check(&mut self, state: impl FnOnce() -> bool, request: impl FnOnce() -> bool) -> bool {
+        if *self == Self::Granted {
+            return true;
+        }
+        if state() {
+            *self = Self::Granted;
+            return true;
+        }
+        let granted = *self == Self::Unchecked && request();
+        *self = if granted { Self::Granted } else { Self::DeniedOnce };
+        granted
+    }
+}
+
+/// Asks for permission the first time anything is posted, caches grants, and re-checks denied state on demand.
 fn permitted(app: &AppHandle) -> bool {
     use tauri::plugin::PermissionState;
     use tauri_plugin_notification::NotificationExt;
-    static ASKED: Mutex<Option<bool>> = Mutex::new(None);
-    let mut asked = crate::lock(&ASKED);
-    if let Some(answer) = *asked {
-        return answer;
-    }
+    static CACHE: Mutex<PermissionCache> = Mutex::new(PermissionCache::Unchecked);
+    let mut cache = crate::lock(&CACHE);
     let notification = app.notification();
-    let state = match notification.permission_state() {
-        Ok(PermissionState::Granted) => PermissionState::Granted,
-        _ => notification.request_permission().unwrap_or(PermissionState::Denied),
-    };
-    let granted = state == PermissionState::Granted;
-    *asked = Some(granted);
-    granted
+    cache.check(
+        || matches!(notification.permission_state(), Ok(PermissionState::Granted)),
+        || matches!(notification.request_permission(), Ok(PermissionState::Granted)),
+    )
 }
 
 /// Windows: a toast with a click callback (the notification plugin has none on desktop).
@@ -447,7 +479,7 @@ mod tests {
             { "name": "Wren", "title": "Launch", "state": "live" }, { "name": "Oak", "title": "Launch", "state": "live" },
             { "name": "Fern", "title": "Ops", "state": "live" }, { "name": "Ash", "title": "Ops", "state": "live" },
         ]);
-        assert_eq!(summary(&review(rows, 4, 2)), Some(Notice { title: "4 agents live in 2 rooms".into(), body: "All listening. Click to review them.".into(), target: Target::Review }));
+        assert_eq!(summary(&review(rows, 4, 2)), Some(Notice { title: "4 agents live in 2 rooms".into(), body: summary_body(&[], CLICKABLE_NOTIFICATIONS), target: Target::Review }));
         let rows = json!([
             { "name": "Wren", "title": "Launch", "state": "live" },
             { "name": "Oak\u{202E}", "title": "Ops", "state": "failed" }, { "name": "Fern", "title": null, "state": "paused" },
@@ -455,11 +487,34 @@ mod tests {
         ]);
         let notice = summary(&review(rows, 1, 1)).unwrap();
         assert_eq!(notice.title, "1 agent live in 1 room");
-        assert_eq!(notice.body, "Did not come back: Oak in Ops. Paused: Fern. Still starting: Ash in Ops. Click to review.");
+        let expected_parts = vec!["Did not come back: Oak in Ops.".into(), "Paused: Fern.".into(), "Still starting: Ash in Ops.".into()];
+        assert_eq!(notice.body, summary_body(&expected_parts, CLICKABLE_NOTIFICATIONS));
+        assert_eq!(summary_body(&[], true), "All listening. Click to review them.");
+        assert_eq!(summary_body(&expected_parts, true), "Did not come back: Oak in Ops. Paused: Fern. Still starting: Ash in Ops. Click to review.");
+        assert_eq!(summary_body(&[], false), "All listening. Choose Review your agents… in the tray.");
+        assert_eq!(summary_body(&expected_parts, false), "Did not come back: Oak in Ops. Paused: Fern. Still starting: Ash in Ops. Choose Review your agents… in the tray.");
         assert_eq!(summary(&review(json!([{ "name": "Oak", "title": "Ops", "state": "failed" }]), 0, 0)).unwrap().title, "No agents are live");
         // Nothing bound: no notice at all.
         assert_eq!(summary(&review(json!([]), 0, 0)), None);
         assert_eq!(summary(&json!({})), None);
+    }
+
+    #[test]
+    fn denied_notification_permission_is_rechecked_without_reprompting_and_grants_are_cached() {
+        let mut cache = PermissionCache::default();
+        let (mut state_calls, mut request_calls) = (0, 0);
+        // First check: not granted yet, prompt denied.
+        assert!(!cache.check(|| { state_calls += 1; false }, || { request_calls += 1; false }));
+        assert_eq!((state_calls, request_calls, cache), (1, 1, PermissionCache::DeniedOnce));
+        // Still denied: re-checks permission_state() without prompting again.
+        assert!(!cache.check(|| { state_calls += 1; false }, || { request_calls += 1; true }));
+        assert_eq!((state_calls, request_calls, cache), (2, 1, PermissionCache::DeniedOnce));
+        // Granted in System Settings: takes effect immediately without restart.
+        assert!(cache.check(|| { state_calls += 1; true }, || { request_calls += 1; false }));
+        assert_eq!((state_calls, request_calls, cache), (3, 1, PermissionCache::Granted));
+        // Once granted, stays cached without extra OS calls.
+        assert!(cache.check(|| { state_calls += 1; false }, || { request_calls += 1; false }));
+        assert_eq!((state_calls, request_calls, cache), (3, 1, PermissionCache::Granted));
     }
 
     #[test]
@@ -499,7 +554,7 @@ mod tests {
         assert!(reader.read(Ok(json!({ "cursor": "ffff0000.0", "reset": true, "notifications": [] })), now).is_empty());
         assert!(reader.summary_due());
         // A summary that waited SETTLE goes out anyway, naming who is still starting.
-        assert_eq!(reader.reviewed(Ok(starting.clone()), now + SETTLE).unwrap().body, "Still starting: Wren in Launch. Click to review.");
+        assert_eq!(reader.reviewed(Ok(starting.clone()), now + SETTLE).unwrap().body, summary_body(&["Still starting: Wren in Launch.".into()], CLICKABLE_NOTIFICATIONS));
         // Another daemon behind the same address (reset): due again, nothing from the stale cursor.
         let reset = reader.read(Ok(json!({ "cursor": "11112222.0", "reset": true, "notifications": [{ "title": "x", "target": { "kind": "app" } }] })), now);
         assert!(reset.is_empty());

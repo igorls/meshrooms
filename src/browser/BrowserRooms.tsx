@@ -4,7 +4,7 @@ import { FloorControl, MAX_MESSAGE_FILES, MAX_UPLOAD_BYTES, MentionText, Message
 import { Wordmark } from '../prototype/RoomPrototype';
 import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
 import { deriveActivity, duration, type ActivityRecord, type AgentActivity } from './activity';
-import { issueLabel, mentionedRepositories, repositoryFrom, taskTimeline, type TaskBody, type TaskEvent } from './board';
+import { MAX_TIME, issueLabel, mentionedRepositories, repositoryFrom, taskTimeline, type TaskBody, type TaskEvent } from './board';
 import type { ApiError } from './client';
 import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
 import { roomDrafts } from './drafts';
@@ -13,7 +13,7 @@ import { joinLink, pairedHere } from './desktop-join';
 import { LocalAgentsSection, identityOfMember, useLocalAgents, wakeLabel } from './LocalAgents';
 import { AgentApps } from './AgentApps';
 import { RoomNotificationControls } from './RoomNotificationControls';
-import { due, foldDecisions, type Decision, type DecisionBody, type VoteBody } from './decisions';
+import { decisionTaskTitle, due, foldDecisions, type Decision, type DecisionBody, type VoteBody } from './decisions';
 import { IMAGE_TYPES, attachmentRef, displayKind, shownText, type AttachmentRef } from './files';
 import { BOARD_DEFAULT, BOARD_STEP, boardLimits, clampBoardWidth, saveBoardWidth, savedBoardWidth } from './panel';
 import type { FileView, SavedMessage } from './peers';
@@ -21,12 +21,13 @@ import { REACTION_EMOJI, memberReacted, type ReactionChip, type ReactionEmoji } 
 import { agentPrompt, PROMPT_HARNESSES, type PromptHarness } from './agent-prompt';
 import { onStorageProblem } from './storage';
 import type { RecentRoom } from './background';
-import { badgeText, countUnread, freshRequests, joinNotice, tabTitle, unreadLabel, waitingLabel, waitingOf, type ReadPosition, type UnreadCount, type Waiting } from './unread';
-import { DEFAULT_ROOM_SETTINGS, INVITE_ERRORS, MAX_REPOSITORIES, PUBLIC_ROOM_SERVICE, ROOM_CLOSED, base64, type BrowserMember, type RoomSettings, type RoomStatus } from './protocol';
+import { badgeText, countUnread, freshRequests, hostJoinNotifications, joinNotice, tabTitle, unreadLabel, waitingLabel, waitingOf, type ReadPosition, type UnreadCount, type Waiting } from './unread';
+import { DEFAULT_ROOM_SETTINGS, INVITE_ERRORS, MAX_REPOSITORIES, PUBLIC_ROOM_SERVICE, ROOM_CLOSED, UPGRADE_REQUIRED, base64, deviceFingerprint, type BrowserMember, type RoomSettings, type RoomStatus } from './protocol';
 import { BrowserSource, type RoomSession, type RoomSource } from './source';
 import './browser.css';
 
 const closedError = (e: unknown) => (e as ApiError).status === 410 && (e as ApiError).code === ROOM_CLOSED;
+const upgradeError = (e: unknown) => !!e && typeof e === 'object' && ((e as ApiError).status === 426 || (e as ApiError).code === UPGRADE_REQUIRED);
 /** Rooms warn a week before idle expiry. */
 const EXPIRY_WARNING = 7 * 86_400_000;
 const deviceLabel = /Mac/.test(navigator.userAgent) ? 'Mac browser' : /Windows/.test(navigator.userAgent) ? 'Windows browser' : 'Browser';
@@ -208,6 +209,7 @@ function Rooms({ source }: { source: RoomSource }) {
   const [network, setNetwork] = useState('');
   const [openingError, setOpeningError] = useState('');
   const [signInRequired, setSignInRequired] = useState(false);
+  const [upgradeRequired, setUpgradeRequired] = useState(false);
   /** Local saving is failing: shown until a save succeeds again, unlike network problems, which the next poll clears. */
   const [storageProblem, setStorageProblem] = useState<string>();
   useEffect(() => onStorageProblem(setStorageProblem), []);
@@ -282,6 +284,8 @@ function Rooms({ source }: { source: RoomSource }) {
   const currentStatus = useRef<RoomStatus | undefined>(undefined);
   /** The open room's actions, once its connection is held (see RoomSource.open). */
   const peers = useRef<RoomSession | null>(null);
+  /** Previous room session teardown in this tab, awaited on retry before re-acquiring the room lock. */
+  const closingRoom = useRef<Promise<void>>(Promise.resolve());
   /** Older messages can be loaded (the local page hands out the newest first). */
   const [olderAvailable, setOlderAvailable] = useState(false);
   const [olderLoading, setOlderLoading] = useState(false);
@@ -316,7 +320,7 @@ function Rooms({ source }: { source: RoomSource }) {
     try {
       setOlderAvailable(await peers.current.loadOlder());
       setRestoreHistory(historyAnchor.current);
-    } catch (error) { setError((error as Error).message); }
+    } catch (error) { if (upgradeError(error)) setUpgradeRequired(true); setError((error as Error).message); }
     finally { historyLoading.current = false; setOlderLoading(false); }
   }
   const detailsHeading = useRef<HTMLHeadingElement>(null);
@@ -373,9 +377,14 @@ function Rooms({ source }: { source: RoomSource }) {
     const tick = () => {
       const at = Date.now();
       if (decisions.some(d => d.state === 'open' && d.closesAt)) setNow(at);
-      for (const d of decisions) if (d.createdBy === status.memberId && due(d, at) && !closing.current.has(`${d.key}:${d.revision}`)) {
-        closing.current.add(`${d.key}:${d.revision}`);
-        void peers.current?.reviseDecision(d, { close: true }).catch(() => closing.current.delete(`${d.key}:${d.revision}`));
+      const session = peers.current;
+      if (!session) return;
+      for (const d of decisions) {
+        const key = `${d.key}:${d.revision}:${d.votes.length}`;
+        if (d.createdBy === status.memberId && due(d, at) && !closing.current.has(key)) {
+          closing.current.add(key);
+          void session.reviseDecision(d, { close: true }).catch(() => closing.current.delete(key));
+        }
       }
     };
     tick(); const timer = setInterval(tick, 5000); return () => clearInterval(timer);
@@ -383,8 +392,11 @@ function Rooms({ source }: { source: RoomSource }) {
 
   useEffect(() => {
     let disposed = false, room: { done: Promise<void>; dispose(): void } | undefined;
-    setReady(false); setError(''); setOpeningError(''); setNetwork(''); setSignInRequired(false);
+    setReady(false); setError(''); setOpeningError(''); setNetwork(''); setSignInRequired(false); setUpgradeRequired(false);
     void (async () => {
+      // Wait for any previous room session in this tab to finish closing and release its lock before retrying.
+      await closingRoom.current.catch(() => {});
+      if (disposed) return;
       const { deviceId: device, recent: rooms, name: profile } = await source.start();
       if (disposed) return;
       if (urlRoom && draftOwner.current !== `${device}:${urlRoom}`) {
@@ -424,7 +436,7 @@ function Rooms({ source }: { source: RoomSource }) {
           }
           setMessages(m); setConnected(c); setOlderAvailable(!!peers.current?.hasOlder());
         },
-        network: (problem, needsSignIn = false) => { setNetwork(problem); setSignInRequired(needsSignIn); if (problem) setReady(true); },
+        network: (problem, needsSignIn = false) => { if (/Reload the page or update the agent bridge/i.test(problem)) setUpgradeRequired(true); setNetwork(problem); setSignInRequired(needsSignIn); if (problem) setReady(true); },
         board: (board, ops) => { setTasks(board); setTaskOps(ops); },
         files: setFiles,
         activity: records => { setActivity(records); setNow(Date.now()); },
@@ -441,8 +453,9 @@ function Rooms({ source }: { source: RoomSource }) {
         recent: setRecent,
         lost: () => { setLostRoom(true); setNetwork(''); },
       });
+      closingRoom.current = room.done.catch(() => {});
       await room.done;
-    })().catch(e => { if (!disposed) { setOpeningError(e.message); setSignInRequired(e.status === 401); setReady(true); } });
+    })().catch(e => { if (!disposed) { if (upgradeError(e)) setUpgradeRequired(true); setOpeningError(e.message); setSignInRequired(e.status === 401); setReady(true); } });
     return () => { disposed = true; room?.dispose(); peers.current = null; };
   }, [source, retry]);
   useEffect(() => {
@@ -467,12 +480,66 @@ function Rooms({ source }: { source: RoomSource }) {
   const ownCount = useMemo(() => position && status?.memberId ? { ...countUnread(messages.map(m => m.packet.body), position, status.memberId, status.members || []), waiting: waitingOf(status) } : undefined,
     [messages, position, status?.memberId, status?.members, status?.requests]);
   useEffect(() => { if (deviceId && ownCount && !closed) peers.current?.publishCount(ownCount); }, [deviceId, ownCount, closed]);
-  /** Unread in the person's other rooms: the tab title's (N). */
-  const others = recent.filter(r => r.id !== urlRoom);
+  /** Unread in the person's other rooms, plus the open room when hidden or hosting pending join requests. */
+  const others = useMemo(() => recent.filter(r => r.id !== urlRoom), [recent]);
   const otherUnread = others.reduce((sum, r) => sum + (counts[r.id]?.unread || 0), 0);
   const otherWaiting = others.flatMap(r => counts[r.id]?.waiting || []);
+  const ownWaiting = useMemo(() => host && !closed ? waitingOf(status) : [], [host, closed, status?.requests, status?.members]);
+  const titleUnread = otherUnread + (!visible && !closed ? (ownCount?.unread || 0) : 0);
+  const titleWaiting = otherWaiting.length + ownWaiting.length;
   // The tab names the open room, so several Meshrooms tabs can be told apart.
-  useEffect(() => { document.title = tabTitle(urlRoom ? title : '', otherUnread, otherWaiting.length); }, [title, otherUnread, otherWaiting.length]);
+  useEffect(() => { document.title = tabTitle(urlRoom ? title : '', titleUnread, titleWaiting); }, [title, titleUnread, titleWaiting]);
+  // Opt-in browser notifications for hosted rooms: permission is requested only on an explicit click.
+  const notifySupported = !source.isLocal && typeof Notification !== 'undefined';
+  const [notifyPermission, setNotifyPermission] = useState<NotificationPermission>(() => notifySupported ? Notification.permission : 'denied');
+  const [hostNotifyEnabled, setHostNotifyEnabled] = useState(false);
+  const notifiedRequests = useRef(new Set<string>());
+  useEffect(() => {
+    if (!notifySupported) return;
+    let active = true;
+    void source.readPref<boolean>('host-join-notifications').then(saved => {
+      if (active) setHostNotifyEnabled(!!saved && Notification.permission === 'granted');
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [notifySupported, source]);
+  async function toggleHostNotifications(enable: boolean) {
+    if (!notifySupported) return;
+    if (!enable) {
+      setHostNotifyEnabled(false);
+      await source.writePref('host-join-notifications', false).catch(() => {});
+      return;
+    }
+    let permission = Notification.permission;
+    if (permission === 'default') {
+      try { permission = await Notification.requestPermission(); } catch { permission = 'denied'; }
+    }
+    setNotifyPermission(permission);
+    const allowed = permission === 'granted';
+    setHostNotifyEnabled(allowed);
+    await source.writePref('host-join-notifications', allowed).catch(() => {});
+    if (allowed) setNotice('Join-request alerts are on for this browser.');
+  }
+  useEffect(() => {
+    if (!notifySupported) return;
+    const rooms: { roomId: string; roomTitle: string; waiting: Waiting[] }[] = [
+      ...(urlRoom && ownWaiting.length ? [{ roomId: urlRoom, roomTitle: title, waiting: ownWaiting }] : []),
+      ...others.map(r => ({ roomId: r.id, roomTitle: r.title, waiting: counts[r.id]?.waiting || [] })).filter(r => r.waiting.length),
+    ];
+    if (!rooms.length) return;
+    const fresh = hostJoinNotifications(rooms, notifiedRequests.current);
+    // Record requests already seen while visible so switching tabs later does not alert for them.
+    if (document.visibilityState === 'visible' || !hostNotifyEnabled || Notification.permission !== 'granted') return;
+    for (const item of fresh) {
+      try {
+        const note = new Notification(item.title, { body: item.body, tag: item.key });
+        note.onclick = () => {
+          window.focus();
+          if (item.roomId && item.roomId !== urlRoom) location.assign(`/r/${item.roomId}`);
+          note.close();
+        };
+      } catch { /* Browsers that disallow direct Notification construction skip quietly. */ }
+    }
+  }, [notifySupported, hostNotifyEnabled, title, ownWaiting, others, counts]);
   // A new request in another room this person hosts is announced once, here, with a way to open that room and admit.
   useEffect(() => {
     if (!deviceId) return;
@@ -533,9 +600,9 @@ function Rooms({ source }: { source: RoomSource }) {
   async function decisionTask(d: Decision) {
     const winner = d.tally.optionIds[0], chosen = d.options.find(o => o.id === winner)?.label ?? '';
     const notes = `Decided in the room: ${d.question}\nOutcome: ${chosen} (${d.tally.tally[winner] ?? 0} of ${d.tally.voters} votes from people)`;
-    // The question carries the meaning ("Yes" alone says nothing); the outcome follows it.
-    const title = `${d.question.replace(/\s*\?\s*$/, '')} → ${chosen}`;
-    await peers.current!.changeTask({ title: title.length > 120 ? `${title.slice(0, 119)}…` : title, notes: notes.slice(0, 2000) });
+    // Budget space for ` → chosen` first so truncation never cuts off the chosen outcome.
+    const title = decisionTaskTitle(d.question, chosen, 120);
+    await peers.current!.changeTask({ title, notes: notes.slice(0, 2000) });
     setBoardOpen(true); setDecisionsOpen(false); setDetailsOpen(false);
   }
   function showMessage(id: string) {
@@ -563,7 +630,9 @@ function Rooms({ source }: { source: RoomSource }) {
   function activityLine(a: AgentActivity) {
     if (a.state === 'offline' || a.state === 'online') return <span className={`agent-activity is-${a.state}`}>{a.state === 'offline' ? 'Offline' : 'Online'}</span>;
     const age = <span className="agent-activity-age"> · {duration(now - a.since)}</span>;
-    if (a.state === 'idle') return <span className="agent-activity is-idle">Idle{a.quiet === undefined ? age : <span className="agent-activity-quiet"> · no check-in for {duration(a.quiet)}</span>}</span>;
+    if (a.state === 'idle') return a.quiet === undefined
+      ? <span className="agent-activity is-idle">Idle{age}</span>
+      : <span className="agent-activity is-idle is-quiet">Not listening<span className="agent-activity-quiet"> · no check-in for {duration(a.quiet)}</span></span>;
     if (a.quiet !== undefined) return <span className="agent-activity is-working is-quiet">Busy<span className="agent-activity-quiet"> · no check-in for {duration(a.quiet)}</span></span>;
     const task = a.on.tasks?.map(id => tasks.find(t => t.id === id)).find(Boolean);
     if (task) return <span className="agent-activity is-working">Working on <button className="agent-activity-link" title="Show on the task board" onClick={() => showTask(task.id)}>“{task.title}”</button>{age}</span>;
@@ -579,7 +648,7 @@ function Rooms({ source }: { source: RoomSource }) {
   async function act(work: () => Promise<void>) {
     if (busy) return;
     setBusy(true); setError(''); setNotice('');
-    try { await work(); } catch (e) { setError((e as Error).message); }
+    try { await work(); } catch (e) { if (upgradeError(e)) setUpgradeRequired(true); setError((e as Error).message); }
     finally { setBusy(false); }
   }
   function create(event: FormEvent) {
@@ -676,10 +745,11 @@ function Rooms({ source }: { source: RoomSource }) {
     const sha = (attachment as Attachment & { sha256: string }).sha256, view = files[sha];
     if (view?.url) return { url: view.url };
     const transfer = view?.transfer;
-    if (transfer?.state === 'fetching') return { note: `Receiving · ${Math.floor(transfer.received * 100 / transfer.size)}%` };
+    if (transfer?.state === 'fetching') return { note: transfer.received > 0 ? `Receiving · ${Math.floor(transfer.received * 100 / transfer.size)}%` : 'Fetching…' };
     if (transfer?.state === 'damaged') return { note: 'A copy failed verification. Trying other devices.' };
-    if (peers.current?.evicted(sha)) return { note: 'Not kept in this browser: newer files filled this room’s storage' };
-    return { note: connected.length ? 'Waiting for a device that has this file' : 'Available when a device that has it connects' };
+    if (transfer?.state === 'waiting') return { note: connected.length ? 'Fetching…' : 'Available when a device that has it connects' };
+    if (peers.current?.evicted(sha)) return { note: source.isLocal ? 'Not kept on this computer: newer files filled this room’s storage' : 'Not kept in this browser: newer files filled this room’s storage' };
+    return { onFetch: () => peers.current?.requestFile(sha) };
   };
   const attachmentsOf = (body: SavedMessage['packet']['body']): Attachment[] => (body.attachments || []).map(ref => ({ ...ref,
     kind: files[ref.sha256]?.url ? displayKind(ref, files[ref.sha256].type) : IMAGE_TYPES.includes(ref.type) ? 'image' : 'file' }));
@@ -691,7 +761,7 @@ function Rooms({ source }: { source: RoomSource }) {
       const { token } = await source.command('agent-invite', urlRoom, { name }) as unknown as { token: string };
       setAgentLink({ name, url: `${roomOrigin}/agent/${urlRoom}#${token}` }); setAgentName('');
       // A name that says which harness it is picks that harness; the person can still change it.
-      if (/codex/i.test(name)) setPromptHarness('codex'); else if (/claude/i.test(name)) setPromptHarness('claude');
+      if (/codex/i.test(name)) setPromptHarness('codex'); else if (/claude/i.test(name)) setPromptHarness('claude'); else if (/hermes/i.test(name)) setPromptHarness('hermes'); else if (/dsh|deepseek/i.test(name)) setPromptHarness('dsh');
     });
   }
   const promptText = agentLink ? agentPrompt({ origin: roomOrigin, roomId: urlRoom, link: agentLink.url, name: agentLink.name, version: agentVersion, harness: promptHarness }) : '';
@@ -714,13 +784,20 @@ function Rooms({ source }: { source: RoomSource }) {
     });
   }
   function dismissAgentCta() { setAgentCtaDismissed(true); void source.writePref(`agent-cta-dismissed:${urlRoom}`, true).catch(() => { /* Shown again next visit. */ }); }
-  /** Removes every device of a member; this device goes last so leaving still reports its result. Their agents leave with them. */
+  /** Atomically removes every device of a member and any agents they operate in one command. */
   function removeMember(member: BrowserMember) {
     void act(async () => {
-      const devices = (status?.devices?.filter(d => d.memberId === member.id) || []).sort((a, b) => Number(a.id === status?.deviceId) - Number(b.id === status?.deviceId));
-      for (const device of devices) await source.command('remove', urlRoom, { deviceId: device.id });
+      await source.command('remove', urlRoom, { memberId: member.id });
       setConfirming(undefined);
       setNotice(member.id === status?.memberId ? 'You left this room.' : `${member.name} was removed from the room.`);
+    });
+  }
+  /** Transfers host privileges to another human member in this room. */
+  function transferHost(member: BrowserMember) {
+    void act(async () => {
+      await source.command('transfer-host', urlRoom, { memberId: member.id });
+      setConfirming(undefined);
+      setNotice(`${member.name} is now the host of this room.`);
     });
   }
   /** The shared TaskBoard offers "local" participants as assignees; in a browser room every member can be assigned. */
@@ -729,7 +806,7 @@ function Rooms({ source }: { source: RoomSource }) {
   async function boardAction(work: (engine: RoomSession) => Promise<void>) {
     setError('');
     try { if (!peers.current) throw new Error('Room connection is not ready.'); await work(peers.current); }
-    catch (e) { setError((e as Error).message); throw e; }
+    catch (e) { if (upgradeError(e)) setUpgradeRequired(true); setError((e as Error).message); throw e; }
   }
   const boardActions = {
     create: (draft: TaskDraft & { title: string }) => boardAction(engine => engine.changeTask({ title: draft.title, notes: draft.notes, assigneeId: draft.assigneeId ?? null, ...(draft.issue ? { issue: draft.issue } : {}) })),
@@ -783,6 +860,13 @@ function Rooms({ source }: { source: RoomSource }) {
       <div><button className="secondary" disabled={busy} onClick={() => removeMember(member)}>{leaving ? 'Leave room' : 'Remove'}</button><button className="browser-text-link" onClick={() => setConfirming(undefined)}>Cancel</button></div>
     </div>;
   }
+  /** Inline confirmation for transferring room hosting to another person. */
+  function confirmTransfer(member: BrowserMember) {
+    return <div className="browser-confirm" role="group" aria-label={`Confirm making ${member.name} host`}>
+      <p>Make {member.name} the host of this room? They will control join requests, room settings and deleting the room, and you will become a regular member.</p>
+      <div><button className="secondary" disabled={busy} onClick={() => transferHost(member)}>Make host</button><button className="browser-text-link" onClick={() => setConfirming(undefined)}>Cancel</button></div>
+    </div>;
+  }
 
   function newRoomForm() {
     return <>
@@ -823,9 +907,13 @@ function Rooms({ source }: { source: RoomSource }) {
       <p className="browser-rail-footer">Meshrooms by WormDB<br />{source.label}</p>
     </aside>
     <main id="browser-main" className={`browser-main ${detailsOpen ? 'browser-details-open' : ''} ${boardOpen ? 'browser-board-open' : ''}`} tabIndex={-1}>
-      {error && <div role="alert" className="browser-error">{error} <button onClick={() => { setError(''); if (!status) setRetry(v => v + 1); }}>{status ? 'Dismiss' : 'Retry'}</button></div>}
+      {upgradeRequired && (status || !connectionProblem) && <section role="alert" className="browser-recovery browser-upgrade" aria-label="Update available"><div>
+        <strong>Update available</strong>
+        <p>{error || connectionProblem || 'This page or bridge is outdated. Reload the page or update the agent bridge to continue.'}</p>
+        </div><button className="primary" onClick={() => location.reload()}>Reload page</button></section>}
+      {!upgradeRequired && error && <div role="alert" className="browser-error">{error} <button onClick={() => { setError(''); if (!status) setRetry(v => v + 1); }}>{status ? 'Dismiss' : 'Retry'}</button></div>}
       {storageProblem && <p role="alert" className="browser-error">{storageProblem}</p>}
-      {connectionProblem && status && <section role="status" className="browser-recovery" aria-label="Connection problem"><div>
+      {!upgradeRequired && connectionProblem && status && <section role="status" className="browser-recovery" aria-label="Connection problem"><div>
         <strong>{signInRequired ? 'Sign in again from the app' : source.isLocal ? 'Connection to this computer interrupted' : 'Connection interrupted'}</strong>
         <p>{connectionProblem}</p>{!signInRequired && <p className="browser-recovery-hint">{openingError ? 'Try again when the app is available. Your draft stays in this tab.' : 'We’ll keep trying to reconnect. Your draft stays in this tab.'}</p>}
         </div>{!signInRequired && <button className="secondary" disabled={busy} onClick={retryConnection}>Try again</button>}</section>}
@@ -839,10 +927,11 @@ function Rooms({ source }: { source: RoomSource }) {
           <div className="browser-entry-actions"><a className="browser-text-link" href="/rooms">Start or open another room</a></div></section>
       : !ready ? <section className="browser-entry" aria-busy="true"><h1>{urlRoom ? 'Opening your room…' : 'Opening your rooms…'}</h1><p>{source.isLocal ? 'Reading your rooms from this computer.' : 'Restoring this browser’s identity.'}</p></section>
       : connectionProblem && !status ? <section className="browser-entry browser-entry-recovery" role="alert">
-          <h1>{signInRequired ? 'Open your rooms from the app' : source.isLocal ? 'Cannot reach Meshrooms on this computer' : 'Your room could not be opened'}</h1>
+          <h1>{upgradeRequired ? 'Update available' : signInRequired ? 'Open your rooms from the app' : source.isLocal ? 'Cannot reach Meshrooms on this computer' : 'Your room could not be opened'}</h1>
           <p>{connectionProblem}</p>
-          {source.isLocal && !signInRequired && <p>Your rooms and settings are kept on this computer. Open Meshrooms and check that the background service is running.</p>}
-          {!signInRequired && <button className="primary" onClick={retryConnection}>Try again</button>}
+          {!upgradeRequired && source.isLocal && !signInRequired && <p>Your rooms and settings are kept on this computer. Open Meshrooms and check that the background service is running.</p>}
+          <div className="browser-entry-actions">{upgradeRequired ? <button className="primary" onClick={() => location.reload()}>Reload page</button> : !signInRequired && <button className="primary" onClick={retryConnection}>Try again</button>}
+            {urlRoom && <a className="browser-text-link" href="/rooms">Start or open another room</a>}</div>
         </section> : !urlRoom ?
         <section className="browser-entry"><h1>{source.isLocal && recent.length ? 'Your rooms' : 'Start a room'}</h1>
           <p>{source.isLocal && recent.length ? 'Open a room paired with this computer.' : 'Share a link. Approve who joins. Start talking.'}</p>
@@ -855,15 +944,16 @@ function Rooms({ source }: { source: RoomSource }) {
         <section className="browser-entry"><h1>{title || 'Join room'}</h1>
           {pending ? <>
             <h2>{status.request!.kind === 'companion' && !status.request!.linkedMemberId ? 'Confirm on your other device' : status.hostOnline ? 'Waiting for approval' : 'Waiting for the host to return'}</h2>
-            {status.request!.kind === 'companion' && !status.request!.linkedMemberId ? <><p>In this room on your trusted device, open <strong>Room details</strong>, then <strong>Add another device</strong>, and enter this code.</p><code className="browser-link-code">{status.request!.code}</code><p>This request expires in ten minutes.</p></> : <p>You’ll enter the conversation when the host admits you.</p>}
+            {status.request!.kind === 'companion' && !status.request!.linkedMemberId ? <><p>In this room on your trusted device, open <strong>Room details</strong>, then <strong>Add another device</strong>, and enter this code.</p><code className="browser-link-code">{status.request!.code}</code><p>This request expires in ten minutes.</p></> : <p>You’ll enter the conversation when the host admits you. {!status.hostOnline && 'The host is offline right now. '}Requests expire after ten minutes.</p>}
             <div className="browser-entry-actions"><button className="secondary" disabled={busy} onClick={() => void act(async () => { await source.command('cancel', urlRoom, { requestId: status.request!.id }); setNotice('Join request canceled.'); })}>Cancel request</button>
               <a className="browser-text-link" href="/rooms">Back to your rooms</a></div>
           </> : <>
-            <p>{status?.request?.state === 'expired' ? 'Your request expired. Ask to join again when you’re ready.' : everJoined.current ? 'This device no longer has access. Ask the host to admit it again.' : status?.request?.state === 'declined' ? 'The host declined your request.' : 'The host will approve your request before you enter.'}</p>
+            <p>{status?.request?.state === 'expired' ? 'Your request expired. Ask to join again when you’re ready.' : everJoined.current ? 'This device no longer has access. Ask the host to admit it again.' : status?.request?.state === 'declined' ? 'The host declined your request.' : 'The host will approve your request before you enter. Requests expire after ten minutes.'}</p>
+            {status && !status.hostOnline && <p role="status" className="browser-host-offline">The host appears to be offline right now. Join requests expire after ten minutes if they don’t return in time.</p>}
             <form className="browser-form" onSubmit={e => { e.preventDefault(); request('person'); }}><label>Your name<input autoComplete="name" value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label>
               <button className="primary" disabled={busy || !status}>{busy ? 'Sending request…' : 'Ask to join'}</button></form>
             <button className="browser-text-link" disabled={busy || !status} onClick={() => request('companion')}>Use my existing identity</button>
-            <p className="browser-entry-note">No installation or agent needed. This browser remembers your identity.</p>
+            <p className="browser-entry-note">{source.isLocal ? 'This computer holds your key for this room. Messages deliver directly between online devices; newcomers don’t receive earlier chat history.' : 'No installation or agent needed. This browser remembers your identity. Messages deliver directly between online devices; newcomers don’t receive earlier chat history.'}</p>
             {!source.isLocal && (appPaired
               ? <div className="browser-entry-actions browser-open-app"><a className="secondary" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
                 <span className="browser-entry-note">Join from the desktop app on this computer instead. It asks before it joins.</span></div>
@@ -893,8 +983,9 @@ function Rooms({ source }: { source: RoomSource }) {
               <div className="browser-agent-cta-actions"><button className="primary" onClick={openAgentConnect}>Connect an agent</button><button className="browser-text-link" onClick={dismissAgentCta}>Not now</button></div></section>}
           <p className="sr-only" role="status">{host && status.requests?.length ? `${status.requests.length} request${status.requests.length === 1 ? '' : 's'} waiting to join. Use the join requests section to admit or decline.` : ''}</p>
           {host && !!status.requests?.length && <section className="browser-requests" aria-label="Join requests"><h2>Waiting to join <span>{status.requests.length}</span></h2>
-            {status.requests.map(r => <div className="browser-request" key={r.id}><div><strong>{r.linkedMemberId ? status.members!.find(m => m.id === r.linkedMemberId)?.name : r.name}</strong><span>{r.kind === 'person' ? 'New person' : r.kind === 'agent' ? `Agent · operated by ${status.members!.find(m => m.id === r.operatorId)?.name || 'a former member'}` : r.linkedMemberId ? 'Confirmed companion device' : 'Waiting for identity confirmation'} · {r.device.label}</span></div>
+            {status.requests.map(r => <div className="browser-request" key={r.id}><div><strong>{r.linkedMemberId ? status.members!.find(m => m.id === r.linkedMemberId)?.name : r.name}</strong><span>{r.kind === 'person' ? 'New person' : r.kind === 'agent' ? `Agent · operated by ${status.members!.find(m => m.id === r.operatorId)?.name || 'a former member'}` : r.linkedMemberId ? 'Confirmed companion device' : 'Waiting for identity confirmation'} · {r.device.label} · <code className="browser-key-fingerprint" title={`Device key fingerprint: ${deviceFingerprint(r.device.id)}`}>Key {deviceFingerprint(r.device.id)}</code></span></div>
               <div className="browser-request-actions"><button disabled={busy} onClick={() => void act(async () => { await source.command('decide', urlRoom, { requestId: r.id, admit: false }); })}>Decline</button>
+                <button className="browser-decline-block" disabled={busy} onClick={() => void act(async () => { await source.command('decide', urlRoom, { requestId: r.id, admit: false, block: true }); })}>Decline &amp; block</button>
                 {(r.kind !== 'companion' || r.linkedMemberId) && <button className="primary" disabled={busy} onClick={() => void act(async () => { await source.command('decide', urlRoom, { requestId: r.id, admit: true }); })}>Admit</button>}</div></div>)}
           </section>}
           <p className="sr-only" aria-live="polite" aria-atomic="true">{liveMessage && <span key={liveMessage.id}>{liveMessage.text}</span>}</p>
@@ -911,7 +1002,8 @@ function Rooms({ source }: { source: RoomSource }) {
               }}>
                 <div className="browser-message-list">
                   {olderAvailable && <div className="browser-day"><button className="browser-text-link" disabled={busy || olderLoading || signInRequired} aria-busy={olderLoading} onClick={loadEarlier}>{olderLoading ? 'Loading earlier messages…' : 'Show earlier messages'}</button></div>}
-                  {!messages.length && <div className="browser-empty"><RoomIcon kind="chat" /><h2>{status.members!.length > 1 ? 'Ready for your first message' : status.requests?.length ? 'Your conversation starts here' : 'Bring someone into the room'}</h2><p>{status.members!.length > 1 ? 'Send a message below to start the conversation.' : status.requests?.length ? 'Someone is waiting to join. Admit them above to get started.' : 'Share the room link with someone, or open it on another device.'}</p></div>}
+                  {!messages.length && <div className="browser-empty"><RoomIcon kind="chat" /><h2>{status.members!.length > 1 ? 'Ready for your first message' : status.requests?.length ? 'Your conversation starts here' : 'Bring someone into the room'}</h2><p>{status.members!.length > 1 ? 'Send a message below to start the conversation.' : status.requests?.length ? 'Someone is waiting to join. Admit them above to get started.' : 'Share the room link with someone, or open it on another device.'}</p>
+                    {host && notifySupported && !hostNotifyEnabled && notifyPermission !== 'denied' && <button type="button" className="browser-text-link" onClick={() => void toggleHostNotifications(true)}>Notify me when someone asks to join</button>}</div>}
                   {items.map((item, index) => {
                     const previous = items[index - 1], at = itemAt(item);
                     const day = (!index || !sameDay(itemAt(previous), at)) && <div className="browser-day"><span>{dayLabel(at)}</span></div>;
@@ -926,7 +1018,7 @@ function Rooms({ source }: { source: RoomSource }) {
                     }
                     if (item.event) {
                       const event = item.event, line = describeTask(event, (id, subject) => id === status.memberId ? subject ? 'You' : 'you' : nameOf(id));
-                      const time = <time dateTime={new Date(at).toISOString()}>{new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>;
+                      const time = <time dateTime={new Date(Math.min(at, MAX_TIME)).toISOString()}>{new Date(Math.min(at, MAX_TIME)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>;
                       return <Fragment key={event.id}>{day}<p className="browser-task-line">
                         {tasks.some(t => t.id === event.taskId) ? <button title="Show on the task board" onClick={() => showTask(event.taskId)}>{line}</button> : <span>{line}</span>}{time}</p></Fragment>;
                     }
@@ -986,7 +1078,7 @@ function Rooms({ source }: { source: RoomSource }) {
                             })}
                             {addReaction}
                           </div>}
-                          {showReceipt && <span className="browser-receipt">{m.targets.length ? `Stored on ${m.receipts.length} of ${m.targets.length} devices` : 'Saved in this browser'}</span>}
+                          {showReceipt && <span className="browser-receipt">{m.targets.length ? `Stored on ${m.receipts.length} of ${m.targets.length} devices` : source.isLocal ? 'Saved on this computer' : 'Saved in this browser'}</span>}
                         </div>
                       </article>
                     </Fragment>;
@@ -1010,7 +1102,7 @@ function Rooms({ source }: { source: RoomSource }) {
                     <span className="browser-key-hint">Enter to send · Shift + Enter for a new line</span></span><button className="primary" disabled={!canSend} aria-busy={sending}><span>{sending ? 'Sending…' : 'Send'}</span><RoomIcon kind="send" /></button></div></form>
                 {draftProblem ? <p className="browser-draft-problem" role="status">Draft changes could not be saved in this tab. Keep this page open or copy your text before leaving.</p>
                   : !sending && (text || replyId || chosen.length > 0) ? <p className="browser-draft-saved">{text || replyId ? 'Draft saved in this tab.' : ''}{chosen.length > 0 ? ' Unsent files stay here while this page is open.' : ''}</p> : null}
-                <p className="browser-connection" role="status"><span className={`browser-connection-dot ${!connectionProblem && connected.length ? 'is-connected' : ''}`} aria-hidden="true" />{connectionProblem ? signInRequired ? 'Sign in again from the app to reconnect' : 'Reconnecting…' : connected.length ? `Connected to ${connected.length} other device${connected.length === 1 ? '' : 's'}` : status.devices!.length > 1 ? 'Waiting for another device to connect' : 'You’re the first one here'}</p>
+                <p className="browser-connection" role="status"><span className={`browser-connection-dot ${!upgradeRequired && !connectionProblem && connected.length ? 'is-connected' : ''}`} aria-hidden="true" />{upgradeRequired ? 'Reload the page to update' : connectionProblem ? signInRequired ? 'Sign in again from the app to reconnect' : 'Reconnecting…' : connected.length ? `Connected to ${connected.length} other device${connected.length === 1 ? '' : 's'}` : status.devices!.length > 1 ? 'Waiting for another device to connect' : 'You’re the first one here'}</p>
               </div>
             </div>
             {boardOpen && <BoardHandle workspace={workspace} width={boardWidth} onCommit={width => { setBoardWidth(width ?? BOARD_DEFAULT); saveBoardWidth(width); }} />}
@@ -1033,6 +1125,7 @@ function Rooms({ source }: { source: RoomSource }) {
                     {wakes && <span className="agent-wakes">{wakeLabel(wakes.room.binding)}</span>}
                     {wakes && <button className="browser-text-link browser-picture-link" onClick={() => setAgentFocus({ id: wakes.agent.id, at: Date.now() })}>Sessions</button>}
                     {removable && (confirming === member.id ? confirmRemove(member) : <button className="browser-remove" disabled={busy} aria-label={`Remove ${member.name} from the room`} onClick={() => setConfirming(member.id)}>{isAgent(member) ? 'Remove agent' : 'Remove'}</button>)}
+                    {host && !isAgent(member) && member.id !== status.memberId && (confirming === `transfer:${member.id}` ? confirmTransfer(member) : <button className="browser-text-link browser-picture-link" disabled={busy} aria-label={`Make ${member.name} host`} onClick={() => setConfirming(`transfer:${member.id}`)}>Make host</button>)}
                     {operatesIt && <button className="browser-text-link browser-picture-link" disabled={busy} onClick={() => pickAvatar(member.id)}>{member.avatar ? 'Change picture' : 'Set picture'}</button>}
                     {member.avatar && member.id !== status.memberId && (operatesIt || host) && <button className="browser-remove" disabled={busy} onClick={() => clearAvatar(member.id)}>Remove picture</button>}</div></div>;
                 })}
@@ -1045,6 +1138,15 @@ function Rooms({ source }: { source: RoomSource }) {
                 <p>Cropped to a square and kept under 16 KB. Everyone in this room sees it.</p>
               </section>
               {detailsOpen && source.notifications && <RoomNotificationControls key={urlRoom} api={source.notifications} roomId={urlRoom} />}
+              {detailsOpen && notifySupported && host && <section className="browser-notifications" aria-label="Browser notifications">
+                <h3>Browser notifications</h3>
+                <p>Get notified when someone asks to join while this tab is in the background.</p>
+                {notifyPermission === 'denied'
+                  ? <p>Notifications are blocked for this site in your browser settings.</p>
+                  : <label className="browser-setting"><input type="checkbox" checked={hostNotifyEnabled && notifyPermission === 'granted'}
+                      onChange={e => void toggleHostNotifications(e.target.checked)} />
+                      <span><strong>Notify on join requests</strong>Alerts arrive only while this tab is hidden.</span></label>}
+              </section>}
               {!isAgent(self) && source.agents && <LocalAgentsSection api={source.agents} state={localAgents} roomId={urlRoom} selfName={self?.name} focus={agentFocus} />}
               {!isAgent(self) && !source.agents && <section className="browser-agents"><h3>Your agents</h3><p>You’re connecting as <strong>{self?.name}</strong>: you’ll be the operator of any agent you connect here, and only you and the host can remove it. Use your own browser, not one an agent is driving.</p>
                 {agentLink && linkState !== 'open' ? <div className="browser-agent-link" role="status"><p>{linkState === 'joined' ? <>Used by <strong>{agentLink.name}</strong>, which joined the room.</>
@@ -1086,8 +1188,8 @@ function Rooms({ source }: { source: RoomSource }) {
                 </ul>}
               </section>
               <section className="browser-invite"><h3>Invite someone</h3><p>New people wait for the host’s approval.</p><label className="sr-only" htmlFor="browser-invite-link">Room invite link</label><input id="browser-invite-link" readOnly value={invite} onFocus={e => e.target.select()} /></section>
-              <section className="browser-device-section"><h3>Your devices</h3><p>Join as yourself from another browser.</p>
-                {host && status.devices!.filter(d => d.memberId === status.memberId).length === 1 && <p className="browser-only-device">This browser holds your only key for this room. Add another device so you don’t lose hosting.{' '}
+              <section className="browser-device-section"><h3>Your devices</h3><p>{source.isLocal ? 'Join as yourself from another device.' : 'Join as yourself from another browser or device.'}</p>
+                {host && status.devices!.filter(d => d.memberId === status.memberId).length === 1 && <p className="browser-only-device">{source.isLocal ? 'This computer holds your key for this room.' : 'This browser holds your only key for this room.'} Add another device so you don’t lose hosting.{' '}
                   <button className="browser-text-link" onClick={() => { const add = linkDevice.current; if (!add) return; add.open = true; add.scrollIntoView({ block: 'nearest' }); add.querySelector('input')?.focus(); }}>Link another device</button></p>}
                 <details ref={linkDevice} className="browser-link-device"><summary>Add another device</summary><p>Open this room link on your other device and choose <strong>Use my existing identity</strong>. Enter its code here.</p>
                   <form onSubmit={e => { e.preventDefault(); void act(async () => { await source.command('link', urlRoom, { code: code.trim().toLowerCase() }); setCode(''); setNotice(host || !settings.hostApprovesDevices ? 'Your device is approved.' : 'Identity confirmed. The host can now admit your device.'); }); }}><label>Device code<input value={code} onChange={e => setCode(e.target.value)} required maxLength={16} autoComplete="off" spellCheck={false} /></label><button className="secondary" disabled={busy || code.trim().length !== 16}>Approve my device</button></form>
@@ -1106,7 +1208,9 @@ function Rooms({ source }: { source: RoomSource }) {
                   <div><button className="secondary" disabled={busy} onClick={deleteRoom}>Delete room</button><button className="browser-text-link" onClick={() => setConfirming(undefined)}>Cancel</button></div>
                 </div> : <button className="browser-remove browser-leave" disabled={busy} onClick={() => setConfirming('delete-room')}>Delete room</button>}
               </section>}
-              <p className="browser-storage-note">Messages and files stay in participating browsers; each keeps the newest 256 MB of files per room. Device receipts confirm storage, not that someone has read a message.</p>
+              <p className="browser-storage-note">{source.isLocal
+                ? 'Messages and files stay on participating devices (saved on this computer and connected peers); each keeps the newest 256 MB of files per room. Messages deliver directly while devices are online together, and newcomers don’t receive earlier chat history. Device receipts confirm storage, not that someone has read a message.'
+                : 'Messages and files stay in participating browsers and devices; each keeps the newest 256 MB of files per room. Messages deliver directly while devices are online together, and newcomers don’t receive earlier chat history. Device receipts confirm storage, not that someone has read a message.'}</p>
             </aside>
           </div>
         </>}

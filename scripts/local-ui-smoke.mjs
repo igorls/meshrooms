@@ -226,6 +226,8 @@ try {
   await local.locator('input[type=file][multiple]').setInputFiles({ name: 'local-note.txt', mimeType: 'text/plain', buffer: Buffer.from('From the app on this computer.\n') });
   await local.getByRole('button', { name: 'Send', exact: true }).click();
   await local.locator('a.attachment-file', { hasText: 'local-note.txt' }).waitFor({ timeout: 30_000 });
+  // Non-image attachments fetch on demand (SEC-11): host clicks Download, then receives the verified file.
+  await host.locator('button.attachment-file', { hasText: 'local-note.txt' }).click({ timeout: 45_000 });
   await host.locator('a.attachment-file', { hasText: 'local-note.txt' }).waitFor({ timeout: 45_000 });
   // A decision opened on the local page: the host votes and the local page counts it, then the local page votes.
   await local.getByRole('button', { name: 'Decide', exact: true }).click();

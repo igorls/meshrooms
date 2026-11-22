@@ -78,3 +78,119 @@ export class IncomingGate {
     const peers = [...this.dropped]; this.dropped.clear(); return peers;
   }
 }
+
+/** Primary chat/sync channel label; older peers open only this channel and reuse it for files. */
+export const PRIMARY_CHANNEL_LABEL = 'meshrooms-browser-v1';
+/** Dedicated bulk file-transfer channel label; upgraded peers isolate file chunks here. */
+export const FILE_CHANNEL_LABEL = 'files';
+/** Initial handshake deadline before a peer that never reached healthy state is torn down. */
+export const CONNECT_TIMEOUT_MS = 20_000;
+/** Recovery grace once an established peer drops to disconnected, or ICE connects without an open channel (SYNC-5). */
+export const UNHEALTHY_GRACE_MS = 12_000;
+
+export type PeerHealthState = {
+  connectionState?: string;
+  iceConnectionState?: string;
+  channelState?: string;
+  started: number;
+  openedOnce?: boolean;
+  unhealthySince?: number;
+};
+
+/**
+ * Evaluates whether a WebRTC peer is healthy, within its recovery grace period, or ready to tear down (SYNC-5).
+ * Tracks `unhealthySince` separately from `started` so a peer connected for >1 h still gets a short recovery grace
+ * on `disconnected`, while terminal `failed`/`closed` states and zombie PCs with a closed DataChannel drop at once.
+ */
+export function evaluatePeerHealth(peer: PeerHealthState, now: number): 'healthy' | 'grace' | 'drop' {
+  const pc = peer.connectionState, ice = peer.iceConnectionState, ch = peer.channelState;
+  if (pc === 'failed' || pc === 'closed' || ice === 'failed' || ice === 'closed' || ch === 'closed') {
+    peer.unhealthySince ??= now;
+    return 'drop';
+  }
+  const pcConnected = pc === 'connected' || (pc === undefined && ch === 'open');
+  const iceOk = !ice || ice === 'connected' || ice === 'completed';
+  if (pcConnected && iceOk && ch === 'open') {
+    peer.openedOnce = true;
+    peer.unhealthySince = undefined;
+    return 'healthy';
+  }
+  if (peer.openedOnce || pc === 'connected' || pc === 'disconnected' || ice === 'disconnected' || ch === 'closing') {
+    peer.unhealthySince ??= now;
+    if (now - peer.unhealthySince > UNHEALTHY_GRACE_MS) return 'drop';
+    if (!peer.openedOnce && now - peer.started > CONNECT_TIMEOUT_MS) return 'drop';
+    return 'grace';
+  }
+  return now - peer.started > CONNECT_TIMEOUT_MS ? 'drop' : 'grace';
+}
+
+/** True when a peer holds a live open primary channel on a non-failed connection (safe to keep across epoch changes). */
+export function isLiveOpenPeer(pcState: string | undefined, iceState: string | undefined, channelState: string | undefined): boolean {
+  return channelState === 'open' && pcState !== 'failed' && pcState !== 'closed' && iceState !== 'failed' && iceState !== 'closed';
+}
+
+/** First `a=ice-ufrag:` token in an SDP body, if present. */
+export function sdpIceUfrag(sdp: string | undefined): string | undefined {
+  if (typeof sdp !== 'string') return undefined;
+  return /(?:^|\r?\n)a=ice-ufrag:([^\r\n\s]+)/.exec(sdp)?.[1];
+}
+
+/** Ordered `a=mid:` identifiers in an SDP body. */
+export function sdpMids(sdp: string | undefined): string[] {
+  if (typeof sdp !== 'string') return [];
+  const mids: string[] = [];
+  for (const match of sdp.matchAll(/(?:^|\r?\n)a=mid:([^\r\n\s]+)/g)) mids.push(match[1]);
+  return mids;
+}
+
+/**
+ * Checks whether an incoming SDP answer is compatible with the current local offer and not a replayed remote `ice-ufrag`
+ * from an earlier/retired connection for the same session. (Note: per RFC 8839, an answer carries the answerer's own
+ * `ice-ufrag`, distinct from the offerer's `ice-ufrag`; both sides share `a=mid` sections.)
+ */
+export function answerMatchesOffer(localSdp: string | undefined, answerSdp: string | undefined, retiredRemoteUfrags?: Set<string>, currentRemoteSdp?: string): boolean {
+  if (typeof answerSdp !== 'string' || !answerSdp) return false;
+  const localUfrag = sdpIceUfrag(localSdp);
+  const answerUfrag = sdpIceUfrag(answerSdp);
+  if (localUfrag && !answerUfrag) return false;
+  if (answerUfrag && retiredRemoteUfrags?.has(answerUfrag)) return false;
+  const previousRemoteUfrag = sdpIceUfrag(currentRemoteSdp);
+  if (answerUfrag && previousRemoteUfrag && answerUfrag === previousRemoteUfrag) return false;
+  const localMids = sdpMids(localSdp), answerMids = sdpMids(answerSdp);
+  if (localMids.length && answerMids.length && (localMids.length !== answerMids.length || localMids.some((m, i) => m !== answerMids[i]))) return false;
+  return true;
+}
+
+/** Deduplicates a poll batch's signals to the newest `seq` per `(from, session, type)` among currently online devices. */
+export function dedupeSignals<T extends { seq: number; from: string; session: string; description?: { type?: string; sdp?: string } }>(
+  signals: T[],
+  available: { id: string; session?: string }[],
+): T[] {
+  const latest = new Map<string, T>();
+  for (const signal of signals) {
+    const type = signal?.description?.type;
+    if ((type !== 'offer' && type !== 'answer') || typeof signal.description?.sdp !== 'string') continue;
+    if (!available.some(d => d.id === signal.from && d.session === signal.session)) continue;
+    const key = `${signal.from}:${signal.session}:${type}`;
+    const prev = latest.get(key);
+    if (!prev || signal.seq >= prev.seq) latest.set(key, signal);
+  }
+  return [...latest.values()].sort((a, b) => a.seq - b.seq);
+}
+
+/** Parses an HTTP `Retry-After` header (delta-seconds or HTTP-date) into milliseconds from `now`. */
+export function parseRetryAfter(header: string | null | undefined, now = Date.now()): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const dateMs = Date.parse(trimmed);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - now) : undefined;
+}
+
+/** Exponential backoff for HTTP 429 polling, honoring `Retry-After` when larger, bounded by `maxMs`. */
+export function nextPollBackoff(currentMs: number, retryAfterMs?: number, baseMs = 2_000, maxMs = 30_000): number {
+  const exp = currentMs > 0 ? currentMs * 2 : baseMs;
+  const desired = retryAfterMs !== undefined && Number.isFinite(retryAfterMs) ? Math.max(exp, retryAfterMs) : exp;
+  return Math.min(maxMs, Math.max(baseMs, desired));
+}

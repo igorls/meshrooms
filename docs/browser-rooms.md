@@ -52,12 +52,23 @@ served by this runtime; private admission data must never be in the web root.
 - Only an authenticated host may admit new members. A member's own companion
   devices join when that member confirms them (their device code is the secret).
   The link gives lobby access; it exposes no member list or connection
-  descriptions before admission.
+  descriptions before admission. Display names and room titles are NFKC-normalized
+  with Unicode control/format characters stripped, active members and open agent
+  links enforce NFKC+case-folded uniqueness, and each pending request displays an
+  8-hex device key fingerprint (`Key XXXX-XXXX`) in the host's approval queue.
+- Declining a join request enforces a five-minute per-device cooldown in that room
+  (HTTP 429 on immediate re-request); **Decline & block** permanently blocks that
+  device key from joining the room (HTTP 403).
 - Companion devices receive separate device credentials and map to the approving
   human. Display names never link identities. One browser profile keeps one device
   identity; one active tab per room prevents conflicting connection ownership.
-- Admission and request receipts persist in a separate SQLite store. Transactions
-  deduplicate retried operations. This is coordination metadata, not chat storage.
+- Admission and request receipts persist in a separate SQLite store managed by
+  ordered `PRAGMA user_version` schema migrations (refusing to open a newer schema
+  version to prevent accidental downgrades). Retired device keys persist in their
+  own `retired_devices` table rather than a truncated JSON slice, and re-admitting
+  a previously retired device clears its stale retired entry so active and former
+  verification keys never conflict. Transactions deduplicate retried operations.
+  This is coordination metadata, not chat storage.
 - Browser messages travel over WebRTC data channels with signed, room-scoped author
   envelopes. The coordinator carries bounded, expiring SDP descriptions, not chat
   messages. It is trusted for membership and signaling in this first slice;
@@ -73,6 +84,19 @@ served by this runtime; private admission data must never be in the web root.
   poll. The coordinator rejects removed-device signaling immediately. Revocation
   propagation requires coordination connectivity; this is not an offline revocation
   protocol. A removed device can deliberately request fresh admission.
+- Removing a member via `remove { memberId }` atomically removes every device of
+  that member and any agents they operate in one transaction. Removing a single
+  device (`remove { deviceId }`) works as before, and revoking a device that left
+  on its own updates its `retired_devices` record in place.
+- A device removed by someone else (the host, or its own member removing a lost
+  device) is revoked: peers accept no task change, vote, reaction or message
+  deletion it signed that they don't already hold, even when another member
+  relays it. A device that left from itself is trusted for records dated up to
+  when it left. Because a stolen device could leave on its own first, the host
+  or the device's own member (or an agent's operator) can still revoke it after
+  it has left, with the same `remove` command. The cost of revoking: a device that joins later, or was offline,
+  never gets the revoked device's records that nobody else holds in a newer form,
+  such as a task only that device last changed.
 
 ## Background rooms and unread counts
 
@@ -174,8 +198,11 @@ Agents are unaffected: bridges keep their own connections.
 ## Room lifecycle and invite codes
 
 - **Beta admission** uses an invite code once per person, rather than once per room. The service remembers admission by the person's authenticated device keys. Linked human companion devices inherit it; guests and agents do not. Admission survives deleting rooms, code expiry and coordinator restarts. Existing room creators and their companion devices retain admission on upgrade. Codes have a number of people they can admit and an expiry; only hashes are stored. A failed create consumes no use. The create form checks admission with a signed `creation-status` request and asks for a code only when needed. Joining a room through its link still needs no beta code. Existing service capacity, creation rate limits and per-device room limits remain in place.
+- **Transferring host (`transfer-host`):** the host can choose **Room details → Make host**
+  on another admitted human member (never an agent) to hand over room ownership
+  atomically. The former host becomes a regular member and may then leave the room.
 - **Deleting a room:** the host chooses **Room details → Delete room**. The room, its
-  admission records and member pictures are deleted from the service. Every later
+  admission records, `retired_devices`, and member pictures are deleted from the service. Every later
   request for it answers 410 with `code: "room-closed"`; members' rooms show "This
   room was closed by its host" instead of retrying, and agent bridges stop.
   Messages already in members' browsers stay there.
@@ -198,13 +225,40 @@ Agents are unaffected: bridges keep their own connections.
 
 This preview caps the service at 256 rooms (`MESHROOMS_MAX_ROOMS`), 16 devices and
 16 pending requests per room. Each browser and agent bridge keeps a rolling window of
-the newest 5,000 messages per room, evicting the oldest. Its newest 1,000 own messages
+the newest 5,000 messages per room, evicting the oldest. While one member's messages
+fill more than half of that window, that member's own oldest messages are evicted
+first, so one member sending as fast as the quota allows can't push everyone else's
+history out. Its newest 1,000 own messages
 still waiting for a receipt are never evicted; older ones stay stored as ordinary
 history, so a device that never returns cannot block sending. Each device accepts at
 most 60 live messages, task changes, decision changes and reactions per member per
 minute of each kind, in bursts of 20. Over-quota packets are dropped: a message goes
 unconfirmed, so its sender retries; for other kinds the receiver asks the sender for
-its state again once the burst is over. Requests expire after ten minutes. The HTTP
+its state again once the burst is over.
+
+A removed task, and a reaction taken back, leave a small removal marker on every
+device, so a device that missed the removal can't bring them back. When a device
+compacts its board or its reactions, it keeps each member's newest 100 task removals
+and newest 200 reaction removals and forgets older ones, so one member can't fill
+either log with things created and removed again. The cost: a device that has held a
+forgotten task or reaction since before it was removed (it was away at the time) can
+bring it back when it reconnects, until someone removes it again. Only the oldest
+removals of a member who made more than their share are exposed. A reaction its
+member gives again after its removal was forgotten shows on every device: once the
+removal is forgotten, that member's own later reaction stands. Times there, and in
+the caps below, are each signer's own and only order one member's own records.
+
+Live tasks and reactions have a per-member cap too, applied to everything a device
+holds whatever order it arrived in, so devices with the same operations show the
+same board. Each member keeps their oldest 200 live tasks (by the time of each
+task's first change) and their newest 200 live reactions; a device refuses to sign
+a 201st task, while a 201st reaction lets the member's oldest go. A device that
+dropped a task another device still keeps gets it back in the next exchange. One
+edge remains for reactions: a device keeps no reactions for messages it never held,
+so for a member past the cap two devices can differ on which of that member's
+oldest reactions they keep.
+
+Requests expire after ten minutes. The HTTP
 rate limit is 240 API requests per source address per minute locally, or 1,200 behind
 the explicitly trusted loopback proxy. IPv6 clients count per /64. When the rate table
 is full, the oldest address makes room; new addresses are never refused for it. Nginx

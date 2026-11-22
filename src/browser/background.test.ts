@@ -127,4 +127,24 @@ describe('background rooms and their claims', () => {
     expect(lost?.name).toBe('AbortError');
     expect(await connectionHeld()).toBe(false);
   });
+
+  test('halting a background room aborts its in-flight status poll immediately', async () => {
+    let seenSignal: AbortSignal | undefined;
+    const hangingApi = {
+      command: async (_action: string, _roomId: string, _payload?: Record<string, unknown>, signal?: AbortSignal) => {
+        seenSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        });
+      },
+    };
+    const { events: on } = events();
+    const room = new BackgroundRoom(hangingApi as any, dev, R, on);
+    expect(await room.started).toBe(true);
+    await until(() => !!seenSignal, 'status poll to start');
+    expect(seenSignal!.aborted).toBe(false);
+    await room.stop();
+    expect(seenSignal!.aborted).toBe(true);
+    expect(await connectionHeld()).toBe(false);
+  });
 });

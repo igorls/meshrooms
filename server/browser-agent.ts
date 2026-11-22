@@ -17,10 +17,10 @@ import { tryLock } from './locks';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
-import { browserProtocol, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
-import { COMPACT_AT, compactBoard, foldBoard, MAX_TASK_OPS, syncChunks, taskBody, validIssueLink, validTaskBody, withinRevisionJump, type BoardSync, type TaskChange, type TaskPacket } from '../src/browser/board';
+import { browserProtocol, signerOf, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
+import { COMPACT_AT, compactBoard, foldBoard, MAX_TASK_OPS, MAX_TIME, syncChunks, taskBody, validIssueLink, validTaskBody, capLiveTasks, mayAddTask, withinRevisionJump, type BoardSync, type TaskChange, type TaskPacket } from '../src/browser/board';
 import {
-  FileTransfers, IMAGE_TYPES, MAX_ATTACHMENT_BYTES, displayKind, MAX_MESSAGE_ATTACHMENTS, attachmentRef, attachmentText, isFilePacket, isSha256, retainedFiles, shownText,
+  FileTransfers, IMAGE_TYPES, LOW_WATER, MAX_ATTACHMENT_BYTES, displayKind, MAX_MESSAGE_ATTACHMENTS, attachmentRef, attachmentText, isFilePacket, isSha256, retainedFiles, shownText,
   validAttachments, type AttachmentRef, type FileStore, type TransferState,
 } from '../src/browser/files';
 import { cleanName, defaultName, sniff } from '../src/attachments';
@@ -28,8 +28,8 @@ import { admissible, castVote, COMPACT_DECISIONS_AT, compactDecisions, decisionC
   type Decision, type DecisionBody, type DecisionMode, type DecisionPacket, type DecisionSync, type VoteBody } from '../src/browser/decisions';
 import { ACTIVITY_RESEND_MS, LISTEN_HEARTBEAT_MS, activityPacket, isActivityPacket, receiveActivity, validActivity, validActivityPacket, validNote, type Activity, type ActivityOn, type ActivityRecord } from '../src/browser/activity';
 import {
-  COMPACT_REACTIONS_AT, MAX_REACTION_KEYS_PER_MEMBER, MAX_REACTION_OPS, REACTION_EMOJI, compactReactions, currentRevision,
-  foldReactions, isReactionEmoji, liveKeysForMember, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody, withinReactionKeyCap,
+  COMPACT_REACTIONS_AT, MAX_REACTION_OPS, REACTION_EMOJI, capReactions, compactReactions, currentRevision,
+  foldReactions, isReactionEmoji, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody,
   type ReactionBody, type ReactionEmoji, type ReactionPacket,
 } from '../src/browser/reactions';
 import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket, type RetractionSync } from '../src/browser/retractions';
@@ -38,7 +38,11 @@ import type { Message, Participant } from '../src/room';
 import { releaseIssueTask } from './github-issues';
 import { whileBusy } from './agent-install';
 import { awaitingDelivery, windowHistory } from '../src/browser/history';
-import { IncomingGate, PACE_LOW_WATER, Resync, SYNC_REQUEST, SendQueue, isSyncRequest, type SyncRequest } from '../src/browser/pacer';
+import {
+  FILE_CHANNEL_LABEL, IncomingGate, PACE_LOW_WATER, PRIMARY_CHANNEL_LABEL, Resync, SYNC_REQUEST, SendQueue,
+  answerMatchesOffer, dedupeSignals, evaluatePeerHealth, isLiveOpenPeer, isSyncRequest, nextPollBackoff, parseRetryAfter, sdpIceUfrag,
+  type PeerHealthState, type SyncRequest,
+} from '../src/browser/pacer';
 import { QuotaDrops, ReceiveQuota, type QuotaKind } from '../src/browser/quota';
 
 type Identity = { id: string; publicKey: string; privateJwk: JsonWebKey };
@@ -66,7 +70,12 @@ type StoredOp = TaskPacket & { seq: number };
  * `sent`: when each outbox message was last sent on this connection, so an unconfirmed one isn't resent every second.
  * `queue` paces this agent's board, decisions and reactions onto the channel; `resync` answers the peer's requests for them.
  */
-type Peer = { pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; started: number; sent: Map<string, number>; queue?: SendQueue; resync: Resync };
+type Peer = {
+  pc: RTCPeerConnection; session: string; channel?: RTCDataChannel; fileChannel?: RTCDataChannel;
+  started: number; unhealthySince?: number; openedOnce?: boolean; offerSent?: boolean;
+  iceKey?: string; remoteUfrag?: string;
+  sent: Map<string, number>; queue?: SendQueue; resync: Resync;
+};
 /** Message, board and decision cursors `listen` continues from; saved in the agent's room folder. */
 export type ListenCursor = { after?: string; boardAfter: number; decisionsAfter: number };
 const LISTEN_CURSOR = 'listen-cursor.json';
@@ -87,7 +96,41 @@ export function replaceFile(path: string, data: string | Uint8Array, rename: (fr
   try { whileBusy(() => rename(temporary, path)); } catch (error) { rmSync(temporary, { force: true }); throw error; }
 }
 function writeJson(path: string, value: unknown) { replaceFile(path, JSON.stringify(value)); }
-function readJson<T>(path: string, fallback: T): T { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; } }
+export function readJson<T>(path: string, fallback: T, read: (p: string) => string = p => readFileSync(p, 'utf8'), platform = process.platform): T {
+  try { return JSON.parse(whileBusy(() => read(path), undefined, platform)); } catch { return fallback; }
+}
+/**
+ * Reads JSON for a writer that will replace the file: a missing file (ENOENT) starts from `fallback`, while a read
+ * failure (EBUSY past retries, EACCES, ENOSPC) or corrupt JSON throws instead of returning an empty fallback that would
+ * overwrite existing history with a single new entry.
+ */
+export function readJsonStrict<T>(path: string, fallback: T, read: (p: string) => string = p => readFileSync(p, 'utf8'), platform = process.platform): T {
+  let text: string;
+  try { text = whileBusy(() => read(path), undefined, platform); }
+  catch (error) { if ((error as { code?: string }).code === 'ENOENT') return fallback; throw error; }
+  return JSON.parse(text);
+}
+/** Formats a timestamp safely as ISO-8601, clamping out-of-range or non-finite values so Date.toISOString never throws. */
+export const safeIso = (at: number) => new Date(Number.isFinite(at) ? Math.min(Math.max(at, 0), MAX_TIME) : 0).toISOString();
+/** Per-peer rate limit on incoming `file-want` requests (60/min, burst 20) so hash floods cannot peg CPU or disk. */
+export class FileWantLimiter {
+  private readonly unit = 60_000;
+  private buckets = new Map<string, { tokens: number; at: number; reported: number }>();
+  constructor(private now: () => number = () => Date.now(), private perMinute = 60, private burst = 20, private maxBuckets = 512) {}
+  private bucket(peer: string) {
+    const at = this.now();
+    let b = this.buckets.get(peer);
+    if (b) {
+      this.buckets.delete(peer);
+      b.tokens = Math.min(this.burst * this.unit, b.tokens + Math.max(0, at - b.at) * this.perMinute); b.at = at;
+    } else b = { tokens: this.burst * this.unit, at, reported: -Infinity };
+    this.buckets.set(peer, b);
+    if (this.buckets.size > this.maxBuckets) this.buckets.delete(this.buckets.keys().next().value!);
+    return b;
+  }
+  take(peer: string) { const b = this.bucket(peer); if (b.tokens < this.unit) return false; b.tokens -= this.unit; return true; }
+  report(peer: string) { const b = this.bucket(peer), at = this.now(); if (at - b.reported < 60_000) return false; b.reported = at; return true; }
+}
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 /** Files younger than this are never evicted: `send` stores them before `run` signs the message naming them. */
 const FILE_GRACE_MS = 10 * 60_000;
@@ -156,23 +199,57 @@ export class BrowserAgent {
    * Folders from before live/ existed are still read.
    */
   private live(name: string) { const path = join(this.dir, LIVE, name); return existsSync(path) || !existsSync(this.path(name)) ? path : this.path(name); }
-  /** Content-addressed files: <dir>/files/<sha256>. Every read re-hashes, so a damaged file is never served or returned. */
+  private readonly verifiedFiles = new Map<string, string>();
+  private rememberVerified(sha: string, stamp: string) {
+    this.verifiedFiles.delete(sha);
+    this.verifiedFiles.set(sha, stamp);
+    if (this.verifiedFiles.size > 512) this.verifiedFiles.delete(this.verifiedFiles.keys().next().value!);
+  }
+  /** Content-addressed files: <dir>/files/<sha256>. Every read (and uncached `has`) re-hashes, deleting damaged copies. */
   readonly files: FileStore & { path: (sha: string) => string; add: (bytes: Uint8Array) => string } = {
     path: sha => this.path(join('files', sha)),
-    // A regular file only: a link planted in files/ is never followed (the hash check would catch its content anyway).
-    has: sha => { try { return isSha256(sha) && lstatSync(this.files.path(sha)).isFile(); } catch { return false; } },
+    // A regular file only: a link planted in files/ is never followed, and uncached files are hashed against their name.
+    has: sha => {
+      if (!isSha256(sha)) return false;
+      const path = this.files.path(sha);
+      try {
+        const stat = lstatSync(path, { bigint: true });
+        if (!stat.isFile()) return false;
+        const stamp = `${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}:${stat.ino}`;
+        if (this.verifiedFiles.get(sha) === stamp) return true;
+        const bytes = new Uint8Array(readFileSync(path));
+        if (sha256(bytes) === sha) { this.rememberVerified(sha, stamp); return true; }
+        this.verifiedFiles.delete(sha);
+        try { unlinkSync(path); } catch { /* Already gone. */ }
+        return false;
+      } catch {
+        this.verifiedFiles.delete(sha);
+        return false;
+      }
+    },
     get: async sha => {
-      if (!this.files.has(sha)) return undefined;
-      const bytes = new Uint8Array(readFileSync(this.files.path(sha)));
-      if (sha256(bytes) === sha) return bytes;
-      try { unlinkSync(this.files.path(sha)); } catch { /* Already gone. */ }
-      return undefined;
+      if (!isSha256(sha)) return undefined;
+      const path = this.files.path(sha);
+      try {
+        const stat = lstatSync(path, { bigint: true });
+        if (!stat.isFile()) return undefined;
+        const bytes = new Uint8Array(readFileSync(path));
+        if (sha256(bytes) === sha) { this.rememberVerified(sha, `${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}:${stat.ino}`); return bytes; }
+        this.verifiedFiles.delete(sha);
+        try { unlinkSync(path); } catch { /* Already gone. */ }
+        return undefined;
+      } catch {
+        this.verifiedFiles.delete(sha);
+        return undefined;
+      }
     },
     // Only verified bytes arrive here, so they always replace whatever is on disk (a damaged copy would block them otherwise).
     put: async (_sha, bytes) => { this.files.add(bytes); },
     add: bytes => {
       const sha = sha256(bytes), path = this.files.path(sha);
-      replaceFile(path, bytes); return sha;
+      replaceFile(path, bytes);
+      this.verifiedFiles.delete(sha);
+      return sha;
     },
   };
   /** Metadata of a file named by a stored (verified) message, by attachment id or hash. */
@@ -209,10 +286,21 @@ export class BrowserAgent {
     // 'agent-redeem' joins the protocol with browser-room agents; older coordinators reject it with a clear error.
     const command = { protocol: browserProtocol, origin: this.origin, id, at: Date.now(), action, roomId: this.roomId, payload } as Command;
     const response = await fetch(`${this.origin}/api/lobby`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
-      headers: { 'Content-Type': 'application/json', Origin: this.origin },
+      headers: { 'Content-Type': 'application/json', Origin: this.origin, 'X-Meshrooms-Protocol': '1' },
       body: JSON.stringify({ command, publicKey: identity.publicKey, signature: await this.sign(command) }) });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(result.error || `Room service rejected ${action} (${response.status}).`), { status: response.status, ...(typeof result.code === 'string' ? { code: result.code } : {}) });
+    if (!response.ok) {
+      const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
+      const code = typeof result.code === 'string' ? result.code : response.status === 426 ? 'upgrade-required' : undefined;
+      const fallback = response.status === 426
+        ? 'This Meshrooms bridge is out of date. Upgrade with bunx @wormdb/meshrooms@latest.'
+        : `Room service rejected ${action} (${response.status}).`;
+      throw Object.assign(new Error(result.error || fallback), {
+        status: response.status,
+        ...(code ? { code } : {}),
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      });
+    }
     return result;
   }
   messages(): Stored[] { return readJson(this.path('messages.json'), []); }
@@ -239,11 +327,6 @@ export class BrowserAgent {
   /** Verified reaction operations this device holds (only for messages it also holds). */
   reactionOps(): ReactionPacket[] { return readJson(this.path('reactions.json'), []); }
   reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
-  /** Reactions on a deleted message are hidden and can't be taken back, so they don't count toward a member's cap. */
-  countedReactions(ops = this.reactionOps()) {
-    const gone = new Set(this.messages().filter(isRetracted).map(m => m.packet.body.id));
-    return ops.map(p => p.body).filter(op => !gone.has(op.messageId));
-  }
   /** Verified retractions, including those of messages this device doesn't hold (yet, or any more). */
   retractOps(): RetractPacket[] { return readJson(this.path('retractions.json'), []); }
   /** Where a plain `listen` continues from: the cursors the last `listen` returned. */
@@ -251,13 +334,32 @@ export class BrowserAgent {
     const c = readJson<Partial<ListenCursor> | undefined>(this.live(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
     return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
   }
-  saveListenCursor(cursor: ListenCursor, expected?: string) {
+  saveListenCursor(cursor: ListenCursor, expected?: string, options: { monotonic?: boolean } = {}) {
     mkdirSync(join(this.dir, LIVE), { recursive: true, mode: 0o700 });
     const lock = join(this.dir, LIVE, 'listen-cursor.lock');
     if (!tryLock(lock, 'the listen cursor', undefined, { maxAgeMs: 30_000 })) throw new Error('The listen cursor is busy. Try again.');
     try {
-      if (expected !== undefined && JSON.stringify(this.listenCursor() ?? null) !== expected) return false;
-      writeJson(join(this.dir, LIVE, LISTEN_CURSOR), cursor); return true;
+      const current = this.listenCursor();
+      if (expected !== undefined && JSON.stringify(current ?? null) !== expected) return false;
+      let next = cursor;
+      if (options.monotonic && current) {
+        const boardMax = this.boardCursor(), decisionMax = this.decisionCursor();
+        const curBoard = current.boardAfter <= boardMax ? current.boardAfter : 0;
+        const curDecisions = current.decisionsAfter <= decisionMax ? current.decisionsAfter : 0;
+        let after = cursor.after;
+        if (current.after !== undefined) {
+          if (cursor.after === undefined) {
+            const ids = this.messages().map(m => m.packet.body.id);
+            if (ids.includes(current.after)) after = current.after;
+          } else if (cursor.after !== current.after) {
+            const ids = this.messages().map(m => m.packet.body.id);
+            const curIdx = ids.indexOf(current.after), nextIdx = ids.indexOf(cursor.after);
+            if (curIdx >= 0 && (nextIdx < 0 || curIdx > nextIdx)) after = current.after;
+          }
+        }
+        next = { ...(after !== undefined ? { after } : {}), boardAfter: Math.max(curBoard, cursor.boardAfter), decisionsAfter: Math.max(curDecisions, cursor.decisionsAfter) };
+      }
+      writeJson(join(this.dir, LIVE, LISTEN_CURSOR), next); return true;
     } finally { try { unlinkSync(lock); } catch { /* Released already. */ } }
   }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
@@ -293,7 +395,7 @@ export class BrowserAgent {
       // `kind` follows the declared type here; `attachment` re-checks it against the verified bytes.
       const attachments = body.attachments?.map(ref => ({ ...ref, kind: IMAGE_TYPES.includes(ref.type) ? 'image' as const : 'file' as const }));
       return { id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human', text,
-        time: new Date(body.at).toISOString(), ...(retracted ? { deleted: true } : {}), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(mentions.length ? { mentions } : {}), ...(attachments ? { attachments } : {}) };
+        time: safeIso(body.at), ...(retracted ? { deleted: true } : {}), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(mentions.length ? { mentions } : {}), ...(attachments ? { attachments } : {}) };
     });
     const ops = this.taskOps();
     const settings = this.settings();
@@ -370,7 +472,8 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
       const steward = current.createdBy === memberId || memberId === ownerId || members.some(m => m.id === current.createdBy && m.operatorId === memberId);
       return steward ? undefined : 'only who opened a decision, its operator, or the host can close it';
     }
-    if (it.action === 'option') return current.mode === 'plan-review' ? 'plan reviews keep their options' : undefined;
+    if (it.action === 'option') return current.mode === 'plan-review' ? 'plan reviews keep their options'
+      : typeof it.label !== 'string' || !it.label.trim() ? 'give the new option a label' : undefined;
     return 'it is not a known decision change';
   }
   if (it.type === 'task') return id(it.taskId) ? undefined : 'its task id is not a UUID';
@@ -422,11 +525,14 @@ export const runnerStuck = (proof: unknown, now = Date.now(), since = 0) => (stu
  * the HTTP status of the latest failure when the service did answer (a rejection, a rate limit, a server error); absent
  * when the request itself failed or timed out.
  */
-export function serviceSilence(proof: unknown): { since: number; failure?: string; status?: number } | undefined {
-  const p = proof as { failingSince?: unknown; failure?: unknown; failureStatus?: unknown } | undefined;
+export function serviceSilence(proof: unknown): { since: number; failure?: string; status?: number; upgradeRequired?: boolean } | undefined {
+  const p = proof as { failingSince?: unknown; failure?: unknown; failureStatus?: unknown; upgradeRequired?: unknown } | undefined;
   return typeof p?.failingSince === 'number' ? { since: p.failingSince, ...(typeof p.failure === 'string' ? { failure: p.failure } : {}),
-    ...(typeof p.failureStatus === 'number' ? { status: p.failureStatus } : {}) } : undefined;
+    ...(typeof p.failureStatus === 'number' ? { status: p.failureStatus } : {}),
+    ...(p.upgradeRequired ? { upgradeRequired: true } : {}) } : undefined;
 }
+/** Poll backoff after HTTP 426 Upgrade Required (OPS-6), avoiding 1 s retry storms while waiting for upgrade. */
+export const UPGRADE_BACKOFF_MS = 60_000;
 /** Written by the runner when the room service answers 410 (the host closed the room, or the service removed it). */
 export const ROOM_CLOSED_FILE = 'room-closed.json';
 /**
@@ -532,27 +638,31 @@ async function answerWithin<T>(work: Promise<T>, ms: number, what: string): Prom
  * deleted messages named. The log is saved first, and `apply` works from the log whatever was just added, so one saved by
  * a pass that then couldn't save the messages (a full disk) still takes effect the next time.
  */
-export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | undefined, save: (messages: Stored[]) => void, release: (sha256: string[]) => void) {
-  const apply = (log = agent.retractOps()) => {
-    const { messages, changed, released } = applyRetractions(agent.messages(), log.map(op => op.body));
+export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | undefined, save: (messages: Stored[]) => void, release: (sha256: string[]) => void,
+  onRetracted?: (ids: string[]) => void) {
+  const readLog = () => readJsonStrict<RetractPacket[]>(join(agent.dir, 'retractions.json'), []);
+  const readMessages = () => readJsonStrict<Stored[]>(join(agent.dir, 'messages.json'), []);
+  const apply = (log = readLog()) => {
+    const { messages, changed, released } = applyRetractions(readMessages(), log.map(op => op.body));
     if (!changed.length) return;
     save(messages);
+    onRetracted?.(changed);
     release(released);
   };
   const add = (incoming: RetractPacket[]) => {
-    const { log, added } = addRetractions(agent.retractOps(), incoming, agent.messages());
+    const { log, added } = addRetractions(readLog(), incoming, readMessages());
     if (added.length) writeJson(join(agent.dir, 'retractions.json'), log);
     apply(log);
   };
   return {
     apply, add,
-    /** Keep those signed by a current or former device of their author, whichever device relayed them. */
+    /** Keep those signed by a device of their author that may still sign (see signerOf), whichever device relayed them. */
     async accept(packets: unknown[]) {
-      const accepted: RetractPacket[] = [], known = new Set(agent.retractOps().map(p => p.body.id)), room = status();
+      const accepted: RetractPacket[] = [], known = new Set(readLog().map(p => p.body.id)), room = status();
       for (const packet of packets as RetractPacket[]) {
         const b = packet?.body;
         if (!validRetractBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
-        const author = room?.devices?.find(d => d.id === b.deviceId) ?? room?.formerDevices?.find(d => d.id === b.deviceId);
+        const author = signerOf(room, b.deviceId, b.at);
         if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
         known.add(b.id);
         accepted.push({ body: b, signature: packet.signature });
@@ -560,7 +670,7 @@ export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | un
       add(accepted);
     },
     /** A message arriving after its retraction is stored as a stub, so its content never reaches the disk. */
-    arriving: (stored: Stored): Stored => agent.retractOps().some(op => mayRetract(op.body, stored.packet.body)) ? retractedStub(stored) : stored,
+    arriving: (stored: Stored): Stored => readLog().some(op => mayRetract(op.body, stored.packet.body)) ? retractedStub(stored) : stored,
   };
 }
 
@@ -569,14 +679,33 @@ export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | un
  * between passes (tests shorten it; the deadlines are what bound a pass).
  */
 export async function runBridge(agent: BrowserAgent, log: (line: string) => void = console.error,
-  options: { deadlines?: Partial<PassDeadlines>; pause?: (ms: number) => Promise<unknown> } = {}) {
+  options: {
+    deadlines?: Partial<PassDeadlines>;
+    pause?: (ms: number) => Promise<unknown>;
+    now?: () => number;
+    gatherMs?: number;
+    createPeerConnection?: (config: { iceServers: { urls: string; username?: string; credential?: string }[] }) => RTCPeerConnection;
+  } = {}) {
   const deadlines: PassDeadlines = { ...PASS_DEADLINES, ...options.deadlines }, pause = options.pause ?? ((ms: number) => Bun.sleep(ms));
+  const now = options.now ?? (() => Date.now()), gatherMs = options.gatherMs ?? 1500;
+  const makePc = options.createPeerConnection ?? (config => new RTCPeerConnection(config));
   const identity = await agent.ensureIdentity();
   const session = randomUUID(); const peers = new Map<string, Peer>();
   let status: RoomStatus | undefined; let epoch = ''; let cursor = 0;
+  let iceServers: RTCIceServer[] = []; let iceKey = '[]';
+  const retiredUfrags = new Map<string, Set<string>>();
+  let pollBackoff = 0;
   let serial: Promise<unknown> = Promise.resolve();
   const transaction = <T>(work: () => Promise<T>) => { const next = serial.then(work); serial = next.catch(() => {}); return next; };
-  const save = (messages: Stored[]) => writeJson(join(agent.dir, 'messages.json'), messages);
+  const readMessages = () => readJsonStrict<Stored[]>(join(agent.dir, 'messages.json'), []);
+  const readTaskOps = () => readJsonStrict<StoredOp[]>(join(agent.dir, 'tasks.json'), []).map((p, i) => ({ ...p, seq: p.seq ?? i + 1 }));
+  const readBoardCursor = (ops: StoredOp[]) => Math.max(readJsonStrict<{ seq: number }>(join(agent.dir, 'board.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0);
+  const readDecisionOps = () => readJsonStrict<StoredDecisionOp[]>(join(agent.dir, 'decisions.json'), []);
+  const readDecisionCursor = (ops: StoredDecisionOp[]) => Math.max(readJsonStrict<{ seq: number }>(join(agent.dir, 'decisions-cursor.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0);
+  const readReactionOps = () => readJsonStrict<ReactionPacket[]>(join(agent.dir, 'reactions.json'), []);
+  const readRetractOps = () => readJsonStrict<RetractPacket[]>(join(agent.dir, 'retractions.json'), []);
+  let referencedCache: Map<string, AttachmentRef> | undefined;
+  const save = (messages: Stored[]) => { writeJson(join(agent.dir, 'messages.json'), messages); referencedCache = undefined; };
   /** Own messages a current device has not confirmed; the window never evicts them. */
   const awaiting = (m: Stored) => awaitingDelivery(m, identity.id, status?.devices && new Set(status.devices.map(d => d.id)));
   /** Append a message to the stored history, evicting the oldest past the rolling window (logged, never silent). */
@@ -595,40 +724,41 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   let syncedAt: number | undefined;
   /** Append verified operations at the next cursors; a large board is compacted like a browser's, without moving the cursor. */
   const storeOps = (ops: StoredOp[], added: TaskPacket[]) => {
-    let seq = agent.boardCursor(ops);
-    let next: StoredOp[] = [...ops, ...added.map(p => ({ ...p, seq: ++seq }))];
+    let seq = readBoardCursor(ops);
+    // Each member keeps their oldest MAX_LIVE_TASKS_PER_MEMBER live tasks over everything held, as browsers do (capLiveTasks).
+    let next: StoredOp[] = capLiveTasks([...ops, ...added.map(p => ({ ...p, seq: ++seq }))]);
     if (next.length > COMPACT_AT) { writeJson(join(agent.dir, 'board.json'), { seq }); next = compactBoard(next); }
     writeJson(join(agent.dir, 'tasks.json'), next);
   };
   /** Keep a task operation signed by a current device of its author; duplicates and a full board are ignored. */
   const acceptOps = async (packets: unknown[]) => {
-    const ops = agent.taskOps(); const known = new Set(ops.map(p => p.body.id)); const added: TaskPacket[] = [];
+    const ops = readTaskOps(); const known = new Set(ops.map(p => p.body.id)); const added: TaskPacket[] = [];
     for (const packet of packets as TaskPacket[]) {
       const b = packet?.body;
       if (ops.length + added.length >= MAX_TASK_OPS) break;
       if (!validTaskBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
-      // A change by someone who has since left still verifies against the key the room service keeps for them.
-      const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
+      // A change by someone who has since left still verifies against the key the room service keeps for them (see signerOf).
+      const author = signerOf(status, b.deviceId, b.at);
       if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
       known.add(b.id); added.push({ body: b, signature: packet.signature });
     }
-    // A revision far past the held ones would freeze the task at the revision cap (see MAX_REVISION_JUMP).
+    // Revisions stay within MAX_REVISION_JUMP of pre-batch held state; storeOps applies the live-task cap.
     const kept = withinRevisionJump(ops.map(p => p.body), added);
     if (kept.length) storeOps(ops, kept);
   };
   const storeDecisionOps = (added: DecisionPacket[]) => {
-    const ops = agent.decisionOps(); let seq = agent.decisionCursor(ops);
+    const ops = readDecisionOps(); let seq = readDecisionCursor(ops);
     let next: StoredDecisionOp[] = [...ops, ...added.map(p => ({ ...p, seq: ++seq }))];
     if (next.length > COMPACT_DECISIONS_AT) { writeJson(join(agent.dir, 'decisions-cursor.json'), { seq }); next = compactDecisionLog(agent, next, status?.memberId); }
     writeJson(join(agent.dir, 'decisions.json'), next);
   };
   // A log that filled up before compaction existed (or before this agent upgraded) is compacted before anything is refused.
-  compactStoredDecisions(agent, agent.members().memberId);
+  try { compactStoredDecisions(agent, agent.members().memberId); } catch (error) { log(`decisions: ${error instanceof Error ? error.message : String(error)}`); }
   /** Keep decision and vote operations signed by a (current or former) device of their author; duplicates are ignored. */
   const acceptDecisionOps = async (packets: unknown[]) => {
     const ops = compactStoredDecisions(agent, status?.memberId);
     const added = await admitDecisionPackets(ops.map(p => p.body), packets, agent.roomId, async (b, signature) => {
-      const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
+      const author = signerOf(status, b.deviceId, b.at);
       return !!author && author.memberId === b.memberId && await agent.verify(author.publicKey, b, signature);
     });
     if (added.length) storeDecisionOps(added);
@@ -653,26 +783,27 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   /** Persist ready reaction ops; refuse past the cap after compaction instead of truncating live keys. */
   const storeReactionOps = (ops: ReactionPacket[], added: ReactionPacket[]) => {
     if (!added.length) return true;
-    let next = [...ops, ...added];
+    // Each member keeps their newest MAX_REACTION_KEYS_PER_MEMBER live reactions over everything held, as browsers do.
+    let next = capReactions([...ops, ...added]);
     if (next.length > COMPACT_REACTIONS_AT) next = compactReactions(next);
     if (next.length > MAX_REACTION_OPS) return false;
     writeJson(join(agent.dir, 'reactions.json'), next);
     return true;
   };
-  /** Keep verified reactions for held messages; unknown messages stay pending until the message is stored. */
+  /** Keep verified reactions for live held messages; retracted messages take none and are not parked; unknown messages stay pending until stored. */
   const addReactionOps = (incoming: ReactionPacket[]) => {
-    const held = new Set(agent.messages().map(m => m.packet.body.id));
-    const ops = agent.reactionOps();
+    const messages = readMessages();
+    const held = new Set(messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+    const retractedIds = new Set(messages.filter(isRetracted).map(m => m.packet.body.id));
+    const ops = readReactionOps();
     const known = new Set([...ops.map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
     let ready: ReactionPacket[] = [];
     for (const op of incoming) {
-      if (known.has(op.body.id)) continue;
+      if (known.has(op.body.id) || retractedIds.has(op.body.messageId)) continue;
       known.add(op.body.id);
       if (held.has(op.body.messageId)) ready.push(op);
       else if (mayHoldPending(pendingReactions, op)) pendingReactions.push(op);
     }
-    // Each member keeps at most MAX_REACTION_KEYS_PER_MEMBER live reactions here too, not only when sending.
-    ready = withinReactionKeyCap(agent.countedReactions(ops), ready);
     if (!ready.length) return true;
     return storeReactionOps(ops, ready);
   };
@@ -685,11 +816,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   /** Keep reaction operations signed by a current or former device of their author; duplicates are ignored. */
   const acceptReactions = async (packets: unknown[]) => {
     const accepted: ReactionPacket[] = [];
-    const known = new Set([...agent.reactionOps().map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
+    const known = new Set([...readReactionOps().map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
     for (const packet of packets as ReactionPacket[]) {
       const b = packet?.body;
       if (!validReactionBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
-      const author = status?.devices?.find(d => d.id === b.deviceId) ?? status?.formerDevices?.find(d => d.id === b.deviceId);
+      const author = signerOf(status, b.deviceId, b.at);
       if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
       known.add(b.id);
       accepted.push({ body: b, signature: packet.signature });
@@ -697,20 +828,28 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     if (accepted.length) addReactionOps(accepted);
   };
   /**
-   * Files named by verified messages. The store and transfers know nothing about messages, so other signed records
-   * (task artifacts, later) can make a file servable the same way.
+   * Files named by verified messages, cached in memory and invalidated on every `messages.json` write so incoming
+   * `file-want` packets never re-read and re-parse the message log synchronously.
    */
-  const referenced = () => new Map(agent.messages().flatMap(m => m.packet.body.attachments || []).map(ref => [ref.sha256, ref]));
+  const referenced = () => referencedCache ??= new Map(agent.messages().flatMap(m => m.packet.body.attachments || []).map(ref => [ref.sha256, ref]));
+  const fileWantLimiter = new FileWantLimiter();
   let transfersDirty = true;
-  const transfers = new FileTransfers({ roomId: agent.roomId, store: agent.files, referenced: sha => referenced().get(sha),
-    channel: id => peers.get(id)?.channel, changed: () => { transfersDirty = true; },
-    peers: () => [...peers].filter(([id, p]) => p.channel?.readyState === 'open' && status?.devices?.some(d => d.id === id)).map(([id]) => id) });
+  const transfers = new FileTransfers({ roomId: agent.roomId, store: agent.files, referenced: sha => referenced().get(sha), now,
+    channel: id => { const p = peers.get(id); return p?.fileChannel?.readyState === 'open' ? p.fileChannel : p?.channel; },
+    changed: () => { transfersDirty = true; },
+    peers: () => [...peers].filter(([id, p]) => (p.fileChannel?.readyState === 'open' || p.channel?.readyState === 'open') && status?.devices?.some(d => d.id === id)).map(([id]) => id) });
   const retractions = retractionLog(agent, () => status, save, released => {
     const gone = new Set(released);
     transfers.keep(sha => !gone.has(sha));
     for (const sha of released) for (const path of [agent.files.path(sha), join(agent.dir, 'wants', sha)]) {
       try { rmSync(path, { force: true }); } catch { /* In use: `prune` removes it, since no message names it now. */ }
     }
+  }, ids => {
+    const retracted = new Set(ids);
+    pendingReactions = pendingReactions.filter(op => !retracted.has(op.body.messageId));
+    // A deleted message's reactions go too, so they count toward nobody's cap here or on a device that joins later.
+    const ops = readReactionOps(), kept = ops.filter(op => !retracted.has(op.body.messageId));
+    if (kept.length !== ops.length) writeJson(join(agent.dir, 'reactions.json'), kept);
   });
   // A runner that stopped between saving the log and the messages is finished here.
   try { retractions.apply(); } catch (error) { log(`retractions: ${error instanceof Error ? error.message : String(error)}`); }
@@ -726,7 +865,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   /** Keep the files of the newest messages up to the room cap, as browsers do; recent files are left for `send` and `attachment`. */
   const prune = () => {
-    const keep = retainedFiles(agent.messages().map(m => m.packet.body.attachments));
+    let held: Stored[];
+    try { held = readMessages(); } catch (error) { log(`prune: ${error instanceof Error ? error.message : String(error)}`); return; }
+    const keep = retainedFiles(held.map(m => m.packet.body.attachments), undefined, undefined, held.map(m => m.packet.body.memberId));
     for (const name of readdirSync(join(agent.dir, 'files'))) {
       const path = join(agent.dir, 'files', name);
       try { if (!keep.has(name) && !wanted.has(name) && Date.now() - statSync(path).mtimeMs > FILE_GRACE_MS) unlinkSync(path); } catch { /* Raced with another prune or a write. */ }
@@ -749,9 +890,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
    * last answered. `failingSince`/`failure`: it hasn't since then, and why (see RUNNER_ALIVE).
    */
   const startedAt = Date.now();
-  let loopAt = startedAt, polledAt: number | undefined, failingSince: number | undefined, failure: string | undefined, failureStatus: number | undefined;
+  let loopAt = startedAt, polledAt: number | undefined, failingSince: number | undefined, failure: string | undefined, failureStatus: number | undefined, upgradeRequired = false;
   /** Since when the room service has answered that this device is no longer in the room, after it was (see RUNNER_ALIVE). */
   let removedSince: number | undefined;
+  /** True while intentionally sleeping between passes (e.g. 60 s HTTP 426 backoff) so `loopAt` does not look wedged. */
+  let sleeping = false;
   /**
    * Proof of life for commands that can't inspect processes (a harness sandbox denies it), so they don't start a second
    * runner. Written every second by the ticker rather than once per pass, so a long pass never makes the process look
@@ -760,12 +903,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const prove = () => {
     try {
       writeJson(join(agent.dir, RUNNER_ALIVE), { pid: process.pid, at: Date.now(), startedAt, loopAt, ...(polledAt ? { polledAt } : {}),
-        ...(failingSince ? { failingSince, failure, ...(failureStatus !== undefined ? { failureStatus } : {}) } : {}), ...(syncedAt ? { syncedAt } : {}),
+        ...(failingSince ? { failingSince, failure, ...(failureStatus !== undefined ? { failureStatus } : {}) } : {}),
+        ...(upgradeRequired ? { upgradeRequired: true } : {}), ...(syncedAt ? { syncedAt } : {}),
         ...(removedSince ? { removedSince } : {}) });
     } catch { /* Written again next second. */ }
   };
   prove();
-  const ticking = setInterval(() => { prove(); activity.tick(); }, 1000);
+  const ticking = setInterval(() => { if (sleeping) loopAt = Date.now(); prove(); activity.tick(); }, 1000);
 
   const flush = () => flushOutbox(agent.messages(), identity.id, peers, log);
   /** Send one signed operation to every open channel; a failing channel gets it again in the next exchange. */
@@ -807,32 +951,103 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   /** A live operation this device does not hold yet, which counts against its sender's quota. */
   const fresh = (held: { body: { id: string } }[], packet: Packet) => !held.some(p => p.body.id === (packet?.body as { id?: unknown })?.id);
-  const connectChannel = (peer: Peer, id: string, channel: RTCDataChannel) => {
-    peer.channel = channel;
-    // Full state goes out once per channel, whichever of the open event or an already-open channel comes first.
-    let stateSent = false;
-    const opened = () => { if (!stateSent) { stateSent = true; sendState(peer); } };
-    const queue = peer.queue = new SendQueue(channel);
-    channel.bufferedAmountLowThreshold = PACE_LOW_WATER;
-    channel.bufferedAmountLow.subscribe(() => queue.pump());
-    channel.stateChanged.subscribe(state => {
-      if (state === 'closed') { if (peers.get(id) === peer) { transfers.closed(id); heard.delete(id); } return; }
-      // A peer that was retired (replaced, or its close still pending) has nothing more to exchange.
-      if (state !== 'open' || peers.get(id) !== peer) return;
-      syncedAt ??= Date.now();
-      log(`channel open to ${id.slice(0, 8)}`);
-      // Exchange boards, decisions, and reactions so either side catches up while apart.
-      opened();
-      transfers.opened(id);
-      activity.opened(channel);
-      flush();
+  const expandIceServers = (servers: RTCIceServer[]) => servers.flatMap(s => (Array.isArray(s.urls) ? s.urls : [s.urls])
+    .map(urls => ({ urls, username: s.username, credential: s.credential as string | undefined })));
+  const healthOf = (peer: Peer, at = now()) => {
+    const state: PeerHealthState = {
+      connectionState: peer.pc.connectionState,
+      iceConnectionState: peer.pc.iceConnectionState,
+      channelState: peer.channel?.readyState,
+      started: peer.started,
+      openedOnce: peer.openedOnce,
+      unhealthySince: peer.unhealthySince,
+    };
+    const verdict = evaluatePeerHealth(state, at);
+    peer.openedOnce = state.openedOnce;
+    peer.unhealthySince = state.unhealthySince;
+    return verdict;
+  };
+  const retireUfrag = (id: string, peerSession: string, ufrag: string | undefined) => {
+    if (!ufrag) return;
+    const key = `${id}:${peerSession}`;
+    let set = retiredUfrags.get(key);
+    if (!set) { set = new Set(); retiredUfrags.set(key, set); }
+    set.add(ufrag);
+    if (set.size > 32) set.delete(set.values().next().value!);
+  };
+  const attachMessageHandler = (peer: Peer, id: string, channel: RTCDataChannel) => {
+    const incoming = (packet: Packet) => transaction(async () => {
+      if (peers.get(id) !== peer) return;
+      const device = status?.devices?.find(d => d.id === id); if (!device) return;
+      const sync = packet as unknown as BoardSync;
+      if (sync?.kind === 'board') { if (sync.roomId === agent.roomId && Array.isArray(sync.ops) && sync.ops.length <= 500) await acceptOps(sync.ops); return; }
+      if ((packet?.body as { kind?: string })?.kind === 'task') {
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if (!fresh(readTaskOps(), packet) || allowed(device.memberId, 'task', id)) await acceptOps([packet]);
+        return;
+      }
+      const decisions = packet as unknown as DecisionSync;
+      if (decisions?.kind === 'decisions') { if (decisions.roomId === agent.roomId && Array.isArray(decisions.ops) && decisions.ops.length <= 500) await acceptDecisionOps(decisions.ops); return; }
+      if (['decision', 'vote'].includes((packet?.body as { kind?: string })?.kind ?? '')) {
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if (!fresh(readDecisionOps(), packet) || allowed(device.memberId, 'decision', id)) await acceptDecisionOps([packet]);
+        return;
+      }
+      const reactions = packet as unknown as { kind?: string; roomId?: string; ops?: unknown };
+      if (reactions?.kind === 'reactions') { if (reactions.roomId === agent.roomId && Array.isArray(reactions.ops) && reactions.ops.length <= 500) await acceptReactions(reactions.ops); return; }
+      if ((packet?.body as { kind?: string })?.kind === 'reaction') {
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if (!fresh([...readReactionOps(), ...pendingReactions], packet) || allowed(device.memberId, 'reaction', id)) await acceptReactions([packet]);
+        return;
+      }
+      const retracted = packet as unknown as RetractionSync;
+      if (retracted?.kind === 'retractions') { if (retracted.roomId === agent.roomId && Array.isArray(retracted.ops) && retracted.ops.length <= 500) await retractions.accept(retracted.ops); return; }
+      if ((packet?.body as { kind?: string })?.kind === 'retract') {
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if (!fresh(readRetractOps(), packet) || allowed(device.memberId, 'retract', id)) await retractions.accept([packet]);
+        return;
+      }
+      const b = packet?.body;
+      if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
+        || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return;
+      if (b.kind === 'message') {
+        if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > MAX_TIME) return;
+        if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !/^[a-f0-9-]{36}$/.test(b.replyTo))) return;
+        if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
+        const messages = readMessages(); const existing = messages.find(m => m.packet.body.id === b.id);
+        // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
+        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
+        // Over quota: not stored and not confirmed, so its sender retries later.
+        if (!existing && !allowed(device.memberId, 'message', id)) return;
+        // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
+        if (!existing) {
+          const arrived = retractions.arriving({ packet: packet as Stored['packet'], targets: [], receipts: [] });
+          if (store(messages, arrived)) {
+            if (isRetracted(arrived)) pendingReactions = pendingReactions.filter(op => op.body.messageId !== b.id);
+            else flushPendingReactions(b.id);
+          }
+        }
+        const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: b.id, deviceId: identity.id };
+        if (channel.readyState === 'open') channel.send(JSON.stringify({ body: receipt, signature: await agent.sign(receipt) }));
+      } else if (b.kind === 'receipt') {
+        const messages = readMessages(); const m = messages.find(m => m.packet.body.id === b.id && m.packet.body.deviceId === identity.id);
+        if (m?.targets.includes(id) && !m.receipts.includes(id)) save(messages.map(x => x === m ? { ...x, receipts: [...x.receipts, id] } : x));
+      }
     });
-    if (channel.readyState === 'open') { opened(); transfers.opened(id); activity.opened(channel); }
-    channel.onMessage.subscribe(raw => {
+    channel.onMessage?.subscribe(raw => {
       const text = raw.toString(); if (text.length > 20_000) return;
       let packet: Packet; try { packet = JSON.parse(text); } catch { return; }
       // File transfers bypass the serialized queue: chunks arrive by the hundred and are cheap to check.
-      if (isFilePacket(packet)) { if (peers.get(id) === peer && status?.devices?.some(d => d.id === id)) transfers.handle(id, packet); return; }
+      if (isFilePacket(packet)) {
+        if (peers.get(id) === peer && status?.devices?.some(d => d.id === id)) {
+          if ((packet as { kind?: unknown }).kind === 'file-want' && !fileWantLimiter.take(id)) {
+            if (fileWantLimiter.report(id)) log(`over file-want quota: dropping file-want packets from ${id.slice(0, 8)}`);
+            return;
+          }
+          transfers.handle(id, packet);
+        }
+        return;
+      }
       // For people's rosters; agents learn nothing from each other's activity. A person device keeps it for its page.
       if (isActivityPacket(packet)) { if (agent.person && peers.get(id) === peer && validActivityPacket(packet, agent.roomId)) heard.set(id, receiveActivity(packet)); return; }
       // Cheap and never queued: answered from the loop, at most once per interval.
@@ -843,57 +1058,72 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
       void incoming(packet).catch(error => log(`incoming: ${error.message}`)).finally(() => { for (const from of gate.done()) requestSync(from); });
     });
-    const incoming = (packet: Packet) => transaction(async () => {
-      if (peers.get(id) !== peer) return;
-      const device = status?.devices?.find(d => d.id === id); if (!device) return;
-      const sync = packet as unknown as BoardSync;
-      if (sync?.kind === 'board') { if (sync.roomId === agent.roomId && Array.isArray(sync.ops)) await acceptOps(sync.ops); return; }
-      if ((packet?.body as { kind?: string })?.kind === 'task') { if (!fresh(agent.taskOps(), packet) || allowed(device.memberId, 'task', id)) await acceptOps([packet]); return; }
-      const decisions = packet as unknown as DecisionSync;
-      if (decisions?.kind === 'decisions') { if (decisions.roomId === agent.roomId && Array.isArray(decisions.ops)) await acceptDecisionOps(decisions.ops); return; }
-      if (['decision', 'vote'].includes((packet?.body as { kind?: string })?.kind ?? '')) { if (!fresh(agent.decisionOps(), packet) || allowed(device.memberId, 'decision', id)) await acceptDecisionOps([packet]); return; }
-      const reactions = packet as unknown as { kind?: string; roomId?: string; ops?: unknown };
-      if (reactions?.kind === 'reactions') { if (reactions.roomId === agent.roomId && Array.isArray(reactions.ops)) await acceptReactions(reactions.ops); return; }
-      if ((packet?.body as { kind?: string })?.kind === 'reaction') {
-        if (!fresh([...agent.reactionOps(), ...pendingReactions], packet) || allowed(device.memberId, 'reaction', id)) await acceptReactions([packet]);
+  };
+  const connectChannel = (peer: Peer, id: string, channel: RTCDataChannel) => {
+    peer.channel = channel;
+    // Full state goes out once per channel, whichever of the open event or an already-open channel comes first.
+    let stateSent = false;
+    const opened = () => {
+      if (stateSent || peers.get(id) !== peer) return;
+      stateSent = true;
+      healthOf(peer);
+      syncedAt ??= Date.now();
+      log(`channel open to ${id.slice(0, 8)}`);
+      sendState(peer);
+      if (peer.fileChannel?.readyState !== 'open') transfers.opened(id);
+      activity.opened(channel);
+      flush();
+    };
+    const queue = peer.queue = new SendQueue(channel);
+    channel.bufferedAmountLowThreshold = PACE_LOW_WATER;
+    channel.bufferedAmountLow?.subscribe(() => queue.pump());
+    channel.stateChanged?.subscribe(state => {
+      if (state === 'closed') {
+        peer.unhealthySince ??= now();
+        if (peers.get(id) === peer) { transfers.closed(id); heard.delete(id); }
         return;
       }
-      const retracted = packet as unknown as RetractionSync;
-      if (retracted?.kind === 'retractions') { if (retracted.roomId === agent.roomId && Array.isArray(retracted.ops)) await retractions.accept(retracted.ops); return; }
-      if ((packet?.body as { kind?: string })?.kind === 'retract') {
-        if (!fresh(agent.retractOps(), packet) || allowed(device.memberId, 'retract', id)) await retractions.accept([packet]);
-        return;
-      }
-      const b = packet?.body;
-      if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
-        || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return;
-      if (b.kind === 'message') {
-        if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at)) return;
-        if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !/^[a-f0-9-]{36}$/.test(b.replyTo))) return;
-        if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
-        const messages = agent.messages(); const existing = messages.find(m => m.packet.body.id === b.id);
-        // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
-        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
-        // Over quota: not stored and not confirmed, so its sender retries later.
-        if (!existing && !allowed(device.memberId, 'message', id)) return;
-        // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
-        if (!existing && store(messages, retractions.arriving({ packet: packet as Stored['packet'], targets: [], receipts: [] }))) flushPendingReactions(b.id);
-        const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: b.id, deviceId: identity.id };
-        if (channel.readyState === 'open') channel.send(JSON.stringify({ body: receipt, signature: await agent.sign(receipt) }));
-      } else if (b.kind === 'receipt') {
-        const messages = agent.messages(); const m = messages.find(m => m.packet.body.id === b.id && m.packet.body.deviceId === identity.id);
-        if (m?.targets.includes(id) && !m.receipts.includes(id)) save(messages.map(x => x === m ? { ...x, receipts: [...x.receipts, id] } : x));
-      }
+      // A peer that was retired (replaced, or its close still pending) has nothing more to exchange.
+      if (state !== 'open' || peers.get(id) !== peer) return;
+      opened();
     });
+    if (channel.readyState === 'open') opened();
+    attachMessageHandler(peer, id, channel);
+  };
+  /** Dedicated `'files'` channel isolating bulk chunks from chat/sync; also accepts non-file traffic from older answerers. */
+  const connectFileChannel = (peer: Peer, id: string, channel: RTCDataChannel) => {
+    peer.fileChannel = channel;
+    try { channel.bufferedAmountLowThreshold = LOW_WATER; } catch { /* Read-only in some mocks. */ }
+    let didOpen = false;
+    const opened = () => {
+      if (didOpen || peers.get(id) !== peer || peer.fileChannel !== channel) return;
+      didOpen = true;
+      transfers.opened(id);
+    };
+    channel.stateChanged?.subscribe(state => {
+      if (state === 'closed') {
+        if (peers.get(id) === peer && peer.fileChannel === channel) {
+          peer.fileChannel = undefined;
+          transfers.closed(id);
+          if (peer.channel?.readyState === 'open') transfers.opened(id);
+        }
+        return;
+      }
+      if (state === 'open') opened();
+    });
+    if (channel.readyState === 'open') opened();
+    attachMessageHandler(peer, id, channel);
   };
   const makePeer = (device: BrowserDevice & { session?: string }) => {
     // werift takes one URL per entry: expand each server so TURN udp/tcp/tls all stay available.
-    const iceServers = (status?.iceServers || []).flatMap(s => (Array.isArray(s.urls) ? s.urls : [s.urls])
-      .map(urls => ({ urls, username: s.username, credential: s.credential as string | undefined })));
-    const pc = new RTCPeerConnection({ iceServers });
-    const peer: Peer = { pc, session: device.session!, started: Date.now(), sent: new Map(), resync: new Resync() };
+    const pc = makePc({ iceServers: expandIceServers(iceServers) });
+    const peer: Peer = { pc, session: device.session!, started: now(), iceKey, sent: new Map(), resync: new Resync() };
     peers.set(device.id, peer);
-    pc.onDataChannel.subscribe(channel => connectChannel(peer, device.id, channel));
+    pc.onDataChannel?.subscribe(channel => channel.label === FILE_CHANNEL_LABEL
+      ? connectFileChannel(peer, device.id, channel)
+      : connectChannel(peer, device.id, channel));
+    pc.connectionStateChange?.subscribe(() => healthOf(peer));
+    pc.iceConnectionStateChange?.subscribe(() => healthOf(peer));
     return peer;
   };
   /**
@@ -907,10 +1137,19 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     return closing;
   };
   const retire = (id: string, peer: Peer) => {
-    if (peers.get(id) === peer) { peers.delete(id); transfers.closed(id); }
+    retireUfrag(id, peer.session, peer.remoteUfrag);
+    if (peers.get(id) === peer) { peers.delete(id); transfers.closed(id); heard.delete(id); }
     return closeConnection(id, peer);
   };
-  /** Every peer, as the room's epoch changes or the room closes; waits for the closes at most `deadlines.close`. */
+  /** OPS-9: on coordinator epoch change, abort only half-open/connecting/unhealthy peers and keep open channels alive. */
+  const retireHalfOpen = () => {
+    for (const [id, peer] of [...peers]) {
+      if (!isLiveOpenPeer(peer.pc.connectionState, peer.pc.iceConnectionState, peer.channel?.readyState)) {
+        void retire(id, peer);
+      }
+    }
+  };
+  /** Every peer, as the room closes or runner stops; waits for the closes at most `deadlines.close`. */
   const retireAll = () => within(Promise.allSettled([...peers].map(([id, peer]) => retire(id, peer))), deadlines.close);
   /**
    * One step of the pass, waited on for at most `ms`. A step still running from an earlier pass is neither started again
@@ -930,10 +1169,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   /** The longest-running step, if one has run past `deadlines.wedged`. */
   const wedged = () => [...inFlight].find(([, entry]) => Date.now() - entry.since > deadlines.wedged)?.[0];
   const describe = async (id: string, peer: Peer, offer: boolean) => {
+    const isClosed = () => peer.pc.connectionState === 'closed';
+    if (peers.get(id) !== peer || isClosed()) return;
     await peer.pc.setLocalDescription(offer ? await peer.pc.createOffer() : await peer.pc.createAnswer());
-    await new Promise(r => setTimeout(r, 1500)); // werift gathers host/srflx candidates quickly; descriptions are not trickled.
-    if (peers.get(id) !== peer) return;
-    await agent.command('signal', { to: id, session, targetSession: peer.session, description: { type: peer.pc.localDescription!.type, sdp: peer.pc.localDescription!.sdp } });
+    if (gatherMs > 0) await new Promise(r => setTimeout(r, gatherMs)); // werift gathers host/srflx candidates quickly; descriptions are not trickled.
+    if (peers.get(id) !== peer || isClosed() || !peer.pc.localDescription) return;
+    if (offer) peer.offerSent = true;
+    await agent.command('signal', { to: id, session, targetSession: peer.session, description: { type: peer.pc.localDescription.type, sdp: peer.pc.localDescription.sdp } });
   };
   const deliverOutbox = () => transaction(async () => {
     const outbox = join(agent.dir, 'outbox');
@@ -950,7 +1192,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           unlinkSync(join(outbox, file)); continue;
         }
         if ('type' in item && item.type === 'decision') {
-          const ops = agent.decisionOps(), author = { roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId };
+          const ops = readDecisionOps(), author = { roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId };
           const current = pickDecision(agent.decisions(ops), item.decisionId, status.memberId);
           try {
             if (!agent.madeDecisionOp(item.id, ops)) {
@@ -971,13 +1213,16 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           unlinkSync(join(outbox, file)); continue;
         }
         if ('type' in item && item.type === 'task') {
-          const ops = agent.taskOps();
+          const ops = readTaskOps();
           if (!ops.some(p => p.body.id === item.id)) {
             const current = foldBoard(ops.map(p => p.body)).find(t => t.id === item.taskId);
             const creating = !ops.some(p => p.body.taskId === item.taskId);
             if (creating || current) { // A task someone removed meanwhile is not recreated by an update.
               const body = { ...taskBody({ roomId: agent.roomId, deviceId: identity.id, memberId: status.memberId, current, taskId: item.taskId, change: item.change, removed: item.removed, repositories: agent.settings().repositories }), id: item.id };
               if (!validTaskBody(body, agent.roomId)) { log(`dropped ${file}: the task change is not within the room's limits`); unlinkSync(join(outbox, file)); continue; }
+              if (!current && !item.removed && !mayAddTask(ops.map(p => p.body), body)) {
+                log(`dropped ${file}: this member reached its live task limit`); unlinkSync(join(outbox, file)); continue;
+              }
               const packet = { body, signature: await agent.sign(body) };
               storeOps(ops, [packet]);
               broadcast(packet);
@@ -989,17 +1234,14 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           continue;
         }
         if ('type' in item && item.type === 'reaction') {
-          const ops = agent.reactionOps();
+          const ops = readReactionOps();
           if (ops.some(p => p.body.id === item.id)) { unlinkSync(join(outbox, file)); continue; }
           // Wait until the message is held; do not drop the outbox item forever. A deleted one takes no reactions.
-          const target = agent.messages().find(m => m.packet.body.id === item.messageId);
+          const messages = readMessages(), target = messages.find(m => m.packet.body.id === item.messageId);
           if (!target) continue;
           if (isRetracted(target)) { unlinkSync(join(outbox, file)); continue; }
           const bodies = ops.map(p => p.body);
-          const remove = memberReacted(agent.reactionChips(), item.messageId, item.emoji, status.memberId);
-          if (!remove && liveKeysForMember(agent.countedReactions(ops), status.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
-            unlinkSync(join(outbox, file)); continue;
-          }
+          const remove = memberReacted(foldReactions(bodies), item.messageId, item.emoji, status.memberId);
           const body: ReactionBody = {
             kind: 'reaction', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId,
             messageId: item.messageId, emoji: item.emoji,
@@ -1018,9 +1260,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         }
         if ('type' in item && item.type === 'retract') {
           // Already in the log: a pass signed it and failed before finishing, and this one finishes it.
-          let packet = agent.retractOps().find(p => p.body.id === item.id);
+          let packet = readRetractOps().find(p => p.body.id === item.id);
           if (!packet) {
-            const target = agent.messages().find(m => m.packet.body.id === item.messageId);
+            const target = readMessages().find(m => m.packet.body.id === item.messageId);
             if (!target || isRetracted(target)) { unlinkSync(join(outbox, file)); continue; }
             const body: RetractBody = { kind: 'retract', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId, at: Date.now(), target: item.messageId };
             packet = { body, signature: await agent.sign(body) };
@@ -1030,12 +1272,12 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           unlinkSync(join(outbox, file)); continue;
         }
         if (!('text' in item)) continue;
-        const messages = agent.messages();
+        const messages = readMessages();
         const files = item.attachments;
         if (files && (!validAttachments(files) || !files.every(ref => agent.files.has(ref.sha256)))) { log(`dropped message ${item.id}: its files are missing`); unlinkSync(join(outbox, file)); continue; }
         if (!messages.some(m => m.packet.body.id === item.id)) {
           const body: MessageBody = { kind: 'message', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId,
-            text: item.text || (files ? attachmentText(files) : ''), at: Date.now(), ...(item.replyTo ? { replyTo: item.replyTo } : {}), ...(files ? { attachments: files } : {}) };
+            text: item.text.trim() || (files ? attachmentText(files) : ''), at: Date.now(), ...(item.replyTo ? { replyTo: item.replyTo } : {}), ...(files ? { attachments: files } : {}) };
           if (store(messages, { packet: { body, signature: await agent.sign(body) }, targets: (status.devices || []).filter(d => d.id !== identity.id).map(d => d.id), receipts: [] })) flushPendingReactions(item.id);
         }
         unlinkSync(join(outbox, file));
@@ -1082,15 +1324,17 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         // An outage, a machine that woke before its network, a rejection: reported through the proof, never a reason to
         // replace this runner, which carries on and polls again (a 410 is handled below).
         const status = (error as { status?: unknown }).status;
+        const code = (error as { code?: unknown }).code;
         if (status !== 410) {
           failingSince ??= Date.now(); failure = error instanceof Error ? error.message : String(error);
           // An HTTP answer (a rejection, a rate limit, a server error) means the service was reached: only a failure without
           // one (the request failed or timed out) can mean this runner's own networking broke. See repairRunner.
           failureStatus = typeof status === 'number' ? status : undefined;
+          upgradeRequired = status === 426 || code === 'upgrade-required';
         }
         throw error;
       } finally { loopAt = Date.now(); }
-      polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined;
+      polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined; upgradeRequired = false; pollBackoff = 0;
       // Everything after the poll shares one budget, so the next poll comes inside the service's presence window.
       const passEnds = Date.now() + deadlines.budget, left = (cap: number) => Math.max(0, Math.min(cap, passEnds - Date.now()));
       // A device the room no longer has, with no request of its own, after it was a member: someone removed this agent.
@@ -1112,7 +1356,30 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (next.settings) rules = { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, repositories: next.repositories ?? [], checkedAt: Date.now() };
       rules ??= agent.settings();
       keep('settings.json', rules);
-      if (epoch && next.epoch !== epoch) { void retireAll(); cursor = 0; }
+      // OPS-9: on coordinator restart (epoch change), keep healthy open DataChannels alive and drop only half-open peers.
+      if (epoch && next.epoch !== epoch) { retireHalfOpen(); cursor = 0; }
+      // OPS-11: store refreshed TURN credentials immediately and update existing connections where supported.
+      if (next.iceServers) {
+        const nextIceKey = JSON.stringify(next.iceServers);
+        if (nextIceKey !== iceKey) {
+          iceServers = next.iceServers;
+          iceKey = nextIceKey;
+          const expanded = expandIceServers(iceServers);
+          for (const [id, peer] of [...peers]) {
+            if (peer.iceKey === iceKey) continue;
+            if (typeof peer.pc.setConfiguration === 'function' && peer.pc.connectionState !== 'closed') {
+              try {
+                peer.pc.setConfiguration({ iceServers: expanded });
+                peer.iceKey = iceKey;
+              } catch {
+                if (peer.pc.connectionState === 'disconnected' || peer.pc.iceConnectionState === 'disconnected') void retire(id, peer);
+              }
+            } else if (peer.pc.connectionState === 'disconnected' || peer.pc.iceConnectionState === 'disconnected') {
+              void retire(id, peer);
+            }
+          }
+        }
+      }
       epoch = next.epoch; status = next;
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
@@ -1122,44 +1389,79 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (agent.person && existsSync(join(agent.dir, ADMISSION_FILE))) rmSync(join(agent.dir, ADMISSION_FILE), { force: true });
       await step('profile', () => applyPendingProfile(agent, log), left(deadlines.profile));
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
-      const available = (next.devices || []).filter(d => d.id !== identity.id && d.session);
+      const devices = (next.devices || []).filter(d => d.id !== identity.id);
+      const available = devices.filter(d => d.session);
       // Alone in the room: no device can send history, so there is nothing to wait for before a watcher starts from now.
       // Without this, a watcher whose operator closed the browser waited for a channel that would never open.
       if (available.length === 0) syncedAt ??= Date.now();
-      for (const [id, peer] of peers) {
-        if (!available.some(d => d.id === id && d.session === peer.session) || ['failed', 'closed'].includes(peer.pc.connectionState)
-          || (peer.pc.connectionState !== 'connected' && Date.now() - peer.started > 20_000)) retire(id, peer);
+      for (const key of [...retiredUfrags.keys()]) {
+        const sep = key.indexOf(':'), devId = key.slice(0, sep), sess = key.slice(sep + 1);
+        const d = devices.find(x => x.id === devId);
+        if (!d || (d.session && d.session !== sess)) retiredUfrags.delete(key);
+      }
+      const at = now();
+      for (const [id, peer] of [...peers]) {
+        const device = devices.find(d => d.id === id);
+        const sessionChanged = !!device?.session && device.session !== peer.session;
+        const liveOpen = isLiveOpenPeer(peer.pc.connectionState, peer.pc.iceConnectionState, peer.channel?.readyState);
+        const staleIceDisconnected = !!peer.iceKey && peer.iceKey !== iceKey && (peer.pc.connectionState === 'disconnected' || peer.pc.iceConnectionState === 'disconnected');
+        if (!device || sessionChanged || (!device.session && !liveOpen) || staleIceDisconnected || healthOf(peer, at) === 'drop') {
+          void retire(id, peer);
+        }
       }
       // Offers and answers are prepared side by side, as the browser does: each waits for its candidates, and one after
       // another a busy room's pass outlasted the service's presence window, so peers took this agent for gone. A peer is
       // replaced before its work starts, so each piece of work belongs to one peer; one not done in time is dropped, and
       // its late steps find it gone (describe checks) instead of signalling for it.
-      const work: { id: string; peer: Peer; done: Promise<unknown> }[] = [];
-      for (const signal of next.signals || []) {
+      const work: { id: string; peer: Peer; kind: 'offer-in' | 'offer-out' | 'answer'; done: Promise<unknown> }[] = [];
+      for (const signal of dedupeSignals(next.signals || [], available)) {
         const device = available.find(d => d.id === signal.from && d.session === signal.session); if (!device) continue;
         if (signal.description.type === 'offer') {
           if (device.id > identity.id) continue;
-          const previous = peers.get(device.id); if (previous) retire(device.id, previous);
+          const previous = peers.get(device.id);
+          const offerUfrag = sdpIceUfrag(signal.description.sdp);
+          if (previous && previous.session === device.session && offerUfrag && previous.remoteUfrag === offerUfrag
+            && isLiveOpenPeer(previous.pc.connectionState, previous.pc.iceConnectionState, previous.channel?.readyState)) continue;
+          if (previous) void retire(device.id, previous);
           const peer = makePeer(device);
-          work.push({ id: device.id, peer, done: (async () => { await peer.pc.setRemoteDescription(signal.description as any); await describe(device.id, peer, false); })() });
-        } else {
+          peer.remoteUfrag = offerUfrag;
+          work.push({ id: device.id, peer, kind: 'offer-in', done: (async () => {
+            const isClosed = () => peer.pc.connectionState === 'closed';
+            if (peers.get(device.id) !== peer || isClosed()) return;
+            await peer.pc.setRemoteDescription(signal.description as any);
+            if (peers.get(device.id) !== peer || isClosed()) return;
+            await describe(device.id, peer, false);
+          })() });
+        } else if (signal.description.type === 'answer') {
+          if (identity.id >= device.id) continue;
           const peer = peers.get(device.id);
-          if (peer?.pc.signalingState === 'have-local-offer') work.push({ id: device.id, peer, done: (async () => { await peer.pc.setRemoteDescription(signal.description as any); })() });
+          if (!peer || peer.session !== device.session || !peer.offerSent || peer.pc.connectionState === 'closed' || peer.pc.signalingState !== 'have-local-offer') continue;
+          if (!answerMatchesOffer(peer.pc.localDescription?.sdp, signal.description.sdp, retiredUfrags.get(`${device.id}:${device.session}`), peer.pc.remoteDescription?.sdp)) continue;
+          peer.remoteUfrag = sdpIceUfrag(signal.description.sdp);
+          work.push({ id: device.id, peer, kind: 'answer', done: (async () => {
+            if (peers.get(device.id) !== peer || peer.pc.connectionState === 'closed' || peer.pc.signalingState !== 'have-local-offer') return;
+            await peer.pc.setRemoteDescription(signal.description as any);
+          })() });
         }
       }
       for (const device of available) {
         if (identity.id < device.id && !peers.has(device.id)) {
-          const peer = makePeer(device); connectChannel(peer, device.id, peer.pc.createDataChannel('meshrooms-browser-v1'));
-          work.push({ id: device.id, peer, done: describe(device.id, peer, true) });
+          const peer = makePeer(device);
+          connectChannel(peer, device.id, peer.pc.createDataChannel(PRIMARY_CHANNEL_LABEL));
+          connectFileChannel(peer, device.id, peer.pc.createDataChannel(FILE_CHANNEL_LABEL));
+          work.push({ id: device.id, peer, kind: 'offer-out', done: describe(device.id, peer, true) });
         }
       }
       const signalMs = left(deadlines.signals), settled = await settleWithin(work.map(w => w.done), signalMs);
       settled.forEach((result, i) => {
-        const { id, peer } = work[i];
-        if (result?.status === 'rejected') log(`signal: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+        const { id, peer, kind } = work[i];
+        if (result?.status === 'rejected') {
+          log(`signal: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+          if (kind !== 'answer' && peers.get(id) === peer && peer.channel?.readyState !== 'open') void retire(id, peer);
+        }
         if (result) return;
         log(`pass: connecting to ${id.slice(0, 8)} did not finish within ${Math.round(signalMs / 100) / 10} s; dropping that connection to try again`);
-        if (peers.get(id) === peer) retire(id, peer);
+        if (peers.get(id) === peer) void retire(id, peer);
       });
       await step('outbox', deliverOutbox, left(deadlines.outbox));
       await step('decisions', closeDueDecisions, left(deadlines.decisions));
@@ -1171,15 +1473,28 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     } catch (error) {
       // 410: the host closed the room or the service removed it. Nothing will change, so stop instead of retrying.
       // A waiting listen reads the marker and returns at once instead of waiting out its timer.
-      if ((error as { status?: number }).status === 410) {
+      const statusCode = (error as { status?: number }).status;
+      const errorCode = (error as { code?: string }).code;
+      if (statusCode === 410) {
         clearInterval(ticking);
         try { writeJson(join(agent.dir, ROOM_CLOSED_FILE), { at: Date.now(), reason: error instanceof Error ? error.message : String(error) }); } catch { /* The next runner hears it again. */ }
         await retireAll();
         throw error;
       }
-      log(`status: ${error instanceof Error ? error.message : String(error)}`);
+      if (statusCode === 426 || errorCode === 'upgrade-required') {
+        const message = error instanceof Error ? error.message : String(error);
+        const retryAfterMs = (error as { retryAfterMs?: number }).retryAfterMs;
+        pollBackoff = Math.max(UPGRADE_BACKOFF_MS, retryAfterMs ?? 0);
+        prove();
+        const hint = message.includes('@wormdb/meshrooms') ? '' : ' Upgrade with: bunx @wormdb/meshrooms@latest';
+        log(`upgrade required (HTTP 426): ${message}${hint}`);
+      } else {
+        pollBackoff = statusCode === 429 ? nextPollBackoff(pollBackoff, (error as { retryAfterMs?: number }).retryAfterMs) : 0;
+        log(`status: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-    await pause(1000);
+    sleeping = true;
+    try { await pause(pollBackoff || 1000); } finally { sleeping = false; }
   }
 }
 
@@ -1330,7 +1645,12 @@ export async function listenRemembering(agent: BrowserAgent, seconds: number,
   flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean; restartRunner?: () => Promise<void> } = {}) {
   const { plan, saved } = listenPlan(agent, flags);
   const result = await listenBrowser(agent, plan.after, seconds, plan.boardAfter, plan.decisionsAfter, plan.outcomesAfter, plan.history, flags.restartRunner);
-  agent.saveListenCursor({ ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor });
+  const next: ListenCursor = { ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor };
+  const unchanged = !!saved && saved.after === next.after && saved.boardAfter === next.boardAfter && saved.decisionsAfter === next.decisionsAfter;
+  const explicit = !!flags.fromStart || flags.after !== undefined || flags.boardAfter !== undefined || flags.decisionsAfter !== undefined;
+  if (result.state !== 'runner-stopped' && result.state !== 'closed' && !(result.state === 'timeout' && unchanged)) {
+    agent.saveListenCursor(next, undefined, { monotonic: !explicit });
+  }
   const resumed = !!saved && (flags.after === undefined || flags.boardAfter === undefined || flags.decisionsAfter === undefined);
   return resumed ? { ...result, resumed } : result;
 }
@@ -1411,7 +1731,7 @@ function taskActivity(agent: BrowserAgent, taskId: string, status: TaskChange['s
 }
 
 /** Queue a task change for `run` to sign and share; returns the task once it is on this device's board. */
-export async function taskBrowser(agent: BrowserAgent, input: { requestId: string; taskId?: string; revision?: number; change: TaskChange; removed?: boolean }) {
+export async function taskBrowser(agent: BrowserAgent, input: { requestId: string; taskId?: string; revision?: number; change: TaskChange; removed?: boolean }, waitMs = 10_000) {
   const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
   const { change } = input;
   if (change.title !== undefined && (!change.title.trim() || change.title.trim().length > 120)) throw new Error('Give the task a title of up to 120 characters.');
@@ -1427,9 +1747,10 @@ export async function taskBrowser(agent: BrowserAgent, input: { requestId: strin
     if (input.revision !== undefined && current.revision !== input.revision) throw new Error(`The task changed since you read it (now revision ${current.revision}). Read tasks again, then retry.`);
   }
   if (!done && !input.taskId && !change.title?.trim()) throw new Error('Use --title for the new task.');
-  if (!done) writeJson(join(agent.dir, 'outbox', `${Date.now()}-${input.requestId}.json`), { type: 'task', id: input.requestId, taskId, change, ...(input.removed ? { removed: true } : {}) } satisfies TaskIntent);
+  const alreadyQueued = readdirSync(join(agent.dir, 'outbox')).some(f => f.endsWith(`-${input.requestId}.json`));
+  if (!done && !alreadyQueued) writeJson(join(agent.dir, 'outbox', `${Date.now()}-${input.requestId}.json`), { type: 'task', id: input.requestId, taskId, change, ...(input.removed ? { removed: true } : {}) } satisfies TaskIntent);
   taskActivity(agent, taskId, change.status, !!input.removed);
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
     // Check the outbox first: `run` stores the operation before deleting the queued file.
     const pending = readdirSync(join(agent.dir, 'outbox')).some(f => f.endsWith(`-${input.requestId}.json`));
@@ -1450,9 +1771,6 @@ export async function reactBrowser(agent: BrowserAgent, input: { requestId: stri
   if (!view.messages.some(m => m.id === input.messageId && !m.deleted)) throw new Error('That message is not in this browser room.');
   const emoji = input.emoji;
   const already = memberReacted(agent.reactionChips(), input.messageId, emoji, view.memberId);
-  if (!already && liveKeysForMember(agent.countedReactions(), view.memberId) >= MAX_REACTION_KEYS_PER_MEMBER) {
-    throw new Error('You have too many reactions in this room. Remove some before adding more.');
-  }
   if (!agent.reactionOps().some(p => p.body.id === input.requestId)) {
     writeJson(join(agent.dir, 'outbox', `${Date.now()}-${input.requestId}.json`), { type: 'reaction', id: input.requestId, messageId: input.messageId, emoji } satisfies ReactionIntent);
   }
@@ -1479,7 +1797,7 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
   const label = (id: string | null) => id === null ? null : d.options.find(o => o.id === id)?.label ?? id;
   return { id: d.id, question: d.question, ...(d.context ? { context: d.context } : {}), mode: d.mode, state: d.state, createdBy: name(d.createdBy),
     options: d.options.map(o => ({ id: o.id, label: o.label, people: d.tally.tally[o.id] ?? 0 })),
-    ...(d.closesAt ? { closesAt: new Date(d.closesAt).toISOString() } : {}),
+    ...(d.closesAt ? { closesAt: safeIso(d.closesAt) } : {}),
     // An outcome is final only once every vote it counted has arrived here (verified); uncounted votes came after it closed.
     ...(d.state === 'closed' && d.outcome ? { outcome: { result: d.outcome.result, options: d.outcome.optionIds.map(label), voters: d.outcome.voters, people: d.outcome.people,
       verified: d.verified, ...(d.uncounted ? { uncounted: d.uncounted } : {}) } }
@@ -1519,6 +1837,7 @@ export async function decisionBrowser(agent: BrowserAgent, intent: DistributiveO
     const steward = current.createdBy === view.memberId || view.memberId === ownerId || members.some(m => m.id === current.createdBy && m.operatorId === view.memberId);
     if ((intent.action === 'close' || intent.action === 'withdraw') && !steward) throw new Error('Only the person or agent who opened it, its operator, or the host can close it.');
     if (intent.action === 'option' && current.mode === 'plan-review') throw new Error('Plan reviews keep Approve / Request changes / Reject.');
+    if (intent.action === 'option' && (!intent.label || !intent.label.trim())) throw new Error('Give the new option a label.');
   }
   if (!done) writeJson(join(agent.dir, 'outbox', `${Date.now()}-${intent.id}.json`), { type: 'decision', ...intent });
   const deadline = Date.now() + seconds * 1000;
@@ -1578,11 +1897,14 @@ export async function admitDecisionPackets(held: (DecisionBody | VoteBody)[], pa
   for (const p of fresh) if (p.body.kind === 'decision' && await genuine(p.body, p.signature)) decisions.push(p);
   const votes = fresh.filter(p => p.body.kind === 'vote');
   const keep = new Set(admissible(held, [...decisions, ...votes].map(p => p.body)).map(b => b.id));
+  const decisionKeys = new Set(held.filter(b => b.kind === 'decision').map(b => `${b.createdBy}:${b.decisionId}`));
   const accepted: DecisionPacket[] = [];
-  for (const p of fresh) {
+  for (const p of [...decisions, ...votes]) {
     if (held.length + accepted.length >= MAX_DECISION_OPS) break;
     if (!keep.has(p.body.id)) continue;
-    if (p.body.kind === 'vote' && !await genuine(p.body, p.signature)) continue;
+    const key = `${p.body.createdBy}:${p.body.decisionId}`;
+    if (p.body.kind === 'vote' && (!decisionKeys.has(key) || !await genuine(p.body, p.signature))) continue;
+    if (p.body.kind === 'decision') decisionKeys.add(key);
     accepted.push({ body: p.body, signature: p.signature });
   }
   return accepted;
@@ -1595,14 +1917,18 @@ export async function admitDecisionPackets(held: (DecisionBody | VoteBody)[], pa
 export function compactDecisionLog(agent: BrowserAgent, ops: StoredDecisionOp[], memberId: string | undefined): StoredDecisionOp[] {
   const next = compactDecisions(ops), kept = new Set(next.map(p => p.body.id));
   const dropped = ops.filter(p => !kept.has(p.body.id) && p.body.memberId === memberId).map(p => p.body.id);
-  if (dropped.length) writeJson(join(agent.dir, 'decisions-done.json'), [...new Set([...agent.compactedDecisionIds(), ...dropped])]);
+  if (dropped.length) {
+    const done = readJsonStrict<string[]>(join(agent.dir, 'decisions-done.json'), []);
+    writeJson(join(agent.dir, 'decisions-done.json'), [...new Set([...done, ...dropped])]);
+  }
   return next;
 }
 /** The stored log, compacted first if it grew past the threshold; the arrival cursor is kept. */
 export function compactStoredDecisions(agent: BrowserAgent, memberId: string | undefined): StoredDecisionOp[] {
-  const ops = agent.decisionOps();
+  const ops = readJsonStrict<StoredDecisionOp[]>(join(agent.dir, 'decisions.json'), []);
   if (ops.length <= COMPACT_DECISIONS_AT) return ops;
-  writeJson(join(agent.dir, 'decisions-cursor.json'), { seq: agent.decisionCursor(ops) });
+  const cursor = Math.max(readJsonStrict<{ seq: number }>(join(agent.dir, 'decisions-cursor.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0);
+  writeJson(join(agent.dir, 'decisions-cursor.json'), { seq: cursor });
   const next = compactDecisionLog(agent, ops, memberId);
   writeJson(join(agent.dir, 'decisions.json'), next);
   return next;

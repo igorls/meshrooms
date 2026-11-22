@@ -1,7 +1,7 @@
 import type { Database } from 'bun:sqlite';
 import { existsSync } from 'node:fs';
 import { idleDays } from './config';
-import { admissionPath, dataDirectory, listRooms, openAdmission, retireRoom } from './store';
+import { admissionPath, dataDirectory, getRoomSummary, listRooms, openAdmission, retireRoom } from './store';
 
 /**
  * Operator room tools. Safe while the service runs: it reads rooms from SQLite for every request and keeps no room cache,
@@ -26,7 +26,7 @@ export function roomsCli(args: string[], db: Database, options: { idleDays: numb
   }
   if (command === 'retire' && id) {
     if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Give the exact room UUID from `rooms list`.');
-    const room = listRooms(db).find(r => r.id === id);
+    const room = getRoomSummary(db, id);
     if (!room || !retireRoom(db, id, 'retired', options.now)) throw new Error(`No room ${id}.`);
     print(`Retired ${id} (${JSON.stringify(room.title)}, ${room.members} member${room.members === 1 ? '' : 's'}). Its link now says it was removed.`);
     return;

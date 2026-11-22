@@ -47,7 +47,7 @@ describe('wake mode — the refusals hold at the real CLI entry', () => {
   test('agent identities, bindings, the person and the daemon are refused: a wake can\'t make, ask for or bind an agent', async () => {
     const env = { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: '/tmp' };
     for (const argv of [['agent', 'create', '--name', 'X', '--harness', 'claude'], ['agent', 'request', '--name', 'X', '--harness', 'exec', '--command', 'x {prompt_file}'],
-      ['agent', 'list'], ['agent', 'approve'], ['bind', '--room', ROOM, '--harness', 'exec', '--command', 'x {prompt_file}'], ['unbind', '--room', ROOM],
+      ['agent', 'list'], ['agent', 'approve'], ['bind', '--room', ROOM, '--harness', 'exec', '--command', 'x {prompt_file}'], ['watch', '--room', ROOM, '--harness', 'dsh'], ['unbind', '--room', ROOM],
       ['person', 'open'], ['daemon', 'status'], ['bindings']]) {
       const message = await refuse(argv, env);
       expect(message).toContain("isn't available");
@@ -67,9 +67,11 @@ describe('wake mode — the refusals hold at the real CLI entry', () => {
     expect(message).toContain('leave out --out');
   });
 
-  test('a note is refused during a wake, because the roster is a way to speak unaddressed', async () => {
-    const message = await refuse(['status', '--room', ROOM, '--note', 'quietly setting the record straight'], { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: '/tmp' });
-    expect(message).toContain('reply in the room');
+  test('a note is refused during a wake (including clearing it with an empty or blank value), because the roster is a way to speak unaddressed', async () => {
+    for (const note of ['quietly setting the record straight', '', '   ']) {
+      const message = await refuse(['status', '--room', ROOM, '--note', note], { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: '/tmp' });
+      expect(message).toContain('reply in the room');
+    }
   });
 
   test('a file outside the wake folder is refused, and the folder is named', async () => {

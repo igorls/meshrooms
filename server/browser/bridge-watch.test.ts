@@ -1,17 +1,17 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { taskBody } from '../../src/browser/board';
 import { openDecision } from '../../src/browser/decisions';
 import { BrowserAgent, listenRemembering, noteDropped, outboxProblem, peekWork, queuedMaySpeak, takeDropped } from '../browser-agent';
 import { claimIssueTask, releaseIssueTask } from '../github-issues';
-import { agentCli, answeredItems, cwdExposes, envProject, insideDir, newerThreadWarning, ourProcess, runnerOwner, startFromNow, wakeGuard, ALIVE_WITHIN_MS, START_SETTLE_MS } from '../agent-cli';
+import { agentCli, answeredItems, cwdExposes, envProject, insideDir, iso, newerThreadWarning, ourProcess, runnerOwner, startFromNow, wakeGuard, ALIVE_WITHIN_MS, START_SETTLE_MS } from '../agent-cli';
 import {
-  CLAUDE_DENIED, CODEX_DISABLED, CODEX_PROFILE, PAUSED_NOTE, WATCH_TIMING, appendNoFollow, claudeReadRules, claudeRulePath, clearDir, codexBase, codexConfig, codexThread, killTree, reapGroup,
+  CLAUDE_DENIED, CODEX_DISABLED, CODEX_PROFILE, DEFAULT_DSH_PROFILE, HARNESSES, HOME_SECRETS, PAUSED_NOTE, STDOUT_MAX_BYTES, STDOUT_TAIL_BYTES, WATCH_TIMING, appendNoFollow, claudeReadRules, claudeRulePath, clearDir, codexBase, codexConfig, codexThread, fileTail, killTree, parsePsOutput, reapGroup,
   runFingerprint, sameRun, wakeReadDenies, agentHomesFile, codexEnvDenies, envProjectProblem, knownAgentHomes, recordAgentHome, stopOwnChild, type KillDeps, emptyState, harnessInvocation, heredocMarker, launcherRules, newestCodexThread,
-  openFresh, readHarnessOutput, hermesWakeEnv, TOOL_SCAN_LIMIT, TOOL_SCAN_OVERFLOW, resolveProgram, runProgram, sessionLedger, type SessionClaim, sessionKey, splitTemplate, wakeLedger, watchLoop, watchPrompt, writeFresh,
+  openFresh, readHarnessOutput, hermesWakeEnv, wakeEnv, TOOL_SCAN_LIMIT, TOOL_SCAN_OVERFLOW, resolveProgram, runProgram, sessionLedger, type SessionClaim, sessionKey, splitTemplate, wakeLedger, watchLoop, watchPrompt, writeFresh,
   type WatchConfig, type WatchDeps, type WatchState,
 } from '../agent-watch';
 
@@ -487,7 +487,10 @@ test('Claude Code gets the prompt on stdin, may run only the wake subcommands, n
   const run = harnessInvocation(watchConfig(), 'the prompt', '/tmp/prompt.txt', found);
   expect(run.stdin).toBe('the prompt');
   const args = run.args, list = (flag: string) => { const rest = args.slice(args.indexOf(flag) + 1); const end = rest.findIndex(a => a.startsWith('--')); return end < 0 ? rest : rest.slice(0, end); };
-  expect(args.slice(0, 9)).toEqual(['-p', '--continue', '--output-format', 'json', '--permission-mode', 'dontAsk', '--strict-mcp-config', '--add-dir', join(watchConfig().roomDir, 'wake')]);
+  // None of the operator's settings files are loaded, so an allow rule of their own never holds for a wake.
+  expect(args.slice(0, 11)).toEqual(['-p', '--continue', '--output-format', 'json', '--permission-mode', 'dontAsk', '--strict-mcp-config', '--setting-sources', '', '--add-dir', join(watchConfig().roomDir, 'wake')]);
+  const named = harnessInvocation(watchConfig({ claudeSettings: ['user', 'local'] }), 'the prompt', '/tmp/prompt.txt', found).args;
+  expect(named[named.indexOf('--setting-sources') + 1]).toBe('user,local');
   expect(list('--disallowedTools')).toEqual([...CLAUDE_DENIED, 'Read(**/.env*)']);
   const allowed = list('--allowedTools');
   expect(allowed).toEqual(launcherRules(L));
@@ -545,7 +548,7 @@ test('a Codex wake runs under a permission profile of its own: the room\'s wake 
 });
 
 test('what a wake may not read: the signing key, other rooms and every other agent, downloads, credentials and transcripts, but not its own room or the bridge', () => {
-  const home = tempHome(), meshrooms = join(home, '.meshrooms'), agentHome = join(meshrooms, 'agents'), rooms = join(agentHome, 'browser-agents');
+  const home = realpathSync(tempHome()), meshrooms = join(home, '.meshrooms'), agentHome = join(meshrooms, 'agents'), rooms = join(agentHome, 'browser-agents');
   const roomDir = join(rooms, 'room-a'), binDirPath = join(meshrooms, 'bin'), codexHome = join(home, '.codex'), appData = join(home, 'AppData', 'Roaming');
   // A neighbour whose folder doesn't follow the agents-* naming, and one elsewhere that connect recorded.
   const custom = join(meshrooms, 'work-bot'), elsewhere = join(home, 'bots', 'helper');
@@ -707,9 +710,10 @@ test('in a wake the bridge refuses whatever would configure it, other rooms, and
   expect(guard({ '--room': room, '--plan-file': join(home, 'secret.txt') }, [], 'ask')).toThrow('files must be in the wake folder');
   expect(guard({ '--room': room, '--context-file': join(home, 'secret.txt') }, [], 'ask')).toThrow('files must be in the wake folder');
   expect(guard({ '--room': room, '--out': join(home, 'x') }, [], 'attachment')).toThrow('leave out --out');
-  // A roster note is seen by everyone: during a wake it would be speaking unaddressed. Clearing one is fine.
+  // A roster note is seen by everyone: during a wake neither setting nor clearing it is allowed (reading status is fine).
   expect(guard({ '--room': room, '--note': 'hello everyone' }, [], 'status')).toThrow('reply in the room');
-  expect(guard({ '--room': room, '--note': '' }, [], 'status')()).toBe(wake);
+  expect(guard({ '--room': room, '--note': '' }, [], 'status')).toThrow('reply in the room');
+  expect(guard({ '--room': room }, [], 'status')()).toBe(wake);
   expect(guard({ '--room': room }, [], 'attachment', null)).toThrow('no wake folder');
   expect(guard({ '--room': room, '--text-file': join(wake, 'reply.md') }, [], 'send', null)).toThrow('files must be in the wake folder');
   // A link inside the wake folder that leads out of it is refused too.
@@ -969,10 +973,13 @@ test('the CLI peeks without consuming, and checks watch options before starting 
     expect(await agentCli(['listen', '--room', r.roomId, '--peek'])).toMatchObject({ work: true, addressed: [mention] });
     expect(r.cursor()).toBe(cursor);
     expect(await agentCli(['watch-status', '--room', r.roomId])).toMatchObject({ state: 'never-started', pid: null, paused: null, lastResult: null });
-    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'nope'])).rejects.toThrow('--harness claude, codex, or exec');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'nope'])).rejects.toThrow('--harness claude, codex, hermes, dsh, or exec');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'exec'])).rejects.toThrow('Give --command');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'exec', '--command', 'my-agent --go'])).rejects.toThrow('{prompt_file}');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--last', '--allow-tools', 'Read'])).rejects.toThrow('--allow-tools is for --harness claude');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--last', '--claude-settings', 'user'])).rejects.toThrow('--claude-settings is for --harness claude');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'claude', '--claude-settings', 'user,everything'])).rejects.toThrow('user, project, local');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'claude', '--pass-env', 'GH_TOKEN,NOT A NAME'])).rejects.toThrow('--pass-env with the names');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex'])).rejects.toThrow('For Codex, name the thread to wake');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--session', 'T1', '--cwd', home])).rejects.toThrow('only finds the thread for --last');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--last', '--harness-bin', join(home, 'no-codex.exe')])).rejects.toThrow("doesn't exist");
@@ -1232,3 +1239,226 @@ test('a Hermes wake inherits no variable that shapes a session, whatever its cas
     HERMES_KANBAN_TASK: 't', hermes_kanban_db: 'x', HERMES_OTHER: 'kept' });
   expect(env).toEqual({ PATH: '/bin', HERMES_HOME: '/home/me/.hermes', HERMES_OTHER: 'kept' });
 });
+
+test('a wake gets no credential from the watcher\'s environment except the ones its harness signs in with', () => {
+  const base = { PATH: '/bin', HOME: '/home/me', LANG: 'C', HTTPS_PROXY: 'http://proxy:8080', KEYBOARD: 'us', MONKEY: 'x',
+    GH_TOKEN: 'g', github_token: 'g', NPM_TOKEN: 'n', NODE_AUTH_TOKEN: 'n', AWS_ACCESS_KEY_ID: 'a', AWS_SECRET_ACCESS_KEY: 'a', AWS_PROFILE: 'p', SSH_AUTH_SOCK: '/s',
+    DATABASE_URL: 'postgres://u:p@h/d', PGPASSWORD: 'p', GOOGLE_APPLICATION_CREDENTIALS: '/c.json', MY_AGENT_API_KEY: 'm',
+    ANTHROPIC_API_KEY: 'k', CLAUDE_CODE_OAUTH_TOKEN: 't', OPENAI_API_KEY: 'o', CODEX_HOME: '/home/me/.codex' };
+  const plain = { PATH: '/bin', HOME: '/home/me', LANG: 'C', HTTPS_PROXY: 'http://proxy:8080', KEYBOARD: 'us', MONKEY: 'x', AWS_PROFILE: 'p', CODEX_HOME: '/home/me/.codex' };
+  const claude = wakeEnv(base, 'claude');
+  expect(claude.env).toEqual({ ...plain, ANTHROPIC_API_KEY: 'k', CLAUDE_CODE_OAUTH_TOKEN: 't' });
+  // Names only, sorted, for the watcher's log.
+  expect(claude.withheld).toEqual(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'DATABASE_URL', 'GH_TOKEN', 'GOOGLE_APPLICATION_CREDENTIALS', 'MY_AGENT_API_KEY', 'NODE_AUTH_TOKEN', 'NPM_TOKEN',
+    'OPENAI_API_KEY', 'PGPASSWORD', 'SSH_AUTH_SOCK', 'github_token']);
+  expect(wakeEnv(base, 'codex').env).toEqual({ ...plain, OPENAI_API_KEY: 'o' });
+  // Hermes reaches only the room's tools, and an exec command is the operator's own: model provider keys stay.
+  for (const harness of ['hermes', 'exec'] as const)
+    expect(wakeEnv(base, harness).env).toEqual({ ...plain, MY_AGENT_API_KEY: 'm', ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o' });
+  // Claude Code on Bedrock or Vertex signs in with the cloud's own variables.
+  expect(Object.keys(wakeEnv({ ...base, CLAUDE_CODE_USE_BEDROCK: '1' }, 'claude').env)).toEqual(expect.arrayContaining(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']));
+  expect(wakeEnv({ ...base, CLAUDE_CODE_USE_BEDROCK: '0' }, 'claude').env.AWS_ACCESS_KEY_ID).toBeUndefined();
+  expect(wakeEnv({ ...base, CLAUDE_CODE_USE_VERTEX: 'true' }, 'claude').env.GOOGLE_APPLICATION_CREDENTIALS).toBe('/c.json');
+  // The operator can pass one through by name, whatever its case.
+  const kept = wakeEnv(base, 'claude', ['gh_token', 'DATABASE_URL']);
+  expect(kept.env.GH_TOKEN).toBe('g'); expect(kept.env.DATABASE_URL).toBe('postgres://u:p@h/d'); expect(kept.env.NPM_TOKEN).toBeUndefined();
+  // The Hermes session variables still go, for every harness.
+  expect(wakeEnv({ PATH: '/bin', HERMES_YOLO_MODE: '1', HERMES_HOME: '/h' }, 'claude').env).toEqual({ PATH: '/bin', HERMES_HOME: '/h' });
+});
+
+test('H-1: hard pause never sets backoffUntil to MAX_SAFE_INTEGER and watch-status handles hard pause and legacy out-of-range timestamps without throwing', async () => {
+  const r = room(); await listened(r);
+  r.say('@Wren breach');
+  const h = harness(r, { reads: false });
+  const state = { value: emptyState() };
+  const withBreach = { ...deps(r, h, { until: after(h, 4 * WATCH_TIMING.pausedRetryMs / 1000), state }),
+    run: async (onStart: (pid: number) => void) => ({ ...(await h.run(onStart)), confinementBroken: true }) };
+  await watchLoop(config(), withBreach);
+  expect(h.runs.length).toBe(1);
+  expect(state.value.paused).toMatchObject({ hard: true });
+  expect(state.value.backoffUntil).toBeUndefined();
+  expect(iso(Number.MAX_SAFE_INTEGER)).toBeNull();
+  expect(iso(-Number.MAX_SAFE_INTEGER)).toBeNull();
+  expect(iso(NaN)).toBeNull();
+  expect(iso(1_700_000_000_000)).toBe(new Date(1_700_000_000_000).toISOString());
+
+  // Even a legacy watch-state.json with backoffUntil: Number.MAX_SAFE_INTEGER must not crash watch-status.
+  writeFileSync(join(r.agent.dir, 'watch-state.json'), JSON.stringify({ ...state.value, backoffUntil: Number.MAX_SAFE_INTEGER }));
+  const savedHome = process.env.MESHROOMS_AGENT_HOME;
+  process.env.MESHROOMS_AGENT_HOME = r.home;
+  try {
+    const status = await agentCli(['watch-status', '--room', r.roomId]) as { paused: { nextTry: string | null; resume: string } };
+    expect(status.paused.nextTry).toBeNull();
+    expect(status.paused.resume).toContain('not retried automatically');
+  } finally {
+    if (savedHome === undefined) delete process.env.MESHROOMS_AGENT_HOME; else process.env.MESHROOMS_AGENT_HOME = savedHome;
+  }
+});
+
+test('H-4/M-3/M-4: parsePsOutput trims leading whitespace, .dsh and realpathSync targets are denied, and codexConfig parses quoted TOML MCP keys', () => {
+  // H-4: leading whitespace before 24-char LC_ALL=C lstart is trimmed before slicing.
+  expect(parsePsOutput('  Mon Jan  5 10:20:30 2026 /usr/bin/bun meshrooms.js run --room abc\n')).toEqual({
+    started: 'Mon Jan  5 10:20:30 2026',
+    command: '/usr/bin/bun meshrooms.js run --room abc',
+  });
+  expect(parsePsOutput('   \n')).toBeUndefined();
+
+  // M-3: .dsh is in HOME_SECRETS, and symlinked secrets add both symlink path and realpathSync target.
+  expect(HOME_SECRETS).toContain('.dsh');
+  const home = realpathSync(tempHome()), roomDir = join(home, '.meshrooms', 'agents', 'browser-agents', 'r1'), binDir = join(home, '.meshrooms', 'bin');
+  const realTarget = join(home, 'real-dsh-secrets');
+  mkdirSync(roomDir, { recursive: true }); mkdirSync(binDir, { recursive: true }); mkdirSync(realTarget, { recursive: true });
+  const linkPath = join(home, '.dsh');
+  let linked = false;
+  try { symlinkSync(realTarget, linkPath, process.platform === 'win32' ? 'junction' : 'dir'); linked = true; } catch { mkdirSync(linkPath, { recursive: true }); }
+  const deniedPaths = wakeReadDenies({ agentHome: join(home, '.meshrooms', 'agents'), roomDir, binDir }, home, join(home, '.codex'), { knownHomes: [] }).map(d => d.path);
+  expect(deniedPaths).toContain(resolve(linkPath));
+  if (linked) expect(deniedPaths).toContain(resolve(realTarget));
+
+  // M-4: codexConfig parses bare, double-quoted, single-quoted, and subtable TOML [mcp_servers.*] headers; harnessInvocation quotes non-bare keys.
+  const codexHome = tempHome();
+  writeFileSync(join(codexHome, 'config.toml'), [
+    '[mcp_servers.docs]',
+    'command = "docs"',
+    '[mcp_servers."my.server"]',
+    'command = "my-srv"',
+    '[mcp_servers."my.server".env]',
+    'KEY = "1"',
+    "[mcp_servers.'spaced server']",
+    'command = "spaced"',
+    '[mcp_servers.web-tools.env]',
+    'X = "2"',
+  ].join('\n'));
+  const parsed = codexConfig(codexHome);
+  expect(parsed.mcpServers).toEqual(['docs', 'my.server', 'spaced server', 'web-tools']);
+  const inv = harnessInvocation(watchConfig({ harness: 'codex', session: '0190a000-0000-7000-8000-00000000000b' }), 'p', '/tmp/p',
+    name => ({ file: `/usr/bin/${name}`, prefix: [] }), { denyRead: [], codexMcpServers: parsed.mcpServers });
+  expect(inv.args).toContain('mcp_servers.docs.enabled=false');
+  expect(inv.args).toContain('mcp_servers."my.server".enabled=false');
+  expect(inv.args).toContain('mcp_servers."spaced server".enabled=false');
+  expect(inv.args).toContain('mcp_servers.web-tools.enabled=false');
+});
+
+test('DeepSeek Harness (dsh): invocation, room-folder cwd, file-reply prompt, fingerprint, output parsing, sessionKey, and wakeEnv', () => {
+  expect(HARNESSES).toContain('dsh');
+  const cfg = watchConfig({ harness: 'dsh' });
+  const prompt = watchPrompt({ roomId: cfg.roomId, launcher: cfg.launcher, harness: 'dsh', requestIds: ['id-1', 'id-2', 'id-3'], wakeDir: join(cfg.roomDir, 'wake'), delimiter: 'X' });
+  // DSH takes the file-reply branch, never Claude's heredoc, and embeds the wake dir inside roomDir.
+  expect(prompt).toContain('--text-file <that file>');
+  expect(prompt).toContain(join(cfg.roomDir, 'wake'));
+  expect(prompt).not.toContain("<<'X'");
+
+  // Default profile is headless, prompt is a single argv element (no stdin), cwd is the room folder.
+  const run = harnessInvocation(cfg, prompt, '/tmp/p', found);
+  expect(run).toEqual({ file: '/usr/bin/dsh', args: ['--profile', DEFAULT_DSH_PROFILE, prompt], cwd: cfg.roomDir });
+  expect(run.stdin).toBeUndefined();
+
+  // Custom profile + Windows .cmd shim prefix preservation.
+  const dir = tempHome();
+  mkdirSync(join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib'), { recursive: true });
+  writeFileSync(join(dir, 'dsh.cmd'), '@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" %*\r\n');
+  const shimRun = harnessInvocation(watchConfig({ harness: 'dsh', profile: 'meshrooms-wake' }), prompt, '/tmp/p', name => resolveProgram(name, { PATH: dir }, 'win32'));
+  expect(shimRun.file).toBe('node');
+  expect(shimRun.args[0]).toContain('bin.js');
+  expect(shimRun.args.slice(1)).toEqual(['--profile', 'meshrooms-wake', prompt]);
+  expect(shimRun.cwd).toBe(cfg.roomDir);
+
+  // Orphan-run detection: prompt embeds the wake dir inside roomDir, so sameRun recognizes the dsh command line.
+  const fp = runFingerprint(cfg), started = '2026-01-01T10:00:00.0000000Z';
+  expect(sameRun({ fingerprint: fp, started }, { command: `node bin.js --profile headless ${JSON.stringify(prompt)}`, started })).toBe(true);
+
+  // Output parsing: summary = last non-empty stdout line; ignores `dsh: reasoning:`; captures last `dsh: <code>: <msg>`.
+  expect(readHarnessOutput('dsh', 'Thinking...\n\nReplied to @Alex.\n\n', 'dsh: reasoning: reading room\n', 0)).toEqual({ summary: 'Replied to @Alex.' });
+  expect(readHarnessOutput('dsh', '', 'dsh: reasoning: trying\ndsh: auth-error: missing key\ndsh: provider-error: rate limited\n', 1)).toEqual({ error: 'rate limited' });
+  expect(readHarnessOutput('dsh', 'Done.\n', 'dsh: reasoning: only reasoning\n', 1)).toEqual({ summary: 'Done.' });
+
+  // sessionKey serializes wakes per agent folder across rooms; different agent folders stay separate.
+  const keyA = sessionKey({ harness: 'dsh', cwd: '/room-1', agentHome: '/home/me/.meshrooms/agents-a' });
+  const keyB = sessionKey({ harness: 'dsh', cwd: '/room-2', agentHome: '/home/me/.meshrooms/agents-a' });
+  const keyOther = sessionKey({ harness: 'dsh', cwd: '/room-1', agentHome: '/home/me/.meshrooms/agents-b' });
+  expect(keyA).toBe(keyB);
+  expect(keyA).not.toBe(keyOther);
+  expect(keyA.startsWith('dsh:')).toBe(true);
+
+  // wakeEnv keeps DEEPSEEK_* and DSH_* credentials and withholds unrelated provider and tool secrets.
+  const dshEnv = wakeEnv({ PATH: '/bin', DEEPSEEK_API_KEY: 'dk', DSH_PROFILE: 'headless', DSH_AUTH_TOKEN: 'dt', OPENAI_API_KEY: 'o', ANTHROPIC_API_KEY: 'a', GH_TOKEN: 'g', HERMES_YOLO_MODE: '1' }, 'dsh');
+  expect(dshEnv.env).toEqual({ PATH: '/bin', DEEPSEEK_API_KEY: 'dk', DSH_PROFILE: 'headless', DSH_AUTH_TOKEN: 'dt' });
+  expect(dshEnv.withheld).toEqual(['ANTHROPIC_API_KEY', 'GH_TOKEN', 'OPENAI_API_KEY']);
+});
+
+test('watch CLI validates dsh options (--profile, rejected flags) and records dsh room-folder cwd and permissions', async () => {
+  const home = tempHome(), savedHome = process.env.MESHROOMS_AGENT_HOME, savedReg = process.env.MESHROOMS_AGENT_REGISTRY;
+  process.env.MESHROOMS_AGENT_HOME = home;
+  process.env.MESHROOMS_AGENT_REGISTRY = join(home, 'agent-homes.json');
+  const r = room(home); await listened(r);
+  try {
+    // --profile rejected for non-dsh harnesses and for unsafe names.
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'claude', '--profile', 'headless'])).rejects.toThrow('--profile is for --harness dsh');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--profile', '../evil'])).rejects.toThrow('--profile');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--profile', 'bad name'])).rejects.toThrow('--profile');
+    // dsh rejects --session, --last, --model, --command, --allow-tools with clear messages.
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--session', 's1'])).rejects.toThrow('--session and --last are not supported for --harness dsh');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--last'])).rejects.toThrow('--session and --last are not supported for --harness dsh');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--model', 'deepseek-chat'])).rejects.toThrow('--model is not supported for --harness dsh');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--command', 'dsh {prompt_file}'])).rejects.toThrow('--command is for --harness exec');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--allow-tools', 'Read'])).rejects.toThrow('--allow-tools is for --harness claude');
+
+    // Valid dsh watch starts cleanly with a fake binary, pins cwd to room folder, and prints the dsh permissions block.
+    const fakeBin = join(home, process.platform === 'win32' ? 'fake-dsh.exe' : 'fake-dsh');
+    writeFileSync(fakeBin, '');
+    const bound = await agentCli(['watch', '--room', r.roomId, '--harness', 'dsh', '--profile', 'meshrooms-wake', '--harness-bin', fakeBin]) as Record<string, any>;
+    try {
+      expect(bound).toMatchObject({
+        watching: true,
+        harness: 'dsh',
+        profile: 'meshrooms-wake',
+        workingFolder: r.agent.dir,
+        session: 'fresh session per wake',
+        permissions: {
+          profile: 'meshrooms-wake',
+          workspace: r.agent.dir,
+          writes: expect.stringContaining('room folder'),
+          reads: expect.stringContaining('unrestricted'),
+        },
+      });
+      const status = await agentCli(['watch-status', '--room', r.roomId]) as Record<string, any>;
+      expect(status).toMatchObject({ harness: 'dsh', profile: 'meshrooms-wake', workingFolder: r.agent.dir });
+    } finally {
+      await agentCli(['watch-stop', '--room', r.roomId]).catch(() => {});
+      if (typeof bound.pid === 'number') try { process.kill(bound.pid); } catch { /* Already stopped. */ }
+    }
+  } finally {
+    if (savedHome === undefined) delete process.env.MESHROOMS_AGENT_HOME; else process.env.MESHROOMS_AGENT_HOME = savedHome;
+    if (savedReg === undefined) delete process.env.MESHROOMS_AGENT_REGISTRY; else process.env.MESHROOMS_AGENT_REGISTRY = savedReg;
+  }
+}, 30_000);
+
+test('runProgram preserves intact >64 KB Claude Code and Hermes JSON stdout lines instead of chopping the opening brace, while staying bounded', async () => {
+  const dir = tempHome();
+  const largeText = 'x'.repeat(90_000);
+  // Claude Code --output-format json: single >64 KB JSON line on stdout.
+  const claudeProg = fakeHarness(dir, `out(JSON.stringify({ session_id: '00000000-0000-4000-8000-000000000099', is_error: false, result: 'prefix ' + 'x'.repeat(90_000) + ' tail-ok', permission_denials: [{ tool_name: 'Write' }] }));`);
+  const claudeRun = await runProgram(claudeProg, { cwd: dir, env: { ...process.env }, timeoutMs: 30_000, output: join(dir, 'claude-big') });
+  expect(statSync(join(dir, 'claude-big.out')).size).toBeGreaterThan(STDOUT_TAIL_BYTES);
+  expect(claudeRun.stdout.startsWith('{')).toBe(true);
+  const claudeParsed = readHarnessOutput('claude', claudeRun.stdout, claudeRun.stderr, claudeRun.exitCode);
+  expect(claudeParsed.sessionId).toBe('00000000-0000-4000-8000-000000000099');
+  expect(claudeParsed.denied).toEqual(['Write']);
+  expect(claudeParsed.error).toBeUndefined();
+  expect(claudeParsed.summary).toContain('tail-ok');
+
+  // Hermes --format stream-json: >64 KB final result line after earlier lines.
+  const hermesProg = fakeHarness(dir, `out('{"type":"tool_use","name":"mcp__meshrooms_0a1b2c3d__listen"}');
+out(JSON.stringify({ type: 'result', session_id: '20260101_000000_abcdef', exit_code: 0, text: ${JSON.stringify(largeText)} + ' end-marker' }));`);
+  const hermesRun = await runProgram(hermesProg, { cwd: dir, env: { ...process.env }, timeoutMs: 30_000, output: join(dir, 'hermes-big') });
+  const hermesParsed = readHarnessOutput('hermes', hermesRun.stdout, hermesRun.stderr, hermesRun.exitCode, 'meshrooms-0a1b2c3d', hermesRun.tools);
+  expect(hermesParsed.sessionId).toBe('20260101_000000_abcdef');
+  expect(hermesParsed.error).toBeUndefined();
+  expect(hermesParsed.summary).toContain('end-marker');
+
+  // Strict upper bound: a single line larger than maxLimit is still capped to maxLimit bytes.
+  const huge = join(dir, 'huge.out');
+  writeFileSync(huge, 'a'.repeat(120_000));
+  expect(fileTail(huge, 10_000, 30_000).length).toBe(30_000);
+  expect(STDOUT_MAX_BYTES).toBe(2 * 1024 * 1024);
+}, 30_000);

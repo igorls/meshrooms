@@ -1,4 +1,5 @@
 /** Signed reaction operations for browser rooms. Fixed emoji set; one per member per emoji per message. */
+import { newestPerMember } from './markers';
 
 export const REACTION_EMOJI = ['👍', '❤️', '😂', '👀', '🎉'] as const;
 export type ReactionEmoji = (typeof REACTION_EMOJI)[number];
@@ -45,7 +46,7 @@ export function validReactionBody(body: unknown, roomId: string): body is Reacti
     && isId(b.messageId)
     && isReactionEmoji(b.emoji)
     && Number.isSafeInteger(b.revision) && b.revision >= 1 && b.revision <= 1_000_000
-    && Number.isSafeInteger(b.at) && b.at > 0
+    && Number.isSafeInteger(b.at) && b.at > 0 && b.at <= 8_640_000_000_000_000 // the latest time a Date can hold
     && (b.removed === undefined || b.removed === true);
 }
 
@@ -110,30 +111,57 @@ export function liveKeysForMember(ops: ReactionBody[], memberId: string) {
 }
 
 /**
- * The incoming ops a device keeps so that no member holds more than `cap` live reactions: an op that would add a live
- * key past the cap is dropped (the sender's own check refuses it too). Removals are applied first, so a member at the cap
- * who removed one reaction and added another is not refused for the order the two arrived in.
+ * The ops that keep each member to `cap` live reactions: each member keeps the newest `cap` they give (by the time of
+ * the op that gives each, then id) and their older ones are forgotten whole, as compaction forgets old removals. The
+ * rule depends only on the ops, never on arrival order or on which messages a device still holds, so devices holding
+ * the same ops show the same reactions. Giving one more never fails; it lets the member's oldest reaction go.
  */
-export function withinReactionKeyCap<T extends { body: ReactionBody }>(held: ReactionBody[], incoming: T[], cap = MAX_REACTION_KEYS_PER_MEMBER): T[] {
-  const latest = new Map<string, ReactionBody>(), live = new Map<string, number>();
-  for (const op of [...held].sort(compare)) latest.set(keyOf(op), op);
-  for (const op of latest.values()) if (!op.removed) live.set(op.memberId, (live.get(op.memberId) ?? 0) + 1);
-  const accepted = new Set<T>();
-  for (const op of [...incoming].sort((a, b) => Number(!a.body.removed) - Number(!b.body.removed) || compare(a.body, b.body))) {
-    const key = keyOf(op.body), previous = latest.get(key);
-    if (previous && compare(op.body, previous) <= 0) { accepted.add(op); continue; } // Superseded: changes nothing.
-    const was = !!previous && !previous.removed, is = !op.body.removed, count = live.get(op.body.memberId) ?? 0;
-    if (is && !was && count >= cap) continue;
-    latest.set(key, op.body); live.set(op.body.memberId, count + Number(is) - Number(was)); accepted.add(op);
+export function capReactions<T extends { body: ReactionBody }>(ops: T[], cap = MAX_REACTION_KEYS_PER_MEMBER): T[] {
+  const latest = new Map<string, ReactionBody>();
+  for (const op of [...ops].sort((a, b) => compare(a.body, b.body))) latest.set(keyOf(op.body), op.body);
+  const byMember = new Map<string, ReactionBody[]>();
+  for (const op of latest.values()) if (!op.removed) {
+    const given = byMember.get(op.memberId);
+    if (given) given.push(op); else byMember.set(op.memberId, [op]);
   }
-  return incoming.filter(op => accepted.has(op));
+  const dropped = new Set<string>();
+  for (const given of byMember.values()) {
+    if (given.length <= cap) continue;
+    given.sort((a, b) => b.at - a.at || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    for (const op of given.slice(cap)) dropped.add(keyOf(op));
+  }
+  return dropped.size ? ops.filter(op => !dropped.has(keyOf(op.body))) : ops;
 }
 
-/** Drop superseded ops so the log stays bounded while the folded chips stay the same. */
-export function compactReactions(ops: ReactionPacket[]): ReactionPacket[] {
-  const latest = new Map<string, ReactionPacket>();
-  for (const op of [...ops].sort((a, b) => compare(a.body, b.body))) latest.set(keyOf(op.body), op);
-  return [...latest.values()].sort((a, b) => compare(a.body, b.body));
+/** Reactions each member may have taken back and still have remembered after compaction (see markers.ts). */
+export const MAX_REMOVED_REACTIONS_PER_MEMBER = 200;
+
+/**
+ * Drop superseded ops so the log stays bounded while the folded chips stay the same, and forget each member's removals
+ * past their newest `maxRemoved`: a forgotten removal leaves its reaction with no op at all, so it shows as not given.
+ *
+ * One case needs more than that. A device that has already forgotten a removal signs revision 1 when its member gives
+ * that reaction again, which loses to the old removal on a device that still remembers it, so the reaction would show
+ * on one device and not the others. When a removal is forgotten, the newest op of its member's own reaction signed
+ * after it (by time) stands instead, if it is one that gives the reaction. Times decide only between one member's own
+ * ops, and only once the removal is forgotten.
+ */
+export function compactReactions(ops: ReactionPacket[], maxRemoved = MAX_REMOVED_REACTIONS_PER_MEMBER): ReactionPacket[] {
+  const byKey = new Map<string, ReactionPacket[]>();
+  for (const op of [...ops].sort((a, b) => compare(a.body, b.body))) {
+    const list = byKey.get(keyOf(op.body));
+    if (list) list.push(op); else byKey.set(keyOf(op.body), [op]);
+  }
+  const markers = [...byKey.values()].map(list => list.at(-1)!.body).filter(op => op.removed);
+  const remembered = newestPerMember(markers, maxRemoved);
+  const kept: ReactionPacket[] = [];
+  for (const list of byKey.values()) {
+    const latest = list.at(-1)!;
+    if (!latest.body.removed || remembered.has(latest.body.id)) { kept.push(latest); continue; }
+    const after = list.filter(op => op.body.at > latest.body.at).at(-1);
+    if (after && !after.body.removed) kept.push(after);
+  }
+  return kept.sort((a, b) => compare(a.body, b.body));
 }
 
 /** Data channel messages over 20,000 characters are dropped, so exchanged reactions are split well below that. */

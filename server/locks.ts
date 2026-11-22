@@ -35,17 +35,20 @@ export function staleLock(path: string, gone: (pid: number) => boolean = pid => 
     return old || (/^\d{1,10}$/.test(owner) && gone(Number(owner))) ? `${found.ino}:${found.mtimeMs}:${owner}` : undefined;
   } catch { return undefined; }
 }
+/** Hard-link errors that mean this file system does not support hard links; anything else (EEXIST, ENOSPC, EROFS) stands. */
+const NO_HARDLINK = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'EPERM', 'ENOSYS']);
 /** Creates a lock with its owner already in it: written to a private file, then hard-linked into place, which fails if one exists. */
-export function takeLock(path: string) {
+export function takeLock(path: string, link: (from: string, to: string) => void = linkSync) {
   const draft = `${path}.${process.pid}.${randomUUID()}`;
   writeFileSync(draft, String(process.pid), { flag: 'wx', mode: 0o600 });
-  try { linkSync(draft, path); }
+  try { link(draft, path); }
   catch (error) {
-    if ((error as { code?: string }).code === 'EEXIST') throw error;
+    const code = (error as { code?: string }).code;
+    if (!code || !NO_HARDLINK.has(code)) throw error;
     // No hard links on this file system (FAT, some network shares): create it in place. A crash between creating
     // and writing then leaves a lock that names no process, which is never taken over, only reported.
     writeFileSync(path, String(process.pid), { flag: 'wx', mode: 0o600 });
-  } finally { unlinkSync(draft); }
+  } finally { try { unlinkSync(draft); } catch { /* Already gone. */ } }
 }
 export const exists = (error: unknown) => (error as { code?: string }).code === 'EEXIST';
 /**
@@ -61,8 +64,18 @@ export function tryLock(lock: string, what: string, gone?: (pid: number) => bool
     if (!exists(error)) throw error;
     const seen = staleLock(lock, gone, maxAgeMs);
     if (!seen) {
-      let owner: string | undefined; try { owner = readFileSync(lock, 'utf8'); } catch { /* Released meanwhile. */ }
-      if (owner !== undefined && !/^\d{1,10}$/.test(owner)) throw new Error(`${lock} doesn't name the ${what} that made it. If no ${what} is running, delete that file, then try again.`);
+      let owner: string | undefined;
+      // On file systems without hard links (or brief Windows flush races), a creator may have created the file before
+      // its pid bytes become visible; retry briefly on an empty lock before calling it broken.
+      for (let i = 0; i < 6; i++) {
+        try { owner = readFileSync(lock, 'utf8'); } catch { owner = undefined; break; }
+        if (owner !== '') break;
+        if (i < 5) Bun.sleepSync(10);
+      }
+      if (owner !== undefined && !/^\d{1,10}$/.test(owner)) {
+        if (staleLock(lock, gone, maxAgeMs)) return false;
+        throw new Error(`${lock} doesn't name the ${what} that made it. If no ${what} is running, delete that file, then try again.`);
+      }
       return false;
     }
     // Reclaiming takes milliseconds; a marker whose process is gone was left by a crash in exactly that window.
@@ -80,8 +93,8 @@ export function tryLock(lock: string, what: string, gone?: (pid: number) => bool
     }
     try {
       if (staleLock(lock, gone, maxAgeMs) !== seen) return false;
-      unlinkSync(lock);
+      try { unlinkSync(lock); } catch (error) { if ((error as { code?: string }).code !== 'ENOENT') throw error; }
       try { takeLock(lock); return true; } catch (error) { if (exists(error)) return false; throw error; }
-    } finally { unlinkSync(reclaim); }
+    } finally { try { unlinkSync(reclaim); } catch { /* Already gone. */ } }
   }
 }

@@ -2,10 +2,28 @@ import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { launchAgentManager } from './startup';
+import { launchAgentManager, runKeyManager, type Exec } from './startup';
 import { testDirectory } from './test-directory';
 
 const plutil = (...args: string[]) => spawnSync('/usr/bin/plutil', args, { encoding: 'utf8' });
+
+test('Windows Run-key registration passes -ExecutionPolicy Bypass before -File', () => {
+  const directory = testDirectory('runkey');
+  try {
+    const values = new Map<string, string>();
+    const run: Exec = (_file, args) => {
+      const [verb, , , name, ...rest] = args;
+      if (verb === 'add') { values.set(name, rest[rest.indexOf('/d') + 1]); return { status: 0, stdout: '' }; }
+      if (verb === 'delete') { values.delete(name); return { status: 0, stdout: '' }; }
+      return values.has(name) ? { status: 0, stdout: `${name} REG_SZ ${values.get(name)}` } : { status: 1, stdout: '' };
+    };
+    const scriptPath = join(directory.path, 'start-at-login.ps1');
+    const manager = runKeyManager({ valueName: 'Meshrooms-test', scriptPath, script: 'exit 0\n' }, { run, host: { supported: true } });
+    expect(manager.apply(true)).toEqual({ installed: true, supported: true });
+    expect(values.get('Meshrooms-test')).toContain(`-WindowStyle Hidden -ExecutionPolicy Bypass -File "${scriptPath}"`);
+    expect(manager.apply(false)).toEqual({ installed: false, supported: true });
+  } finally { directory.cleanup(); }
+});
 
 // Uses a private LaunchAgents directory: the test never registers a real login item.
 test.skipIf(process.platform !== 'darwin')('a macOS LaunchAgent supervises the foreground daemon and verifies before reporting', () => {

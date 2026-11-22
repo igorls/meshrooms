@@ -26,7 +26,7 @@ the static site's connect-src 'none' must not be inherited by these routes.
 Use deploy/systemd service definitions. The relay listens on the host's public
 IPv4 address, accepts short-lived authenticated allocations, bounds bandwidth and
 allocation counts, and denies private/special peer networks. Open only 3478
-UDP/TCP, 5349 TCP, and 49160–49259 UDP for this service. Existing HTTPS and native
+UDP/TCP, 5349 TCP, and 49160–49659 UDP for this service. Existing HTTPS and native
 MeshGuard services remain separate. The scoped Certbot hook copies renewed TLS
 files into /etc/meshrooms/turn and restarts this relay only.
 
@@ -40,11 +40,12 @@ scripts/deploy-browser.sh --dry-run <sha>   # checks and the full plan; no build
 MESHROOMS_DEPLOY_HOST=root@<deploy-host> scripts/deploy-browser.sh <sha>
 ```
 
-`MESHROOMS_DEPLOY_HOST`, `MESHROOMS_PUBLIC_ORIGIN`, `MESHROOMS_CANDIDATE_PORT` (default 4329) and
-`MESHROOMS_KEEP_RELEASES` (default 10) override the defaults. `--package-only` builds the tarball
-without touching any host; CI runs it on every push. The script refuses modified tracked files
-(untracked files are ignored, since it builds from a clean `git archive` export) and any revision
-that is not on `origin/main`.
+`MESHROOMS_DEPLOY_HOST`, `MESHROOMS_PUBLIC_ORIGIN`, `MESHROOMS_CANDIDATE_PORT` (default 4329),
+`MESHROOMS_KEEP_RELEASES` (default 10) and `MESHROOMS_SKIP_NPM_CHECK` (set to `1` to bypass checking
+that `@wormdb/meshrooms@<CURRENT_AGENT_VERSION>` is published on npm) override the defaults.
+`--package-only` builds the tarball without touching any host or npm; CI runs it on every push. The
+script refuses modified tracked files (untracked files are ignored, since it builds from a clean
+`git archive` export) and any revision that is not on `origin/main`.
 
 What it does, and what to do by hand if it can't:
 
@@ -73,11 +74,12 @@ What it does, and what to do by hand if it can't:
    it halfway. It takes a verified admission backup (the deploy stops if that fails), records the
    previous app and site symlink targets, the running revision and a copy of the Nginx site in
    /root/meshrooms-rollback-before-<sha>.txt (a second deploy of the same revision gets a timestamped
-   name), and prints differences between the live Nginx site, Nginx snippet or systemd unit and the
+   name), and prints differences between the live Nginx files or installed systemd units and the
    release's deploy/ copies as warnings; the script never installs them.
 6. Atomically point both symlinks at the new release (each checked with readlink), restart
-   meshrooms-browser and require local health to report the new revision. Nginx is not reloaded: its
-   configuration did not change, and the site root follows the symlink.
+   meshrooms-browser (and meshrooms-admin if active) and require local health to report the new
+   revision. Nginx is not reloaded: its configuration did not change, and the site root follows the
+   symlink.
 7. From the maintainer machine, require public /api/lobby/health to report the revision, /rooms and
    / to answer 200, and the public agent bundle hash to match the build.
 8. Only after that, `prune` keeps the newest 10 releases (by unpack time) and their site copies. It
@@ -104,6 +106,73 @@ Verify public HTTPS /rooms, /r/<id>, /api/lobby/health, hashed assets, static si
 browser smoke with forced relay and inspect selected ICE candidate pairs; merely
 configuring a TURN URL is not qualification. Test the TLS relay separately.
 The HTTP request-body cap, application quotas and relay quotas all remain active.
+
+## Request limits
+
+Two layers bound what one client, and everyone together, can ask of the host.
+
+**Nginx**, in front. `deploy/nginx/meshrooms-limits.conf` defines two zones and `deploy/nginx/meshrooms.conf` applies
+them to the whole site:
+- `meshrooms_addr`: 20 requests a second with a burst of 60 per IPv4 address (including IPv4-mapped IPv6) or IPv6 `/64`
+  (canonical RFC 5952 IPv6 addresses are mapped to their `/64` prefix so rotating interface IDs share one bucket).
+- `meshrooms_all`: 400 requests a second for all addresses together with a burst of 400. `GET /api/lobby/health` is
+  exempt from this zone so a flood on `/api/lobby` cannot starve the 2-minute uptime probe. It has no global zone of
+  its own: a bucket everyone shares would let one address keep every health check, the probe's and a deploy's
+  included, at 429. The per-address zone still applies to it.
+
+Requests past a burst get 429 at once (as JSON on `/api/lobby`, including `/api/lobby/health`, so browsers and bridges
+back off cleanly). Install the limits file as `/etc/nginx/conf.d/meshrooms-limits.conf` **before** the site file and
+`/etc/nginx/snippets/meshrooms-browser.conf`: the site and snippet reference its zones, redacted log format
+(`meshrooms_redacted`), and fallback error-page CSP map (`$meshrooms_fallback_csp`), and `nginx -t` fails if any of them
+are missing. Then `nginx -t` and reload. A deploy prints a warning when the live file differs from the release's, as it
+does for the site, snippet and installed systemd units; it never changes them. The numbers are starting values that have
+not been load-tested: raise the shared ceiling only with measurements of what the host serves at its CPU quota.
+
+**The room service**, behind it:
+- 1,200 lobby requests a minute per IPv4 address or IPv6 /64 behind the trusted loopback proxy (240 direct), and five
+  times that (6,000 a minute behind the proxy) for the /48 around a /64. One /48 holds 65,536 separate /64s, so without
+  the wider count a client with a routed /48 has that many quotas; requests already refused by their own /64 do not
+  charge the /48, so one noisy /64 cannot spend its neighbours' quota. Each rate table tracks up to 32,768 active keys
+  so one /48 spending its full budget across distinct /64s cannot evict unrelated addresses' counters.
+- The agent pages (`/agent/<room>`) count against the same quota, since they read the room from the database.
+- 6 new rooms an hour per address or /64, and four times that per /48. A create counts once its device is
+  authenticated, whatever the outcome; an unsigned or malformed one counts against the request quota only, so
+  people behind one address can't be locked out of creating rooms by requests that cost nothing to make. The slot is
+  taken right before the create runs, so creates (or invite-code guesses) sent at the same time can't get past it.
+- Queued connection offers are bounded per recipient device (32, of at most 16,000 characters each), per sender within
+  each recipient's queue (8, with newer `offer`/`answer` signals superseding unpolled ones from the same sender), and
+  across all rooms at 32 million characters in memory. Expired offers (after 30 seconds) are pruned proactively before
+  enforcing limits, and acknowledged signals are drained as soon as the recipient's cursor advances.
+
+## Logging, redaction, and security headers
+
+Room URLs contain UUIDs that resolve to room titles and entry pages, so production logs must not accumulate raw room
+identifiers or payloads:
+
+- **Redacted Nginx access logs:** `deploy/nginx/meshrooms-limits.conf` defines the `meshrooms_redacted` log format, and
+  both the HTTP and HTTPS servers in `deploy/nginx/meshrooms.conf` write to `/var/log/nginx/meshrooms-access.log` using
+  it. Before logging, Nginx strips query strings (such as avatar `?h=<hash>` or accidental parameters) and replaces
+  every room or member UUID in both the request URI (`/r/<id>`, `/agent/<id>`, `/agent/<id>.md`,
+  `/api/lobby/rooms/<id>`, `/api/lobby/rooms/<id>/avatars/<id>`, and any fallback UUID segment) and the `Referer` header
+  with `<id>`. Route prefixes and status codes stay intact for operations without recording room links.
+- **Coordinator logs:** `meshrooms-browser` writes structured JSON lines to `journald` with lobby command action,
+  status, and latency, plus redacted `:id` route shapes on 5xx errors. It never logs room UUIDs, chat payloads, WebRTC
+  SDP, device keys, or invite codes.
+- **Log retention and access control:** Keep Nginx access and error logs restricted (`0640 www-data adm`) with short
+  rotation (7–14 days daily, compressed) in `/etc/logrotate.d/nginx`, which covers `/var/log/nginx/*.log` including
+  `meshrooms-access.log` and `error.log`. Nginx's internal error log (for example `limit_req` rejections or upstream
+  5xx errors) cannot apply custom `map` variables and may include raw request lines, so short retention and restricted
+  permissions apply to all Nginx logs. Bound `systemd-journald` retention similarly (for example `MaxRetentionSec=14day`).
+  Verify with `logrotate -d /etc/logrotate.d/nginx`.
+- **Transport and error-page headers:** `deploy/nginx/meshrooms.conf` and `deploy/nginx/meshrooms-browser.conf` send
+  `Strict-Transport-Security: max-age=15552000` (180 days, without `includeSubDomains` or `preload` so sibling
+  subdomains under `wormdb.dev` are unaffected). Every `add_header` directive uses `always` across static routes,
+  proxied routes, and Nginx-generated error responses (404, 413, 429, 5xx). `meshrooms-browser.conf` uses
+  `proxy_hide_header` on fixed headers already emitted by the coordinator (`X-Content-Type-Options`, `Referrer-Policy`,
+  `Permissions-Policy`, `X-Frame-Options`) so Nginx emits them once on upstream responses and still sets them on
+  Nginx-generated errors, alongside a fallback `Content-Security-Policy` emitted only when upstream did not supply one.
+- **Favicon handling:** `location = /favicon.ico` returns `204` with `access_log off` and `log_not_found off` while
+  inheriting all server-level security headers, avoiding noisy 404 entries (pages declare `/assets/mark.svg`).
 
 ## State and recovery
 
@@ -202,6 +271,8 @@ run() { sudo -u meshrooms env MESHROOMS_BROWSER_DATA=/var/lib/meshrooms-browser 
 run server/browser/invites.ts mint --uses 5 --days 14 --note "Beta cohort A"   # prints the code once
 run server/browser/invites.ts list                                           # id, state, uses, expiry, note (never the code)
 run server/browser/invites.ts revoke <id>
+run server/browser/invites.ts people                                         # admitted person id, linked device count, earliest admission
+run server/browser/invites.ts revoke-person <person>                         # remove room-creation access for all of a person's devices
 
 run server/browser/rooms.ts list                  # id, title, members, devices, last active, expiry
 run server/browser/rooms.ts retire <room uuid>    # its link then says it was removed by the operator
@@ -211,9 +282,10 @@ Hosts delete their own rooms from Room details, and idle rooms are removed after
 MESHROOMS_ROOM_IDLE_DAYS, so retiring by hand is for abuse or a host who can't.
 Confirm the exact UUID with `rooms list` and back up admission first. Never retire
 rooms by title or age in bulk, and don't remove other rooms to make a test pass.
-The service caps rooms at MESHROOMS_MAX_ROOMS (256) and hosted rooms per device at
-eight. Production smoke tests with a fresh identity need an invite code (MESHROOMS_TEST_INVITE); mint a
-one-use code for the run.
+The service caps rooms at MESHROOMS_MAX_ROOMS (256), hosted rooms per admitted person
+(across all linked devices, or per device when invites are off) at eight, and linked
+beta-admitted devices per person at eight. Production smoke tests with a fresh identity
+need an invite code (MESHROOMS_TEST_INVITE); mint a one-use code for the run.
 
 Local and HTTPS origins have separate browser identity/history. Moving a local
 room's URL to the public domain does not migrate it. Create a hosted room and use
@@ -255,11 +327,16 @@ serve status --json` has no Funnel exposure, `ss -ltnp` shows the backend only o
 loopback, unauthenticated `/api/state` answers 401, and the public site does not
 expose the panel or its API. Test sign-in, mint, copy and revoke from an authorized
 Tailnet device. A credential rotation requires restarting the admin service; its
-in-memory sessions then expire. Restart this service after deploying new code.
+in-memory sessions then expire. Deploys automatically restart `meshrooms-admin` when
+it is active (and rollback restarts it too), and its static UI assets are preloaded
+into memory at startup.
 
-The panel shows invitation usage, admitted-person counts, and room metadata. Codes
-appear only in the successful mint response; subsequent listings cannot recover
-them. Mint and revoke actions are logged by invitation ID, without codes or passwords.
-Revoking an invite prevents future redemptions; already-admitted people retain access.
-Sign-in is rate-limited, sessions last eight hours, and mutations require an exact
-Origin plus a per-session CSRF token. Cookies are Secure, HttpOnly and SameSite=Strict.
+The panel shows invitation usage, admitted people (with per-person revocation across
+all linked devices), and room metadata. Codes appear only in the successful mint
+response; subsequent listings cannot recover them. Mint and revoke actions are logged
+by invitation or person ID, without codes or passwords. Revoking an invite prevents
+future redemptions; revoking a person removes beta room-creation access for all of
+their linked devices while leaving existing rooms until closed or retired. Sign-in is
+rate-limited, sessions last eight hours, and mutations require an exact Origin plus a
+constant-time checked per-session CSRF token. Cookies are Secure, HttpOnly and
+SameSite=Strict, and responses carry `Strict-Transport-Security`.

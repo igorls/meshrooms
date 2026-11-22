@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BrowserLobby, LobbyError } from './lobby';
 import { browserHandler } from './http';
-import { consumeInvite, invitesCli, listInvites, mintInvite, normalizeInvite, revokeInvite } from './invites';
-import { client, testOrigin as origin } from './test-client';
+import { BETA_DEVICES_PER_PERSON, betaPerson, consumeInvite, invitesCli, listBetaPeople, listInvites, mintInvite, normalizeInvite, revokeBetaPerson, revokeInvite } from './invites';
+import { client, testOrigin as origin, type TestClient } from './test-client';
 
 const DAY = 86_400_000;
 const db = (lobby: BrowserLobby) => (lobby as unknown as { db: Database }).db;
@@ -143,6 +143,31 @@ test('a beta invite admits a person once, across rooms, expiry and a service res
   } finally { lobby.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a revoked person stays revoked across a service restart, until they redeem a new invite', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'meshrooms-beta-revoke-')), path = join(dir, 'admission.sqlite');
+  let lobby = new BrowserLobby(path, { origin, invites: 'required' });
+  const on = async (device: TestClient, action: Parameters<TestClient['signed']>[0], payload = {}) => lobby.execute(await device.signed(action, crypto.randomUUID(), payload));
+  try {
+    const { code } = mintInvite(db(lobby), { uses: 1, days: 1 });
+    const host = await client(lobby), comp = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Beta', name: 'Alex', label: 'Browser', invite: code });
+    await comp.send('request', room, { kind: 'companion', name: 'Alex', label: 'Desktop' });
+    await host.send('link', room, { code: (await comp.status(room)).request!.code });
+    expect(revokeBetaPerson(db(lobby), betaPerson(db(lobby), (await host.status(room)).deviceId)!)).toBe(2);
+    // The restart re-admits hosts of existing rooms from before invites, but not a host the operator revoked.
+    lobby.close(); lobby = new BrowserLobby(path, { origin, invites: 'required' });
+    expect(await on(host, 'creation-status')).toMatchObject({ admitted: false });
+    expect(await on(comp, 'creation-status')).toMatchObject({ admitted: false });
+    expect(listBetaPeople(db(lobby))).toHaveLength(0);
+    // A new invite gives the person back room creation, and that survives the next restart.
+    const again = mintInvite(db(lobby), { uses: 1, days: 1 });
+    await on(host, 'create', { title: 'Back', name: 'Alex', label: 'Browser', invite: again.code });
+    lobby.close(); lobby = new BrowserLobby(path, { origin, invites: 'required' });
+    expect(await on(host, 'creation-status')).toMatchObject({ admitted: true });
+    expect(await on(comp, 'creation-status')).toMatchObject({ admitted: true });
+  } finally { lobby.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('only a linked human companion inherits beta admission, never a guest or an agent', async () => {
   const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
   try {
@@ -197,5 +222,140 @@ test('devices linked before their person redeems an invite inherit admission wit
     expect(await companion.send('creation-status', room)).toMatchObject({ admitted: true });
     await companion.send('create', crypto.randomUUID(), { title: 'Linked desktop', name: 'Guest', label: 'Desktop' });
     expect(listInvites(db(lobby)).every(i => i.remaining === 0)).toBe(true);
+  } finally { lobby.close(); }
+});
+
+test('the 8-room hosting cap applies per admitted person across linked and removed companions', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
+  try {
+    const invite = mintInvite(db(lobby), { uses: 2, days: 1 });
+    const d1 = await client(lobby), d2 = await client(lobby), d3 = await client(lobby), other = await client(lobby);
+    const first = crypto.randomUUID();
+    await d1.send('create', first, { title: 'Room 1', name: 'Alex', label: 'Browser', invite: invite.code });
+    // Link d2 and d3 as Alex's companions in Room 1, then remove d1 from Room 1 so d1 is no longer active there.
+    for (const [comp, label] of [[d2, 'Desktop'], [d3, 'Laptop']] as const) {
+      await comp.send('request', first, { kind: 'companion', name: 'Alex', label });
+      await d1.send('link', first, { code: (await comp.status(first)).request!.code });
+    }
+    await d2.send('remove', first, { deviceId: (await d1.status(first)).deviceId });
+    // d1 creates 3 more rooms (total 4 across Alex) and d2 creates 4 more (total 8 across Alex).
+    for (let i = 2; i <= 4; i++) await d1.send('create', crypto.randomUUID(), { title: `Room ${i}`, name: 'Alex', label: 'Browser' });
+    for (let i = 5; i <= 8; i++) await d2.send('create', crypto.randomUUID(), { title: `Room ${i}`, name: 'Alex', label: 'Desktop' });
+    // Neither d1, d2 nor d3 (which hosts 0 rooms directly!) can create a 9th room for Alex.
+    for (const dev of [d1, d2, d3]) {
+      const err = await rejected(dev.send('create', crypto.randomUUID(), { title: 'Too many', name: 'Alex', label: 'Device' }));
+      expect(err.status).toBe(429); expect(err.message).toContain('eight rooms');
+    }
+    // Closing one of Alex's rooms frees a slot for any of Alex's devices; another admitted person has their own cap.
+    await d2.send('close', first);
+    await d3.send('create', crypto.randomUUID(), { title: 'Replacement 8th', name: 'Alex', label: 'Laptop' });
+    expect((await rejected(d1.send('create', crypto.randomUUID(), { title: 'Still 9th', name: 'Alex', label: 'Browser' }))).status).toBe(429);
+    await other.send('create', crypto.randomUUID(), { title: 'Other person', name: 'Sam', label: 'Browser', invite: invite.code });
+  } finally { lobby.close(); }
+});
+
+test('beta_admissions caps distinct devices per person and never mints unlimited creator keys', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
+  try {
+    const { code } = mintInvite(db(lobby), { uses: 1, days: 1 });
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Primary', invite: code });
+    const hostId = (await host.status(room)).deviceId;
+    const person = betaPerson(db(lobby), hostId)!;
+    const admitted: Awaited<ReturnType<typeof client>>[] = [host];
+    // Link companions until BETA_DEVICES_PER_PERSON distinct devices are admitted (removing earlier ones from the room
+    // to stay within DEVICES_PER_MEMBER = 4 in this room).
+    for (let i = 1; i < BETA_DEVICES_PER_PERSON; i++) {
+      const comp = await client(lobby);
+      await comp.send('request', room, { kind: 'companion', name: 'Alex', label: `Comp ${i}` });
+      await host.send('link', room, { code: (await comp.status(room)).request!.code });
+      const compId = (await comp.status(room)).deviceId;
+      expect(betaPerson(db(lobby), compId)).toBe(person);
+      expect(await comp.send('creation-status', room)).toMatchObject({ admitted: true });
+      admitted.push(comp);
+      await host.send('remove', room, { deviceId: compId });
+    }
+    expect(listBetaPeople(db(lobby))).toEqual([{ id: person, devices: BETA_DEVICES_PER_PERSON, admittedAt: expect.any(Number) }]);
+
+    // The 9th distinct device can still join the room as a companion, but gets NO beta admission row.
+    const ninth = await client(lobby);
+    await ninth.send('request', room, { kind: 'companion', name: 'Alex', label: 'Ninth' });
+    await host.send('link', room, { code: (await ninth.status(room)).request!.code });
+    const ninthId = (await ninth.status(room)).deviceId;
+    expect(betaPerson(db(lobby), ninthId)).toBeUndefined();
+    expect(await ninth.send('creation-status', room)).toMatchObject({ admitted: false });
+    expect((await rejected(ninth.send('create', crypto.randomUUID(), { title: 'Blocked', name: 'Alex', label: 'Ninth' }))).code).toBe('invite-required');
+    expect(listBetaPeople(db(lobby))[0].devices).toBe(BETA_DEVICES_PER_PERSON);
+
+    // Even if host removes itself leaving only un-admitted ninth as host of `room`, `room` still counts toward Alex's 8-room cap.
+    await ninth.send('remove', room, { deviceId: hostId });
+    for (let i = 2; i <= 8; i++) await admitted[1].send('create', crypto.randomUUID(), { title: `Room ${i}`, name: 'Alex', label: 'Comp 1' });
+    expect((await rejected(host.send('create', crypto.randomUUID(), { title: 'Room 9', name: 'Alex', label: 'Primary' }))).status).toBe(429);
+  } finally { lobby.close(); }
+});
+
+test('operators can list admitted people and revoke a person across all linked devices via API and CLI', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
+  try {
+    const out: string[] = [];
+    invitesCli(['people'], db(lobby), line => out.push(line));
+    expect(out).toEqual(['No admitted people.']);
+
+    const { code } = mintInvite(db(lobby), { uses: 2, days: 1 });
+    const host = await client(lobby), comp = await client(lobby), other = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Beta', name: 'Alex', label: 'Browser', invite: code });
+    await comp.send('request', room, { kind: 'companion', name: 'Alex', label: 'Desktop' });
+    await host.send('link', room, { code: (await comp.status(room)).request!.code });
+    await other.send('create', crypto.randomUUID(), { title: 'Other', name: 'Sam', label: 'Browser', invite: code });
+
+    const alexPerson = betaPerson(db(lobby), (await host.status(room)).deviceId)!;
+    const people = listBetaPeople(db(lobby));
+    expect(people).toHaveLength(2);
+    expect(people.find(p => p.id === alexPerson)).toMatchObject({ id: alexPerson, devices: 2 });
+
+    out.length = 0;
+    invitesCli(['people'], db(lobby), line => out.push(line));
+    expect(out.join('\n')).toContain(`${alexPerson}\t2 devices\tadmitted `);
+    expect(out.join('\n')).not.toContain(code);
+
+    out.length = 0;
+    invitesCli(['revoke-person', alexPerson], db(lobby), line => out.push(line));
+    expect(out).toEqual([`Revoked ${alexPerson} (2 devices).`]);
+    expect(revokeBetaPerson(db(lobby), alexPerson)).toBe(0);
+    expect(() => invitesCli(['revoke-person', alexPerson], db(lobby))).toThrow('No admitted person');
+
+    // Both of Alex's devices lost creation admission; Sam keeps theirs.
+    expect(await host.send('creation-status', room)).toMatchObject({ admitted: false });
+    expect(await comp.send('creation-status', room)).toMatchObject({ admitted: false });
+    expect((await rejected(host.send('create', crypto.randomUUID(), { title: 'After revoke', name: 'Alex', label: 'Browser' }))).code).toBe('invite-required');
+    expect((await rejected(comp.send('create', crypto.randomUUID(), { title: 'After revoke', name: 'Alex', label: 'Desktop' }))).code).toBe('invite-required');
+    expect(await other.send('creation-status', crypto.randomUUID())).toMatchObject({ admitted: true });
+    expect(listBetaPeople(db(lobby))).toHaveLength(1);
+  } finally { lobby.close(); }
+});
+
+test('LIFE-4: transferring host updates rooms.owner_person atomically to the new host\'s beta identity (or clears it)', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin, invites: 'required' });
+  try {
+    const { code } = mintInvite(db(lobby), { uses: 2, days: 1 });
+    const alex = await client(lobby), sam = await client(lobby), guest = await client(lobby);
+    const room = crypto.randomUUID();
+    await alex.send('create', room, { title: 'Owned', name: 'Alex', label: 'Browser', invite: code });
+    await sam.send('create', crypto.randomUUID(), { title: 'Sam room', name: 'Sam', label: 'Browser', invite: code });
+    await sam.send('request', room, { name: 'Sam', label: 'Browser', kind: 'person' });
+    await guest.send('request', room, { name: 'Guest', label: 'Browser', kind: 'person' });
+    for (const r of (await alex.status(room)).requests!) await alex.send('decide', room, { requestId: r.id, admit: true });
+
+    const alexPerson = betaPerson(db(lobby), (await alex.status(room)).deviceId)!;
+    const samPerson = betaPerson(db(lobby), (await sam.status(room)).deviceId)!;
+    expect(db(lobby).query('SELECT owner_person FROM rooms WHERE id=?').get(room)).toEqual({ owner_person: alexPerson });
+
+    // Transfer to beta-admitted Sam -> owner_person becomes Sam's beta person.
+    await alex.send('transfer-host', room, { memberId: (await sam.status(room)).memberId! });
+    expect(db(lobby).query('SELECT owner_person FROM rooms WHERE id=?').get(room)).toEqual({ owner_person: samPerson });
+
+    // Transfer to non-beta Guest -> owner_person clears to null.
+    await sam.send('transfer-host', room, { memberId: (await guest.status(room)).memberId! });
+    expect(db(lobby).query('SELECT owner_person FROM rooms WHERE id=?').get(room)).toEqual({ owner_person: null });
   } finally { lobby.close(); }
 });

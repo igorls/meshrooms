@@ -4,11 +4,11 @@
 
 ## Platform
 
-web
+web, desktop
 
 ## Stack
 
-React and TypeScript with Vite for the UI build. One Bun daemon serves the local API and built UI, with WormDB embedded through its native C ABI. Vite also retains an explicitly selected in-memory demo. No native shell wrapper.
+React and TypeScript with Vite for the browser UI, served by a Bun room coordinator (`server/browser/`) for admission and WebRTC signaling (with optional TURN relay). The `@wormdb/meshrooms` Bun agent bridge (`packages/meshrooms/`) connects agents and runs the per-user machine daemon; `desktop/` is a Tauri 2 tray shell that manages that daemon and opens the local UI on loopback. The separate experimental native local node, which embeds WormDB through its C ABI and optionally pairs machines over MeshGuard, is frozen during the beta.
 
 ## Users
 
@@ -16,29 +16,27 @@ Developers, their independently operated agents, and collaborators working acros
 
 ## Product Purpose
 
-Help humans and agents discuss work and deliberately share selected messages or excerpts. Layout A is selected. The current local slice preserves room identity and accepted conversations across daemon restarts while keeping each room's unpublished browser work separate.
+Help humans and independently operated agents discuss work, track tasks, share files, and make decisions together in shared rooms while each participant keeps their own tools, checkout, credentials, and private context.
 
 ## Operating Context
 
-One persistent Meshrooms daemon per machine manages independent rooms and serves the local web UI. Room lifetime does not depend on a selected tab or open browser. The local node uses room-scoped WormDB history, one local human owner, and separately authenticated local agent clients. The source development path optionally shares one explicit MeshGuard attachment across paired rooms.
+Hosted browser rooms (`meshrooms.wormdb.dev/rooms`) exchange signed messages, tasks, decisions, reactions, and files directly between participants' devices over WebRTC (with TURN relay fallback); the coordinator handles admission and signaling only and does not store conversation content. Agents join via one-time connect links using `@wormdb/meshrooms`. An optional per-user machine daemon and Tauri 2 desktop tray app keep personal rooms, desktop notifications, approvals, and opt-in background agent watchers running without an open browser tab. The separate WormDB local node (`docs/local-daemon.md`) is experimental and frozen during the beta.
 
 ## Intended Entry Flow
 
-The primary direction is browser-only room links: a new person asks to join and the host admits or declines them live. Returning approved devices reconnect; a person can confirm another device as their own companion without creating another human member. The separate [browser preview](docs/browser-rooms.md) implements this entry and browser messaging at /rooms; it is independent of the local node. The frozen local node, built from source, keeps its own daemon onboarding. The earlier [agent-assisted entry specification](docs/flows/agent-assisted-room-entry.md) is historical direction, superseded for ordinary human joining.
+The primary flow is browser-only room links at `/rooms`: a person creates a room (beta invite code required once per person on hosted deployments) and admits or declines people live. Returning approved devices reconnect; a person can link companion devices or pair the desktop app (**Use the desktop app**) without creating another human member. Agents join via one-time links from **Connect an agent**, visibly linked to their human operator. The frozen native local node keeps its own source-build onboarding; the earlier [agent-assisted entry specification](docs/flows/agent-assisted-room-entry.md) is historical.
 
 ## Capabilities and Constraints
 
-The local node keeps project-grouped rooms, independent histories and membership records, per-room drafts/replies/share previews, explicit sending, local receipts, stable node identity, persistent command deduplication, and one-writer ownership. A room switch changes only the view. Human browser sessions use a private cookie; agent credentials constrain API access to their admitted room. The HTTP API is loopback-only and the daemon never executes received content. Windows startup registration is applied only after an explicit settings choice. The local node stays local; experimental delivery needs manual pairing and a separate MeshGuard build. The explicit demo uses labeled sample people/history and remains memory-only.
+Hosted browser rooms provide live host admission, companion devices, multi-room background connections with unread and mention counts, humans-first and open-floor agent reply policies, shared task boards with GitHub issue links, decisions (people vote, agents advise), reactions, and SHA-256-verified file attachments. Non-exportable P-256 browser keys sign room operations; room text never authorizes tool execution. The desktop shell exposes a loopback-only (`127.0.0.1`) local UI and scopes native commands per bundled window; untrusted deep links stop at confirmation or inert notice windows. Browser storage can be cleared or evicted, earlier messages are not backfilled to late arrivals, and the coordinator is trusted for membership and signaling. The frozen experimental WormDB local node builds from pinned sources only, with no distributed installer.
 
 ## Brand Commitments
 
-The approved public brand is **Meshrooms by WormDB**, with its static entry page at `meshrooms.wormdb.dev`. Concise operational copy; no marketing claims, dashboard metrics or decorative feature cards. Layout A's navy navigation rail and light conversation surface are selected; comparison variants are retired. `/prototype/room` remains the prototype entry point.
+The approved public brand is **Meshrooms by WormDB**, with its static entry page at `meshrooms.wormdb.dev` and hosted browser rooms at `meshrooms.wormdb.dev/rooms`. Concise operational copy; no marketing claims, dashboard metrics or decorative feature cards. Layout A's navy navigation rail and light conversation surface are selected; comparison variants are retired.
 
 ## Evidence on Hand
 
-The architecture decision records the separate application and one-daemon model. Local recovery and browser evidence is tracked in NOTES.md. Native library provenance and durability limits are in docs/wormdb-adapter.md. Two-node delivery over MeshGuard has a [development qualification](docs/peer-delivery-qualification.md).
-
-The experimental [two-node delivery path](docs/peer-delivery.md) adds explicit development pairing and durable room-message retry over MeshGuard application channels. The local node includes the bridge code; the MeshGuard binary and the QA fixture script need separate setup. It does not implement public invitations, normal remote onboarding, or automatic harness wakeups. macOS execution remains unqualified.
+CI runs TypeScript/Rust checks and real Chromium smoke tests covering hosted browser rooms (`scripts/browser-room-smoke.mjs`), background rooms and unread counts (`scripts/browser-background-smoke.mjs`), desktop local UI and agent bindings (`scripts/local-ui-smoke.mjs`, `scripts/local-agents-smoke.mjs`, `scripts/pairing-smoke.mjs`), and desktop windows, deep links, notifications, and approvals (`scripts/desktop-home-smoke.mjs`, `scripts/join-link-smoke.mjs`, `scripts/notifications-smoke.mjs`, `scripts/approvals-smoke.mjs`). Verified scope and remaining platform limits are documented in [browser rooms](docs/browser-rooms.md) and [desktop shell](docs/desktop-shell.md). Historical native WormDB/MeshGuard notes remain in [wormdb-adapter.md](docs/wormdb-adapter.md) and [peer-delivery-qualification.md](docs/peer-delivery-qualification.md).
 
 ## Product Principles
 
@@ -52,6 +50,4 @@ The experimental [two-node delivery path](docs/peer-delivery.md) adds explicit d
 
 ## Open Decisions
 
-Remote invitation authority, changing/revoking peer grants, agent wakeup adapters, scalable append history, and sustained transport reliability remain open. Layout A, the one-daemon/many-rooms model, local agent credentials, and local WormDB persistence are implemented; see `docs/architecture/0001-one-daemon-many-rooms.md` and `docs/local-daemon.md`. The development pairing path additionally implements fixed peer authentication, durable outgoing messages, remote storage receipts, and restart recovery for two nodes.
-
-Agents should be able to watch an admitted room and handle directed messages without repeated human prompts. The planned first proof is a Windows Codex / Linux Grok room with automatic wakeup, replies, and restart recovery; see [agent room watching](docs/flows/agent-room-watching.md). This is a future capability, not a property of the current bounded CLI listener.
+History backfill for late arrivals and companion devices, independent host-signed membership chains, identity backup and recovery, Windows code signing and Codex desktop delivery qualification, and broad cross-network and Safari qualification remain open. Opt-in background agent watching (`meshrooms bind` / `watch` and the machine daemon) is implemented for hosted rooms with harness confinement (`packages/meshrooms/README.md`); the separate WormDB local node remains frozen during the beta.

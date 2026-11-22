@@ -1,8 +1,11 @@
 import { expect, test } from 'bun:test';
 import { DesktopError } from './codex-desktop';
-import { desktopDeliveryStep, type DesktopDelivery, type DeliveryDeps } from './desktop-delivery';
+import { desktopDeliveryStep, resolveDesktopDelivery, type DesktopDelivery, type DeliveryDeps } from './desktop-delivery';
+import { watchDesktop } from './desktop-watch';
+import { emptyState, type WatchConfig, type WatchState } from './agent-watch';
 import { BrowserAgent } from './browser-agent';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { agentCli } from './agent-cli';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -92,4 +95,102 @@ test('the shared cursor compare-and-set refuses a stale commit under the bridge 
     expect(agent.saveListenCursor({ boardAfter: 3, decisionsAfter: 3 }, before)).toBe(false);
     expect(agent.listenCursor()).toEqual({ boardAfter: 2, decisionsAfter: 2 });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('watchDesktop records idle at startup, prefixes activity notes with wakeup, skips live leases, and does not spin while halted until resolved', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mr-desktop-watch-'));
+  try {
+    const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), wren = crypto.randomUUID(), deviceId = 'a'.repeat(64);
+    const agent = new BrowserAgent(dir, 'http://127.0.0.1:1', roomId);
+    writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: wren, ownerId: alex, members: [{ id: alex, name: 'Alex', role: 'human' }, { id: wren, name: 'Wren', role: 'agent', operatorId: alex }], devices: [] }));
+    const config: WatchConfig = { roomId, harness: 'codex', codexDelivery: 'desktop', session: 'thread-1', generation: 'gen-1', cwd: dir, maxWakesPerHour: 20, maxAgentWakesPerHour: 40, runTimeoutMinutes: 10, allowTools: [], launcher: 'meshrooms.js', agentHome: dir, binDir: dir, roomDir: agent.dir };
+    let state: WatchState = emptyState();
+    let now = 1_000_000, ticks = 0, claims = 0, writes = 0, sends = 0, liveHold: 'none' | 'attached' = 'attached', failUncertain = false;
+    const mention = { kind: 'message', roomId, id: crypto.randomUUID(), deviceId, memberId: alex, text: '@Wren ping', at: now };
+    writeFileSync(join(agent.dir, 'messages.json'), JSON.stringify([{ packet: { body: mention, signature: '' }, targets: [], receipts: [] }]));
+
+    // 1. Live listener attached: records idle on startup, sets wakeup-prefixed live note, does NOT claim or send.
+    await watchDesktop(agent, config, {
+      now: () => now,
+      sleep: async ms => { now += ms; ticks++; },
+      ready: () => true,
+      current: () => ticks < 2,
+      ensureRunner: async () => {},
+      readState: () => structuredClone(state),
+      writeState: s => { writes++; state = structuredClone(s); },
+      log: () => {},
+      claim: () => { claims++; return { started: () => {}, release: () => {} }; },
+      withdraw: () => {},
+      live: { check: () => ({ hold: liveHold }), begin: () => true, end: () => {}, restoreCursor: () => {} },
+      send: async (_, beforeSend) => { sends++; beforeSend(); return { turnId: 'turn-1' }; },
+    });
+    expect(agent.activity()?.state).toBe('idle');
+    expect(agent.activity()?.note).toMatch(/^wakeup /);
+    expect(claims).toBe(0);
+    expect(sends).toBe(0);
+
+    // 2. Live listener detaches; delivery becomes uncertain -> halts and stops spinning on subsequent ticks.
+    liveHold = 'none'; failUncertain = true; ticks = 0; writes = 0; claims = 0; sends = 0;
+    await watchDesktop(agent, config, {
+      now: () => now,
+      sleep: async ms => { now += ms; ticks++; },
+      ready: () => true,
+      current: () => ticks < 8,
+      ensureRunner: async () => {},
+      readState: () => structuredClone(state),
+      writeState: s => { writes++; state = structuredClone(s); },
+      log: () => {},
+      claim: () => { claims++; return { started: () => {}, release: () => {} }; },
+      withdraw: () => {},
+      live: { check: () => ({ hold: 'none' }), begin: () => true, end: () => {}, restoreCursor: () => {} },
+      send: async (_, beforeSend) => { sends++; beforeSend(); if (failUncertain) throw new DesktopError('uncertain', 'lost ack'); return { turnId: 'turn-2' }; },
+    });
+    expect(state.halted?.generation).toBe('gen-1');
+    expect(state.desktop?.state).toBe('uncertain');
+    expect(agent.activity()?.note).toMatch(/^wakeup /);
+    // Even after 8 ticks (past the old 5s retry timer), it claimed and sent ONLY ONCE!
+    expect(claims).toBe(1);
+    expect(sends).toBe(1);
+
+    // 3. Operator resolves uncertain delivery to retry -> loop detects it, clears halt, delivers once, sets wakeup note.
+    resolveDesktopDelivery(agent.dir, state.desktop!.id!, 'retry');
+    failUncertain = false; ticks = 0; claims = 0; sends = 0;
+    await watchDesktop(agent, config, {
+      now: () => now,
+      sleep: async ms => { now += ms; ticks++; },
+      ready: () => true,
+      current: () => ticks < 3,
+      ensureRunner: async () => {},
+      readState: () => structuredClone(state),
+      writeState: s => { state = structuredClone(s); },
+      log: () => {},
+      claim: () => { claims++; return { started: () => {}, release: () => {} }; },
+      withdraw: () => {},
+      live: { check: () => ({ hold: 'none' }), begin: () => true, end: () => {}, restoreCursor: () => {} },
+      send: async (_, beforeSend) => { sends++; beforeSend(); return { turnId: 'turn-2' }; },
+    });
+    expect(state.halted).toBeUndefined();
+    expect(state.desktop).toMatchObject({ state: 'accepted', turnId: 'turn-2' });
+    expect(agent.activity()?.note).toBe('wakeup room event accepted by Codex desktop');
+    expect(claims).toBe(1);
+    expect(sends).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform !== 'win32')('startWatch fails fast when --codex-delivery desktop is selected on Windows', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mr-win-desktop-'));
+  const savedAgent = process.env.MESHROOMS_AGENT_HOME, savedPerson = process.env.MESHROOMS_PERSON_HOME;
+  try {
+    const roomId = crypto.randomUUID();
+    const agent = new BrowserAgent(dir, 'http://127.0.0.1:1', roomId);
+    writeFileSync(join(agent.dir, 'room.json'), JSON.stringify({ origin: 'http://127.0.0.1:1', roomId }));
+    process.env.MESHROOMS_AGENT_HOME = dir;
+    process.env.MESHROOMS_PERSON_HOME = join(dir, 'person');
+    await expect(agentCli(['watch', '--room', roomId, '--harness', 'codex', '--codex-delivery', 'desktop', '--session', crypto.randomUUID()]))
+      .rejects.toThrow('--codex-delivery headless');
+  } finally {
+    if (savedAgent === undefined) delete process.env.MESHROOMS_AGENT_HOME; else process.env.MESHROOMS_AGENT_HOME = savedAgent;
+    if (savedPerson === undefined) delete process.env.MESHROOMS_PERSON_HOME; else process.env.MESHROOMS_PERSON_HOME = savedPerson;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

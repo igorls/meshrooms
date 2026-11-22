@@ -119,7 +119,9 @@ export function createHandler({ node, origins, distDir, dataDir, access, startup
       if (!allowedHosts.has(request.headers.get('host') || url.host)) throw new NodeError(403, 'Use the local daemon address.');
       if (url.pathname.startsWith('/api/')) {
         const origin = request.headers.get('origin');
-        if ((origin && !allowedOrigins.has(origin)) || request.headers.get('sec-fetch-site') === 'cross-site') throw new NodeError(403, 'This local API does not accept cross-site requests.');
+        // Another localhost port is the same site (and shares this cookie), so same-site is refused like cross-site.
+        const site = request.headers.get('sec-fetch-site');
+        if ((origin && !allowedOrigins.has(origin)) || site === 'cross-site' || site === 'same-site') throw new NodeError(403, 'This local API does not accept cross-site requests.');
         if (request.method === 'GET' && url.pathname === '/api/node/health') {
           const challenge = url.searchParams.get('challenge');
           if (challenge !== null && !/^[\w-]{16,128}$/.test(challenge)) throw new NodeError(400, 'Invalid health challenge.');

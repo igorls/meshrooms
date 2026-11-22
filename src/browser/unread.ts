@@ -115,14 +115,43 @@ export function freshRequests(counts: Record<string, UnreadCount>, seen: Set<str
   return fresh;
 }
 
+/** A pending join request eligible for an opt-in browser notification, keyed by `${roomId}:${request.id}`. */
+export type HostNotification = { key: string; roomId: string; request: Waiting; title: string; body: string };
+
 /**
- * `(N) Room · Meshrooms`, N being what's unread in the person's other rooms. People waiting to join are spelled out,
- * `(3 · 1 waiting)`, not added to N: they need a different action (admitting), and their requests expire after ten
- * minutes, so they shouldn't read as three more messages.
+ * Collects newly arrived join requests for rooms this browser hosts, deduplicated per `(roomId, request.id)` via `seen`.
+ * Notification text avoids leaking message content, codes, or requester-controlled text onto lock screens.
  */
-export function tabTitle(roomTitle: string, otherUnread: number, otherWaiting = 0) {
+export function hostJoinNotifications(
+  rooms: { roomId: string; roomTitle: string; waiting: Waiting[] }[],
+  seen: Set<string>,
+): HostNotification[] {
+  const out: HostNotification[] = [];
+  for (const { roomId, roomTitle, waiting } of rooms) {
+    for (const request of waiting) {
+      const key = `${roomId}:${request.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const label = roomTitle || 'your room';
+      const body = request.kind === 'agent'
+        ? `An agent is waiting to join ${label}.`
+        : request.kind === 'companion'
+          ? `A device is waiting to join ${label}.`
+          : `Someone asked to join ${label}.`;
+      out.push({ key, roomId, request, title: 'Join request · Meshrooms', body });
+    }
+  }
+  return out;
+}
+
+/**
+ * `(N) Room · Meshrooms`, N being unread messages (in other rooms, and in the open room while hidden). People waiting
+ * to join (including in the open room when hosted here) are spelled out, `(3 · 1 waiting)`, not added to N: they need
+ * a different action (admitting), and their requests expire after ten minutes.
+ */
+export function tabTitle(roomTitle: string, unread: number, waiting = 0) {
   const base = roomTitle ? `${roomTitle} · Meshrooms` : 'Meshrooms';
-  const parts = [...(otherUnread > 0 ? [badgeText(otherUnread)] : []), ...(otherWaiting > 0 ? [`${otherWaiting} waiting`] : [])];
+  const parts = [...(unread > 0 ? [badgeText(unread)] : []), ...(waiting > 0 ? [`${waiting} waiting`] : [])];
   return parts.length ? `(${parts.join(' · ')}) ${base}` : base;
 }
 

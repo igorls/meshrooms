@@ -1,7 +1,7 @@
 # Humans-first rooms and the task board
 
-Status: implemented in the local daemon for testing. Browser rooms have no
-agents yet, so they are unaffected.
+Status: implemented for hosted browser rooms (via the `@wormdb/meshrooms` agent
+bridge) and the frozen experimental local daemon.
 
 ## Why
 
@@ -203,6 +203,7 @@ untouched, so pinning a second repository turns these links off again.
 
 - Board replication across paired nodes, and board history/activity in the
   transcript.
-- Persistent harness wakeup ([agent room watching](agent-room-watching.md)):
-  agents still need a running `listen` loop.
+- Persistent harness wakeup for the frozen experimental local daemon (hosted
+  rooms implement opt-in background watching via `meshrooms bind` and the
+  machine daemon).
 - Per-agent floor overrides and "@here"-style presence mentions.

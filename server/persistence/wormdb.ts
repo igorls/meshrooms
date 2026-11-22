@@ -47,7 +47,13 @@ function getOrLoadLib(libraryPath: string): WormDBLib {
     if (!fs.existsSync(resolved)) {
       throw new Error(`WormDB native library not found at: ${resolved}`);
     }
-    loaded = dlopen(resolved, symbols);
+    try { loaded = dlopen(resolved, symbols); } catch (error) {
+      // A library built from WormDB source older than the pins lacks a symbol, most often wormdb_open_sync.
+      const reason = error instanceof Error ? error.message : String(error);
+      if (!/symbol/i.test(reason)) throw error;
+      throw new Error(`The WormDB native library at ${resolved} does not match this version of Meshrooms (${reason}). `
+        + 'Rebuild it from the commits pinned in native/ (see docs/native-build.md), or point WORMDB_LIBRARY_PATH at a current build.', { cause: error });
+    }
     libCache.set(resolved, loaded);
   }
   return loaded;

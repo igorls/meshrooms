@@ -45,8 +45,8 @@ export const LIVE_TIMING = { heartbeatMs: 5_000, staleMs: 30_000, sliceSeconds: 
  */
 export const PICKUP_LIFE_MS = 10 * 60_000, PICKUP_CAP_MS = 60 * 60_000;
 export const DEFAULT_PICKUP_MINUTES = 10, DEFAULT_MAX_WAIT_HOURS = 24;
-/** Exit codes of `listen --until-addressed`: 0 work (or the upper bound passed), 3 room closed, 4 agent removed, 5 runner not repaired. */
-export const LIVE_EXIT = { work: 0, closed: 3, removed: 4, runner: 5 } as const;
+/** Exit codes of `listen --until-addressed`: 0 work (or the upper bound passed), 3 room closed, 4 agent removed or rejected, 5 runner not repaired, 6 parent process exited. */
+export const LIVE_EXIT = { work: 0, closed: 3, removed: 4, runner: 5, parentExited: 6 } as const;
 /** How many headless runs a listen reports at most. */
 export const MAX_WOKEN_RUNS = 5;
 
@@ -237,8 +237,15 @@ export const writeWokenSeen = (roomDir: string, at: number) => { try { replaceFi
 /** One internal listen, as listenRemembering returns it. */
 export type SliceResult = { state: string; addressed?: unknown[]; tasks?: unknown[]; decisions?: unknown; error?: string; [key: string]: unknown };
 /** What a listen return holds for the agent: messages that address it, assignments, or decisions (peekWork's rule). */
-export const sliceHasWork = (result: SliceResult) => !['timeout', 'closed', 'runner-stopped', 'waiting'].includes(result.state)
+export const sliceHasWork = (result: SliceResult) => !['timeout', 'closed', 'runner-stopped', 'waiting', 'waiting-for-host', 'rejected', 'removed', 'parent-exited'].includes(result.state)
   && (!!result.addressed?.length || !!result.tasks?.length || !!result.decisions);
+/** Pending admission state while an agent is `waiting-for-host` before its first slice can read the room. */
+export type AdmissionState =
+  | 'admitted'
+  | 'pending'
+  | { state: 'closed'; error?: string }
+  | { state: 'rejected'; error?: string }
+  | { state: 'runner-stopped'; error?: string };
 
 export type LiveListenDeps = {
   now(): number;
@@ -250,8 +257,15 @@ export type LiveListenDeps = {
   release(): void;
   /** One internal listen of at most `seconds`: listenRemembering, which consumes only what it returns as work. */
   listen(seconds: number): Promise<SliceResult>;
+  /**
+   * Optional pending-admission check before reading the room (`waiting-for-host`): waits cleanly while `'pending'`,
+   * repairs on `runner-stopped`, exits 3 on `closed` and 4 on `rejected`, then transitions to `listen` once `'admitted'`.
+   */
+  admission?(): Promise<AdmissionState> | AdmissionState;
   /** Whether the room service said this agent is no longer in the room (the runner's proof, removedSince). */
   removed(): boolean;
+  /** Optional parent-process liveness check (`--parent <pid>`): once false, releases the lease and exits 6 (`parent-exited`). */
+  parentAlive?(): boolean;
   /** Repairs a runner that stopped, when this command owns it (repairRunner); otherwise leaves it to its owner. */
   repair(): Promise<unknown>;
   cursor(): string;
@@ -263,32 +277,62 @@ export type LiveListenDeps = {
 export type LiveListenOptions = { maxWaitMs: number; graceMs: number; timing?: typeof LIVE_TIMING };
 /**
  * `listen --until-addressed`: waits, in internal slices, until there is work for this agent, holding the live lease the
- * whole time. Never returns on a runner gap: a slice that reports the runner stopped is followed by a repair (or, while
- * the watcher owns the runner, by waiting for it), and only trouble that lasts runnerTroubleMs ends the wait (exit 5).
+ * whole time. While admission is pending (`waiting-for-host`), waits cleanly until admitted, closed (exit 3), or
+ * rejected (exit 4). Never returns on a runner gap: a slice that reports the runner stopped is followed by a repair
+ * (or, while the watcher owns the runner, by waiting for it), and only trouble that lasts runnerTroubleMs ends the wait
+ * (exit 5). When `parentAlive` is given (`--parent <pid>`), exiting the parent releases the lease and exits 6.
  * A first listen's history without anything for the agent is caught up silently. Past `maxWaitMs` it exits 0 with
  * `state: timeout`, so a forgotten listener doesn't live forever.
  */
 export async function liveListen(deps: LiveListenDeps, options: LiveListenOptions): Promise<{ exitCode: number; result: SliceResult }> {
   const timing = options.timing ?? LIVE_TIMING, start = deps.now(), left = () => options.maxWaitMs - (deps.now() - start);
   const timeout = (last?: SliceResult): { exitCode: number; result: SliceResult } => ({ exitCode: LIVE_EXIT.work, result: { ...(last ?? {}), state: 'timeout' } });
+  const parentGone = (last?: SliceResult): { exitCode: number; result: SliceResult } => ({ exitCode: LIVE_EXIT.parentExited, result: { ...(last ?? {}), state: 'parent-exited' } });
   let waitLogged = false;
   for (;;) {
+    if (deps.parentAlive && !deps.parentAlive()) return parentGone();
     const attached = deps.attach();
-    if (attached !== 'busy' && 'refused' in attached) throw new Error(attached.refused);
+    if (attached !== 'busy' && 'refused' in attached) throw Object.assign(new Error(attached.refused), { code: 'LISTENER_ATTACHED' });
     if (attached !== 'busy' && 'attached' in attached) break;
     if (attached !== 'busy' && !waitLogged) { deps.log('a headless wake is handling this agent\'s work; waiting for it to finish'); waitLogged = true; }
     if (left() <= 0) return timeout();
     await deps.sleep(timing.attachPollMs);
   }
-  let lost = false, handedOff = false, last: SliceResult | undefined, troubleSince: number | undefined;
+  let lost = false, handedOff = false, admitted = !deps.admission, admissionLogged = false, last: SliceResult | undefined, troubleSince: number | undefined;
   const stop = deps.every(timing.heartbeatMs, () => { if (!deps.beat()) lost = true; });
   try {
     for (;;) {
-      if (lost) throw new Error('Another live listener took this agent\'s lease over; this one stops without reading. Run it again only if that one is gone.');
+      if (lost) throw Object.assign(new Error('Another live listener took this agent\'s lease over; this one stops without reading. Run it again only if that one is gone.'), { code: 'LEASE_LOST' });
+      if (deps.parentAlive && !deps.parentAlive()) return parentGone(last);
       if (deps.removed()) return { exitCode: LIVE_EXIT.removed, result: { ...(last ?? {}), state: 'removed', error: 'This agent was removed from the room. Stop listening to it; connect again with a new link to rejoin.' } };
       if (left() <= 0) return timeout(last);
+      if (!admitted) {
+        const status = await deps.admission!();
+        if (status === 'admitted') {
+          admitted = true;
+          troubleSince = undefined;
+        } else if (status === 'pending') {
+          troubleSince = undefined;
+          if (!admissionLogged) { deps.log('waiting for the host to admit this agent'); admissionLogged = true; }
+          await deps.sleep(Math.min(timing.attachPollMs, Math.max(0, left())));
+          continue;
+        } else if (status.state === 'closed') {
+          return { exitCode: LIVE_EXIT.closed, result: { state: 'closed', ...(status.error ? { error: status.error } : {}) } };
+        } else if (status.state === 'rejected') {
+          return { exitCode: LIVE_EXIT.removed, result: { state: 'rejected', error: status.error ?? 'This agent was not admitted to the room. Connect again with a new link to join.' } };
+        } else {
+          troubleSince ??= deps.now();
+          if (deps.now() - troubleSince >= timing.runnerTroubleMs) return { exitCode: LIVE_EXIT.runner, result: { state: 'runner-stopped',
+            error: status.error ?? `The room's background process stopped and was not running again within ${Math.round(timing.runnerTroubleMs / 60_000)} minutes. Check status, then run this listen again.` } };
+          await deps.repair();
+          await deps.sleep(Math.min(timing.attachPollMs, Math.max(0, left())));
+          continue;
+        }
+      }
       const before = deps.cursor();
-      const result = await deps.listen(Math.max(1, Math.min(timing.sliceSeconds, Math.ceil(left() / 1000))));
+      // When watching a parent PID, keep internal slices short so parent exit releases the lease promptly.
+      const sliceCap = deps.parentAlive ? Math.min(timing.sliceSeconds, Math.max(1, Math.ceil(timing.heartbeatMs / 1000))) : timing.sliceSeconds;
+      const result = await deps.listen(Math.max(1, Math.min(sliceCap, Math.ceil(left() / 1000))));
       if (result.state === 'closed') return { exitCode: LIVE_EXIT.closed, result };
       if (result.state === 'runner-stopped') {
         troubleSince ??= deps.now();

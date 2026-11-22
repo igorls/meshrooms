@@ -73,7 +73,7 @@ function render(view) {
   }
   rooms(['sending', 'waiting', 'cancelling', 'cancelled', 'cancel-failed', 'done', 'failed'].includes(view.stage) ? view.rooms || [] : [], true);
   if (view.stage === 'sending') text('Asking to join your rooms…', `Sending the requests to ${view.origin}.`);
-  else if (view.stage === 'waiting') text('Now confirm in your browser', `The requests are sent. In ${view.name}'s browser, open Have the desktop app? at the top of the room, then press Confirm pairing. Keep that browser tab open until it confirms.`);
+  else if (view.stage === 'waiting') text('Now confirm in your browser', `The requests are sent. Return to the browser tab where ${view.name} started pairing (or choose Finish desktop pairing at the top of the room), then press Confirm pairing. Keep that browser tab open until it confirms.`);
   else if (view.stage === 'cancelling') text('Cancelling pairing…', 'Withdrawing this computer’s pending requests.');
   else if (view.stage === 'cancel-failed') text('Could not cancel pairing', 'Try again to withdraw the pending requests.');
   else if (view.stage === 'cancelled') text('Pairing cancelled', 'Pending requests were withdrawn. Any rooms already joined are still on this computer. You can start a new pairing from your browser.');

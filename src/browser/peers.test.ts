@@ -1,12 +1,12 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { fakeStorage, installFakeIndexedDB } from './test-indexeddb';
-import { BrowserPeers } from './peers';
+import { BrowserPeers, PENDING_REACTION_TTL_MS } from './peers';
 import { MAX_STORED_MESSAGES } from './history';
-import { MAX_PENDING_INCOMING, PACE_HIGH_WATER, Resync, SYNC_REQUEST } from './pacer';
-import { syncChunks, taskBody } from './board';
+import { FILE_CHANNEL_LABEL, MAX_PENDING_INCOMING, PACE_HIGH_WATER, PRIMARY_CHANNEL_LABEL, Resync, SYNC_REQUEST, UNHEALTHY_GRACE_MS } from './pacer';
+import { MAX_LIVE_TASKS_PER_MEMBER, syncChunks, taskBody } from './board';
 import { FenceError, claimFence, identity } from './storage';
 import { QUOTA_BURST, QuotaDrops } from './quota';
-import { MAX_REACTION_KEYS_PER_MEMBER, REACTION_EMOJI } from './reactions';
+import { MAX_PENDING_PER_MEMBER, MAX_REACTION_KEYS_PER_MEMBER, REACTION_EMOJI, reactionSyncChunks, type ReactionPacket } from './reactions';
 
 /**
  * BrowserPeers over an in-memory IndexedDB and fake data channels, so the receive paths (window, receipts, quotas,
@@ -57,7 +57,7 @@ const receipts = (channel: Fake) => channel.sent.map(t => JSON.parse(t)).filter(
 
 beforeEach(() => { records.clear(); fakeStorage.writes = 0; fakeStorage.failWith = undefined; });
 
-describe('browser history window (SYNC-2)', () => {
+describe('browser history window', () => {
   test('a full history evicts its oldest message, stores the new one and always confirms it', async () => {
     const stored = Array.from({ length: MAX_STORED_MESSAGES }, (_, i) => ({
       packet: { body: { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: remote.id, memberId: them, text: `old ${i}`, at: i + 1 }, signature: 'x' }, targets: [], receipts: [] }));
@@ -76,7 +76,7 @@ describe('browser history window (SYNC-2)', () => {
     expect(engine.messages).toHaveLength(MAX_STORED_MESSAGES);
   });
 
-  test('a message that could not be saved is not confirmed, and the failure is left to the storage banner (SYNC-4)', async () => {
+  test('a message that could not be saved is not confirmed, and the failure is left to the storage banner', async () => {
     const { channel, settle, deliver, errors } = await room();
     fakeStorage.failWith = 'QuotaExceededError';
     deliver(await messageFrom('lost for now')); await settle();
@@ -104,7 +104,7 @@ describe('browser history window (SYNC-2)', () => {
     // 1,001 signed sends plus a full history window: about 4 s on a desktop, past the default 5 s on a busy CI runner.
   }, 20_000);
 
-  test('receipts are written together rather than rewriting the history for each one (SYNC-7)', async () => {
+  test('receipts are written together rather than rewriting the history for each one', async () => {
     const { engine, deliver, settle } = await room();
     for (let i = 0; i < 3; i++) await engine.send(`hello ${i}`);
     const before = fakeStorage.writes;
@@ -126,7 +126,7 @@ const taskFrom = async (title: string, revision?: number) => {
   return { body, signature: await remote.sign(body) };
 };
 
-describe('browser receive quotas (SEC-5)', () => {
+describe('browser receive quotas', () => {
   test('a member’s live messages past the burst are dropped without a receipt, and accepted again as the quota refills', async () => {
     const { engine, channel, settle, deliver } = await room();
     const debug = console.debug; const lines: string[] = []; console.debug = (line: string) => { lines.push(line); };
@@ -185,7 +185,7 @@ describe('browser receive quotas (SEC-5)', () => {
   });
 });
 
-describe('browser sync pacing (SYNC-3)', () => {
+describe('browser sync pacing', () => {
   test('packets dropped under load make the receiver ask the peer for its state again', async () => {
     const { engine, channel, settle, deliver } = await room();
     const ops = await Promise.all(Array.from({ length: MAX_PENDING_INCOMING + 6 }, (_, i) => taskFrom(`Task ${i}`)));
@@ -410,6 +410,16 @@ describe('message retractions (HIST-3)', () => {
     expect(held(engine, message.body.id).retracted).toBe(true);
     engine.status = status;
   });
+  test('a retraction relayed for a device someone else removed is refused, whatever time it claims', async () => {
+    const { engine, deliver, settle } = await room();
+    const message = await messageFrom('kept after the laptop was lost');
+    deliver(message); await settle();
+    const lost = await keyPair();
+    engine.status = { ...status, formerDevices: [{ id: lost.id, publicKey: lost.publicKey, memberId: them, retiredAt: Date.now() + 60_000, revoked: true }] };
+    deliver({ kind: 'retractions', roomId, ops: [await retraction(message.body.id, lost)] }); await settle();
+    expect(held(engine, message.body.id).retracted).toBeFalsy();
+    engine.status = status;
+  });
   test('the log is sent to peers with the rest of the state, and a stub never is', async () => {
     const { engine, channel } = await room();
     await engine.send('old news');
@@ -429,7 +439,7 @@ describe('message retractions (HIST-3)', () => {
     await engine.retract(id);
     await expect(engine.react(id, '👍')).rejects.toThrow('That message is not in this browser.');
   });
-  test('reactions on deleted messages stop counting toward the member’s cap', async () => {
+  test('a member past the reaction cap keeps their newest, and a deleted message takes its reactions with it', async () => {
     const { engine } = await room();
     const ids: string[] = [];
     for (let i = 0; i < MAX_REACTION_KEYS_PER_MEMBER / REACTION_EMOJI.length; i++) {
@@ -439,10 +449,14 @@ describe('message retractions (HIST-3)', () => {
     }
     await engine.send('still here');
     const kept = engine.messages.at(-1).packet.body.id;
-    await expect(engine.react(kept, '👍')).rejects.toThrow('too many reactions');
-    for (const id of ids) await engine.retract(id);
+    // One more never fails: the member's oldest reaction lets go.
     await engine.react(kept, '👍');
-    expect(engine.chips().some((chip: { messageId: string }) => chip.messageId === kept)).toBe(true);
+    const shown = () => engine.chips().map((chip: { messageId: string; emoji: string }) => `${chip.messageId} ${chip.emoji}`);
+    expect(shown()).toContain(`${kept} 👍`);
+    expect(shown()).not.toContain(`${ids[0]} ${REACTION_EMOJI[0]}`);
+    expect(shown()).toHaveLength(MAX_REACTION_KEYS_PER_MEMBER);
+    await engine.retract(ids[1]);
+    expect(engine.reactionOps.some((op: ReactionPacket) => op.body.messageId === ids[1])).toBe(false);
   });
   test('a file write under way when its message is deleted is removed behind it', async () => {
     const { engine } = await room();
@@ -459,5 +473,518 @@ describe('message retractions (HIST-3)', () => {
     const id = stale.engine.messages[0].packet.body.id;
     await room();
     await expect(stale.engine.retract(id)).rejects.toThrow(FenceError);
+  });
+
+  test('incoming reactions targeting a retracted stub are ignored and never parked pending', async () => {
+    const { engine, deliver, settle } = await room();
+    const message = await messageFrom('will be retracted');
+    deliver(message); await settle();
+    deliver(await retraction(message.body.id)); await settle();
+    const reactionForStub = async (emoji: (typeof REACTION_EMOJI)[number]) => {
+      const body = { kind: 'reaction' as const, roomId, id: crypto.randomUUID(), deviceId: remote.id, memberId: them, messageId: message.body.id, emoji, revision: 1, at: Date.now() };
+      return { body, signature: await remote.sign(body) };
+    };
+    deliver(await reactionForStub('👍'));
+    deliver({ kind: 'reactions', roomId, ops: [await reactionForStub('❤️')] });
+    await settle();
+    expect(engine.reactionOps).toHaveLength(0);
+    expect(engine.pendingReactions).toHaveLength(0);
+  });
+
+  test('messages leaving the history window change no reaction, so devices agree whatever they still hold', async () => {
+    const { engine } = await room();
+    await engine.send('old');
+    const old = engine.messages.at(-1).packet.body.id;
+    await engine.react(old, '👍');
+    await engine.send('new');
+    const latest = engine.messages.at(-1).packet.body.id;
+    engine.messages = engine.messages.filter((m: any) => m.packet.body.id !== old);
+    await engine.react(latest, '👍');
+    expect(engine.reactionOps.map((op: ReactionPacket) => op.body.messageId)).toEqual([old, latest]);
+  });
+});
+
+describe('P0-2 board sync limits & P0-7 already-open channel', () => {
+  test('a single member cannot fill the board via board sync envelopes or bypass MAX_REVISION_JUMP in one batch', async () => {
+    const { engine, deliver, settle } = await room();
+    const flood = await Promise.all(Array.from({ length: MAX_LIVE_TASKS_PER_MEMBER + 40 }, (_, i) => taskFrom(`Flood ${i}`)));
+    for (const chunk of syncChunks(roomId, flood)) deliver(chunk);
+    await settle();
+    expect(engine.ops).toHaveLength(MAX_LIVE_TASKS_PER_MEMBER);
+    // Another member (local) can still create tasks cleanly.
+    await engine.changeTask({ title: 'Mine still fits' });
+    expect(engine.ops).toHaveLength(MAX_LIVE_TASKS_PER_MEMBER + 1);
+    // Stepping +1000 repeatedly in one board sync envelope cannot advance past MAX_REVISION_JUMP.
+    const target = flood[0].body;
+    const step1000 = { ...target, id: crypto.randomUUID(), revision: 1000 };
+    const step2000 = { ...target, id: crypto.randomUUID(), revision: 2000 };
+    deliver({
+      kind: 'board',
+      roomId,
+      ops: [
+        { body: step1000, signature: await remote.sign(step1000) },
+        { body: step2000, signature: await remote.sign(step2000) },
+      ],
+    });
+    await settle();
+    const revs = engine.ops.filter((op: any) => op.body.taskId === target.taskId).map((op: any) => op.body.revision);
+    expect(revs).toContain(1000);
+    expect(revs).not.toContain(2000);
+  });
+
+  test('an already-open channel triggers sendState once and a replaced peer’s late onopen is a no-op', async () => {
+    const engine = new BrowserPeers({} as never, roomId, local.id, 'session', () => {}, () => {}) as any;
+    engine.fenced(await claimFence(`owner:${local.id}:${roomId}`));
+    await engine.load();
+    engine.status = status;
+    await engine.changeTask({ title: 'Existing task' });
+
+    const openChannel = fakeChannel();
+    const peerA = { pc: { close() {} }, session: 's1', started: Date.now(), sent: new Map(), resync: new Resync() };
+    engine.peers.set(remote.id, peerA);
+    engine.connectChannel(peerA, remote.id, openChannel);
+    const boardsAfterConnect = () => openChannel.sent.map(t => JSON.parse(t)).filter(p => p.kind === 'board');
+    expect(boardsAfterConnect()).toHaveLength(1);
+    // A subsequent onopen firing on the same channel must be idempotent.
+    openChannel.onopen?.();
+    expect(boardsAfterConnect()).toHaveLength(1);
+
+    // A channel connected in 'connecting' state whose peer gets replaced before onopen fires does nothing.
+    const staleChannel = { ...fakeChannel(), readyState: 'connecting' };
+    const peerStale = { pc: { close() {} }, session: 's2', started: Date.now(), sent: new Map(), resync: new Resync() };
+    engine.peers.set(remote.id, peerStale);
+    engine.connectChannel(peerStale, remote.id, staleChannel);
+    expect(staleChannel.sent).toHaveLength(0);
+    const peerReplacement = { pc: { close() {} }, session: 's3', started: Date.now(), sent: new Map(), resync: new Resync() };
+    engine.peers.set(remote.id, peerReplacement);
+    staleChannel.readyState = 'open';
+    staleChannel.onopen?.();
+    expect(staleChannel.sent).toHaveLength(0);
+  });
+});
+
+describe('WebRTC WAN stability and dedicated file channel (OPS-9, SYNC-5, OPS-11, SEC-11)', () => {
+  const OriginalPC = globalThis.RTCPeerConnection;
+  let ufragSeq = 0;
+  let createdPcs: FakePC[] = [];
+  let failSetConfig = false;
+  let omitSetConfig = false;
+
+  type MockChannel = Fake & { label: string; removeEventListener(type: string, fn: () => void): void };
+  function mockChannel(label: string, initialState = 'connecting'): MockChannel {
+    return {
+      label,
+      readyState: initialState,
+      bufferedAmount: 0,
+      bufferedAmountLowThreshold: 0,
+      sent: [],
+      send(text: string) { this.sent.push(text); },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+  }
+
+  class FakePC {
+    iceServers: RTCIceServer[];
+    connectionState: RTCPeerConnectionState = 'new';
+    iceConnectionState: RTCIceConnectionState = 'new';
+    signalingState: RTCSignalingState = 'stable';
+    iceGatheringState: RTCIceGatheringState = 'complete';
+    localDescription: { type: RTCSdpType; sdp: string; toJSON(): { type: RTCSdpType; sdp: string } } | null = null;
+    remoteDescription: { type: RTCSdpType; sdp: string } | null = null;
+    remoteDescriptions: RTCSessionDescriptionInit[] = [];
+    channels: MockChannel[] = [];
+    closed = false;
+    configUpdates: RTCIceServer[][] = [];
+    ondatachannel?: (ev: { channel: MockChannel }) => void;
+    onconnectionstatechange?: () => void;
+    oniceconnectionstatechange?: () => void;
+    setConfiguration?: (config: RTCConfiguration) => void;
+    constructor(config: RTCConfiguration = {}) {
+      this.iceServers = config.iceServers ? [...config.iceServers] : [];
+      if (!omitSetConfig) {
+        this.setConfiguration = (next: RTCConfiguration) => {
+          if (failSetConfig) throw new Error('setConfiguration unsupported');
+          this.iceServers = next.iceServers ? [...next.iceServers] : [];
+          this.configUpdates.push(this.iceServers);
+        };
+      }
+      createdPcs.push(this);
+    }
+    createDataChannel(label: string) {
+      const ch = mockChannel(label, 'connecting');
+      this.channels.push(ch);
+      return ch;
+    }
+    async createOffer() {
+      const ufrag = `off${++ufragSeq}`;
+      return { type: 'offer' as const, sdp: `v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=ice-ufrag:${ufrag}\r\na=mid:0\r\n` };
+    }
+    async createAnswer() {
+      const ufrag = `ans${++ufragSeq}`;
+      return { type: 'answer' as const, sdp: `v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=ice-ufrag:${ufrag}\r\na=mid:0\r\n` };
+    }
+    async setLocalDescription(desc: { type: RTCSdpType; sdp: string }) {
+      if (this.closed) throw new Error('closed');
+      this.localDescription = { ...desc, toJSON: () => ({ type: desc.type, sdp: desc.sdp }) };
+      this.signalingState = desc.type === 'offer' ? 'have-local-offer' : 'stable';
+    }
+    async setRemoteDescription(desc: RTCSessionDescriptionInit) {
+      if (this.closed) throw new Error('closed');
+      this.remoteDescriptions.push(desc);
+      this.remoteDescription = { type: desc.type, sdp: desc.sdp ?? '' };
+      this.signalingState = desc.type === 'offer' ? 'have-remote-offer' : 'stable';
+    }
+    addEventListener() {}
+    removeEventListener() {}
+    close() {
+      this.closed = true;
+      this.connectionState = 'closed';
+      this.iceConnectionState = 'closed';
+      this.signalingState = 'closed';
+    }
+  }
+
+  const peerLow = '0'.repeat(64); // sorts < local.id (remote offers, we answer)
+  const peerHigh = 'f'.repeat(64); // sorts > local.id (we offer, remote answers)
+
+  beforeEach(() => {
+    createdPcs = [];
+    failSetConfig = false;
+    omitSetConfig = false;
+    (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = FakePC;
+  });
+  afterEach(() => {
+    (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = OriginalPC;
+  });
+
+  async function wanRoom(options: { onSignal?: (payload: Record<string, unknown>) => Promise<void> | void; now?: () => number } = {}) {
+    const signalsSent: Record<string, unknown>[] = [];
+    const errors: string[] = [];
+    const api = {
+      command: async (action: string, _roomId: string, payload: Record<string, unknown>) => {
+        if (action === 'signal') {
+          await options.onSignal?.(payload);
+          signalsSent.push(payload);
+        }
+        return {};
+      },
+    };
+    const engine = new BrowserPeers(api as never, roomId, local.id, 'local-session', () => {}, msg => errors.push(msg),
+      () => {}, () => {}, () => {}, () => {}, () => {}, options.now ?? (() => Date.now())) as any;
+    engine.fenced(await claimFence(`owner:${local.id}:${roomId}`));
+    await engine.load();
+    return { engine, signalsSent, errors };
+  }
+
+  const makeStatus = (overrides: Record<string, unknown> = {}) => ({
+    roomId, title: 'Room', epoch: 'e1', hostOnline: true, deviceId: local.id, memberId: me, ownerId: me,
+    members: [{ id: me, name: 'Me' }, { id: them, name: 'Them' }],
+    devices: [
+      { id: local.id, publicKey: local.publicKey, label: 'me', memberId: me, admittedAt: 1, session: 'local-session' },
+      { id: peerHigh, publicKey: remote.publicKey, label: 'high', memberId: them, admittedAt: 1, session: 'sess-high' },
+    ],
+    signals: [],
+    iceServers: [{ urls: 'turn:turn.example:3478', username: '1000:room', credential: 'cred-1' }],
+    ...overrides,
+  });
+
+  test('OPS-9: coordinator epoch change keeps open healthy peers alive while tearing down connecting peers', async () => {
+    let clock = 1_000_000;
+    const { engine } = await wanRoom({ now: () => clock });
+    const devA = { id: peerHigh, publicKey: remote.publicKey, label: 'open', memberId: them, admittedAt: 1, session: 's-open' };
+    const devB = { id: `${'f'.repeat(63)}e`, publicKey: remote.publicKey, label: 'connecting', memberId: them, admittedAt: 1, session: 's-conn' };
+    await engine.update(makeStatus({ devices: [
+      { id: local.id, publicKey: local.publicKey, label: 'me', memberId: me, admittedAt: 1, session: 'local-session' },
+      devA, devB,
+    ] }));
+    expect(createdPcs).toHaveLength(2);
+    const peerOpen = engine.peers.get(devA.id);
+    const peerConn = engine.peers.get(devB.id);
+    const pcOpen = peerOpen.pc as FakePC;
+    const pcConn = peerConn.pc as FakePC;
+    // Mark devA healthy & open, leave devB half-open ('connecting').
+    pcOpen.connectionState = 'connected';
+    pcOpen.iceConnectionState = 'connected';
+    peerOpen.channel.readyState = 'open';
+    peerOpen.channel.onopen?.();
+    pcConn.connectionState = 'connecting';
+
+    // Coordinator restarts -> new epoch, and devA hasn't polled the new coordinator yet (session temporarily undefined!).
+    clock += 2_000;
+    await engine.update(makeStatus({
+      epoch: 'e2',
+      devices: [
+        { id: local.id, publicKey: local.publicKey, label: 'me', memberId: me, admittedAt: 1, session: 'local-session' },
+        { ...devA, session: undefined },
+        devB,
+      ],
+    }));
+    // Open peer survives untouched! Half-open connecting peer was torn down and immediately renegotiated.
+    expect(pcOpen.closed).toBe(false);
+    expect(engine.peers.get(devA.id)).toBe(peerOpen);
+    expect(pcConn.closed).toBe(true);
+    expect(engine.peers.get(devB.id)).not.toBe(peerConn);
+    expect(engine.peers.get(devB.id)).toBeDefined();
+
+    // Actually removing devA from the room still disconnects it immediately.
+    await engine.update(makeStatus({
+      epoch: 'e2',
+      devices: [{ id: local.id, publicKey: local.publicKey, label: 'me', memberId: me, admittedAt: 1, session: 'local-session' }, devB],
+    }));
+    expect(pcOpen.closed).toBe(true);
+    expect(engine.peers.has(devA.id)).toBe(false);
+  });
+
+  test('SYNC-5: long-lived peer gets unhealthySince grace on disconnected, zombie connected+closed channel drops immediately', async () => {
+    let clock = 1_000_000;
+    const { engine } = await wanRoom({ now: () => clock });
+    await engine.update(makeStatus());
+    const peer = engine.peers.get(peerHigh);
+    const pc = peer.pc as FakePC;
+    pc.connectionState = 'connected';
+    pc.iceConnectionState = 'connected';
+    peer.channel.readyState = 'open';
+    peer.channel.onopen?.();
+    await engine.update(makeStatus());
+
+    // Advance clock > 1 hour (long-lived healthy session), then briefly drop to 'disconnected'.
+    clock += 2 * 3_600_000;
+    pc.connectionState = 'disconnected';
+    pc.iceConnectionState = 'disconnected';
+    await engine.update(makeStatus());
+    expect(pc.closed).toBe(false);
+    expect(engine.peers.get(peerHigh)).toBe(peer);
+    expect(peer.unhealthySince).toBe(clock);
+
+    // Recovers within grace period: unhealthySince clears and PC stays alive!
+    clock += 5_000;
+    pc.connectionState = 'connected';
+    pc.iceConnectionState = 'connected';
+    await engine.update(makeStatus());
+    expect(pc.closed).toBe(false);
+    expect(peer.unhealthySince).toBeUndefined();
+
+    // Drops again and stays disconnected past UNHEALTHY_GRACE_MS -> torn down and recreated!
+    clock += 10_000;
+    pc.connectionState = 'disconnected';
+    pc.iceConnectionState = 'disconnected';
+    await engine.update(makeStatus());
+    expect(pc.closed).toBe(false);
+    clock += UNHEALTHY_GRACE_MS + 1;
+    await engine.update(makeStatus());
+    expect(pc.closed).toBe(true);
+    const peer2 = engine.peers.get(peerHigh);
+    expect(peer2).not.toBe(peer);
+
+    // Zombie PC: connectionState === 'connected' while DataChannel is 'closed' -> dropped immediately!
+    const pc2 = peer2.pc as FakePC;
+    pc2.connectionState = 'connected';
+    pc2.iceConnectionState = 'connected';
+    peer2.channel.readyState = 'closed';
+    await engine.update(makeStatus());
+    expect(pc2.closed).toBe(true);
+    expect(engine.peers.get(peerHigh)).not.toBe(peer2);
+
+    // Zombie PC #2: connectionState === 'connected' while DataChannel never opens ('connecting') -> dropped after grace!
+    const peer3 = engine.peers.get(peerHigh);
+    const pc3 = peer3.pc as FakePC;
+    pc3.connectionState = 'connected';
+    pc3.iceConnectionState = 'connected';
+    peer3.channel.readyState = 'connecting';
+    await engine.update(makeStatus());
+    expect(pc3.closed).toBe(false);
+    clock += UNHEALTHY_GRACE_MS + 1;
+    await engine.update(makeStatus());
+    expect(pc3.closed).toBe(true);
+    expect(engine.peers.get(peerHigh)).not.toBe(peer3);
+  });
+
+  test('SYNC-5: failed signal cleans up half-open peer immediately; duplicate offers and stale answers are rejected', async () => {
+    let clock = 1_000_000;
+    let shouldFailSignal = true;
+    const { engine, signalsSent } = await wanRoom({
+      now: () => clock,
+      onSignal: () => { if (shouldFailSignal) throw new Error('signal 409'); },
+    });
+
+    // 1. Failed signal cleans up peer immediately (doesn't stall 20 s).
+    await engine.update(makeStatus());
+    expect(engine.peers.has(peerHigh)).toBe(false);
+    expect(createdPcs[0].closed).toBe(true);
+
+    // Next poll retries immediately (only +1 s later).
+    clock += 1_000;
+    shouldFailSignal = false;
+    await engine.update(makeStatus());
+    expect(engine.peers.has(peerHigh)).toBe(true);
+    expect(signalsSent).toHaveLength(1);
+    const pc1 = engine.peers.get(peerHigh).pc as FakePC;
+
+    // 2. Valid answer with ufrag 'ans-valid-1' is accepted; mismatched mid or missing ufrag is rejected.
+    await engine.update(makeStatus({
+      signals: [{ seq: 1, from: peerHigh, session: 'sess-high', targetSession: 'local-session',
+        description: { type: 'answer', sdp: 'v=0\r\na=ice-ufrag:badmid\r\na=mid:99\r\n' } }],
+    }));
+    expect(pc1.remoteDescriptions).toHaveLength(0);
+
+    await engine.update(makeStatus({
+      signals: [{ seq: 2, from: peerHigh, session: 'sess-high', targetSession: 'local-session',
+        description: { type: 'answer', sdp: 'v=0\r\na=ice-ufrag:ans-valid-1\r\na=mid:0\r\n' } }],
+    }));
+    expect(pc1.remoteDescriptions).toHaveLength(1);
+
+    // Force pc1 to fail -> recreates pc2, and retires 'ans-valid-1'. A stale replayed answer carrying 'ans-valid-1' is ignored!
+    pc1.connectionState = 'failed';
+    await engine.update(makeStatus());
+    const pc2 = engine.peers.get(peerHigh).pc as FakePC;
+    expect(pc2).not.toBe(pc1);
+    await engine.update(makeStatus({
+      signals: [{ seq: 3, from: peerHigh, session: 'sess-high', targetSession: 'local-session',
+        description: { type: 'answer', sdp: 'v=0\r\na=ice-ufrag:ans-valid-1\r\na=mid:0\r\n' } }],
+    }));
+    expect(pc2.remoteDescriptions).toHaveLength(0);
+
+    // 3. Multiple offers from peerLow in one poll batch deduplicate to the newest seq (only 1 PC created, 1 answer sent).
+    const beforePcs = createdPcs.length, beforeSignals = signalsSent.length;
+    await engine.update(makeStatus({
+      devices: [
+        { id: local.id, publicKey: local.publicKey, label: 'me', memberId: me, admittedAt: 1, session: 'local-session' },
+        { id: peerLow, publicKey: remote.publicKey, label: 'low', memberId: them, admittedAt: 1, session: 'sess-low' },
+      ],
+      signals: [
+        { seq: 10, from: peerLow, session: 'sess-low', targetSession: 'local-session', description: { type: 'offer', sdp: 'v=0\r\na=ice-ufrag:old-off\r\na=mid:0\r\n' } },
+        { seq: 11, from: peerLow, session: 'sess-low', targetSession: 'local-session', description: { type: 'offer', sdp: 'v=0\r\na=ice-ufrag:new-off\r\na=mid:0\r\n' } },
+      ],
+    }));
+    expect(createdPcs.length - beforePcs).toBe(1);
+    expect(signalsSent.length - beforeSignals).toBe(1);
+    expect(createdPcs.at(-1)!.remoteDescription?.sdp).toContain('a=ice-ufrag:new-off');
+  });
+
+  test('OPS-11: refreshed TURN iceServers update existing PCs via setConfiguration and recreate disconnected PCs when unavailable', async () => {
+    let clock = 1_000_000;
+    const { engine } = await wanRoom({ now: () => clock });
+    const ice1 = [{ urls: 'turn:turn.example:3478', username: '1000:room', credential: 'cred-1' }];
+    const ice2 = [{ urls: 'turn:turn.example:3478', username: '4600:room', credential: 'cred-2' }];
+    await engine.update(makeStatus({ iceServers: ice1 }));
+    const peer = engine.peers.get(peerHigh);
+    const pc = peer.pc as FakePC;
+    pc.connectionState = 'connected';
+    pc.iceConnectionState = 'connected';
+    peer.channel.readyState = 'open';
+    peer.channel.onopen?.();
+    expect(pc.iceServers).toEqual(ice1);
+
+    // Refreshed TURN credentials arrive -> pushed via setConfiguration immediately!
+    await engine.update(makeStatus({ iceServers: ice2 }));
+    expect(pc.configUpdates).toEqual([ice2]);
+    expect(pc.iceServers).toEqual(ice2);
+
+    // When setConfiguration throws/is absent and a peer is disconnected, it recreates cleanly with the fresh credentials.
+    const ice3 = [{ urls: 'turn:turn.example:3478', username: '8200:room', credential: 'cred-3' }];
+    failSetConfig = true;
+    pc.connectionState = 'disconnected';
+    pc.iceConnectionState = 'disconnected';
+    await engine.update(makeStatus({ iceServers: ice3 }));
+    expect(pc.closed).toBe(true);
+    const replacement = engine.peers.get(peerHigh).pc as FakePC;
+    expect(replacement).not.toBe(pc);
+    expect(replacement.iceServers).toEqual(ice3);
+  });
+
+  test('SEC-11: dedicated files data channel isolates bulk transfers and falls back to primary channel for older peers', async () => {
+    const { engine } = await wanRoom();
+    await engine.update(makeStatus());
+    const peer = engine.peers.get(peerHigh);
+    const pc = peer.pc as FakePC;
+    // Offerer creates both primary and dedicated 'files' channels.
+    expect(pc.channels.map(c => c.label)).toEqual([PRIMARY_CHANNEL_LABEL, FILE_CHANNEL_LABEL]);
+    const [primary, filesCh] = pc.channels;
+    pc.connectionState = 'connected';
+    pc.iceConnectionState = 'connected';
+    primary.readyState = 'open';
+    primary.onopen?.();
+    filesCh.readyState = 'open';
+    filesCh.onopen?.();
+    // File capability announcement went out on 'files', and subsequent file-want goes over 'files' (not primary).
+    expect(filesCh.sent.map(s => JSON.parse(s).kind)).toContain('files');
+    primary.sent.length = 0;
+    filesCh.sent.length = 0;
+    filesCh.onmessage?.({ data: JSON.stringify({ kind: 'files', roomId, version: 1 }) });
+    const imgRef = { id: crypto.randomUUID(), name: 'pic.png', type: 'image/png', size: 128, sha256: 'a'.repeat(64) };
+    const pdfRef = { id: crypto.randomUUID(), name: 'doc.pdf', type: 'application/pdf', size: 512, sha256: 'b'.repeat(64) };
+    // Deliver a message with one image and one PDF: only the image is auto-fetched!
+    const msgBody = { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: peerHigh, memberId: them, text: 'attachments', at: Date.now(), attachments: [imgRef, pdfRef] };
+    primary.onmessage?.({ data: JSON.stringify({ body: msgBody, signature: await remote.sign(msgBody) }) });
+    while (engine.incoming.size) await Bun.sleep(1);
+    await engine.serial;
+    // Image file-want went over the dedicated 'files' channel, NOT primary, and PDF was NOT auto-fetched!
+    const wantedShas = () => filesCh.sent.map(s => JSON.parse(s)).filter(p => p.kind === 'file-want').map(p => p.sha256);
+    expect(wantedShas()).toEqual([imgRef.sha256]);
+    expect(primary.sent.map(s => JSON.parse(s)).some(p => p.kind === 'file-want')).toBe(false);
+    // Explicit on-demand requestFile() fetches the PDF over the dedicated 'files' channel.
+    engine.requestFile(pdfRef.sha256);
+    expect(wantedShas()).toEqual([imgRef.sha256, pdfRef.sha256]);
+
+    // Older single-channel peer (answerer receiving only primary channel): files seamlessly fall back to primary channel!
+    await engine.update(makeStatus({
+      devices: [
+        { id: local.id, publicKey: local.publicKey, label: 'me', memberId: me, admittedAt: 1, session: 'local-session' },
+        { id: peerLow, publicKey: remote.publicKey, label: 'low', memberId: them, admittedAt: 1, session: 'sess-low' },
+      ],
+      signals: [{ seq: 20, from: peerLow, session: 'sess-low', targetSession: 'local-session',
+        description: { type: 'offer', sdp: 'v=0\r\na=ice-ufrag:legacy1\r\na=mid:0\r\n' } }],
+    }));
+    const legacyPeer = engine.peers.get(peerLow);
+    const legacyPc = legacyPeer.pc as FakePC;
+    const legacyChan = mockChannel(PRIMARY_CHANNEL_LABEL, 'open');
+    legacyPc.ondatachannel?.({ channel: legacyChan });
+    expect(legacyPeer.fileChannel).toBeUndefined();
+    expect(legacyChan.sent.map(s => JSON.parse(s).kind)).toContain('files');
+  });
+});
+
+describe('client sync polish (receipt TOCTOU and pendingReactions stale eviction)', () => {
+  test('a channel closing mid-receipt sign or throwing on send does not raise a peer error banner', async () => {
+    const { engine, channel, settle, deliver, errors } = await room();
+    // Simulate a channel whose send() throws InvalidStateError after readyState was checked open before signing.
+    channel.send = () => { throw new DOMException('RTCDataChannel is not open', 'InvalidStateError'); };
+    const packet = await messageFrom('arrived right before disconnect');
+    deliver(packet);
+    await settle();
+    expect(engine.messages.some((m: any) => m.packet.body.id === packet.body.id)).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  test('stale pendingReactions expire past TTL and evict oldest entries when member pending cap is reached', async () => {
+    let clock = 1_000_000;
+    const engine = new BrowserPeers({} as never, roomId, local.id, 'session', () => {}, () => {},
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => clock) as any;
+    engine.fenced(await claimFence(`owner:${local.id}:${roomId}`));
+    await engine.load();
+    engine.status = status;
+    const channel = fakeChannel(), peer = { pc: { close() {} }, session: 's', started: clock, sent: new Map(), resync: new Resync() };
+    engine.peers.set(remote.id, peer); engine.connectChannel(peer, remote.id, channel);
+    const settle = async () => { while (engine.incoming.size) await Bun.sleep(1); await engine.serial; };
+    const deliver = (packet: unknown) => channel.onmessage!({ data: JSON.stringify(packet) });
+    const makeReaction = async (messageId: string, i: number) => {
+      const body = { kind: 'reaction' as const, roomId, id: crypto.randomUUID(), deviceId: remote.id, memberId: them, messageId, emoji: '👍' as const, revision: 1, at: clock + i };
+      return { body, signature: await remote.sign(body) };
+    };
+
+    // Park MAX_PENDING_PER_MEMBER + 5 reactions for never-arriving (evicted) messages: oldest 5 evict FIFO so newest stay!
+    const ops = await Promise.all(Array.from({ length: MAX_PENDING_PER_MEMBER + 5 }, (_, i) => makeReaction(crypto.randomUUID(), i)));
+    for (const chunk of reactionSyncChunks(roomId, ops)) deliver(chunk);
+    await settle();
+    expect(engine.pendingReactions).toHaveLength(MAX_PENDING_PER_MEMBER);
+    expect(engine.pendingReactions[0].body.id).toBe(ops[5].body.id);
+    expect(engine.pendingReactions.at(-1).body.id).toBe(ops.at(-1)!.body.id);
+
+    // Advance past PENDING_REACTION_TTL_MS: tick() evicts all stale pending reactions cleanly.
+    clock += PENDING_REACTION_TTL_MS + 1;
+    engine.tick();
+    expect(engine.pendingReactions).toHaveLength(0);
+    expect(engine.pendingReactionAt.size).toBe(0);
   });
 });

@@ -19,6 +19,7 @@ import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, type 
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { recentClaudeSessions, claudeConfigDir, claudeProjectDir } from '../agent-live';
+import { compareVersions, isVersion } from '../agent-install';
 import { locateProgram, resolveProgram, type Program } from '../agent-watch';
 import { detectHermes, runHermesCommand, type HermesRunner } from './hermes';
 
@@ -67,10 +68,12 @@ export const CODEX_INSPECT_LIMIT = 200;
 export const CODEX_INDEX_BYTES = 2 * 1024 * 1024;
 /**
  * Versions whose storage was measured. Claude Code: major 2 (projects/<folder>/<session>.jsonl, a `user` line with the
- * prompt and `cwd`). Codex CLI: 0.159.x (sessions/YYYY/MM/DD/rollout-*-<id>.jsonl with a session_meta first line, and
- * session_index.jsonl with thread names). Anything else fails closed.
+ * prompt and `cwd`). Codex CLI: >= 0.159.0 (sessions/YYYY/MM/DD/rollout-*-<id>.jsonl with a session_meta first line, and
+ * session_index.jsonl with thread names; the structural parser ignores unrecognized layouts).
  */
-export const CLAUDE_VERIFIED = /^2\.\d+\.\d+$/, CODEX_VERIFIED = /^0\.(159|163)\.\d+(?:-alpha\.\d+(?:\.\d+)?)?$/;
+export const CLAUDE_VERIFIED = /^2\.\d+\.\d+$/, CODEX_MIN_VERSION = '0.159.0';
+export const codexVersionSupported = (version: string | null): version is string =>
+  version !== null && isVersion(version) && compareVersions(version, CODEX_MIN_VERSION) >= 0;
 
 /** The output of a command, or why there is none. Never stderr, never an exception's text. */
 export type CommandResult = { ok: true; stdout: string } | { ok: false; reason: 'not-found' | 'failed' | 'timeout' | 'output-limit' };
@@ -290,7 +293,7 @@ async function scanVersioned(deps: ScanDeps, harness: 'claude' | 'codex'): Promi
   const probe = await versionOf(deps, harness, harness === 'claude' ? parseClaudeVersion : parseCodexVersion);
   if (!probe.found) return { ...base, detected: false, sessionsAvailable: false, reason: 'not-found' };
   if ('failed' in probe) return { ...base, detected: true, sessionsAvailable: false, reason: 'version-command-failed' };
-  const verified = probe.version !== null && (harness === 'claude' ? CLAUDE_VERIFIED : CODEX_VERIFIED).test(probe.version);
+  const verified = probe.version !== null && (harness === 'claude' ? CLAUDE_VERIFIED.test(probe.version) : codexVersionSupported(probe.version));
   return { ...base, detected: true, ...(probe.version ? { version: probe.version } : {}), sessionsAvailable: verified, ...(verified ? {} : { reason: 'unsupported-version' as const }) };
 }
 async function scanHermes(deps: ScanDeps) {

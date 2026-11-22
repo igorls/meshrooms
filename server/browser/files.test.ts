@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import {
-  CHUNK_BYTES, FileTransfers, attachmentRef, attachmentText, displayKind, retainedFiles, sha256Hex, shownText, validAttachments,
+  CHUNK_BYTES, FileTransfers, HIGH_WATER, LOW_WATER, MAX_INFLIGHT_BYTES, attachmentRef, attachmentText, autoFetchFiles, displayKind, retainedFiles, sha256Hex, shownText, validAttachments,
   type AttachmentRef, type FileChannel, type FileStore,
 } from '../../src/browser/files';
 
@@ -50,6 +50,25 @@ test('devices keep the files of the newest messages up to the room cap', () => {
   expect([...retainedFiles(lists, 1000, 2).keys()].map(Number)).toEqual([4, 2]);
   // A file sent again later counts once, at its newest use.
   expect([...retainedFiles([[ref(1, 60)], [ref(1, 60)]], 100).keys()].map(Number)).toEqual([1]);
+});
+
+test("one member's files take at most half the room's space once someone else has files there too", () => {
+  const ref = (n: number, size: number): AttachmentRef => ({ id: crypto.randomUUID(), name: `${n}.png`, type: 'image/png', size, sha256: String(n).padStart(64, '0') });
+  // Alex and Sam sent a file each; then Mallory sent five of 30 bytes. Room cap 100, so Mallory's half is 50.
+  const lists = [[ref(1, 20)], [ref(2, 20)], [ref(3, 30)], [ref(4, 30)], [ref(5, 30)], [ref(6, 30)], [ref(7, 30)]];
+  const owners = ['alex', 'sam', 'mallory', 'mallory', 'mallory', 'mallory', 'mallory'];
+  // Without owners the newest three fill the room and the others' files are gone.
+  expect([...retainedFiles(lists, 100).keys()].map(Number)).toEqual([7, 6, 5]);
+  // With them, Mallory keeps the newest one that fits her half, and the others' files stay.
+  expect([...retainedFiles(lists, 100, undefined, owners).keys()].map(Number)).toEqual([7, 2, 1]);
+  // The count is shared the same way: four files in the room, two for any one member.
+  expect([...retainedFiles(lists, 1000, 4, owners).keys()].map(Number)).toEqual([7, 6, 2, 1]);
+  // A room where one member alone has files keeps the whole cap for them.
+  const alone = lists.slice(2), aloneOwners = owners.slice(2);
+  expect([...retainedFiles(alone, 100, undefined, aloneOwners).keys()].map(Number)).toEqual([7, 6, 5]);
+  // Messages without files, and files without a named sender, change nothing.
+  expect([...retainedFiles([undefined, ...alone], 100, undefined, ['sam', ...aloneOwners]).keys()].map(Number)).toEqual([7, 6, 5]);
+  expect([...retainedFiles(lists, 100, undefined, [undefined, undefined, ...aloneOwners]).keys()].map(Number)).toEqual([7, 6, 5]);
 });
 
 type Device = { id: string; files: Map<string, Uint8Array>; transfers: FileTransfers; channels: Map<string, Pipe>; refs: Map<string, AttachmentRef>; puts: number };
@@ -174,8 +193,132 @@ test('senders wait for the channel buffer to drain', async () => {
   const send = channel.send.bind(channel); channel.send = data => { send(data); peak = Math.max(peak, channel.bufferedAmount); };
   reader.transfers.want(ref);
   expect(await until(() => reader.files.has(ref.sha256), 10_000)).toBe(true);
-  expect(peak).toBeLessThan(1_000_000 + 20_000);
-  expect(peak).toBeGreaterThan(900_000);
+  expect(HIGH_WATER).toBe(262_144);
+  expect(peak).toBeLessThan(HIGH_WATER + 20_000);
+  expect(peak).toBeGreaterThan(HIGH_WATER - 32_000);
+});
+
+test('senders wake immediately on bufferedamountlow instead of spin-polling (SEC-11)', async () => {
+  const bytes = png(CHUNK_BYTES * 30); const ref = await attachmentRef(bytes, 'fast.png');
+  const sent: any[] = [];
+  const listeners = new Map<string, Set<() => void>>();
+  let wakes = 0;
+  const channel: FileChannel & { bufferedAmount: number } = {
+    readyState: 'open',
+    bufferedAmount: 0,
+    bufferedAmountLowThreshold: 0,
+    addEventListener(type, fn) { (listeners.get(type) ?? (listeners.set(type, new Set()), listeners.get(type)!)).add(fn); },
+    removeEventListener(type, fn) { listeners.get(type)?.delete(fn); },
+    send(data) {
+      sent.push(JSON.parse(data));
+      channel.bufferedAmount += data.length;
+      if (channel.bufferedAmount > HIGH_WATER) {
+        queueMicrotask(() => {
+          channel.bufferedAmount = 0;
+          wakes++;
+          for (const fn of [...(listeners.get('bufferedamountlow') ?? [])]) { listeners.get('bufferedamountlow')?.delete(fn); fn(); }
+        });
+      }
+    },
+  };
+  const transfers = new FileTransfers({
+    roomId,
+    store: { has: () => true, get: async () => bytes, put: async () => {} },
+    referenced: () => ref,
+    channel: () => channel,
+    peers: () => ['peer'],
+  });
+  const start = Date.now();
+  transfers.handle('peer', { kind: 'file-want', roomId, sha256: ref.sha256, offset: 0 });
+  expect(await until(() => sent.some(p => p.kind === 'file-done'), 2000)).toBe(true);
+  expect(channel.bufferedAmountLowThreshold).toBe(LOW_WATER);
+  expect(wakes).toBeGreaterThan(0);
+  // Woke via microtask event rather than waiting 50 ms fallback timers per drain.
+  expect(Date.now() - start).toBeLessThan(150);
+});
+
+test('partial downloads allocate lazily, respect MAX_INFLIGHT_BYTES, and free buffers on stall/skip/disconnect (SEC-11)', async () => {
+  expect(MAX_INFLIGHT_BYTES).toBe(32 * 1024 * 1024);
+  let now = 1_000_000;
+  const bigRef = (n: number, size: number): AttachmentRef => ({
+    id: crypto.randomUUID(), name: `f${n}.png`, type: 'image/png', size, sha256: String(n).padStart(64, '0'),
+  });
+  const wanted: { peer: string; sha256: string; offset: number }[] = [];
+  const channel = (peer: string): FileChannel => ({
+    readyState: 'open', bufferedAmount: 0,
+    send(data) { const p = JSON.parse(data); if (p.kind === 'file-want') wanted.push({ peer, sha256: p.sha256, offset: p.offset }); },
+  });
+  // Cap at 150 KB: allows one 100 KB download at a time, blocking a second 100 KB download until the first frees RAM.
+  const transfers = new FileTransfers({
+    roomId,
+    store: { has: () => false, get: async () => undefined, put: async () => {} },
+    referenced: () => undefined,
+    channel,
+    peers: () => ['a', 'b'],
+    now: () => now,
+    maxInflightBytes: 150_000,
+  });
+  transfers.handle('a', { kind: 'files', roomId, version: 1 });
+  transfers.handle('b', { kind: 'files', roomId, version: 1 });
+
+  // 100 KB file: receiving one 1 KB chunk holds ONLY 1 KB in memory (no eager 100 KB / 10 MB allocation!).
+  const f1 = bigRef(1, 100_000), f2 = bigRef(2, 100_000);
+  transfers.want(f1);
+  transfers.want(f2);
+  // Only f1 started because f1 + f2 (200 KB) exceeds maxInflightBytes (150 KB).
+  expect(wanted.map(w => w.sha256)).toEqual([f1.sha256]);
+  const oneKb = btoa('x'.repeat(1024));
+  transfers.handle('a', { kind: 'file-chunk', roomId, sha256: f1.sha256, offset: 0, data: oneKb });
+  expect(transfers.inflightBytes).toBe(1024);
+
+  // Stalling f1 frees its partial buffer immediately!
+  now += 16_000;
+  transfers.tick();
+  expect(transfers.inflightBytes).toBe(0);
+  // Now f1 retried on peer b at offset 0 (partial buffer was released).
+  const retry = wanted.find(w => w.peer === 'b' && w.sha256 === f1.sha256);
+  expect(retry?.offset).toBe(0);
+
+  // Bad chunk / skip frees buffer immediately too.
+  transfers.handle('b', { kind: 'file-chunk', roomId, sha256: f1.sha256, offset: 0, data: oneKb });
+  expect(transfers.inflightBytes).toBe(1024);
+  transfers.handle('b', { kind: 'file-chunk', roomId, sha256: f1.sha256, offset: 9999, data: oneKb });
+  expect(transfers.inflightBytes).toBe(0);
+
+  // Disconnect keeps lazy chunks briefly for resume, then releases them after STALL_MS idle.
+  now += 21_000;
+  transfers.tick();
+  const activePeer = wanted.at(-1)!.peer;
+  const activeSha = wanted.at(-1)!.sha256;
+  transfers.handle(activePeer, { kind: 'file-chunk', roomId, sha256: activeSha, offset: 0, data: oneKb });
+  expect(transfers.inflightBytes).toBe(1024);
+  transfers.closed(activePeer);
+  transfers.closed(activePeer === 'a' ? 'b' : 'a');
+  // Still 1 KB briefly for cross-peer resume, then released on tick past STALL_MS.
+  now += 16_000;
+  transfers.tick();
+  expect(transfers.inflightBytes).toBe(0);
+});
+
+test('autoFetchFiles fetches only raster images within per-sender and retained caps (SEC-11)', () => {
+  const ref = (n: number, type: string, size: number): AttachmentRef => ({
+    id: crypto.randomUUID(), name: `f${n}`, type, size, sha256: String(n).padStart(64, '0'),
+  });
+  const lists = [
+    [ref(1, 'image/png', 10)],
+    [ref(2, 'application/pdf', 5)],
+    [ref(3, 'text/plain', 5)],
+    [ref(4, 'application/octet-stream', 5)],
+    [ref(5, 'image/jpeg', 15)],
+    [ref(6, 'image/webp', 15)],
+    [ref(7, 'image/png', 10)],
+  ];
+  const owners = ['alice', 'alice', 'bob', 'bob', 'alice', 'alice', 'bob'];
+  const retained = retainedFiles(lists, 1000, 100, owners);
+  // With per-sender cap 25: alice keeps newest image 6 (15) + image 1 (10) = 25 (image 5 of 15 skipped as 15+15>25);
+  // bob keeps image 7 (10); PDF/text/binary (2,3,4) are never auto-fetched.
+  const auto = autoFetchFiles(lists, owners, retained, 25);
+  expect([...auto.keys()].map(Number)).toEqual([7, 6, 1]);
 });
 
 test("requests beyond the upload limits never read files", async () => {

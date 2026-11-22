@@ -7,8 +7,9 @@ import {
   watcherRunnerCheck, withRunnerLock, type FoundRunner, type RepairDeps,
 } from '../agent-cli';
 import {
-  BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, runBridge, runnerStopped, runnerStuck, runnerTrouble, serviceSilence, settleWithin, stuckFor, within,
+  BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, UPGRADE_BACKOFF_MS, runBridge, runnerStopped, runnerStuck, runnerTrouble, serviceSilence, settleWithin, stuckFor, within,
 } from '../browser-agent';
+import { FILE_CHANNEL_LABEL, PRIMARY_CHANNEL_LABEL, UNHEALTHY_GRACE_MS } from '../../src/browser/pacer';
 import { fakeRunner } from './fake-runner';
 
 const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), wren = crypto.randomUUID();
@@ -402,6 +403,46 @@ test('recording a runner start stops asking once its budget has passed', () => {
   expect(slept).toBe(250);
 });
 
+test('H-6: runnerStarted bails immediately when process inspection is unavailable in a sandbox or container', () => {
+  let looks = 0, slept = 0;
+  const started = runnerStarted(70, () => { looks++; return { unavailable: true }; }, ms => { slept += ms; }, 15_000);
+  expect(started).toBeUndefined();
+  expect(looks).toBe(1);
+  expect(slept).toBe(0);
+});
+
+test('H-8: locks only fall back from hardlink on no-hardlink errnos, retry brief empty locks, and reclaim expired short-held locks', async () => {
+  const { takeLock, tryLock } = await import('../locks');
+  const { utimesSync } = await import('node:fs');
+  const dir = tempDir();
+  // takeLock rethrows unexpected errors like ENOSPC instead of falling back to wx.
+  const enospcPath = join(dir, 'enospc.lock');
+  expect(() => takeLock(enospcPath, () => { throw Object.assign(new Error('no space'), { code: 'ENOSPC' }); })).toThrow('no space');
+  expect(existsSync(enospcPath)).toBe(false);
+  // takeLock DOES fall back to wx on ENOTSUP/EXDEV/EPERM/ENOSYS/EOPNOTSUPP.
+  const fallbackPath = join(dir, 'notsup.lock');
+  takeLock(fallbackPath, () => { throw Object.assign(new Error('not supported'), { code: 'ENOTSUP' }); });
+  expect(existsSync(fallbackPath)).toBe(true);
+
+  // An expired short-held runner.lock (even with junk/crashed content) ages out past maxAgeMs instead of deadlocking forever.
+  const runnerLock = join(dir, RUNNER_LOCK);
+  writeFileSync(runnerLock, '');
+  const old = new Date(Date.now() - 180_000);
+  utimesSync(runnerLock, old, old);
+  expect(await withRunnerLock(dir, async () => 'recovered', 300)).toBe('recovered');
+  expect(existsSync(runnerLock)).toBe(false);
+
+  // Stale reclaim marker with maxAgeMs is cleared instead of throwing permanently.
+  const aged = join(dir, 'aged.lock');
+  writeFileSync(aged, String(process.pid));
+  writeFileSync(`${aged}.reclaim`, '2147483000');
+  utimesSync(aged, old, old);
+  utimesSync(`${aged}.reclaim`, old, old);
+  expect(tryLock(aged, 'aged', undefined, { maxAgeMs: 30_000 })).toBe(false);
+  expect(existsSync(`${aged}.reclaim`)).toBe(false);
+  expect(tryLock(aged, 'aged', undefined, { maxAgeMs: 30_000 })).toBe(true);
+});
+
 test('a runner is stopped only while it still is this room\'s runner, and nothing new starts until it is gone', async () => {
   const room = '0190a000-0000-7000-8000-00000000000a', command = `bun /opt/meshrooms/bin/meshrooms.js run --room ${room}`, started = '2026-01-01T10:00:00.0000000Z';
   const record = { pid: 70, started };
@@ -513,3 +554,220 @@ test('a runner alone in its room counts as synced, so a watcher can start; with 
   } finally { r.state.closed = true; }
   expect(String(await bridge)).toContain('closed by its host');
 }, 40_000);
+
+test('OPS-11: runBridge applies exponential backoff on HTTP 429 honoring Retry-After and resets on success', async () => {
+  const pauses: number[] = [];
+  let seq = 0;
+  const r = room({
+    status: () => {
+      seq++;
+      if (seq === 1) return Promise.reject(Object.assign(new Error('Too many requests.'), { status: 429 }));
+      if (seq === 2) return Promise.reject(Object.assign(new Error('Too many requests.'), { status: 429 }));
+      if (seq === 3) return Promise.reject(Object.assign(new Error('Too many requests.'), { status: 429, retryAfterMs: 12_000 }));
+      if (seq === 4) return Promise.reject(Object.assign(new Error('Too many requests.'), { status: 429 }));
+      if (seq === 5) return Promise.reject(Object.assign(new Error('Too many requests.'), { status: 429 }));
+      return undefined; // 6+: succeeds and resets backoff to 1000 ms
+    },
+  });
+  const bridge = runBridge(r.agent, () => {}, {
+    pause: async ms => { pauses.push(ms); await Bun.sleep(10); },
+  }).catch(error => error);
+  try {
+    await r.until(() => pauses.length >= 6);
+    expect(pauses.slice(0, 6)).toEqual([2_000, 4_000, 12_000, 24_000, 30_000, 1_000]);
+  } finally { r.state.closed = true; }
+  expect(String(await bridge)).toContain('closed by its host');
+}, 20_000);
+
+test('OPS-9, SYNC-5, OPS-11, SEC-11: runBridge keeps open peers across epoch changes, opens files channel, refreshes ICE, and recovers zombies/failed signals', async () => {
+  const peerOpenId = 'f'.repeat(64);
+  const peerConnId = 'e'.repeat(64);
+  let clock = 1_000_000;
+  let epoch = 'e1';
+  let iceServers: RTCIceServer[] = [{ urls: 'turn:turn.example:3478', username: '1000:room', credential: 'cred-1' }];
+  let devices: { id: string; memberId: string; publicKey: string; label: string; admittedAt: number; session?: string }[] = [
+    { id: peerOpenId, memberId: alex, publicKey: 'A'.repeat(88), label: 'open', admittedAt: 1, session: 's-open' },
+    { id: peerConnId, memberId: alex, publicKey: 'B'.repeat(88), label: 'conn', admittedAt: 1, session: 's-conn' },
+  ];
+  let failSignalsFor: string | undefined;
+  type Sub<T> = { handlers: ((v: T) => void)[]; subscribe(fn: (v: T) => void): void; fire(v: T): void };
+  const sub = <T,>(): Sub<T> => ({ handlers: [], subscribe(fn) { this.handlers.push(fn); }, fire(v) { for (const fn of this.handlers) fn(v); } });
+  type MockBridgeChannel = {
+    label: string; readyState: string; bufferedAmount: number; bufferedAmountLowThreshold: number;
+    sent: string[]; send(data: string): void;
+    stateChanged: Sub<string>; onMessage: Sub<string>; bufferedAmountLow: Sub<void>;
+  };
+  type MockBridgePC = {
+    iceServers: { urls: string; username?: string; credential?: string }[];
+    configUpdates: { urls: string; username?: string; credential?: string }[][];
+    connectionState: string; iceConnectionState: string; signalingState: string;
+    localDescription: { type: string; sdp: string } | null;
+    remoteDescription: { type: string; sdp: string } | null;
+    channels: MockBridgeChannel[]; closed: boolean;
+    onDataChannel: Sub<MockBridgeChannel>; connectionStateChange: Sub<string>; iceConnectionStateChange: Sub<string>;
+    createDataChannel(label: string): MockBridgeChannel;
+    createOffer(): Promise<{ type: 'offer'; sdp: string }>;
+    createAnswer(): Promise<{ type: 'answer'; sdp: string }>;
+    setLocalDescription(d: { type: string; sdp: string }): Promise<void>;
+    setRemoteDescription(d: { type: string; sdp: string }): Promise<void>;
+    setConfiguration(cfg: { iceServers?: { urls: string; username?: string; credential?: string }[] }): void;
+    close(): Promise<void>;
+  };
+  const pcs: MockBridgePC[] = [];
+  let ufrag = 0;
+  const createPeerConnection = (cfg: { iceServers: { urls: string; username?: string; credential?: string }[] }) => {
+    const pc: MockBridgePC = {
+      iceServers: [...cfg.iceServers],
+      configUpdates: [],
+      connectionState: 'new', iceConnectionState: 'new', signalingState: 'stable',
+      localDescription: null, remoteDescription: null, channels: [], closed: false,
+      onDataChannel: sub(), connectionStateChange: sub(), iceConnectionStateChange: sub(),
+      createDataChannel(label) {
+        const ch: MockBridgeChannel = {
+          label, readyState: 'connecting', bufferedAmount: 0, bufferedAmountLowThreshold: 0, sent: [],
+          send(data) { this.sent.push(data); },
+          stateChanged: sub(), onMessage: sub(), bufferedAmountLow: sub(),
+        };
+        this.channels.push(ch);
+        return ch;
+      },
+      async createOffer() { return { type: 'offer', sdp: `v=0\r\na=ice-ufrag:bo${++ufrag}\r\na=mid:0\r\n` }; },
+      async createAnswer() { return { type: 'answer', sdp: `v=0\r\na=ice-ufrag:ba${++ufrag}\r\na=mid:0\r\n` }; },
+      async setLocalDescription(d) { this.localDescription = d; this.signalingState = d.type === 'offer' ? 'have-local-offer' : 'stable'; },
+      async setRemoteDescription(d) { this.remoteDescription = d; this.signalingState = d.type === 'offer' ? 'have-remote-offer' : 'stable'; },
+      setConfiguration(next) { if (next.iceServers) { this.iceServers = [...next.iceServers]; this.configUpdates.push(this.iceServers); } },
+      async close() { this.closed = true; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; this.signalingState = 'closed'; },
+    };
+    pcs.push(pc);
+    return pc as unknown as any;
+  };
+
+  let signalCount = 0;
+  const r = room({
+    status: () => Promise.resolve({
+      roomId, memberId: wren, ownerId: alex, epoch, members, devices, iceServers, signals: [],
+      settings: { floor: 'open', agentAssignmentsWake: false, guestAgentApproval: true },
+    }),
+    answer: async action => {
+      if (action === 'signal') {
+        signalCount++;
+        if (failSignalsFor) throw new Error('signal failed');
+      }
+      return {};
+    },
+  });
+  const bridge = runBridge(r.agent, () => {}, {
+    pause: () => Bun.sleep(15),
+    now: () => clock,
+    gatherMs: 0,
+    createPeerConnection,
+  }).catch(error => error);
+  try {
+    // Wait until both peers are created with both primary + dedicated 'files' channels.
+    await r.until(() => pcs.length >= 2);
+    const [pcOpen, pcConn] = pcs;
+    expect(pcOpen.channels.map(c => c.label)).toEqual([PRIMARY_CHANNEL_LABEL, FILE_CHANNEL_LABEL]);
+    // Open pcOpen's primary and files channels; leave pcConn still connecting.
+    pcOpen.connectionState = 'connected';
+    pcOpen.iceConnectionState = 'connected';
+    pcOpen.channels[0].readyState = 'open';
+    pcOpen.channels[0].stateChanged.fire('open');
+    pcOpen.channels[1].readyState = 'open';
+    pcOpen.channels[1].stateChanged.fire('open');
+    // File announcement went over the dedicated 'files' channel!
+    expect(pcOpen.channels[1].sent.map(s => JSON.parse(s).kind)).toContain('files');
+
+    // OPS-9: coordinator restarts (epoch e1 -> e2) and peerOpen's session is momentarily absent;
+    // pcOpen MUST stay open while half-open pcConn IS retired and renegotiated!
+    const pollsBeforeEpoch = r.state.polls;
+    epoch = 'e2';
+    devices = [
+      { id: peerOpenId, memberId: alex, publicKey: 'A'.repeat(88), label: 'open', admittedAt: 1, session: undefined },
+      { id: peerConnId, memberId: alex, publicKey: 'B'.repeat(88), label: 'conn', admittedAt: 1, session: 's-conn' },
+    ];
+    await r.until(() => r.state.polls >= pollsBeforeEpoch + 2 && pcConn.closed);
+    expect(pcOpen.closed).toBe(false);
+    expect(pcConn.closed).toBe(true);
+    expect(pcs.length).toBeGreaterThanOrEqual(3);
+
+    // OPS-11: refreshed TURN iceServers push into live pcOpen via setConfiguration.
+    devices = [{ id: peerOpenId, memberId: alex, publicKey: 'A'.repeat(88), label: 'open', admittedAt: 1, session: 's-open' }];
+    iceServers = [{ urls: 'turn:turn.example:3478', username: '4600:room', credential: 'cred-2' }];
+    await r.until(() => pcOpen.configUpdates.length >= 1);
+    expect(pcOpen.configUpdates.at(-1)![0].credential).toBe('cred-2');
+
+    // SYNC-5: long-lived (>1h) peer drops to disconnected -> gets UNHEALTHY_GRACE_MS grace, then retires past grace!
+    clock += 2 * 3_600_000;
+    pcOpen.connectionState = 'disconnected';
+    pcOpen.iceConnectionState = 'disconnected';
+    const pollsAtDrop = r.state.polls;
+    await r.until(() => r.state.polls >= pollsAtDrop + 2);
+    expect(pcOpen.closed).toBe(false); // Still inside 12 s grace!
+    clock += UNHEALTHY_GRACE_MS + 1;
+    await r.until(() => pcOpen.closed);
+    const pcReplacement = pcs.at(-1)!;
+    expect(pcReplacement).not.toBe(pcOpen);
+    expect(pcReplacement.iceServers[0].credential).toBe('cred-2');
+
+    // Zombie connected PC with closed DataChannel retires immediately!
+    pcReplacement.connectionState = 'connected';
+    pcReplacement.iceConnectionState = 'connected';
+    pcReplacement.channels[0].readyState = 'closed';
+    await r.until(() => pcReplacement.closed);
+
+    // Failed signal retires half-open peer immediately instead of stalling 20 s!
+    const pcsBeforeFail = pcs.length;
+    failSignalsFor = peerOpenId;
+    const prevLatest = pcs.at(-1)!;
+    prevLatest.connectionState = 'failed';
+    await r.until(() => pcs.length >= pcsBeforeFail + 2 && pcs[pcsBeforeFail].closed);
+    expect(signalCount).toBeGreaterThan(2);
+  } finally { failSignalsFor = undefined; r.state.closed = true; }
+  expect(String(await bridge)).toContain('closed by its host');
+}, 30_000);
+
+test('OPS-6: BrowserAgent.command sends X-Meshrooms-Protocol: 1 and runBridge handles HTTP 426 cleanly', async () => {
+  const originalFetch = globalThis.fetch;
+  const seenHeaders: Record<string, string>[] = [];
+  const home = tempDir();
+  const realAgent = new BrowserAgent(home, 'https://meshrooms.example', roomId);
+  globalThis.fetch = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    seenHeaders.push((init?.headers ?? {}) as Record<string, string>);
+    return Response.json({ error: 'Bridge version unsupported.', code: 'upgrade-required' }, { status: 426 });
+  }, { preconnect: originalFetch.preconnect });
+  try {
+    await expect(realAgent.command('status', { session: 's' })).rejects.toMatchObject({
+      status: 426,
+      code: 'upgrade-required',
+      message: 'Bridge version unsupported.',
+    });
+    expect(seenHeaders[0]['X-Meshrooms-Protocol']).toBe('1');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // runBridge logs a clear upgrade hint, records upgradeRequired in runner-alive.json, backs off 60s, and clears on recovery.
+  const pauses: number[] = [];
+  const logs: string[] = [];
+  let seq = 0;
+  const r = room({
+    status: () => {
+      seq++;
+      if (seq <= 2) return Promise.reject(Object.assign(new Error('Coordinator requires a newer protocol.'), { status: 426, code: 'upgrade-required' }));
+      return undefined; // 3+: recovered
+    },
+  });
+  const bridge = runBridge(r.agent, line => logs.push(line), {
+    pause: async ms => { pauses.push(ms); await Bun.sleep(10); },
+  }).catch(error => error);
+  try {
+    await r.until(() => pauses.length >= 1 && r.proof().upgradeRequired === true);
+    expect(pauses[0]).toBe(UPGRADE_BACKOFF_MS);
+    expect(r.proof()).toMatchObject({ upgradeRequired: true, failureStatus: 426, failure: 'Coordinator requires a newer protocol.' });
+    expect(serviceSilence(r.proof())).toMatchObject({ status: 426, upgradeRequired: true, failure: 'Coordinator requires a newer protocol.' });
+    expect(logs.some(line => line.includes('426') && line.includes('bunx @wormdb/meshrooms@') && line.includes('Coordinator requires a newer protocol.'))).toBe(true);
+    await r.until(() => pauses.length >= 3 && r.proof().upgradeRequired === undefined && typeof r.proof().polledAt === 'number');
+    expect(pauses.slice(0, 3)).toEqual([UPGRADE_BACKOFF_MS, UPGRADE_BACKOFF_MS, 1_000]);
+  } finally { r.state.closed = true; }
+  expect(String(await bridge)).toContain('closed by its host');
+}, 20_000);

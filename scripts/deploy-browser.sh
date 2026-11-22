@@ -16,6 +16,7 @@
 #   MESHROOMS_DEPLOY_REMOTE      git remote holding main (default origin)
 #   MESHROOMS_ALLOW_NO_ROLLBACK  set to 1 only for a first deploy with no previous release
 #   MESHROOMS_KEEP_RELEASES      releases kept on the host after a successful deploy (default 10)
+#   MESHROOMS_SKIP_NPM_CHECK     set to 1 to skip verifying @wormdb/meshrooms@<CURRENT_AGENT_VERSION> on npm
 #
 # The working tree must have no modified tracked files (untracked files are ignored: the release
 # is built from a clean export of <sha>, never from the working tree). The release contains the
@@ -36,7 +37,7 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15)
 
 log() { printf '[deploy %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 mode=deploy
 out=
@@ -121,12 +122,24 @@ Steps:
             and a 403 for a foreign Host; stop it
       (prepare also takes the host's deploy lease for $full and requires nginx -t to pass)
    6. host, detached: verified admission backup, record rollback targets, warn on nginx/systemd
-            drift, swap both symlinks atomically, restart meshrooms-browser, require local health
+            drift, swap both symlinks atomically, restart meshrooms-browser (and meshrooms-admin if active), require local health
    7. here: require $ORIGIN/api/lobby/health revision == $full, /rooms, / and the agent hash
    8. any failure after the swap restores the previous symlinks, restarts and exits non-zero
    9. host: keep the newest ${MESHROOMS_KEEP_RELEASES:-10} releases (never the live or rollback target), release the lease
 PLAN
   exit 0
+fi
+
+if [[ $mode == deploy ]]; then
+  skip_npm_check=${MESHROOMS_SKIP_NPM_CHECK:-0}
+  [[ $skip_npm_check == [01] ]] || die "MESHROOMS_SKIP_NPM_CHECK must be 0 or 1"
+  if [[ $skip_npm_check != 1 && -f $src/server/browser/agent-version.ts ]]; then
+    ver=$(sed -nE "s/^export const CURRENT_AGENT_VERSION = ['\"]([^'\"]+)['\"];?/\1/p" "$src/server/browser/agent-version.ts" | head -n 1)
+    [[ $ver =~ ^[0-9A-Za-z._+-]+$ ]] || die "could not read CURRENT_AGENT_VERSION from server/browser/agent-version.ts"
+    log "verifying @wormdb/meshrooms@$ver is published on npm"
+    curl -fsS -m 15 "https://registry.npmjs.org/@wormdb/meshrooms/$ver" >/dev/null \
+      || die "@wormdb/meshrooms@$ver is not published on npm yet (publish it first, or set MESHROOMS_SKIP_NPM_CHECK=1)"
+  fi
 fi
 
 local_bun=$(bun --version)

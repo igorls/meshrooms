@@ -248,7 +248,7 @@ const PAGE_ROUTES = /^\/(?:|rooms|agent-apps|r\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]
 /** Built assets: Vite's hashed files, by name only. Nothing else in the folder is ever served. */
 const ASSET = /^\/assets\/[\w.-]{1,200}$/;
 /** Room service actions the page may ask the person device to sign. Never create, status or signal (the runner's). */
-export const PAGE_COMMANDS = ['request', 'cancel', 'decide', 'link', 'remove', 'agent-invite', 'settings', 'profile', 'repositories', 'close'] as const;
+export const PAGE_COMMANDS = ['request', 'cancel', 'decide', 'link', 'remove', 'agent-invite', 'settings', 'profile', 'repositories', 'transfer-host', 'close'] as const;
 /** Avatars are 16 KB at most in the room service; a proxied one is kept in memory, at most this many. */
 const AVATAR_BYTES = 16 * 1024, AVATAR_CACHE = 256, AVATAR_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 

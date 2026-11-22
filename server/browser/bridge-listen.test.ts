@@ -311,3 +311,33 @@ test('a reply to another agent is for that agent: listen and the watch peek both
     expect(await listen(r.agent)).toMatchObject({ state: 'addressed', floor, addressed: [mine] });
   }
 });
+
+test('AGT-5: concurrent listen never rewinds listen-cursor.json on runner-stopped, closed, timeout, or monotonic merge', async () => {
+  const r = room();
+  const m1 = r.say('one'), m2 = r.say('@Wren two');
+  r.assign('Task 1'); r.assign('Task 2');
+  r.decide(ask('Q1')); r.decide(ask('Q2'));
+  expect(await listen(r.agent)).toMatchObject({ state: 'history', cursor: m2 });
+  expect(r.cursor()).toEqual({ after: m2, boardAfter: 2, decisionsAfter: 2 });
+
+  // Monotonic saveListenCursor never moves after, boardAfter, or decisionsAfter backwards.
+  expect(r.agent.saveListenCursor({ after: m1, boardAfter: 1, decisionsAfter: 1 }, undefined, { monotonic: true })).toBe(true);
+  expect(r.cursor()).toEqual({ after: m2, boardAfter: 2, decisionsAfter: 2 });
+  expect(r.agent.saveListenCursor({ boardAfter: 0, decisionsAfter: 0 }, undefined, { monotonic: true })).toBe(true);
+  expect(r.cursor()).toEqual({ after: m2, boardAfter: 2, decisionsAfter: 2 });
+
+  // Timeout when cursor is unchanged must not overwrite an advance made by a concurrent listener while waiting.
+  const waiting = listenRemembering(r.agent, 1);
+  await Bun.sleep(150);
+  const m3 = r.say('three (observed by concurrent listener)');
+  r.agent.saveListenCursor({ after: m3, boardAfter: 2, decisionsAfter: 2 });
+  expect(await waiting).toMatchObject({ state: 'timeout', cursor: m2 });
+  expect(r.cursor()).toEqual({ after: m3, boardAfter: 2, decisionsAfter: 2 });
+
+  // Closed room must not overwrite listen-cursor.json either.
+  writeFileSync(join(r.agent.dir, 'room-closed.json'), JSON.stringify({ at: Date.now(), reason: 'Closed.' }));
+  const m4 = r.say('four');
+  r.agent.saveListenCursor({ after: m4, boardAfter: 2, decisionsAfter: 2 });
+  expect(await listenRemembering(r.agent, 1, { after: m1, boardAfter: 0, decisionsAfter: 0 })).toMatchObject({ state: 'closed' });
+  expect(r.cursor()).toEqual({ after: m4, boardAfter: 2, decisionsAfter: 2 });
+});

@@ -45,7 +45,7 @@ export function AgentApps({ api }: { api: LocalAgents }) {
     <a className="skip-link" href="#agent-apps-main">Skip to agent apps</a>
     <header className="agent-apps-header"><a className="browser-brand" href="/rooms" aria-label="Meshrooms rooms"><Wordmark demo={false} /></a>
       <nav aria-label="Meshrooms"><a href="/rooms">Your rooms</a><a href="/agent-apps" aria-current="page">Agent apps</a></nav></header>
-    <main id="agent-apps-main" className="agent-apps-main">
+    <main id="agent-apps-main" className="agent-apps-main" tabIndex={-1}>
       <div className="agent-apps-heading"><div><p className="agent-apps-eyebrow">ON THIS COMPUTER</p><h1>Agent apps</h1>
         <p>Connect the agents you already work with.</p></div>
         <button className="secondary" disabled={!!busy} onClick={() => { setBusy('scan'); void refresh().finally(() => setBusy(undefined)); }}>{busy === 'scan' ? 'Checking…' : 'Check apps'}</button></div>

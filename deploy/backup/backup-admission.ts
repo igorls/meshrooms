@@ -18,7 +18,13 @@ import { basename, dirname, join, resolve } from 'node:path';
 
 const PREFIX = 'admission-';
 const NAME = /^admission-(\d{8}T\d{6}Z)\.sqlite$/;
-const TABLES = ['rooms', 'receipts', 'avatars'];
+export const TABLES = ['rooms', 'receipts', 'avatars', 'room_activity', 'closed_rooms', 'service_state', 'creation_invites', 'beta_admissions'] as const;
+/** Tables introduced by ordered `PRAGMA user_version` schema migrations (server/browser/store.ts). */
+export const VERSIONED_TABLES = [
+  { minVersion: 1, table: 'room_devices' },
+  { minVersion: 2, table: 'retired_devices' },
+  { minVersion: 2, table: 'beta_revocations' },
+] as const;
 const DAY = 86_400_000;
 /** Must match BACKUP_STATUS_FILE in server/browser/backup-status.ts (a test checks both sides). */
 export const STATUS_FILE = 'last-backup.json';
@@ -42,13 +48,20 @@ export function verify(file: string) {
   try {
     const integrity = db.query('PRAGMA integrity_check').all().map(row => Object.values(row as object)[0]);
     if (integrity.length !== 1 || integrity[0] !== 'ok') throw new Error(`integrity_check failed for ${file}: ${integrity.slice(0, 5).join('; ')}`);
+    const schemaVersion = (db.query('PRAGMA user_version').get() as { user_version: number }).user_version;
     const present = new Set(db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => (row as { name: string }).name));
     const counts: Record<string, number> = {};
     for (const table of TABLES) {
       if (!present.has(table)) throw new Error(`${file} has no ${table} table; it is not an admission database`);
       counts[table] = (db.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
     }
-    return { integrity: 'ok', counts, bytes: statSync(file).size };
+    for (const { minVersion, table } of VERSIONED_TABLES) {
+      if (schemaVersion >= minVersion && !present.has(table)) {
+        throw new Error(`${file} has no ${table} table; it is not a valid schema v${schemaVersion} admission database`);
+      }
+      if (present.has(table)) counts[table] = (db.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
+    }
+    return { integrity: 'ok', schemaVersion, counts, bytes: statSync(file).size };
   } finally { db.close(); }
 }
 

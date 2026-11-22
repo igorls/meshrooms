@@ -22,6 +22,7 @@ test('each harness choice fills in its name, and "other" leaves a placeholder', 
   // Someone who talks to their agent in the Codex desktop app says so; the CLI keeps its own label.
   expect(agentPrompt({ origin, roomId, link, name: 'A', version: '0.2.0-beta.2', harness: 'codexApp' })).toContain("--harness 'Codex app'");
   expect(agentPrompt({ origin, roomId, link, name: 'A', version: '0.2.0-beta.2', harness: 'hermes' })).toContain("--harness 'Hermes Agent'");
+  expect(agentPrompt({ origin, roomId, link, name: 'A', version: '0.2.0-beta.2', harness: 'dsh' })).toContain("--harness 'DeepSeek Harness'");
   expect(agentPrompt({ origin, roomId, link, name: 'A', version: '0.2.0-beta.2', harness: 'other' })).toContain("--harness '<your harness>'");
 });
 

@@ -223,6 +223,11 @@ export function scanText(file: string, text: string, terms: Term[], allow: Allow
       hits.push({ file, line: at, ...hit });
     }
   });
+  // A term of several words can be split by a hard wrap, which the line scan above cannot see.
+  if (!binary) for (const { re } of terms) for (const m of text.matchAll(re)) {
+    if (!/[\r\n]/.test(m[0])) continue;
+    hits.push({ file, line: text.slice(0, m.index).split('\n').length, kind: 'private-term', match: m[0].replace(/\s+/g, ' ') });
+  }
   return hits;
 }
 

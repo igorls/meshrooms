@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agentApps, HARNESS_APPS_FILE, harnessPreferences, saveHarnessPreference } from './harness-apps';
+import { agentApps, defaultCodexDelivery, HARNESS_APPS_FILE, harnessPreferences, saveHarnessPreference } from './harness-apps';
 import { readDesktopDelivery, resolveDesktopDelivery, saveDesktopDelivery, type DesktopDelivery } from './desktop-delivery';
 import { agentRoute, type AgentRouteContext, type AgentServices } from './local-agents';
 
@@ -11,10 +11,15 @@ afterEach(() => { for (const dir of clean.splice(0)) rmSync(dir, { recursive: tr
 function home() { const dir = mkdtempSync(join(tmpdir(), 'mr-apps-')); clean.push(dir); return dir; }
 const scans = [{ harness: 'codex' as const, label: 'Codex', detected: true, version: '0.163.0-alpha.10.2', sessionsAvailable: true }];
 
-test('new Codex bindings default to desktop delivery; preferences persist without changing binding records', async () => {
+test('new Codex bindings default to desktop only on macOS and headless on Windows/Linux; explicit preferences persist without changing binding records', async () => {
   const dir = home();
-  expect(harnessPreferences(dir).codex).toEqual({ enabled: true, codexDelivery: 'desktop' });
+  expect(harnessPreferences(dir, 'darwin').codex).toEqual({ enabled: true, codexDelivery: 'desktop' });
+  expect(harnessPreferences(dir, 'win32').codex).toEqual({ enabled: true, codexDelivery: 'headless' });
+  expect(harnessPreferences(dir, 'linux').codex).toEqual({ enabled: true, codexDelivery: 'headless' });
+  expect(harnessPreferences(dir).codex).toEqual({ enabled: true, codexDelivery: defaultCodexDelivery() });
   const binding = join(dir, 'watch.json'); writeFileSync(binding, '{"harness":"codex","session":"legacy"}');
+  saveHarnessPreference(dir, 'codex', { enabled: true, codexDelivery: 'desktop' });
+  expect(harnessPreferences(dir, 'win32').codex).toEqual({ enabled: true, codexDelivery: 'desktop' });
   saveHarnessPreference(dir, 'codex', { enabled: false, codexDelivery: 'headless' });
   expect(harnessPreferences(dir).codex).toEqual({ enabled: false, codexDelivery: 'headless' });
   expect(readFileSync(binding, 'utf8')).toBe('{"harness":"codex","session":"legacy"}');

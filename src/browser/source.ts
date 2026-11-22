@@ -11,14 +11,14 @@
  */
 import type { Task } from '../collab';
 import type { TaskBody, TaskChange } from './board';
-import { BrowserApi, type ApiError } from './client';
+import { BrowserApi, UPGRADE_REQUIRED, type ApiError } from './client';
 import type { DecisionDraft } from './DecisionViews';
 import type { Decision, DecisionBody, VoteBody } from './decisions';
 import type { ActivityRecord } from './activity';
 import type { AttachmentRef } from './files';
 import { BrowserPeers, type FileView, type SavedMessage } from './peers';
 import type { ReactionChip, ReactionEmoji } from './reactions';
-import { identity, persistStorage, read, write } from './storage';
+import { identity, persistStorage, read, readArray, write } from './storage';
 import { BackgroundRooms, announceRooms, announceVisibility, claimRoom, forgetRoom, holdConnection, onRoomsChanged, recordOpened, type RecentRoom } from './background';
 import { clearWaiting, onCountsChanged, publishCount, publishedCounts, readPosition, saveReadPosition, type ReadPosition, type UnreadCount } from './unread';
 import { ROOM_CLOSED, type Command, type JoinRequest, type RoomStatus } from './protocol';
@@ -29,7 +29,7 @@ export type RoomEvents = {
   ready(session: RoomSession): void;
   status(next: RoomStatus): void;
   messages(messages: SavedMessage[], connected: string[], added?: SavedMessage): void;
-  network(problem: string, signInRequired?: boolean): void;
+  network(problem: string, signInRequired?: boolean, error?: ApiError): void;
   board(tasks: Task[], ops: TaskBody[]): void;
   files(view: Record<string, FileView>): void;
   activity(records: Record<string, ActivityRecord>): void;
@@ -56,6 +56,8 @@ export interface RoomSession {
   vote(decision: Decision, optionId: string | null, comment?: string): Promise<void>;
   /** Whether a file of the room was let go here because newer ones filled its storage. */
   evicted(sha: string): boolean;
+  /** Ask peers for an attachment on demand (non-images, or images past the per-sender auto-fetch budget). */
+  requestFile(sha: string): void;
   /** The person has read up to this message. */
   markRead(messageId: string): Promise<void>;
   /** The open room's badge, for this person's other tabs. */
@@ -104,7 +106,7 @@ export interface LocalAgents {
   unbind(roomId: string, member: string): Promise<{ wakes: string }>;
 }
 /** The room service actions the screens send, besides what a RoomSession does. */
-export type RoomAction = Extract<Command['action'], 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'agent-invite' | 'settings' | 'profile' | 'repositories' | 'close'>;
+export type RoomAction = Extract<Command['action'], 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'agent-invite' | 'settings' | 'profile' | 'repositories' | 'transfer-host' | 'close'>;
 export type MessageNotificationLevel = 'mentions' | 'all' | 'off';
 /** Message notifications for this person's room on this computer, available from the desktop app's local page only. */
 export interface RoomNotifications {
@@ -147,29 +149,43 @@ export interface RoomSource {
 }
 
 const closedError = (e: unknown) => (e as ApiError).status === 410 && (e as ApiError).code === ROOM_CLOSED;
+const upgradeError = (e: unknown) => (e as ApiError).status === 426 || (e as ApiError).code === UPGRADE_REQUIRED;
+const isRecentRoom = (v: unknown): v is RecentRoom =>
+  !!v && typeof v === 'object' && typeof (v as RecentRoom).id === 'string' && typeof (v as RecentRoom).title === 'string';
+const isString = (v: unknown): v is string => typeof v === 'string';
 
 /** The hosted site: this browser is the device. Its behaviour is the browser rooms' as they were, moved here. */
 export class BrowserSource implements RoomSource {
   readonly isLocal = false;
   readonly label = 'Browser preview';
-  private api = new BrowserApi();
+  constructor(private api = new BrowserApi(), private pollMs = 1500, private backoffBaseMs = 15_000) {}
   async start() {
     const device = await identity();
-    const rooms = await read<RecentRoom[]>('recent-rooms') || [];
-    const profile = await read<string>('display-name') || '';
+    const rooms = await readArray<RecentRoom>('recent-rooms', isRecentRoom);
+    const profile = await read<string>('display-name', isString) || '';
     return { deviceId: device.id, recent: rooms, name: profile };
   }
   async health() {
-    const health = await fetch('/api/lobby/health', { signal: AbortSignal.timeout(10_000) }).then(r => r.json());
+    const response = await fetch('/api/lobby/health', { signal: AbortSignal.timeout(10_000) });
+    const health = await response.json().catch(() => ({})) as { inviteRequired?: unknown; currentAgentVersion?: unknown };
     const admission = health?.inviteRequired === true ? await this.api.command('creation-status', crypto.randomUUID()) as unknown as { admitted?: boolean } : undefined;
     return { ...(health?.inviteRequired === true && !admission?.admitted ? { inviteRequired: true } : {}), ...(typeof health?.currentAgentVersion === 'string' ? { currentAgentVersion: health.currentAgentVersion } : {}) };
   }
   async room(roomId: string) {
     const response = await fetch(`/api/lobby/rooms/${roomId}`, { signal: AbortSignal.timeout(10_000) });
-    const info = await response.json();
+    const info = await response.json().catch(() => ({})) as { title?: unknown; error?: string; code?: unknown };
     if (response.status === 410 && info.code === ROOM_CLOSED) return { closed: info.error as string };
-    if (!response.ok) throw new Error(info.error || 'Room unavailable.');
-    return { title: info.title as string };
+    if (!response.ok) {
+      const fallback = response.status === 429
+        ? 'Too many requests. Try again shortly.'
+        : response.status === 426
+          ? 'This Meshrooms client is out of date. Reload to upgrade.'
+          : 'Room unavailable.';
+      const code = typeof info.code === 'string' ? info.code : response.status === 426 ? UPGRADE_REQUIRED : undefined;
+      throw Object.assign(new Error(info.error || fallback), { status: response.status, ...(code ? { code } : {}) });
+    }
+    if (typeof info.title !== 'string') throw new Error('Room unavailable.');
+    return { title: info.title };
   }
   command(action: RoomAction, roomId: string, payload: Record<string, unknown> = {}) {
     return this.api.command(action, roomId, payload) as unknown as Promise<Record<string, unknown>>;
@@ -180,7 +196,7 @@ export class BrowserSource implements RoomSource {
     const refresh = () => on.counts(publishedCounts(deviceId));
     refresh();
     const stopCounts = onCountsChanged(refresh);
-    const stopRooms = onRoomsChanged(() => void read<RecentRoom[]>('recent-rooms').then(rooms => on.recent(rooms || [])).catch(() => {}));
+    const stopRooms = onRoomsChanged(() => void readArray<RecentRoom>('recent-rooms', isRecentRoom).then(rooms => on.recent(rooms)).catch(() => {}));
     const stopBeats = announceVisibility();
     const background = new BackgroundRooms(deviceId, openRoom);
     return () => { stopCounts(); stopRooms(); stopBeats(); background.dispose(); };
@@ -192,10 +208,20 @@ export class BrowserSource implements RoomSource {
   async writePref(key: string, value: unknown) { await write(key, value); }
 
   open(urlRoom: string, deviceId: string, events: RoomEvents) {
-    let disposed = false, timer: ReturnType<typeof setTimeout> | undefined, wake: (() => void) | undefined;
+    let disposed = false, timer: ReturnType<typeof setTimeout> | undefined, wake: (() => void) | undefined, backoff = 0;
     let engine: BrowserPeers | undefined, lastRequest: JoinRequest | undefined;
-    const api = this.api;
+    const api = this.api, abort = new AbortController();
+    const wakeNow = () => { clearTimeout(timer); timer = undefined; const resolve = wake; wake = undefined; resolve?.(); };
+    const onVisible = () => { if (document.visibilityState === 'visible' && backoff === 0) wakeNow(); };
+    const onOnline = () => { if (backoff === 0) wakeNow(); };
+    const removeListeners = () => {
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible);
+      if (typeof removeEventListener === 'function') removeEventListener('online', onOnline);
+    };
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible);
+    if (typeof addEventListener === 'function') addEventListener('online', onOnline);
     const done = (async () => {
+      try {
       await navigator.locks.request(`meshrooms-room:${urlRoom}`, { ifAvailable: true }, async lock => {
         if (!lock) throw new Error('This room is already open in another tab of this browser. Close that tab, then retry here.');
         if (disposed) return;
@@ -223,6 +249,7 @@ export class BrowserSource implements RoomSource {
           reviseDecision: (decision, change) => peers.reviseDecision(decision, change),
           vote: (decision, optionId, comment) => peers.vote(decision, optionId, comment),
           evicted: sha => peers.evicted(sha),
+          requestFile: sha => peers.requestFile(sha),
           markRead: messageId => saveReadPosition(deviceId, urlRoom, messageId, fence),
           publishCount: count => publishCount(deviceId, urlRoom, count),
           // A browser holds its whole history: there is never an older page to load.
@@ -233,11 +260,13 @@ export class BrowserSource implements RoomSource {
         await engine.load();
         const stored = await readPosition(deviceId, urlRoom, latest.map(m => m.packet.body), fence);
         if (!disposed) events.position(stored);
+        let upgradeFailure: ApiError | undefined;
         // A write that found another tab's claim stops the engine; then this tab stops polling and connecting too.
         while (!disposed && !engine.isStopped()) {
           try {
-            const next = await api.command('status', urlRoom, { session, cursor, epoch });
+            const next = await api.command('status', urlRoom, { session, cursor, epoch }, abort.signal);
             if (disposed) break;
+            backoff = 0;
             if (next.epoch !== epoch) cursor = 0;
             epoch = next.epoch;
             if (!next.memberId && !next.request && lastRequest) {
@@ -250,7 +279,7 @@ export class BrowserSource implements RoomSource {
             if (next.memberId) {
               if (!recorded) {
                 const joined = await navigator.locks.request('meshrooms-recent', async () => {
-                  const all = await read<RecentRoom[]>('recent-rooms') || [];
+                  const all = await readArray<RecentRoom>('recent-rooms', isRecentRoom);
                   // Opening a room keeps its place in the list (only its title refreshes); a newly joined room goes first.
                   const known = all.some(r => r.id === urlRoom);
                   await write('recent-rooms', (known ? all.map(r => r.id === urlRoom ? { ...r, title: next.title } : r) : [{ id: urlRoom, title: next.title }, ...all]).slice(0, 64));
@@ -265,22 +294,40 @@ export class BrowserSource implements RoomSource {
             await engine.update(next);
             for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
           } catch (e) {
+            if (disposed || abort.signal.aborted) break;
             // The host closed the room, or the service removed it: stop polling and say so, instead of retrying forever.
             if (closedError(e)) {
               engine.stop(); publishCount(deviceId, urlRoom, undefined);
               if (!disposed) { events.closed((e as Error).message); void forgetRoom(urlRoom).then(rooms => { if (!disposed) events.recent(rooms); }); }
               break;
             }
-            if (!disposed) events.network((e as Error).message);
+            // OPS-6: coordinator requires a newer client protocol; stop polling immediately instead of spin-retrying.
+            if (upgradeError(e)) {
+              const err = e as ApiError;
+              const message = err.message || 'This Meshrooms client is out of date. Reload to upgrade.';
+              upgradeFailure = Object.assign(new Error(message), { status: 426, code: UPGRADE_REQUIRED });
+              engine.stop();
+              if (!disposed) events.network(upgradeFailure.message, false, upgradeFailure);
+              break;
+            }
+            // Over the service's rate limit: back off exponentially (honoring Retry-After when present), matching BackgroundRoom.
+            if ((e as ApiError).status === 429) {
+              const exp = backoff ? backoff * 2 : this.backoffBaseMs;
+              const retryAfterMs = (e as ApiError).retryAfterMs ?? 0;
+              backoff = Math.min(Math.max(60_000, this.backoffBaseMs), Math.max(exp, retryAfterMs));
+            }
+            if (!disposed) events.network((e as Error).message, false, e as ApiError);
           }
-          if (!disposed) await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(resolve, 1500); });
+          if (!disposed) await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(() => { timer = undefined; wake = undefined; resolve(); }, this.pollMs + backoff); });
         }
         if (engine.lostRoom() && !disposed) events.lost();
         // Every write finishes before the connection is handed back to the background.
         await engine.close();
+        if (upgradeFailure) throw upgradeFailure;
         });
       });
+      } finally { removeListeners(); }
     })();
-    return { done, dispose() { disposed = true; engine?.stop(); clearTimeout(timer); wake?.(); } };
+    return { done, dispose() { disposed = true; abort.abort(); engine?.stop(); wakeNow(); removeListeners(); } };
   }
 }

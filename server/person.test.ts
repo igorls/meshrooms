@@ -220,6 +220,7 @@ async function runnerAndPeers(names: string[], pause = 250) {
     cleanups.push(() => void peer.stop());
     const signed = async <T extends object>(body: T) => ({ body, signature: await agent.sign(body) });
     return Object.assign(peer, {
+      sign: signed,
       say: (text: string, attachments?: AttachmentRef[]) => signed({ kind: 'message', roomId: room.roomId, id: crypto.randomUUID(), deviceId: peer.id, memberId: peer.memberId, text, at: Date.now(), ...(attachments ? { attachments } : {}) }),
       retract: (target: string, memberId = peer.memberId) => signed({ kind: 'retract', roomId: room.roomId, id: crypto.randomUUID(), deviceId: peer.id, memberId, at: Date.now(), target }),
     });
@@ -250,21 +251,23 @@ test('a sender still retrying a deleted message gets its receipt and the content
   await finish();
 }, 90_000);
 
-test('a live retraction counts by who signed it, not by which device relayed it', async () => {
-  const { peers: [robin, wren], held, onDisk, finish } = await runnerAndPeers(['Robin', 'Wren']);
+test('a live retraction requires sender deviceId; a relayed retraction via sync envelope counts by who signed it', async () => {
+  const { sam, peers: [robin, wren], held, onDisk, finish } = await runnerAndPeers(['Robin', 'Wren']);
   const message = await wren!.say('the secret'), id = message.body.id;
   wren!.send(message);
   await until(() => held(id));
-  // Robin claims to be Wren with Robin's own key, then alters what Wren signed. Neither gets through.
+  // Robin claims to be Wren with Robin's own key, alters what Wren signed, or replays Wren's live packet directly: none gets through.
   robin!.send(await robin!.retract(id, wren!.memberId));
   const real = await wren!.retract(id);
   robin!.send({ ...real, body: { ...real.body, at: real.body.at + 1 } });
-  // Packets are handled in order, so once this one is stored the two before it were refused.
+  robin!.send(real);
+  // Packets are handled in order, so once this one is stored all three before it were refused.
   const marker = await robin!.say('after those');
   robin!.send(marker);
   await until(() => held(marker.body.id));
   expect(onDisk()).toContain('the secret');
-  robin!.send(real);
+  // Relayed inside a retractions sync envelope, Wren's genuine signature is verified and applied.
+  robin!.send({ kind: 'retractions', roomId: sam.roomId, ops: [real] });
   await until(() => held(id)?.retracted);
   expect(onDisk()).not.toContain('the secret');
   await finish();
@@ -617,3 +620,89 @@ test('create makes a room hosted by the person device, with the invite code the 
   expect(defaultRoomService(join(home, 'nobody'), {})).toBe('https://meshrooms.wormdb.dev');
   expect(defaultRoomService(home, { MESHROOMS_ROOM_SERVICE: 'https://rooms.example' })).toBe('https://rooms.example');
 });
+
+test('out-of-range timestamps, sync envelope caps, retracted reactions, file-want rate limit, askAgents array, and trimmed outbox text', async () => {
+  const { FileWantLimiter, safeIso } = await import('./browser-agent');
+  const { localMessages, queueDecision, roomSummary } = await import('./person');
+  const { home } = folders(), roomId = crypto.randomUUID(), alex = crypto.randomUUID(), wren = crypto.randomUUID();
+  const agent = new BrowserAgent(home, 'http://127.0.0.1:1', roomId);
+  writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: alex, ownerId: alex, members: [{ id: alex, name: 'Alex', role: 'human' }, { id: wren, name: 'Wren', role: 'agent' }], devices: [] }));
+
+  // corrupted out-of-range / negative / NaN timestamps never crash localMessages, roomSummary, or agent.view.
+  const badMessages = [
+    { packet: { body: { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: 'a'.repeat(64), memberId: alex, text: 'huge', at: 9_007_199_254_740_991 }, signature: '' }, targets: [], receipts: [] },
+    { packet: { body: { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: 'a'.repeat(64), memberId: alex, text: 'neg', at: -5_000_000_000_000_000_000 }, signature: '' }, targets: [], receipts: [] },
+  ];
+  writeFileSync(join(agent.dir, 'messages.json'), JSON.stringify(badMessages));
+  expect(agent.view().messages.map(m => m.time)).toEqual([safeIso(9_007_199_254_740_991), safeIso(-5_000_000_000_000_000_000)]);
+  expect(localMessages(agent).map(m => m.at)).toEqual([safeIso(9_007_199_254_740_991), safeIso(0)]);
+  const summary = roomSummary({ roomId, origin: 'http://127.0.0.1:1', kind: 'person', joinedAt: 1000 }, agent);
+  expect(summary.lastMessageAt).toBe(new Date(8_640_000_000_000_000).toISOString());
+
+  // per-peer FileWantLimiter enforces burst 20, refills at 60/min (1/sec), and isolates peers.
+  let now = 10_000;
+  const limiter = new FileWantLimiter(() => now);
+  for (let i = 0; i < 20; i++) expect(limiter.take('peer-a')).toBe(true);
+  expect(limiter.take('peer-a')).toBe(false);
+  expect(limiter.report('peer-a')).toBe(true);
+  expect(limiter.report('peer-a')).toBe(false);
+  expect(limiter.take('peer-b')).toBe(true);
+  now += 1_000;
+  expect(limiter.take('peer-a')).toBe(true);
+  expect(limiter.take('peer-a')).toBe(false);
+
+  // queueDecision accepts validated string[] for askAgents (deduplicated) and rejects invalid arrays.
+  const requestId = crypto.randomUUID();
+  const opened = queueDecision(agent, { action: 'open', requestId, question: 'Ship?', options: ['Yes', 'No'], askAgents: [wren, wren] });
+  await Bun.sleep(100);
+  const queuedFile = readdirSync(join(agent.dir, 'outbox')).find(f => f.endsWith(`-${requestId}.json`))!;
+  const queuedIntent = JSON.parse(readFileSync(join(agent.dir, 'outbox', queuedFile), 'utf8'));
+  expect(queuedIntent.askAgents).toEqual([wren]);
+  rmSync(join(agent.dir, 'outbox', queuedFile));
+  expect((await opened).status).toBe('dropped');
+  await expect(queueDecision(agent, { action: 'open', question: 'Ship?', options: ['Yes', 'No'], askAgents: ['not-a-uuid'] })).rejects.toMatchObject({ status: 400 });
+  await expect(queueDecision(agent, { action: 'open', question: 'Ship?', options: ['Yes', 'No'], askAgents: Array.from({ length: 17 }, () => crypto.randomUUID()) })).rejects.toMatchObject({ status: 400 });
+});
+
+test('on live channels: drops out-of-range message time, oversized sync envelopes, retracted reactions, spoofed live ops, and trims outbox text', async () => {
+  const { sam, peers: [robin, wren], held, finish } = await runnerAndPeers(['Robin', 'Wren'], 50);
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+  const ref = await attachmentRef(bytes, 'pic.png');
+  sam.files.add(bytes);
+  // whitespace-only outbox text with attachment must fall back to attachmentText (trimmed), not whitespace.
+  const outId = crypto.randomUUID();
+  writeFileSync(join(sam.dir, 'outbox', `${Date.now()}-${outId}.json`), JSON.stringify({ id: outId, text: '   ', attachments: [ref] }));
+  await until(() => held(outId));
+  expect(held(outId)!.packet.body.text).toBe('Attached pic.png');
+
+  // signed messages with at > MAX_TIME or at < 0 are rejected (neither stored nor confirmed).
+  const badAtId = crypto.randomUUID(), negAtId = crypto.randomUUID();
+  robin!.send(await robin!.sign({ kind: 'message', roomId: sam.roomId, id: badAtId, deviceId: robin!.id, memberId: robin!.memberId, text: 'future', at: 9_007_199_254_740_991 }));
+  robin!.send(await robin!.sign({ kind: 'message', roomId: sam.roomId, id: negAtId, deviceId: robin!.id, memberId: robin!.memberId, text: 'negative', at: -1 }));
+
+  // Retract a message, then send a genuinely signed reaction targeting the retracted stub.
+  const retractMsg = await robin!.say('soon retracted');
+  robin!.send(retractMsg);
+  await until(() => held(retractMsg.body.id));
+  robin!.send(await robin!.retract(retractMsg.body.id));
+  await until(() => held(retractMsg.body.id)?.retracted);
+  robin!.send(await robin!.sign({ kind: 'reaction', roomId: sam.roomId, id: crypto.randomUUID(), deviceId: robin!.id, memberId: robin!.memberId, messageId: retractMsg.body.id, emoji: '👍', revision: 1, at: Date.now() }));
+
+  // live single-op task signed by Wren cannot be sent directly over Robin's channel (deviceId !== sender).
+  const taskId = crypto.randomUUID(), taskOpId = crypto.randomUUID();
+  const wrenTask = await wren!.sign({ kind: 'task', roomId: sam.roomId, id: taskOpId, taskId, deviceId: wren!.id, memberId: wren!.memberId, at: Date.now(), revision: 1, title: 'Spoofed live', notes: '', status: 'todo', assigneeId: null });
+  robin!.send(wrenTask);
+
+  // oversized sync envelope (> 500 ops) is rejected cleanly even when it carries a valid op.
+  const hugeEnvelope = { kind: 'board', roomId: sam.roomId, ops: [wrenTask, ...Array.from({ length: 500 }, () => ({}))] };
+  robin!.send(hugeEnvelope);
+
+  const goodMsg = await robin!.say('valid marker');
+  robin!.send(goodMsg);
+  await until(() => held(goodMsg.body.id));
+  expect(sam.reactionOps()).toEqual([]);
+  expect(sam.taskOps()).toEqual([]);
+  expect(held(badAtId)).toBeUndefined();
+  expect(held(negAtId)).toBeUndefined();
+  await finish();
+}, 90_000);

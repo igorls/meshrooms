@@ -36,6 +36,10 @@ test('operations are validated, and board exchange stays under the data channel 
   expect(validTaskBody({ ...good, title: ' ' }, roomId)).toBe(false);
   expect(validTaskBody({ ...good, notes: 'n'.repeat(2001) }, roomId)).toBe(false);
   expect(validTaskBody({ ...good, assigneeId: 'someone' }, roomId)).toBe(false);
+  // A time no Date can hold is refused, and one already stored cannot stop the board from folding.
+  expect(validTaskBody({ ...good, at: 8_640_000_000_000_000 }, roomId)).toBe(true);
+  expect(validTaskBody({ ...good, at: 8_640_000_000_000_001 }, roomId)).toBe(false);
+  expect(foldBoard([{ ...good, at: Number.MAX_SAFE_INTEGER }])[0].title).toBe('Valid');
   expect(() => taskBody({ roomId, deviceId: device, memberId: alex, change: { title: '' } })).toThrow('title');
   const packets = Array.from({ length: 40 }, () => ({ body: op(alex, { title: 'T', notes: 'x'.repeat(1900) }), signature: 's'.repeat(88) }));
   const chunks = syncChunks(roomId, packets);
@@ -230,4 +234,57 @@ test('a task created or retitled with #42 links that issue, and an unlink stays 
   expect(auto(alex, { title: '#46 Review' }, foldBoard([created])[0]).issue).toBe(link);
   // A derived link passes validation, so peers accept the operation.
   expect(validTaskBody(created, roomId)).toBe(true);
+});
+
+test('compaction keeps each member\'s newest removal markers only, so create-and-remove pairs cannot fill the board', () => {
+  const removedTask = (memberId: string, at: number) => {
+    const created = op(memberId, { title: `T${at}` }, undefined, { at });
+    const removal = { ...taskBody({ roomId, deviceId: device, memberId, current: foldBoard([created])[0], change: {}, removed: true }), at: at + 1 };
+    return [created, removal];
+  };
+  // Sam removes 150 tasks, Alex removes 3, and one live task stays.
+  const samOps = Array.from({ length: 150 }, (_, i) => removedTask(sam, 10_000 + i * 10)).flat();
+  const mine = Array.from({ length: 3 }, (_, i) => removedTask(alex, 50_000 + i * 10)).flat();
+  const live = op(alex, { title: 'Keep me' }, undefined, { at: 60_000 });
+  const packets = [...samOps, ...mine, live].map(body => ({ body, signature: 's' }));
+  const compacted = compactBoard(packets, 100).map(p => p.body);
+  const markers = compacted.filter(b => b.removed);
+  // Sam's newest 100 removals stay, the 50 oldest go with their tasks; Alex's three stay; the live task is untouched.
+  expect(markers.filter(b => b.memberId === sam)).toHaveLength(100);
+  expect(Math.min(...markers.filter(b => b.memberId === sam).map(b => b.at))).toBe(10_000 + 50 * 10 + 1);
+  expect(markers.filter(b => b.memberId === alex)).toHaveLength(3);
+  expect(compacted.filter(b => !b.removed).map(b => b.title)).toEqual(['Keep me']);
+  expect(foldBoard(compacted).map(t => t.title)).toEqual(['Keep me']);
+  // Every device picks the same markers, whatever order it holds them in.
+  expect(compactBoard([...packets].reverse(), 100).map(p => p.body.id).sort()).toEqual(compacted.map(b => b.id).sort());
+  // A device that still holds a forgotten task's removal sends it back with the task: the task stays removed.
+  const forgotten = samOps.slice(0, 2);
+  expect(foldBoard([...compacted, ...forgotten]).map(t => t.title)).toEqual(['Keep me']);
+
+  // A flood, compacted as devices compact (past COMPACT_AT): the board never reaches MAX_TASK_OPS.
+  let board: { body: TaskBody; signature: string }[] = [];
+  for (let i = 0; i < 3000; i++) {
+    board = [...board, ...removedTask(sam, i * 10).map(body => ({ body, signature: 's' }))];
+    if (board.length > 1000) board = compactBoard(board);
+    expect(board.length).toBeLessThanOrEqual(2000);
+  }
+  expect(foldBoard(board.map(p => p.body))).toEqual([]);
+});
+
+test('a removal signed by someone else cannot make another member\'s removal forgettable', () => {
+  const created = op(alex, { title: 'Removed by Alex' }, undefined, { at: 1000 });
+  const byAlex = { ...taskBody({ roomId, deviceId: device, memberId: alex, current: foldBoard([created])[0], change: {}, removed: true }), at: 2000 };
+  // Sam signs a removal of the same task that sorts before Alex's (lower revision and id) and is dated long ago, then
+  // makes 100 newer removals of his own, so his marker for this task is the first he forgets.
+  const bySam = { ...byAlex, id: '00000000-0000-4000-8000-000000000000', memberId: sam, revision: 1, at: 1 };
+  const flood = Array.from({ length: 100 }, (_, i) => {
+    const mine = op(sam, { title: `S${i}` }, undefined, { at: 10_000 + i * 10 });
+    return [mine, { ...taskBody({ roomId, deviceId: device, memberId: sam, current: foldBoard([mine])[0], change: {}, removed: true }), at: 10_001 + i * 10 }];
+  }).flat();
+  const compacted = compactBoard([created, byAlex, bySam, ...flood].map(body => ({ body, signature: 's' })), 100).map(p => p.body);
+  // Sam's marker is forgotten; Alex's stays, so the task stays removed and a device that sends its creation back
+  // cannot bring it back.
+  expect(compacted.some(b => b.id === bySam.id)).toBe(false);
+  expect(compacted.some(b => b.id === byAlex.id)).toBe(true);
+  expect(foldBoard([...compacted, created]).some(t => t.title === 'Removed by Alex')).toBe(false);
 });
