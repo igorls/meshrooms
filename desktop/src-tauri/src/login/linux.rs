@@ -243,10 +243,10 @@ mod tests {
 
     #[test]
     fn xdg_config_home_must_be_absolute_else_falls_back_to_dot_config() {
-        let home = Path::new("/home/tester");
-        assert_eq!(config_dir(home, None), PathBuf::from("/home/tester/.config"));
-        assert_eq!(config_dir(home, Some(OsStr::new(""))), PathBuf::from("/home/tester/.config"));
-        assert_eq!(config_dir(home, Some(OsStr::new("relative/config"))), PathBuf::from("/home/tester/.config"));
+        let home = Path::new("/home/someone");
+        assert_eq!(config_dir(home, None), PathBuf::from("/home/someone/.config"));
+        assert_eq!(config_dir(home, Some(OsStr::new(""))), PathBuf::from("/home/someone/.config"));
+        assert_eq!(config_dir(home, Some(OsStr::new("relative/config"))), PathBuf::from("/home/someone/.config"));
         assert_eq!(config_dir(home, Some(OsStr::new("/tmp/xdg"))), PathBuf::from("/tmp/xdg"));
     }
 

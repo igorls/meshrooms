@@ -135,7 +135,7 @@ test('Delivery sidecar sends fixed wake cues only, coalesces pending work, and d
   expect(bindings).toHaveLength(1);
   expect(bindings[0]).toMatchObject({ roomId: ROOM_ID, conversationId: CONV_ID, enabled: true, minIntervalSeconds: 30 });
 
-  const launcher = '/home/op/.meshrooms/bin/meshrooms.js';
+  const launcher = '/home/someone/.meshrooms/bin/meshrooms.js';
   const cue = buildWakeCue(ROOM_ID, launcher);
   expect(cue).toContain(ROOM_ID);
   expect(cue).toContain(`bun "${launcher}" listen --room ${ROOM_ID} --wait-seconds 5`);

@@ -12,7 +12,7 @@ const folder = () => { const dir = testDirectory('agy-confinement'); cleanups.pu
 
 const ROOM = '0f5c3a52-9c1e-4d7b-8a61-2b3c4d5e6f70';
 const OTHER_ROOM = '11111111-2222-4333-8444-555555555555';
-const LAUNCHER = '/home/op/.meshrooms/bin/meshrooms.js';
+const LAUNCHER = '/home/someone/.meshrooms/bin/meshrooms.js';
 const DELIM = 'MESHROOMS_EOF_abc12345';
 
 test('evaluateAgyHook auto-approves exact bridge wake subcommands for this room and heredoc sends', () => {
