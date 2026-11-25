@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.9):
+  - **A Grok Bot's rooms no longer wait for each other.** For `--harness exec`, the session two rooms share is the
+    folder and the command *as it runs*, so a command template with `{room}` in it (as `grok wake --room {room}` has)
+    is a session per room: a wake in one room starts at once, instead of waiting until another room's routine run ends
+    (on a box, up to the full wake timeout). A template without `{room}` still serves its rooms in turn.
+  - **`grok keepalive`** for a Grok Bot's hourly keepalive routine, on a box without systemd: starts the daemon if none
+    runs, gives a daemon it just started a moment to bring the agent's rooms back, and reports `ok`, or `attention` in
+    plain words (by room title, never an id, path or key): the daemon, the webhook file, each room's wakes and
+    connection, an agent folder in a place that gets cleared, a Bun older than 1.4.2. Exits 1 when something needs the
+    person. Refused during a wake. The Grok Bot guide and docs explain what survives a new box (the home folder, so
+    the agent folder under `~/.meshrooms` and its signing key) and what doesn't (every process, until the keepalive).
+  - **Connecting on a network that drops UDP.** werift resolves `setLocalDescription` only once every STUN and TURN
+    server has answered or timed out, and a `turn:…?transport=udp` URL that never answers held that for about 13 s, past
+    the pass's 10 s signal deadline: the agent dropped every connection it started before its offer went out, and
+    peers stayed offline. An offer or answer now goes out after at most 3 s of gathering (as the browser's does after
+    4 s) with the candidates gathered so far, TURN over TCP/TLS among them, while werift keeps gathering. An answer that
+    werift still holds behind that gathering no longer drops the connection at the signal deadline; the 20 s connect
+    timeout still does if it never opens. A room service can list udp TURN again for such agents.
+- The room page and join guide (service):
+  - **The MeshGuard web gateway stays reachable.** `deploy/nginx/meshrooms.conf` keeps `/meshguard-web/ws` and
+    `/meshguard-web/health`, proxied to MeshGuard's browser transport gateway on loopback, so installing the release's
+    Nginx site no longer drops them.
+  - **Grok Bot in Connect an agent.** *Your agent runs on* has a **Grok Bot** choice (picked by itself for a name with
+    "Grok" in it). Its prompt tells the bot to connect in an agent folder of its own, with `--harness 'Grok Bot'` and no
+    model, through `bun x` (a box's `bunx` shim can fail with `File not found`), and to follow the Grok Bot guide at the
+    tag of the bridge the room names; the webhook is asked for only
+    through a secure form. The join guide lists Grok Bot with the other harnesses and shows its `grok wake` binding.
 - The agent bridge (0.2.0-beta.8) and the desktop app (0.1.0-alpha.8):
   - **Revoked devices stay revoked.** A device removed by the host, or a lost device removed by its member, can no
     longer keep writing through a relaying peer. A device that left from itself is trusted for what it signed up to

@@ -970,14 +970,19 @@ export function canonicalPath(path: string, platform = process.platform) {
 /**
  * The key two watchers share when they would resume the same harness session: the harness, where it keeps its sessions
  * (Claude Code's config folder, Codex's home, Hermes's home: one id is one session only within one store), and the
- * session. Without a session id, the folder whose most recent session is resumed; for exec, the folder and the command.
- * A uuid-shaped id (Claude Code's, Codex's) is one id in either case. Read from a watch.json, so nothing is trusted to
- * be a string.
+ * session. Without a session id, the folder whose most recent session is resumed; for exec, the folder and the command
+ * as it runs: {room} is filled in first, so a template that names its room (a Grok Bot's `grok wake --room {room}`)
+ * gives each room a queue of its own instead of one room's wake waiting on another's. A template without {room} still
+ * shares one session across its rooms. A uuid-shaped id (Claude Code's, Codex's) is one id in either case. Read from a
+ * watch.json, so nothing is trusted to be a string.
  */
-export const sessionKey = (config: Pick<WatchConfig, 'harness' | 'session' | 'cwd' | 'command'> & Partial<Pick<WatchConfig, 'agentHome'>>, env: Record<string, string | undefined> = process.env, home = homedir()) => {
+export const sessionKey = (config: Pick<WatchConfig, 'harness' | 'session' | 'cwd' | 'command'> & Partial<Pick<WatchConfig, 'agentHome' | 'roomId'>>, env: Record<string, string | undefined> = process.env, home = homedir()) => {
   const folder = typeof config.cwd === 'string' ? canonicalPath(config.cwd) : '';
   if (config.harness === 'dsh') return `dsh:${typeof config.agentHome === 'string' ? canonicalPath(config.agentHome) : folder}`;
-  if (config.harness === 'exec') return `exec:${folder}:${typeof config.command === 'string' ? config.command.trim() : ''}`;
+  if (config.harness === 'exec') {
+    const command = typeof config.command === 'string' ? config.command.trim() : '';
+    return `exec:${folder}:${typeof config.roomId === 'string' ? command.replaceAll('{room}', config.roomId) : command}`;
+  }
   const store = canonicalPath(config.harness === 'claude' ? env.CLAUDE_CONFIG_DIR || join(home, '.claude') : config.harness === 'hermes' ? env.HERMES_HOME || join(home, '.hermes')
     : env.CODEX_HOME || join(home, '.codex'));
   const given = typeof config.session === 'string' ? config.session.trim() : undefined;

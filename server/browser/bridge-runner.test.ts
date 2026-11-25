@@ -7,9 +7,9 @@ import {
   watcherRunnerCheck, withRunnerLock, type FoundRunner, type RepairDeps,
 } from '../agent-cli';
 import {
-  BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, UPGRADE_BACKOFF_MS, runBridge, runnerStopped, runnerStuck, runnerTrouble, serviceSilence, settleWithin, stuckFor, within,
+  BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, UPGRADE_BACKOFF_MS, runBridge, withGatheredCandidates, runnerStopped, runnerStuck, runnerTrouble, serviceSilence, settleWithin, stuckFor, within,
 } from '../browser-agent';
-import { FILE_CHANNEL_LABEL, PRIMARY_CHANNEL_LABEL, UNHEALTHY_GRACE_MS } from '../../src/browser/pacer';
+import { CONNECT_TIMEOUT_MS, FILE_CHANNEL_LABEL, PRIMARY_CHANNEL_LABEL, UNHEALTHY_GRACE_MS } from '../../src/browser/pacer';
 import { fakeRunner } from './fake-runner';
 
 const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), wren = crypto.randomUUID();
@@ -23,14 +23,14 @@ const tempDir = () => { const dir = mkdtempSync(join(tmpdir(), 'mr-bridge-runner
  * `answer` says. Passes pause 20 ms instead of a second, so the loop comes round quickly; nothing below depends on how
  * quickly, only on it coming round, and each wait allows 20 s for what takes well under one.
  */
-function room(options: { answer?: (action: string) => Promise<unknown>; status?: () => Promise<unknown> | undefined } = {}) {
+function room(options: { answer?: (action: string, payload?: any) => Promise<unknown>; status?: () => Promise<unknown> | undefined } = {}) {
   const home = tempDir();
   const agent = new BrowserAgent(home, 'http://127.0.0.1:1', roomId);
   writeFileSync(join(agent.dir, 'room.json'), JSON.stringify({ origin: 'http://127.0.0.1:1', roomId }));
   writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: wren, ownerId: alex, members, devices: [] }));
   const state = { polls: 0, closed: false };
-  (agent as unknown as { command: (action: string) => Promise<unknown> }).command = async action => {
-    if (action !== 'status') return (options.answer ?? (async () => ({})))(action);
+  (agent as unknown as { command: (action: string, payload?: unknown) => Promise<unknown> }).command = async (action, payload) => {
+    if (action !== 'status') return (options.answer ?? (async () => ({})))(action, payload);
     if (state.closed) throw Object.assign(new Error('This room was closed by its host.'), { status: 410 });
     state.polls++;
     const custom = options.status?.();
@@ -768,6 +768,92 @@ test('OPS-6: BrowserAgent.command sends X-Meshrooms-Protocol: 1 and runBridge ha
     expect(logs.some(line => line.includes('426') && line.includes('bunx @wormdb/meshrooms@') && line.includes('Coordinator requires a newer protocol.'))).toBe(true);
     await r.until(() => pauses.length >= 3 && r.proof().upgradeRequired === undefined && typeof r.proof().polledAt === 'number');
     expect(pauses.slice(0, 3)).toEqual([UPGRADE_BACKOFF_MS, UPGRADE_BACKOFF_MS, 1_000]);
+  } finally { r.state.closed = true; }
+  expect(String(await bridge)).toContain('closed by its host');
+}, 20_000);
+
+test('a gathered candidate is added to the end of its media section once, and a malformed one is left out', () => {
+  const sdp = 'v=0\r\na=group:BUNDLE 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:0\r\na=candidate:1 1 udp 1 192.0.2.1 5000 typ host\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n';
+  const relay = 'candidate:2 1 udp 2 203.0.113.9 49200 typ relay raddr 0.0.0.0 rport 0';
+  const out = withGatheredCandidates(sdp, [
+    { candidate: 'candidate:1 1 udp 1 192.0.2.1 5000 typ host', sdpMLineIndex: 0 }, // already there
+    { candidate: relay, sdpMLineIndex: 0 }, { candidate: relay, sdpMLineIndex: 0 },
+    { candidate: 'candidate:3 1 udp 3 192.0.2.3 5000 typ host', sdpMLineIndex: 1 },
+    { candidate: 'candidate:4 1 udp 4 192.0.2.4 5000 typ host\r\na=injected', sdpMLineIndex: 0 },
+    { candidate: 'not a candidate', sdpMLineIndex: 0 },
+  ]);
+  expect(out.split('\r\n')).toEqual(['v=0', 'a=group:BUNDLE 0', 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:0',
+    'a=candidate:1 1 udp 1 192.0.2.1 5000 typ host', `a=${relay}`, 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:1',
+    'a=candidate:3 1 udp 3 192.0.2.3 5000 typ host', '']);
+  expect(withGatheredCandidates('v=0\r\n', [{ candidate: relay }])).toBe('v=0\r\n');
+});
+
+// werift's setLocalDescription resolves only when every STUN/TURN server answered; with UDP dropped a udp TURN URL held it
+// past the pass's signal deadline, and every connection the agent started was dropped before its offer went out.
+test('an offer whose gathering outlasts the gather deadline goes out with the candidates so far, and its answer is kept while werift still gathers', async () => {
+  const peerId = 'f'.repeat(64), relay = 'candidate:2 1 udp 2 203.0.113.9 49200 typ relay raddr 0.0.0.0 rport 0';
+  const sub = <T,>() => ({ handlers: [] as ((v: T) => void)[], subscribe(fn: (v: T) => void) { this.handlers.push(fn); return { unSubscribe: () => { this.handlers = this.handlers.filter(h => h !== fn); } }; }, fire(v: T) { for (const fn of this.handlers) fn(v); } });
+  const pcs: any[] = [];
+  const createPeerConnection = () => {
+    const pc: any = {
+      connectionState: 'new', iceConnectionState: 'new', signalingState: 'stable', localDescription: null, remoteDescription: null, closed: false,
+      onDataChannel: sub(), connectionStateChange: sub(), iceConnectionStateChange: sub(), onIceCandidate: sub<{ candidate: string; sdpMLineIndex: number } | undefined>(),
+      createDataChannel: (label: string) => ({ label, readyState: 'connecting', bufferedAmount: 0, bufferedAmountLowThreshold: 0, send() {}, stateChanged: sub(), onMessage: sub(), bufferedAmountLow: sub() }),
+      async createOffer() { return { type: 'offer', sdp: 'v=0\r\na=ice-ufrag:slow1\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:0\r\n' }; },
+      // As werift does: the description is in place and the host candidate comes at once, but the promise waits for every server.
+      setLocalDescription(d: { type: string; sdp: string }) {
+        pc.localDescription = d; pc.signalingState = 'have-local-offer';
+        pc.onIceCandidate.fire({ candidate: 'candidate:1 1 udp 1 192.0.2.1 5000 typ host', sdpMLineIndex: 0 });
+        setTimeout(() => pc.onIceCandidate.fire({ candidate: relay, sdpMLineIndex: 0 }), 5);
+        return new Promise<void>(() => {});
+      },
+      // Queued behind the gathering, as in werift.
+      setRemoteDescription(d: { type: string; sdp: string }) { pc.answered = d; return new Promise<void>(() => {}); },
+      setConfiguration() {},
+      async close() { pc.closed = true; pc.connectionState = 'closed'; },
+    };
+    pcs.push(pc);
+    return pc;
+  };
+  const signals: { to: string; description: { type: string; sdp: string } }[] = [];
+  let answer: unknown[] = [];
+  const logs: string[] = [];
+  let clock = 1_000_000;
+  const r = room({
+    status: () => { const out = answer; answer = []; return Promise.resolve({
+      roomId, memberId: wren, ownerId: alex, epoch: 'one', members, iceServers: [], signals: out,
+      devices: [{ id: peerId, memberId: alex, publicKey: 'A'.repeat(88), label: 'browser', admittedAt: 1, session: 's-1' }],
+      settings: { floor: 'open', agentAssignmentsWake: false, guestAgentApproval: true },
+    }); },
+    answer: async (action, payload) => { if (action === 'signal') signals.push(payload); return {}; },
+  });
+  const bridge = runBridge(r.agent, line => logs.push(line), {
+    pause: () => Bun.sleep(15), now: () => clock, gatherMs: 0, gatherDeadlineMs: 50, deadlines: { signals: 200 }, createPeerConnection: createPeerConnection as any,
+  }).catch(error => error);
+  try {
+    await r.until(() => signals.length >= 1);
+    expect(signals).toHaveLength(1);
+    expect(signals[0].to).toBe(peerId);
+    expect(signals[0].description.type).toBe('offer');
+    expect(signals[0].description.sdp).toContain('a=candidate:1 1 udp 1 192.0.2.1 5000 typ host\r\n');
+    expect(signals[0].description.sdp).toContain(`a=${relay}\r\n`);
+    expect(logs.some(line => line.includes('sending 2 candidate(s) gathered so far'))).toBe(true);
+    expect(logs.some(line => line.includes('did not finish within'))).toBe(false);
+    expect(pcs[0].closed).toBe(false);
+
+    // The browser answers; werift holds that answer until its gathering ends. The connection is kept, not dropped.
+    answer = [{ seq: 1, from: peerId, session: 's-1', description: { type: 'answer', sdp: 'v=0\r\na=ice-ufrag:brw1\r\na=mid:0\r\n' } }];
+    await r.until(() => logs.some(line => line.includes('still waiting on gathering')));
+    const polls = r.state.polls;
+    await r.until(() => r.state.polls >= polls + 3);
+    expect(pcs[0].answered?.type).toBe('answer');
+    expect(pcs[0].closed).toBe(false);
+    expect(pcs).toHaveLength(1);
+    expect(signals).toHaveLength(1);
+
+    // Kept only until the connect timeout: one that never opens is dropped and tried afresh.
+    clock += CONNECT_TIMEOUT_MS + 1;
+    await r.until(() => pcs[0].closed && pcs.length >= 2);
   } finally { r.state.closed = true; }
   expect(String(await bridge)).toContain('closed by its host');
 }, 20_000);

@@ -23,7 +23,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { replaceFile } from './browser-agent';
 
 /** The webhook a Grok Bot routine gave: where to POST and the key it checks. */
@@ -227,4 +227,78 @@ export function grokWakeGuard(sub: string | undefined, values: Record<string, st
   if (sub !== 'wake') throw new Error(`grok ${sub ?? 'help'} isn't available to an agent the room watcher woke. Only its operator can run it, outside a wake.`);
   if (values['--room'] !== room) throw new Error(`This wake is for room ${room}; use --room ${room}.`);
   return env.MESHROOMS_WAKE_DIR ?? '';
+}
+
+/** One of this agent's rooms as `grok keepalive` reports it (from `bindings`): no message text, only state. */
+export type GrokRoomHealth = {
+  roomId: string; title: string | null; wakes: string; reason?: string; runner: boolean; closed?: boolean; stopped?: boolean;
+};
+export type GrokKeepaliveDeps = {
+  agentHome: string;
+  startDaemon: () => Promise<{ running: boolean; started: boolean }>;
+  /** This agent folder's rooms, read again each time it is called (the daemon brings runners and watchers up). */
+  rooms: () => GrokRoomHealth[];
+  /** Whether the wake routine's webhook is saved and usable: undefined if so, else why not (never the URL or key). */
+  webhookProblem: () => string | undefined;
+  bunVersion: string;
+  now: () => number; sleep: (ms: number) => Promise<void>;
+  /** How long a daemon that has just started gets to bring this agent's rooms up before they're reported. */
+  settleMs?: number;
+};
+export type GrokKeepaliveResult = {
+  ok: boolean; daemon: { running: boolean; started: boolean }; agentHome: string; webhook: 'ok' | 'problem';
+  rooms: GrokRoomHealth[]; attention: string[]; exitCode: number;
+};
+
+/**
+ * Folder names whose contents tools and hosts treat as rebuildable and may clear (a box that is replaced keeps the home
+ * folder but not these), or that are temporary by name. An agent folder in one of them can lose the agent's signing key.
+ */
+const VOLATILE = new Set(['dist', 'build', 'out', 'coverage', 'target', '.cache', '.next', 'tmp', 'temp', 'node_modules']);
+export function volatileAgentHome(agentHome: string, tmp: string) {
+  const full = resolve(agentHome), inTemp = relative(resolve(tmp), full);
+  if (!inTemp || (!inTemp.startsWith('..') && !isAbsolute(inTemp))) return true;
+  return full.split(/[\\/]+/).some(part => VOLATILE.has(part.toLowerCase()));
+}
+const MIN_BUN = [1, 4, 2];
+const bunTooOld = (version: string) => {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version)?.slice(1).map(Number);
+  if (!parts) return false;
+  for (let i = 0; i < 3; i++) if (parts[i] !== MIN_BUN[i]) return parts[i] < MIN_BUN[i];
+  return false;
+};
+/** A room that needs nothing: wakes on, its runner up, still open. */
+const roomOk = (room: GrokRoomHealth) => room.wakes === 'on' && room.runner && !room.closed && !room.stopped;
+
+/**
+ * `grok keepalive`: what a Grok Bot's hourly keepalive routine runs, since a box has no systemd or login session to start
+ * the daemon and the box can be replaced (its home folder kept, its processes not). Starts the daemon if none runs
+ * (idempotent), gives a daemon it just started a moment to bring this agent's runners and watchers back, then reports
+ * what needs the person: the daemon, the webhook, each room's wakes and runner, an agent folder in a place that gets
+ * cleared, a Bun too old. `ok` (exit 0) means the routine can end without a word; otherwise `attention` says what, in
+ * words a person can be told (room titles, never ids or paths), and it exits 1.
+ */
+export async function grokKeepalive(deps: GrokKeepaliveDeps, tmp: string): Promise<GrokKeepaliveResult> {
+  const attention: string[] = [];
+  let daemon = { running: false, started: false };
+  try { const d = await deps.startDaemon(); daemon = { running: d.running, started: d.started }; }
+  catch (error) { attention.push(`The Meshrooms daemon would not start: ${error instanceof Error ? error.message.split('\n')[0].slice(0, 200) : String(error)}`); }
+  let rooms = deps.rooms();
+  if (daemon.started) {
+    for (const until = deps.now() + (deps.settleMs ?? 20_000); deps.now() < until && !rooms.every(roomOk); rooms = deps.rooms()) await deps.sleep(1_000);
+  }
+  const webhook = deps.webhookProblem();
+  if (webhook) attention.push(`The wake routine's webhook can't be used (${webhook}); run grok setup again.`);
+  if (!rooms.length) attention.push('This agent is in no room yet.');
+  const named = (room: GrokRoomHealth) => room.title ? `"${room.title}"` : 'one room';
+  for (const room of rooms) {
+    if (room.closed) attention.push(`The room ${named(room)} was closed; leave it (unbind, stop) and take it out of the wake routine.`);
+    else if (room.stopped) attention.push(`The connection to ${named(room)} was stopped; connect again with a new link to rejoin.`);
+    else if (room.wakes !== 'on') attention.push(`Wakes in ${named(room)} are ${room.wakes}${room.reason ? `: ${room.reason.replace(/[.\s]+$/, '')}` : ''}.`);
+    else if (!room.runner) attention.push(`The connection to ${named(room)} isn't up yet.`);
+  }
+  if (volatileAgentHome(deps.agentHome, tmp)) attention.push('The agent folder is in a temporary or build folder that can be cleared, which would lose this agent; move it under ~/.meshrooms.');
+  if (bunTooOld(deps.bunVersion)) attention.push(`Bun ${deps.bunVersion} is older than 1.4.2; run bun upgrade.`);
+  const ok = attention.length === 0 && daemon.running;
+  return { ok, daemon, agentHome: deps.agentHome, webhook: webhook ? 'problem' : 'ok', rooms, attention, exitCode: ok ? GROK_EXIT.ok : GROK_EXIT.failed };
 }

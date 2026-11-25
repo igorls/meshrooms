@@ -31,10 +31,10 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import { MCP_TOOLS, serveMcp } from './mcp';
-import { GROK_DEFAULTS, grokPing, grokSetup, grokWake, grokWakeGuard, grokWebhookFile, readGrokWebhook } from './grok-bot';
+import { GROK_DEFAULTS, grokKeepalive, grokPing, grokSetup, grokWake, grokWakeGuard, grokWebhookFile, readGrokWebhook } from './grok-bot';
 import { watchDesktop } from './desktop-watch';
 import { defaultCodexDelivery, harnessPreferences } from './harness-apps';
 import { BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, replaceFile, roomClosed, runnerStuck, runnerTrouble, serviceSilence, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, peekWork, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
@@ -1887,7 +1887,7 @@ async function agentCommand(sub: string, values: Record<string, string>) {
   throw new Error('Use agent create, request or list.');
 }
 /**
- * `grok <setup|check|wake>`: a Grok Bot as the agent's harness (grok-bot.ts). setup and check are the operator's; wake is
+ * `grok <setup|check|keepalive|wake>`: a Grok Bot as the agent's harness (grok-bot.ts). setup, check and keepalive are the operator's; wake is
  * the exec program a binding runs, and exits 0 (the room was read), 1 (the webhook or agent can't be used) or 2 (the
  * routine didn't read the room in time), which the watcher counts like any harness's run.
  */
@@ -1905,6 +1905,19 @@ async function grokCommand(sub: string | undefined, values: Record<string, strin
     const ping = await grokPing(webhook);
     return { ok: ping.pinged, file, ...ping, ...(ping.pinged ? {} : { [EXIT_CODE]: 1 }) };
   }
+  if (sub === 'keepalive') {
+    const agentHome = home();
+    const { exitCode, ...result } = await grokKeepalive({
+      agentHome, startDaemon: () => startDaemon(), bunVersion: Bun.version, now: Date.now, sleep: ms => Bun.sleep(ms),
+      webhookProblem: () => { try { readGrokWebhook(file); return undefined; } catch (error) { return existsSync(file) ? (error instanceof Error ? error.message : String(error)) : 'none is saved'; } },
+      rooms: () => listBindings().bindings.filter(row => resolve(String(row.agentHome)) === agentHome).map(row => {
+        const r = row as { roomId: string; title?: string | null; wakes: { state: string; reason?: string | null }; runner?: unknown; closed?: unknown; retired?: unknown; stopped?: unknown };
+        return { roomId: r.roomId, title: r.title ?? null, wakes: r.wakes.state, ...(r.wakes.reason ? { reason: r.wakes.reason } : {}), runner: !!r.runner,
+          ...(r.closed || r.retired ? { closed: true } : {}), ...(r.stopped ? { stopped: true } : {}) };
+      }),
+    }, tmpdir());
+    return { ...result, ...(exitCode ? { [EXIT_CODE]: exitCode } : {}) };
+  }
   if (sub === 'wake') {
     const agent = knownRoom(values['--room']);
     const count = (key: string, fallback: number, max: number) => {
@@ -1920,7 +1933,7 @@ async function grokCommand(sub: string | undefined, values: Record<string, strin
       log: line => process.stderr.write(`${terminalSafe(`grok wake: ${line}`)}\n`) });
     return { ...result, ...(exitCode ? { [EXIT_CODE]: exitCode } : {}) };
   }
-  throw new Error('Use grok setup, grok check or grok wake.');
+  throw new Error('Use grok setup, grok check, grok keepalive or grok wake.');
 }
 /** `daemon <run|start|stop|status|install|uninstall> [--bin-dir DIR]`. */
 async function daemonCommand(sub: string, values: Record<string, string>) {
@@ -2334,6 +2347,7 @@ export async function agentCli(argv: string[], stdin?: () => Promise<string>): P
     'unbind --room ROOM  (turns wakes off; the agent stays in the room and connected)', 'bindings [--json]  (every agent on this machine: binding, wakes, runner, pending work)',
     "grok setup [--webhook-file FILE]  (Grok Bot: serves a one-time page on 127.0.0.1 where the person fills in their wake routine's webhook URL and key; saved 0600, never printed)",
     'grok check [--webhook-file FILE] [--ping]  (whether the saved webhook is usable, naming only its host; --ping posts one test event)',
+    'grok keepalive [--webhook-file FILE]  (for an hourly routine on a box without systemd: starts the daemon if none runs, then reports what needs the person; exits 1 with `attention` when something does)',
     "grok wake --room ROOM --prompt-file FILE [--timeout-minutes 10] [--poll-seconds 5] [--webhook-file FILE]  (the exec program a Grok Bot binding runs: bind --harness exec --command 'bun \"<launcher>\" grok wake --room {room} --prompt-file {prompt_file}')",
     'mcp --room ROOM [--wake-dir DIR] [--agent-home DIR]  (a stdio MCP server exposing the wake subcommands as tools, so a harness can be confined to this room; --agent-home is needed whenever MESHROOMS_AGENT_HOME is not the default, because Hermes filters stdio env and this server would otherwise read the shared one)',
     'watch-status --room ROOM', 'watch-stop --room ROOM  (turns wakes off; the daemon, if it runs, leaves them off)',

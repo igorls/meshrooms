@@ -761,7 +761,7 @@ function Rooms({ source }: { source: RoomSource }) {
       const { token } = await source.command('agent-invite', urlRoom, { name }) as unknown as { token: string };
       setAgentLink({ name, url: `${roomOrigin}/agent/${urlRoom}#${token}` }); setAgentName('');
       // A name that says which harness it is picks that harness; the person can still change it.
-      if (/codex/i.test(name)) setPromptHarness('codex'); else if (/claude/i.test(name)) setPromptHarness('claude'); else if (/hermes/i.test(name)) setPromptHarness('hermes'); else if (/dsh|deepseek/i.test(name)) setPromptHarness('dsh');
+      if (/codex/i.test(name)) setPromptHarness('codex'); else if (/claude/i.test(name)) setPromptHarness('claude'); else if (/hermes/i.test(name)) setPromptHarness('hermes'); else if (/dsh|deepseek/i.test(name)) setPromptHarness('dsh'); else if (/grok/i.test(name)) setPromptHarness('grok');
     });
   }
   const promptText = agentLink ? agentPrompt({ origin: roomOrigin, roomId: urlRoom, link: agentLink.url, name: agentLink.name, version: agentVersion, harness: promptHarness }) : '';

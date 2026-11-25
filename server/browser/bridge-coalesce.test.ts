@@ -27,6 +27,7 @@ const alex = crypto.randomUUID(), wren = crypto.randomUUID(), deviceId = 'a'.rep
 /** The fake harness: what a woken agent does, driven by its room's control file. */
 const FAKE = `const fs = require('fs'), path = require('path');
 const [promptFile] = process.argv.slice(2);
+const startedAt = Date.now();
 const control = JSON.parse(fs.readFileSync(process.env.FAKE_CONTROL, 'utf8'));
 const log = entry => fs.appendFileSync(path.join(control.shared, 'deliveries.jsonl'), JSON.stringify({ room: process.env.MESHROOMS_WAKE_ROOM, ...entry }) + '\\n');
 if (control.lease && fs.existsSync(control.lease)) { log({ refused: true }); process.stderr.write('SESSION_NOT_OWNED\\n'); process.exit(1); }
@@ -63,7 +64,7 @@ const arriving = (control.flood ?? 0) + (control.during && !fs.existsSync(once) 
 if (control.during) fs.writeFileSync(once, '1');
 for (let i = 0; i < arriving; i++) add(crypto.randomUUID(), '@Wren and another thing', control.human);
 const until = Date.now() + (control.sleepMs ?? 0); while (Date.now() < until) {}
-log({ replied, skip, overlap, resent, offered: replies.map(r => r.message) });
+log({ replied, skip, overlap, resent, offered: replies.map(r => r.message), startedAt, endedAt: Date.now() });
 if (!overlap) fs.unlinkSync(busy);
 process.exit(control.exitCode ?? 0);
 `;
@@ -87,7 +88,7 @@ function room(home: string, shared: string, roomId = crypto.randomUUID()) {
   return { agent, roomId, say, control, controlFile, replies };
 }
 type Room = ReturnType<typeof room>;
-type Delivery = { room: string; refused?: boolean; broken?: boolean; replied?: string[]; skip?: string[]; overlap?: boolean; offered?: string[]; resent?: string[] };
+type Delivery = { room: string; refused?: boolean; broken?: boolean; replied?: string[]; skip?: string[]; overlap?: boolean; offered?: string[]; resent?: string[]; startedAt?: number; endedAt?: number };
 const deliveries = (shared: string): Delivery[] => { try { return readFileSync(join(shared, 'deliveries.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)); } catch { return []; } };
 
 /** A machine for these tests: a fake clock every loop shares, the fake harness, and one session for every room. */
@@ -99,11 +100,12 @@ function machine() {
   const key = replyKey(home);
   /** The deps of one room's watcher, as runWatch wires them, with the clock, state and stop condition of the test. */
   const watcher = (r: Room, options: { until: () => boolean; state?: { value: WatchState }; generation?: string; fenced?: () => string | undefined;
-    outcome?: (result: RunOutcome) => RunOutcome; logs?: string[]; session?: string }) => {
+    outcome?: (result: RunOutcome) => RunOutcome; logs?: string[]; session?: string; command?: string }) => {
     const state = options.state ?? { value: emptyState() };
-    const config: WatchConfig = { roomId: r.roomId, harness: 'exec', cwd: base, command: `"${process.execPath}" "${script}" {prompt_file}`, maxWakesPerHour: 100, maxAgentWakesPerHour: 100,
+    const config: WatchConfig = { roomId: r.roomId, harness: 'exec', cwd: base, command: options.command ?? `"${process.execPath}" "${script}" {prompt_file}`, maxWakesPerHour: 100, maxAgentWakesPerHour: 100,
       runTimeoutMinutes: 1, allowTools: [], launcher: 'x', agentHome: home, binDir: join(base, 'bin'), roomDir: r.agent.dir, ...(options.generation ? { generation: options.generation } : {}) };
-    const ledger = sessionLedger(locks, sessionKey({ harness: 'claude', session: options.session ?? 'S', cwd: base }), r.roomId, {
+    // With a command of its own, the key is the one the bridge computes for it (as runWatch does); else one session for every room.
+    const ledger = sessionLedger(locks, options.command ? sessionKey(config) : sessionKey({ harness: 'claude', session: options.session ?? 'S', cwd: base }), r.roomId, {
       alive: pid => pid === process.pid || processRuns(pid), holdMs: 24 * 3_600_000, ownedMs: WATCH_TIMING.busyRetryMs, freshMs: 30_000, now: () => clock.now, ...(options.generation ? { generation: options.generation } : {}) });
     const promptFile = join(r.agent.dir, 'watch-prompt.txt');
     const deps: WatchDeps = {
@@ -134,7 +136,7 @@ function machine() {
     };
     return { deps, state, config, ledger };
   };
-  return { base, shared, clock, hooks, home, key, locks, watcher, room: () => room(home, shared), at: (seconds: number) => () => clock.now >= 1_000_000 + seconds * 1000 };
+  return { base, shared, clock, hooks, home, key, locks, script, watcher, room: () => room(home, shared), at: (seconds: number) => () => clock.now >= 1_000_000 + seconds * 1000 };
 }
 const exec = { maxWakesPerHour: 100, maxAgentWakesPerHour: 100, harness: 'exec' as const };
 
@@ -203,6 +205,33 @@ test('two rooms bound to one session: one wake at a time, each confined to its o
   expect(order.indexOf(b.roomId)).toBeLessThanOrEqual(1);
   expect(b.replies(bMention)).toBe(1);
   expect(a.replies(aMentions[0])).toBe(1);
+}, 60_000);
+
+test('an exec command that names its room ({room}, as a Grok Bot\'s grok wake does) gives each room its own queue: B\'s wake doesn\'t wait for A\'s', async () => {
+  // Reproduces a box run: one Grok Bot in two rooms, A's routine slow; B's webhook waited 43.9 s for A's run to end.
+  const served = async (command: string) => {
+    const m = machine(), a = m.room(), b = m.room();
+    a.control({ sleepMs: 1500 }); b.control({});
+    const aMention = a.say('@Wren in A'), bMention = b.say('@Wren in B');
+    const full = command.replace('SCRIPT', m.script);
+    const wa = m.watcher(a, { until: () => deliveries(m.shared).length >= 2 || m.clock.now > 1_000_000 + 3_600_000, command: full });
+    const wb = m.watcher(b, { until: () => deliveries(m.shared).length >= 2 || m.clock.now > 1_000_000 + 3_600_000, command: full });
+    // A starts first and is mid-run when B's watcher asks for the session.
+    const aLoop = watchLoop(exec, wa.deps);
+    while (!existsSync(join(m.shared, 'busy'))) await new Promise(done => setTimeout(done, 10));
+    await Promise.all([aLoop, watchLoop(exec, wb.deps)]);
+    expect(a.replies(aMention)).toBe(1);
+    expect(b.replies(bMention)).toBe(1);
+    const sent = deliveries(m.shared), ofA = sent.find(d => d.room === a.roomId)!, ofB = sent.find(d => d.room === b.roomId)!;
+    return { aKey: sessionKey(wa.config), bKey: sessionKey(wb.config), bStartedBeforeAEnded: ofB.startedAt! < ofA.endedAt! };
+  };
+  const own = await served(`"${process.execPath}" "SCRIPT" {prompt_file} --room {room}`);
+  expect(own.aKey).not.toBe(own.bKey);
+  expect(own.bStartedBeforeAEnded).toBe(true);
+  // A command without {room} is one session for every room still: B waits its turn.
+  const shared = await served(`"${process.execPath}" "SCRIPT" {prompt_file}`);
+  expect(shared.aKey).toBe(shared.bKey);
+  expect(shared.bStartedBeforeAEnded).toBe(false);
 }, 60_000);
 
 test('events that arrive during a wake are covered by exactly one follow-up wake', async () => {
@@ -413,6 +442,12 @@ test('every room bound to one session computes one key, however the session is s
   expect(key({ harness: 'hermes', session: '20260101_000000_ABCDEF', cwd: dir }, {})).not.toBe(key({ harness: 'hermes', session: '20260101_000000_abcdef', cwd: dir }, {}));
   // What a hand-edited watch.json holds is not trusted to be text.
   expect(() => sessionKey({ harness: 'exec', cwd: dir, command: 42 as unknown as string })).not.toThrow();
+  // exec: the folder and the command as it runs, so {room} is filled in; a template without it is one key for every room.
+  const grok = { harness: 'exec' as const, cwd: dir, command: 'bun "/l/meshrooms.js" grok wake --room {room} --prompt-file {prompt_file}' };
+  expect(sessionKey({ ...grok, roomId: 'room-a' })).not.toBe(sessionKey({ ...grok, roomId: 'room-b' }));
+  expect(sessionKey({ ...grok, roomId: 'room-a' })).toBe(sessionKey({ ...grok, roomId: 'room-a', command: ` ${grok.command} ` }));
+  const plain = { harness: 'exec' as const, cwd: dir, command: 'my-agent {prompt_file}' };
+  expect(sessionKey({ ...plain, roomId: 'room-a' })).toBe(sessionKey({ ...plain, roomId: 'room-b' }));
   expect(() => sessionKey({ harness: 'claude', cwd: dir, session: 7 as unknown as string })).not.toThrow();
 });
 

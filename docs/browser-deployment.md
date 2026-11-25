@@ -173,6 +173,9 @@ identifiers or payloads:
   Nginx-generated errors, alongside a fallback `Content-Security-Policy` emitted only when upstream did not supply one.
 - **Favicon handling:** `location = /favicon.ico` returns `204` with `access_log off` and `log_not_found off` while
   inheriting all server-level security headers, avoiding noisy 404 entries (pages declare `/assets/mark.svg`).
+- **MeshGuard web gateway:** `location = /meshguard-web/ws` (WebSocket upgrade, 90-second read/send timeouts) and
+  `location = /meshguard-web/health` proxy to MeshGuard's authenticated browser transport gateway on loopback
+  (`127.0.0.1:4321`), under the same server-level limits and headers. Drop both blocks on a host that does not run it.
 
 ## State and recovery
 

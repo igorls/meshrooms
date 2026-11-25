@@ -614,6 +614,41 @@ export async function settleWithin<T>(work: Promise<T>[], ms: number): Promise<(
   return [...results];
 }
 /**
+ * How long `describe` waits for werift's candidate gathering before it signals what it has. werift's setLocalDescription
+ * resolves only once every STUN and TURN server has answered or timed out. On a network that drops UDP, one udp TURN URL
+ * holds it for about 13 s, which is past the pass's `signals` deadline, so the agent dropped every connection it started.
+ * Past this deadline the description goes out with the candidates gathered so far (relay over TCP/TLS comes in about a
+ * second) and werift keeps gathering. The browser does the same: it waits up to 4 s, then sends what it has.
+ */
+export const GATHER_DEADLINE_MS = 3_000;
+/** A gathered candidate as werift's onIceCandidate reports it. */
+export type GatheredCandidate = { candidate: string; sdpMLineIndex?: number | null };
+/**
+ * `sdp` with each of `candidates` added to the end of its media section as an `a=candidate` line. Candidates already
+ * there, or with a line break in them, are skipped. Descriptions are not trickled, so this is how candidates gathered
+ * before the gather deadline reach the peer.
+ */
+export function withGatheredCandidates(sdp: string, candidates: GatheredCandidate[]): string {
+  const eol = sdp.includes('\r\n') ? '\r\n' : '\n';
+  const lines = sdp.split(eol); if (lines.at(-1) === '') lines.pop();
+  const sections = lines.flatMap((line, i) => line.startsWith('m=') ? [i] : []);
+  if (!sections.length) return sdp;
+  const present = new Set(lines.filter(line => line.startsWith('a=candidate:')).map(line => line.slice(2)));
+  const added = new Map<number, string[]>();
+  for (const { candidate, sdpMLineIndex } of candidates) {
+    const text = String(candidate ?? '').replace(/^a=/, '');
+    if (!text.startsWith('candidate:') || /[\r\n]/.test(text) || present.has(text)) continue;
+    present.add(text);
+    const section = Math.min(Math.max(Number.isInteger(sdpMLineIndex) ? sdpMLineIndex! : 0, 0), sections.length - 1);
+    added.set(section, [...(added.get(section) ?? []), `a=${text}`]);
+  }
+  for (let section = sections.length - 1; section >= 0; section--) {
+    const extra = added.get(section); if (!extra) continue;
+    lines.splice(section + 1 < sections.length ? sections[section + 1] : lines.length, 0, ...extra);
+  }
+  return lines.join(eol) + eol;
+}
+/**
  * How long one pass of the runner waits on each step. The room service keeps a device present for 25 s after it
  * handled its last poll (PRESENCE_MS). Between one poll being handled and the next: the rest of that poll's round trip
  * (the request gives up after 10 s, and `poll` backs that up), everything after it (which shares `budget`), the second's
@@ -684,10 +719,12 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     pause?: (ms: number) => Promise<unknown>;
     now?: () => number;
     gatherMs?: number;
+    gatherDeadlineMs?: number;
     createPeerConnection?: (config: { iceServers: { urls: string; username?: string; credential?: string }[] }) => RTCPeerConnection;
   } = {}) {
   const deadlines: PassDeadlines = { ...PASS_DEADLINES, ...options.deadlines }, pause = options.pause ?? ((ms: number) => Bun.sleep(ms));
   const now = options.now ?? (() => Date.now()), gatherMs = options.gatherMs ?? 1500;
+  const gatherDeadlineMs = options.gatherDeadlineMs ?? GATHER_DEADLINE_MS;
   const makePc = options.createPeerConnection ?? (config => new RTCPeerConnection(config));
   const identity = await agent.ensureIdentity();
   const session = randomUUID(); const peers = new Map<string, Peer>();
@@ -1171,11 +1208,26 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const describe = async (id: string, peer: Peer, offer: boolean) => {
     const isClosed = () => peer.pc.connectionState === 'closed';
     if (peers.get(id) !== peer || isClosed()) return;
-    await peer.pc.setLocalDescription(offer ? await peer.pc.createOffer() : await peer.pc.createAnswer());
-    if (gatherMs > 0) await new Promise(r => setTimeout(r, gatherMs)); // werift gathers host/srflx candidates quickly; descriptions are not trickled.
-    if (peers.get(id) !== peer || isClosed() || !peer.pc.localDescription) return;
+    const description = offer ? await peer.pc.createOffer() : await peer.pc.createAnswer();
+    // Descriptions are not trickled: gather for at most gatherDeadlineMs, then send the candidates found so far
+    // (see GATHER_DEADLINE_MS). werift keeps gathering; a late failure is only logged.
+    const gathered: GatheredCandidate[] = [];
+    const watching = peer.pc.onIceCandidate?.subscribe(c => { if (c?.candidate) gathered.push({ candidate: c.candidate, sdpMLineIndex: c.sdpMLineIndex }); });
+    const applying = peer.pc.setLocalDescription(description);
+    let complete = false;
+    try {
+      complete = await within(applying, gatherDeadlineMs);
+      if (complete) await applying;
+      else applying.catch(error => log(`gathering for ${id.slice(0, 8)} failed after its description was sent: ${error instanceof Error ? error.message : String(error)}`));
+    } finally { (watching as { unSubscribe?: () => void } | undefined)?.unSubscribe?.(); }
+    if (complete && gatherMs > 0) await new Promise(r => setTimeout(r, gatherMs)); // werift gathers host/srflx candidates quickly.
+    if (peers.get(id) !== peer || isClosed()) return;
+    const local = peer.pc.localDescription;
+    if (!local) throw new Error(`no local description for ${id.slice(0, 8)} within ${gatherDeadlineMs / 1000} s`);
+    if (!complete) log(`gathering for ${id.slice(0, 8)} still running after ${gatherDeadlineMs / 1000} s; sending ${gathered.length} candidate(s) gathered so far`);
     if (offer) peer.offerSent = true;
-    await agent.command('signal', { to: id, session, targetSession: peer.session, description: { type: peer.pc.localDescription.type, sdp: peer.pc.localDescription.sdp } });
+    await agent.command('signal', { to: id, session, targetSession: peer.session,
+      description: { type: local.type, sdp: complete ? local.sdp : withGatheredCandidates(local.sdp, gathered) } });
   };
   const deliverOutbox = () => transaction(async () => {
     const outbox = join(agent.dir, 'outbox');
@@ -1460,6 +1512,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           if (kind !== 'answer' && peers.get(id) === peer && peer.channel?.readyState !== 'open') void retire(id, peer);
         }
         if (result) return;
+        // werift applies an answer only once its own gathering ends (description operations queue behind it), which can
+        // outlast this pass when a description went out at the gather deadline. The answer is still being applied, so the
+        // connection is kept: the connect timeout (evaluatePeerHealth) drops it if it never opens.
+        if (kind === 'answer') { log(`pass: applying the answer from ${id.slice(0, 8)} is still waiting on gathering; keeping that connection`); return; }
         log(`pass: connecting to ${id.slice(0, 8)} did not finish within ${Math.round(signalMs / 100) / 10} s; dropping that connection to try again`);
         if (peers.get(id) === peer) void retire(id, peer);
       });

@@ -612,6 +612,9 @@ test('the agent explainer and bridge are served per room, naming the room by id 
     const guide = await (await bare(new Request(`${origin}/agent/${room}.md`))).text();
     expect(guide).toContain(`bunx @wormdb/meshrooms@${CURRENT_AGENT_VERSION} connect '<the link, including #token>'`);
     expect([...guide.matchAll(/bunx @wormdb\/meshrooms(\S*)/g)].map(m => m[1]).every(v => v === `@${CURRENT_AGENT_VERSION}`)).toBe(true);
+    // A Grok Bot is pointed at its guide at the same bridge's tag, so the guide's commands are that bridge's.
+    expect(guide).toContain(`https://raw.githubusercontent.com/igorls/meshrooms/bridge-v${CURRENT_AGENT_VERSION}/skills/meshrooms-grok-bot/SKILL.md`);
+    expect(guide).toContain("grok wake --room {room} --prompt-file {prompt_file}");
     expect(await (await bare(new Request(`${origin}/api/lobby/health`))).json()).toMatchObject({ minAgentVersion: MIN_AGENT_VERSION, currentAgentVersion: CURRENT_AGENT_VERSION });
 
     mkdirSync(join(dir.path, 'agent'));

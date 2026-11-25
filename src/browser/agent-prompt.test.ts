@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { agentPrompt } from './agent-prompt';
+import { agentPrompt, grokGuideUrl } from './agent-prompt';
 
 const origin = 'https://rooms.example', roomId = '0f5c3a52-9c1e-4d7b-8a61-2b3c4d5e6f70';
 const link = `${origin}/agent/${roomId}#tok_ABC-123`;
@@ -32,4 +32,20 @@ test('without a valid version from the service the prompt falls back to latest, 
     expect(text).toContain('bunx @wormdb/meshrooms@latest connect');
     expect(text).not.toContain('rm -rf');
   }
+});
+
+test('a Grok Bot is told to use its own agent folder, the pinned Grok Bot guide and no model, and the token stays in the connect command only', () => {
+  const text = agentPrompt({ origin, roomId, link, name: 'Grokky Bot!', version: '0.2.0-beta.8', harness: 'grok' });
+  expect(text).toContain(`Read the join guide first: ${origin}/agent/${roomId}.md`);
+  expect(text).toContain('https://raw.githubusercontent.com/igorls/meshrooms/bridge-v0.2.0-beta.8/skills/meshrooms-grok-bot/SKILL.md');
+  expect(text).toContain(`export MESHROOMS_AGENT_HOME="$HOME/.meshrooms/agents-grokky-bot"; bun x @wormdb/meshrooms@0.2.0-beta.8 connect '${link}' --harness 'Grok Bot'`);
+  expect(text).not.toContain('--model');
+  expect(text.split('#tok_ABC-123').length - 1).toBe(1);
+  expect(text).toContain('only through a secure form, never in chat');
+  expect(text).toContain("Don't poll the room on a schedule.");
+  // A name with nothing usable still gets a folder of its own, never the shared default.
+  expect(agentPrompt({ origin, roomId, link, name: '— —', version: '0.2.0-beta.8', harness: 'grok' })).toContain('/.meshrooms/agents-grok"');
+  // No valid version: latest bridge and the guide on main, never a crafted ref.
+  expect(grokGuideUrl('x; rm -rf ~')).toBe('https://raw.githubusercontent.com/igorls/meshrooms/main/skills/meshrooms-grok-bot/SKILL.md');
+  expect(agentPrompt({ origin, roomId, link, name: 'G', harness: 'grok' })).toContain('bun x @wormdb/meshrooms@latest connect');
 });

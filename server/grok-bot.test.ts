@@ -1,5 +1,5 @@
 /**
- * `grok setup|check|wake`: a Grok Bot woken through its webhook routine. The webhook is a local mock server and the room
+ * `grok setup|check|keepalive|wake`: a Grok Bot woken through its webhook routine. The webhook is a local mock server and the room
  * a fake peek sequence, so nothing here reaches a real routine or room. Asserted: the key is sent only in the
  * Authorization header and never comes back in a result, room text never goes into the body, the exit codes match what
  * the watcher counts, the 0600 file is refused when anyone else could read it, and the setup page takes one submission
@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentCli } from './agent-cli';
 import { HOME_SECRETS } from './agent-watch';
-import { GROK_DIR, GROK_EXIT, grokPing, grokSetup, grokWake, grokWakeGuard, grokWebhookFile, normalizeKey, readGrokWebhook, webhookUrlProblem, writeGrokWebhook, type PeekLike } from './grok-bot';
+import { GROK_DIR, GROK_EXIT, grokKeepalive, grokPing, grokSetup, grokWake, grokWakeGuard, grokWebhookFile, normalizeKey, readGrokWebhook, webhookUrlProblem, writeGrokWebhook, volatileAgentHome, type GrokKeepaliveDeps, type GrokRoomHealth, type PeekLike } from './grok-bot';
 
 /** Synthetic fixtures. Never a real room id or key. */
 const ROOM = '00000000-0000-4000-8000-000000000001';
@@ -213,7 +213,7 @@ describe('grok — wake mode', () => {
   test('only grok wake, for the wake\'s own room', () => {
     expect(grokWakeGuard('wake', { '--room': ROOM }, env)).toBe('/tmp');
     expect(() => grokWakeGuard('wake', { '--room': OTHER_ROOM }, env)).toThrow(ROOM);
-    for (const sub of ['setup', 'check', undefined]) expect(() => grokWakeGuard(sub, {}, env)).toThrow(/isn't available/);
+    for (const sub of ['setup', 'check', 'keepalive', undefined]) expect(() => grokWakeGuard(sub, {}, env)).toThrow(/isn't available/);
     expect(grokWakeGuard('setup', {}, {})).toBeUndefined();
   });
   test('the refusals hold at the real CLI entry', async () => {
@@ -232,5 +232,77 @@ describe('grok — wake mode', () => {
     writeGrokWebhook(file, { url: 'https://hooks.example/r/abc', key: KEY });
     const out = await agentCli(['grok', 'check', '--webhook-file', file]);
     expect(out).toEqual({ ok: true, file, webhookHost: 'hooks.example' });
+  });
+});
+
+describe('grok keepalive', () => {
+  const healthy: GrokRoomHealth = { roomId: ROOM, title: 'Design review', wakes: 'on', runner: true };
+  /** Fake deps on a fake clock: the daemon's answer, the rooms each read returns (the last repeats), the webhook. */
+  const deps = (options: { daemon?: { running: boolean; started: boolean } | Error; rooms?: GrokRoomHealth[][]; webhook?: string; home?: string; bun?: string } = {}) => {
+    let now = 0, reads = 0, slept = 0;
+    const d: GrokKeepaliveDeps = {
+      agentHome: options.home ?? '/home/me/.meshrooms/agents-grokky',
+      startDaemon: async () => { if (options.daemon instanceof Error) throw options.daemon; return options.daemon ?? { running: true, started: false }; },
+      rooms: () => { const all = options.rooms ?? [[healthy]]; return all[Math.min(reads++, all.length - 1)]; },
+      webhookProblem: () => options.webhook, bunVersion: options.bun ?? '1.4.4',
+      now: () => now, sleep: async ms => { now += ms; slept += ms; },
+    };
+    return { d, slept: () => slept, reads: () => reads };
+  };
+
+  test('a daemon already running, a room with wakes on and a saved webhook: ok, exit 0, nothing to tell, no waiting', async () => {
+    const f = deps();
+    const result = await grokKeepalive(f.d, '/tmp');
+    expect(result).toMatchObject({ ok: true, exitCode: GROK_EXIT.ok, daemon: { running: true, started: false }, webhook: 'ok', attention: [] });
+    expect(f.slept()).toBe(0);
+  });
+
+  test('after a box restart the daemon it starts gets a moment to bring the rooms back before they are reported', async () => {
+    const down = { ...healthy, runner: false };
+    const f = deps({ daemon: { running: true, started: true }, rooms: [[down], [down], [down], [healthy]] });
+    const result = await grokKeepalive(f.d, '/tmp');
+    expect(result).toMatchObject({ ok: true, daemon: { started: true }, rooms: [healthy] });
+    expect(f.slept()).toBe(3_000);
+    // A room that never comes back is reported once the moment is over.
+    const never = deps({ daemon: { running: true, started: true }, rooms: [[down]] });
+    const late = await grokKeepalive({ ...never.d, settleMs: 5_000 }, '/tmp');
+    expect(late.ok).toBe(false);
+    expect(late.attention).toEqual(["The connection to \"Design review\" isn't up yet."]);
+    expect(never.slept()).toBe(5_000);
+  });
+
+  test('what needs the person is said in words, by room title, never with a room id, a path or the webhook', async () => {
+    const f = deps({ webhook: 'none is saved', home: '/workspace/build/agents-grokky', bun: '1.3.9', rooms: [[
+      { ...healthy, wakes: 'paused', reason: 'harness did not respond' },
+      { roomId: OTHER_ROOM, title: 'Old', wakes: 'on', runner: true, closed: true },
+      { roomId: OTHER_ROOM, title: null, wakes: 'unbound', runner: true },
+    ]] });
+    const result = await grokKeepalive(f.d, '/tmp');
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(GROK_EXIT.failed);
+    expect(result.webhook).toBe('problem');
+    expect(result.attention).toEqual([
+      "The wake routine's webhook can't be used (none is saved); run grok setup again.",
+      'Wakes in "Design review" are paused: harness did not respond.',
+      'The room "Old" was closed; leave it (unbind, stop) and take it out of the wake routine.',
+      'Wakes in one room are unbound.',
+      'The agent folder is in a temporary or build folder that can be cleared, which would lose this agent; move it under ~/.meshrooms.',
+      'Bun 1.3.9 is older than 1.4.2; run bun upgrade.',
+    ]);
+    for (const line of result.attention) { expect(line).not.toContain(ROOM); expect(line).not.toContain(OTHER_ROOM); expect(line).not.toContain('/workspace'); }
+  });
+
+  test('a daemon that will not start, or an agent in no room, is reported, never ok', async () => {
+    const failed = await grokKeepalive(deps({ daemon: new Error('The daemon did not start.\nmore detail') }).d, '/tmp');
+    expect(failed).toMatchObject({ ok: false, daemon: { running: false }, attention: ['The Meshrooms daemon would not start: The daemon did not start.'] });
+    const alone = await grokKeepalive(deps({ rooms: [[]] }).d, '/tmp');
+    expect(alone).toMatchObject({ ok: false, attention: ['This agent is in no room yet.'] });
+  });
+
+  test('an agent folder in a folder that gets cleared is told apart from one that persists', () => {
+    expect(volatileAgentHome('/home/me/.meshrooms/agents-grokky', '/tmp')).toBe(false);
+    expect(volatileAgentHome('/workspace/scratch/agents', '/tmp')).toBe(false);
+    for (const home of ['/workspace/dist/agents', '/workspace/.cache/m', '/home/me/project/target/x', '/tmp/agents', '/var/x/tmp/a']) expect(volatileAgentHome(home, '/tmp')).toBe(true);
+    expect(volatileAgentHome('/tmpfoo/agents', '/tmp')).toBe(false);
   });
 });
