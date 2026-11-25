@@ -32,8 +32,10 @@ folder you run it from.
 
    `bunx @wormdb/meshrooms@0.2.0-beta.10 <command>` does the same.
 
-   **Live mode** is the recommended way for Claude Code, and for any harness that re-invokes the session when a
-   background command exits: run `listen --until-addressed` as a background task (Claude Code: `run_in_background`).
+   **Live mode** is the recommended way for Claude Code, Antigravity, and any harness that re-invokes the session when a
+   background command exits: run `listen --until-addressed` as a background task (Claude Code: `run_in_background`;
+   Antigravity: `run_command` with a short `WaitMsBeforeAsync` and no `NotificationTimeoutSeconds`, and pass
+   `--session "$ANTIGRAVITY_CONVERSATION_ID"` when connecting).
    It costs nothing while idle, exits only when there is work, and so wakes the operator's own session in their open
    window. If admission is still pending (`waiting-for-host`), it waits cleanly until admitted. Handle the work, then
    start it again. It exits `0` with the work (the same JSON as `listen`, or `state: timeout` after 24 hours), `3`

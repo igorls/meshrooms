@@ -1,5 +1,5 @@
 /** Harnesses the connect prompt can name for the agent; `other` leaves the placeholder for the agent to fill in. */
-export const PROMPT_HARNESSES = { claude: 'Claude Code', codex: 'Codex CLI', codexApp: 'Codex app', hermes: 'Hermes Agent', dsh: 'DeepSeek Harness', grok: 'Grok Bot', other: '' } as const;
+export const PROMPT_HARNESSES = { claude: 'Claude Code', codex: 'Codex CLI', codexApp: 'Codex app', agy: 'Antigravity', hermes: 'Hermes Agent', dsh: 'DeepSeek Harness', grok: 'Grok Bot', other: '' } as const;
 export type PromptHarness = keyof typeof PROMPT_HARNESSES;
 
 const VERSION = /^\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z.-]{1,32})?$/;

@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Meshrooms</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--color-background-primary, #f6f6f1);
+      --surface: var(--color-background-secondary, #ffffff);
+      --surface-alt: var(--color-background-tertiary, #eef2e8);
+      --text: var(--color-text-primary, #1f3328);
+      --muted: var(--color-text-secondary, #5f6f61);
+      --border: var(--color-border-primary, #d7dfd0);
+      --accent: var(--color-ring-primary, #3f6b47);
+      --accent-soft: #e6f0e3;
+      --warn-soft: #f7eed6;
+      --warn-text: #7b5f24;
+      --radius: var(--border-radius-md, 10px);
+      --font: var(--font-sans, system-ui, -apple-system, sans-serif);
+      --mono: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    }
+    [data-theme="dark"] {
+      --bg: var(--color-background-primary, #141816);
+      --surface: var(--color-background-secondary, #1c221f);
+      --surface-alt: var(--color-background-tertiary, #252e29);
+      --text: var(--color-text-primary, #e7efe9);
+      --muted: var(--color-text-secondary, #9eb0a3);
+      --border: var(--color-border-primary, #2e3a33);
+      --accent: var(--color-ring-primary, #72b37c);
+      --accent-soft: #213627;
+      --warn-soft: #382f1b;
+      --warn-text: #e2c278;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 14px;
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.45;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 8px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: 0 0 auto; }
+    h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+    .meta { font-size: 11px; color: var(--muted); }
+    button {
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .layout { display: grid; gap: 12px; }
+    .rooms { display: flex; flex-wrap: wrap; gap: 6px; }
+    .room-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      font-size: 12px;
+    }
+    .room-pill.active { border-color: var(--accent); background: var(--accent-soft); }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .status-dot.live { background: var(--accent); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+    }
+    .card h2 { font-size: 13px; margin: 0 0 8px; font-weight: 650; }
+    .stats { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .stats strong { color: var(--text); }
+    ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+    li {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--surface-alt);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .badge {
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .badge.open { background: var(--accent-soft); color: var(--text); border-color: transparent; }
+    .badge.warn { background: var(--warn-soft); color: var(--warn-text); border-color: transparent; }
+    .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="dot" aria-hidden="true"></span>
+      <div>
+        <h1>Meshrooms</h1>
+        <div id="updated" class="meta">Connecting to Antigravity…</div>
+      </div>
+    </div>
+    <button id="refreshBtn" type="button">Refresh</button>
+  </header>
+
+  <main id="root" class="layout" aria-live="polite"></main>
+
+  <script>
+    (function () {
+      const rootEl = document.getElementById('root');
+      const updatedEl = document.getElementById('updated');
+      const refreshBtn = document.getElementById('refreshBtn');
+
+      let nextId = 1;
+      const pending = new Map();
+      let hostCapabilities = {};
+      let currentState = null;
+
+      function post(msg) {
+        window.parent.postMessage(msg, '*');
+      }
+
+      function request(method, params) {
+        const id = nextId++;
+        return new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject });
+          post({ jsonrpc: '2.0', id, method, params });
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error('Host request timed out'));
+            }
+          }, 15000);
+        });
+      }
+
+      function applyHostContext(ctx) {
+        if (!ctx || typeof ctx !== 'object') return;
+        if (ctx.theme === 'dark' || ctx.theme === 'light') {
+          document.documentElement.dataset.theme = ctx.theme;
+        }
+        const vars = ctx.styles && ctx.styles.variables;
+        if (vars && typeof vars === 'object') {
+          for (const [key, val] of Object.entries(vars)) {
+            if (typeof key === 'string' && key.startsWith('--') && typeof val === 'string') {
+              document.documentElement.style.setProperty(key, val);
+            }
+          }
+        }
+      }
+
+      function el(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined && text !== null) node.textContent = String(text);
+        return node;
+      }
+
+      function clear(node) {
+        while (node.firstChild) node.removeChild(node.firstChild);
+      }
+
+      function render(state) {
+        currentState = state;
+        clear(rootEl);
+        if (!state || !Array.isArray(state.rooms)) {
+          updatedEl.textContent = 'Waiting for room data…';
+          rootEl.appendChild(el('div', 'card empty', 'No room snapshot received yet. Click Refresh to inspect connected rooms.'));
+          return;
+        }
+        updatedEl.textContent = state.generatedAt
+          ? 'Updated ' + new Date(state.generatedAt).toLocaleTimeString()
+          : 'Ready';
+
+        if (!state.rooms.length) {
+          const card = el('section', 'card');
+          card.appendChild(el('h2', '', 'No connected rooms yet'));
+          card.appendChild(el('p', 'empty', 'Ask Antigravity to connect to a Meshrooms invite link, then click Refresh.'));
+          rootEl.appendChild(card);
+        } else {
+          const switcher = el('div', 'rooms');
+          for (const room of state.rooms) {
+            const btn = el('button', 'room-pill' + (room.roomId === state.selectedRoomId ? ' active' : ''));
+            btn.type = 'button';
+            btn.appendChild(el('span', 'status-dot' + (room.runnerAlive ? ' live' : '')));
+            btn.appendChild(el('span', '', room.title));
+            btn.addEventListener('click', () => refresh(room.roomId));
+            switcher.appendChild(btn);
+          }
+          rootEl.appendChild(switcher);
+
+          const sel = state.selected;
+          if (sel) {
+            const summaryCard = el('section', 'card');
+            summaryCard.appendChild(el('h2', '', sel.title));
+            const stats = el('div', 'stats');
+            const addStat = (label, value) => {
+              const s = el('span');
+              s.appendChild(el('strong', '', value));
+              s.appendChild(document.createTextNode(' ' + label));
+              stats.appendChild(s);
+            };
+            addStat('runner', sel.runnerAlive ? 'online' : 'down');
+            addStat('participants', sel.memberCount);
+            addStat('open tasks', sel.openTasks);
+            addStat('open decisions', sel.openDecisions);
+            if (sel.harness) addStat('harness', sel.harness + (sel.wakesEnabled ? ' (wakes on)' : ' (wakes off)'));
+            summaryCard.appendChild(stats);
+            summaryCard.appendChild(el('div', 'meta', 'Room ID: ' + sel.roomId));
+
+            if (hostCapabilities && hostCapabilities.message) {
+              const actions = el('div', 'actions');
+              const askBtn = el('button', '', 'Check room in chat');
+              askBtn.type = 'button';
+              askBtn.addEventListener('click', () => {
+                request('ui/message', {
+                  role: 'user',
+                  content: [{ type: 'text', text: 'Check Meshrooms room ' + sel.roomId + ' using listen --peek and summarize open tasks or addressed messages.' }],
+                }).catch(() => {});
+              });
+              actions.appendChild(askBtn);
+              summaryCard.appendChild(actions);
+            }
+            rootEl.appendChild(summaryCard);
+
+            const tasksCard = el('section', 'card');
+            tasksCard.appendChild(el('h2', '', 'Task board (' + sel.tasks.length + ')'));
+            if (!sel.tasks.length) {
+              tasksCard.appendChild(el('div', 'empty', 'No tasks on the board.'));
+            } else {
+              const ul = el('ul');
+              for (const task of sel.tasks) {
+                const li = el('li');
+                const left = el('div');
+                left.appendChild(el('div', '', task.title));
+                const metaParts = [task.assignee ? 'Assignee: ' + task.assignee : null, task.notes].filter(Boolean);
+                if (metaParts.length) left.appendChild(el('div', 'sub', metaParts.join(' · ')));
+                li.appendChild(left);
+                li.appendChild(el('span', 'badge' + (task.status === 'doing' ? ' open' : ''), task.status));
+                ul.appendChild(li);
+              }
+              tasksCard.appendChild(ul);
+            }
+            rootEl.appendChild(tasksCard);
+
+            const decCard = el('section', 'card');
+            decCard.appendChild(el('h2', '', 'Decisions (' + sel.decisions.length + ')'));
+            if (!sel.decisions.length) {
+              decCard.appendChild(el('div', 'empty', 'No decisions recorded.'));
+            } else {
+              const ul = el('ul');
+              for (const dec of sel.decisions) {
+                const li = el('li');
+                const left = el('div');
+                left.appendChild(el('div', '', dec.question));
+                if (dec.options && dec.options.length) {
+                  left.appendChild(el('div', 'sub', dec.options.map(o => o.label + ' (' + o.votes + ')').join(' · ')));
+                }
+                li.appendChild(left);
+                li.appendChild(el('span', 'badge' + (dec.state === 'open' ? ' open' : ''), dec.state));
+                ul.appendChild(li);
+              }
+              decCard.appendChild(ul);
+            }
+            rootEl.appendChild(decCard);
+          }
+        }
+
+        const delivery = state.delivery;
+        if (delivery) {
+          const delCard = el('section', 'card');
+          delCard.appendChild(el('h2', '', 'Antigravity live delivery'));
+          if (!delivery.bindings || !delivery.bindings.length) {
+            delCard.appendChild(el('div', 'empty', delivery.sidecarActive
+              ? 'Delivery sidecar is active with no bound conversations configured.'
+              : 'Sidecar standby: configure bindings in ~/.meshrooms/antigravity-delivery.json to deliver fixed wake cues into open Antigravity chats.'));
+          } else {
+            const ul = el('ul');
+            for (const b of delivery.bindings) {
+              const li = el('li');
+              const left = el('div');
+              left.appendChild(el('div', '', 'Room ' + b.roomId.slice(0, 8) + (b.conversationId ? ' -> chat ' + b.conversationId.slice(0, 8) : '')));
+              if (b.lastError) left.appendChild(el('div', 'sub', b.lastError));
+              else if (b.lastDeliveredAt) left.appendChild(el('div', 'sub', 'Last wake cue: ' + new Date(b.lastDeliveredAt).toLocaleTimeString()));
+              li.appendChild(left);
+              li.appendChild(el('span', 'badge' + (b.lastError ? ' warn' : b.enabled ? ' open' : ''), b.enabled ? b.state : 'disabled'));
+              ul.appendChild(li);
+            }
+            delCard.appendChild(ul);
+          }
+          rootEl.appendChild(delCard);
+        }
+      }
+
+      async function refresh(roomId) {
+        refreshBtn.disabled = true;
+        try {
+          const res = await request('tools/call', {
+            name: 'meshrooms_app_state',
+            arguments: roomId ? { roomId } : {},
+          });
+          if (res && res.structuredContent) render(res.structuredContent);
+        } catch (err) {
+          updatedEl.textContent = 'Refresh unavailable: ' + (err && err.message ? err.message : 'host error');
+        } finally {
+          refreshBtn.disabled = false;
+        }
+      }
+
+      refreshBtn.addEventListener('click', () => refresh(currentState && currentState.selectedRoomId));
+
+      window.addEventListener('message', (event) => {
+        const msg = event.data;
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.id !== undefined && pending.has(msg.id)) {
+          const entry = pending.get(msg.id);
+          pending.delete(msg.id);
+          if (msg.error) entry.reject(new Error(msg.error.message || 'RPC error'));
+          else entry.resolve(msg.result);
+          return;
+        }
+        if (msg.method === 'ui/notifications/tool-result' && msg.params && msg.params.structuredContent) {
+          render(msg.params.structuredContent);
+        } else if (msg.method === 'ui/notifications/host-context-changed' && msg.params) {
+          applyHostContext(msg.params);
+        }
+      });
+
+      request('ui/initialize', {
+        protocolVersion: '2026-01-26',
+        appInfo: { name: 'meshrooms', version: '0.2.0' },
+        appCapabilities: {},
+      }).then((initResult) => {
+        if (initResult && initResult.hostCapabilities) hostCapabilities = initResult.hostCapabilities;
+        if (initResult && initResult.hostContext) applyHostContext(initResult.hostContext);
+        post({ jsonrpc: '2.0', method: 'ui/notifications/initialized' });
+        if (!currentState) refresh();
+      }).catch(() => {
+        updatedEl.textContent = 'Standalone preview';
+      });
+    })();
+  </script>
+</body>
+</html>

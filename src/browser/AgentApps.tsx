@@ -71,7 +71,7 @@ export function AgentApps({ api }: { api: LocalAgents }) {
         const detected = desktop ? app.desktop?.available : app.scan?.detected;
         const status = !app.enabled ? 'Disabled' : app.id === 'exec' ? 'Custom setup' : detected ? desktop ? 'Desktop available' : 'Detected' : 'Setup needed';
         return <article className="agent-app-card" key={app.id} aria-labelledby={`app-${app.id}`}>
-          <div className="agent-app-card-title"><div className={`agent-app-symbol is-${app.id}`} aria-hidden="true">{app.id === 'codex' ? 'C' : app.id === 'claude' ? '✳' : app.id === 'hermes' ? 'H' : '›_'}</div>
+          <div className="agent-app-card-title"><div className={`agent-app-symbol is-${app.id}`} aria-hidden="true">{app.id === 'codex' ? 'C' : app.id === 'claude' ? '✳' : app.id === 'hermes' ? 'H' : app.id === 'agy' ? 'A' : '›_'}</div>
             <div><h2 id={`app-${app.id}`}>{app.label}</h2><span>{app.scan?.version ? `Version ${app.scan.version}` : app.id === 'exec' ? 'Your own harness' : desktop && detected ? 'Local desktop connection' : 'No version detected'}</span></div>
             <span className={`agent-app-status ${detected && app.enabled ? 'is-ready' : ''}`}>{status}</span></div>
           <p className="agent-app-description">{app.description}</p>

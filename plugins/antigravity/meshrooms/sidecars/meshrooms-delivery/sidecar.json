@@ -1,0 +1,10 @@
+{
+  "command": "bun",
+  "args": [
+    "--no-env-file",
+    "worker.ts"
+  ],
+  "restart_policy": "on-failure",
+  "display_name": "Meshrooms Delivery",
+  "description": "Watches bound Meshrooms rooms via read-only peek and delivers fixed wake cues into open Antigravity conversations using agentapi."
+}

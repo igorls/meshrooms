@@ -1,10 +1,12 @@
+import { Database } from 'bun:sqlite';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
-  CLAUDE_VERIFIED, CODEX_MIN_VERSION, SESSION_LIMIT, TITLE_CODE_POINTS, claudeSessionFolder, codexVersionSupported, folderLabel, freshClaudeSession, freshCodexThread, harnessScanner, headLines, hermesIdFresh,
-  listClaudeSessions, listCodexThreads, listSessions,
-  parseClaudeVersion, parseCodexVersion, plainText, promptTitle, resolveHarnessProgram, runBounded, scanHarnesses, type CommandResult, type ScanDeps,
+  AGY_MIN_VERSION, CLAUDE_VERIFIED, CODEX_MIN_VERSION, SESSION_LIMIT, TITLE_CODE_POINTS, agyVersionSupported, claudeSessionFolder, codexVersionSupported, folderLabel, freshAgySession, freshClaudeSession, freshCodexThread, harnessScanner, headLines, hermesIdFresh,
+  listAgySessions, listClaudeSessions, listCodexThreads, listSessions, newestAgySession,
+  parseAgyVersion, parseClaudeVersion, parseCodexVersion, plainText, promptTitle, resolveHarnessProgram, runBounded, scanHarnesses, type CommandResult, type ScanDeps,
 } from './harnesses';
 import { HERMES_VERIFIED_BUILD } from './hermes';
 import { testDirectory } from '../test-directory';
@@ -62,6 +64,11 @@ test('versions: only the version is kept, and semver minimums open the sessions'
   expect(CODEX_MIN_VERSION).toBe('0.159.0');
   for (const ok of ['0.159.0', '0.159.2', '0.160.0', '0.163.0-alpha.10.2', '0.170.0', '1.0.0']) expect(codexVersionSupported(ok)).toBe(true);
   for (const old of ['0.158.9', '0.159.0-alpha.1', '0.1.0', null]) expect(codexVersionSupported(old)).toBe(false);
+  expect(AGY_MIN_VERSION).toBe('1.2.0');
+  expect(parseAgyVersion('1.5.17\n')).toBe('1.5.17');
+  expect(parseAgyVersion('agy 1.5.17')).toBeNull();
+  for (const ok of ['1.2.0', '1.5.17', '2.0.0']) expect(agyVersionSupported(ok)).toBe(true);
+  for (const old of ['1.1.9', '0.9.0', null]) expect(agyVersionSupported(old)).toBe(false);
 });
 
 test('titles and folder labels are plain capped text: no markup, control, format or bidi characters, never a path', () => {
@@ -128,7 +135,7 @@ test('Codex threads: newest first, subagents\' threads left out, Codex\'s own th
 });
 
 /** A machine where `found` programs answer `--version` with what `answers` says. */
-function machine(answers: Partial<Record<'claude' | 'codex' | 'hermes', CommandResult | 'missing'>>, dirs: { claudeDir?: string; codexHome?: string } = {}) {
+function machine(answers: Partial<Record<'claude' | 'codex' | 'hermes' | 'agy', CommandResult | 'missing'>>, dirs: { claudeDir?: string; codexHome?: string; agyCliDir?: string } = {}) {
   const asked: string[] = [];
   const deps: ScanDeps = {
     resolve: name => { if (answers[name as 'claude'] === 'missing' || answers[name as 'claude'] === undefined) throw new Error('not on PATH'); return { file: `/bin/${name}`, prefix: [] }; },
@@ -139,7 +146,7 @@ function machine(answers: Partial<Record<'claude' | 'codex' | 'hermes', CommandR
       if (args[0] === '--version') return answer;
       return { ok: true, stdout: 'No sessions found.\n' };
     },
-    claudeDir: dirs.claudeDir ?? folder(), codexHome: dirs.codexHome ?? folder(),
+    claudeDir: dirs.claudeDir ?? folder(), codexHome: dirs.codexHome ?? folder(), agyCliDir: dirs.agyCliDir ?? folder(),
   };
   return { deps, asked };
 }
@@ -147,30 +154,33 @@ function machine(answers: Partial<Record<'claude' | 'codex' | 'hermes', CommandR
 test('the scan: what is installed and which sessions can be listed, failing closed on versions below minimum', async () => {
   const f = claudeFixture();
   const ok = (stdout: string): CommandResult => ({ ok: true, stdout });
-  const { deps, asked } = machine({ claude: ok('2.1.289 (Claude Code)\n'), codex: ok('codex-cli 0.158.0\n'), hermes: ok(`Hermes Agent v${HERMES_VERIFIED_BUILD} (2026.1.1)\n`) }, { claudeDir: f.dir });
+  const { deps, asked } = machine({ claude: ok('2.1.289 (Claude Code)\n'), codex: ok('codex-cli 0.158.0\n'), hermes: ok(`Hermes Agent v${HERMES_VERIFIED_BUILD} (2026.1.1)\n`), agy: ok('1.5.17\n') }, { claudeDir: f.dir });
   const scan = await scanHarnesses(deps);
   expect(scan).toEqual([
     { harness: 'claude', label: 'Claude Code', detected: true, version: '2.1.289', sessionsAvailable: true },
     { harness: 'codex', label: 'Codex', detected: true, version: '0.158.0', sessionsAvailable: false, reason: 'unsupported-version' },
     { harness: 'hermes', label: 'Hermes', detected: true, version: HERMES_VERIFIED_BUILD, sessionsAvailable: true },
+    { harness: 'agy', label: 'Antigravity', detected: true, version: '1.5.17', sessionsAvailable: true },
     { harness: 'exec', label: 'Custom command', detected: true, sessionsAvailable: false, reason: 'custom-command' },
   ]);
   // Newer Codex versions >= 0.159.0 are supported without needing narrow allowlist bumps.
   const newerCodex = machine({ codex: ok('codex-cli 0.170.0\n') });
   expect((await scanHarnesses(newerCodex.deps)).find(s => s.harness === 'codex')).toEqual({ harness: 'codex', label: 'Codex', detected: true, version: '0.170.0', sessionsAvailable: true });
   // Only --version, with a fixed argv.
-  expect(asked.sort()).toEqual(['/bin/claude --version', '/bin/codex --version']);
+  expect(asked.sort()).toEqual(['/bin/agy --version', '/bin/claude --version', '/bin/codex --version']);
   expect((await listSessions('claude', deps)).sessions.map(s => s.id)).toEqual([f.first, f.second, f.third, f.noTitle]);
   expect(await listSessions('codex', deps)).toEqual({ harness: 'codex', sessionsAvailable: false, reason: 'unsupported-version', sessions: [], truncated: false });
   expect(await listSessions('hermes', deps)).toEqual({ harness: 'hermes', sessionsAvailable: true, sessions: [], truncated: false });
+  expect(await listSessions('agy', deps)).toEqual({ harness: 'agy', sessionsAvailable: true, sessions: [], truncated: false });
   expect(await listSessions('exec', deps)).toMatchObject({ sessionsAvailable: false, reason: 'custom-command' });
 
   // Missing, failing and unparsable programs.
-  const other = machine({ claude: 'missing', codex: { ok: false, reason: 'timeout' }, hermes: ok('Hermes Agent v0.21.4 (2026.1.1)\n') });
+  const other = machine({ claude: 'missing', codex: { ok: false, reason: 'timeout' }, hermes: ok('Hermes Agent v0.21.4 (2026.1.1)\n'), agy: ok('1.0.0\n') });
   expect(await scanHarnesses(other.deps)).toEqual([
     { harness: 'claude', label: 'Claude Code', detected: false, sessionsAvailable: false, reason: 'not-found' },
     { harness: 'codex', label: 'Codex', detected: true, sessionsAvailable: false, reason: 'version-command-failed' },
     { harness: 'hermes', label: 'Hermes', detected: true, version: '0.21.4', sessionsAvailable: false, reason: 'unsupported-version' },
+    { harness: 'agy', label: 'Antigravity', detected: true, version: '1.0.0', sessionsAvailable: false, reason: 'unsupported-version' },
     { harness: 'exec', label: 'Custom command', detected: true, sessionsAvailable: false, reason: 'custom-command' },
   ]);
   const garbled = machine({ claude: ok('C:\\private\\path\\claude.exe crashed'), codex: { ok: false, reason: 'not-found' } });
@@ -254,4 +264,43 @@ test('a new session\'s id is the one this run made: Codex by its rollout, Claude
   expect(hermesIdFresh(stamp(start - 3_600_000), start, start + 10_000)).toBe(false);
   expect(hermesIdFresh(stamp(start + 3_600_000), start, start + 10_000)).toBe(false);
   expect(hermesIdFresh('not-an-id', start, start + 10_000)).toBe(false);
+});
+
+test('Antigravity CLI sessions: reads conversation_summaries.db readonly, filters subagents/killed, verifies freshness', () => {
+  const cliDir = folder(), wake = join(folder(), 'wake');
+  mkdirSync(wake, { recursive: true });
+  const dbPath = join(cliDir, 'conversation_summaries.db');
+  const db = new Database(dbPath);
+  db.exec(`CREATE TABLE conversation_summaries (
+    conversation_id TEXT PRIMARY KEY,
+    title TEXT,
+    workspace_uris TEXT,
+    last_modified_time TEXT,
+    nesting_depth INTEGER DEFAULT 0,
+    parent_conversation_id TEXT DEFAULT '',
+    killed INTEGER DEFAULT 0
+  )`);
+  const newest = uuid(), older = uuid(), subagent = uuid(), killed = uuid();
+  const nowIso = new Date().toISOString().replace('T', ' ').replace('Z', '+00:00');
+  const oldIso = '2026-01-01 10:00:00.000000+00:00';
+  const wakeUri = pathToFileURL(wake).href;
+  const insert = db.prepare('INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)');
+  insert.run(newest, 'Fix \u202elinux tray', JSON.stringify([wakeUri]), nowIso, 0, '', 0);
+  insert.run(older, 'Earlier work', JSON.stringify(['file:///home/someone/proj-beta']), oldIso, 0, '', 0);
+  insert.run(subagent, 'Subagent run', JSON.stringify([wakeUri]), nowIso, 1, newest, 0);
+  insert.run(killed, 'Killed chat', JSON.stringify([wakeUri]), nowIso, 0, '', 1);
+  db.close();
+
+  const { sessions, truncated } = listAgySessions(cliDir);
+  expect(truncated).toBe(false);
+  expect(sessions.map(s => s.id)).toEqual([newest, older]);
+  expect(sessions[0]).toMatchObject({ title: 'Fix linux tray', folder: 'wake' });
+  expect(sessions[1]).toMatchObject({ title: 'Earlier work', folder: 'proj-beta' });
+  expect(JSON.stringify(sessions)).not.toContain('home/someone');
+  expect(listAgySessions(cliDir, 1)).toMatchObject({ truncated: true });
+  expect(newestAgySession(wake, cliDir)).toBe(newest);
+  expect(freshAgySession(newest, wake, Date.now() - 5_000, cliDir)).toBe(true);
+  expect(freshAgySession(older, wake, Date.now() - 5_000, cliDir)).toBe(false);
+  expect(freshAgySession(newest, join(wake, '..', 'other'), Date.now() - 5_000, cliDir)).toBe(false);
+  expect(listAgySessions(join(cliDir, 'missing'))).toEqual({ sessions: [], truncated: false });
 });

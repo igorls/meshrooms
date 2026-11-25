@@ -340,7 +340,7 @@ export type AgentDeps = {
    * A new session of `harness` for the identity in this room, with its name and the room in the first prompt: its id,
    * proven made by this run (never an id the run merely printed).
    */
-  bootstrap(agent: BrowserAgent, input: { harness: 'claude' | 'codex' | 'hermes'; name: string; model?: string; title: string | null; identityId: string }): Promise<string>;
+  bootstrap(agent: BrowserAgent, input: { harness: 'claude' | 'codex' | 'hermes' | 'agy'; name: string; model?: string; title: string | null; identityId: string }): Promise<string>;
   /** Where an existing session of this harness works (Claude Code: its transcript's folder), when binding needs it. */
   sessionFolder(harness: HarnessId, session: string): string | undefined;
   /** Throws when a custom command's template doesn't parse (splitTemplate). */
@@ -501,7 +501,7 @@ export async function bindNewSession(roomId: string, key: string, deps: AgentDep
       return { identityId: identity.id, roomId, harness: identity.harness, kind: 'new' as const, state: 'bound' as const, session: null };
     });
   }
-  const harness = identity.harness as 'claude' | 'codex' | 'hermes';
+  const harness = identity.harness as 'claude' | 'codex' | 'hermes' | 'agy';
   const key2 = identity.id;
   if (inProgress.has(key2)) throw busy();
   // Each one is a model run: a few per agent per window, however often the page asks.
@@ -516,7 +516,7 @@ export async function bindNewSession(roomId: string, key: string, deps: AgentDep
       reason = 'bind-refused';
       // Deleted while its session started (delete waits for this lock, so only from outside the daemon): nothing is bound.
       stillThere(home, identity.id);
-      const bound = await bindChecked(deps, agent, { '--harness': harness, '--session': session, ...(harness === 'codex' ? { '--codex-delivery': 'headless' } : { '--cwd': wake }), ...model });
+      const bound = await bindChecked(deps, agent, { '--harness': harness, '--session': session, ...(harness === 'codex' ? { '--codex-delivery': 'headless' } : harness === 'agy' ? {} : { '--cwd': wake }), ...model });
       await setBound(home, identity, roomId, { kind: 'new', state: 'bound', session, ...(harness === 'codex' ? { codexDelivery: 'headless' } : {}), at: Date.now() });
       logAgents(home, { event: 'bound', identity: identity.id, room: roomId, harness, session, warnings: bound.warnings?.length ?? 0 });
       return session;
@@ -590,7 +590,7 @@ function rebindValues(identity: AgentIdentity, record: BoundRecord, agent: Brows
   const wake = wakeDir({ roomDir: agent.dir }), model: Record<string, string> = identity.model ? { '--model': identity.model } : {};
   if (identity.harness === 'exec') return identity.command ? { '--harness': 'exec', '--command': identity.command, '--cwd': wake } : undefined;
   if (!record.session) return undefined;
-  let cwd: string | undefined = identity.harness === 'codex' ? undefined : wake;
+  let cwd: string | undefined = identity.harness === 'codex' || identity.harness === 'agy' ? undefined : wake;
   if (record.kind === 'existing' && identity.harness === 'claude') {
     if (!record.cwd) return undefined;
     if (deps.sessionFolder('claude', record.session) !== record.cwd)
@@ -697,7 +697,7 @@ function validApproval(value: unknown, now: number): value is Approval {
   if (a.kind === 'identity') return (keys === 'expiresAt,harness,id,kind,name,requestedAt' || keys === 'expiresAt,harness,id,kind,model,name,requestedAt')
     && nameProblem(a.name) === undefined && a.harness !== 'exec' && (a.model === undefined || (typeof a.model === 'string' && MODEL.test(a.model)));
   return keys === 'cwd,expiresAt,folder,harness,id,identityId,kind,requestedAt,roomId,session,title' && a.harness !== 'exec' && shownText(a.title, 60) && shownText(a.folder, 40)
-    && (a.harness === 'codex' ? a.cwd === null : typeof a.cwd === 'string' && a.cwd.length <= 4_096 && !/[\p{Cc}\p{Cf}]/u.test(a.cwd) && !RENDERS_BLANK.test(a.cwd))
+    && (a.harness === 'codex' || a.harness === 'agy' ? a.cwd === null : typeof a.cwd === 'string' && a.cwd.length <= 4_096 && !/[\p{Cc}\p{Cf}]/u.test(a.cwd) && !RENDERS_BLANK.test(a.cwd))
     && a.kind === 'bind-existing' && typeof a.identityId === 'string' && UUID.test(a.identityId) && typeof a.roomId === 'string' && UUID.test(a.roomId)
     && typeof a.session === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(a.session) && (a.title === null || typeof a.title === 'string') && (a.folder === null || typeof a.folder === 'string');
 }

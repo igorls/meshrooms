@@ -352,21 +352,22 @@ export async function liveListen(deps: LiveListenDeps, options: LiveListenOption
 }
 
 /** How `connect --session` and `watch` read a harness's session id. */
-export type SessionHarness = 'claude' | 'codex' | 'hermes' | 'other';
+export type SessionHarness = 'claude' | 'codex' | 'hermes' | 'agy' | 'other';
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 /** The harness a `connect --harness` text names (it is free text, like 'Claude Code'). */
 export const sessionHarness = (text: string | undefined): SessionHarness =>
-  /claude/i.test(text ?? '') ? 'claude' : /codex/i.test(text ?? '') ? 'codex' : /hermes/i.test(text ?? '') ? 'hermes' : 'other';
+  /claude/i.test(text ?? '') ? 'claude' : /codex/i.test(text ?? '') ? 'codex' : /hermes/i.test(text ?? '') ? 'hermes' : /antigravity|\bagy\b/i.test(text ?? '') ? 'agy' : 'other';
 /**
- * The session `connect --session` recorded, as the default for `watch --harness codex|hermes` when neither --session nor
+ * The session `connect --session` recorded, as the default for `watch --harness codex|hermes|agy` when neither --session nor
  * --last is given: only one recorded for that same harness, in its own format.
  */
-export function recordedSessionFor(harness: 'codex' | 'hermes', recorded: { id: string; harness: SessionHarness } | undefined) {
+export function recordedSessionFor(harness: 'codex' | 'hermes' | 'agy', recorded: { id: string; harness: SessionHarness } | undefined) {
   return recorded && recorded.harness === harness && sessionProblem(harness, recorded.id) === undefined ? recorded.id : undefined;
 }
 /** Whether `id` has the shape of that harness's session ids; undefined when it does, else what to give instead. */
 export function sessionProblem(harness: SessionHarness, id: string): string | undefined {
   if (harness === 'claude') return UUID.test(id) ? undefined : 'A Claude Code session id is a UUID (claude --resume lists them; /status shows the current one).';
+  if (harness === 'agy') return UUID.test(id) ? undefined : 'An Antigravity conversation id is a UUID (from $ANTIGRAVITY_CONVERSATION_ID or agy sessions).';
   if (harness === 'hermes') return /^\d{8}_\d{6}_[0-9a-f]{4,}$/i.test(id) ? undefined : 'A Hermes session id looks like 20260101_000000_abcdef.';
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) ? undefined : 'Use --session with the session id your harness printed.';
 }

@@ -128,6 +128,7 @@ fn harness_label(harness: &str) -> Option<&'static str> {
         "claude" => Some("Claude Code"),
         "codex" => Some("Codex"),
         "hermes" => Some("Hermes"),
+        "agy" => Some("Antigravity"),
         _ => None,
     }
 }
@@ -239,6 +240,7 @@ pub fn item(entry: &Value) -> Option<Value> {
             let cwd = match &entry["cwd"] {
                 Value::Null if desktop => "The existing chat's working folder".to_string(),
                 Value::Null if harness == "codex" => "The room's own folder (Codex always works there)".to_string(),
+                Value::Null if harness == "agy" => "The room's own folder (Antigravity wakes work there)".to_string(),
                 Value::String(cwd) => shown(Some(cwd), MAX_FOLDER, ""),
                 _ => {
                     whole.set(false);
@@ -792,6 +794,15 @@ mod tests {
         assert_eq!(shown["canApprove"], true);
         entry["codexDelivery"] = json!("unknown");
         assert_eq!(item(&entry).unwrap()["canApprove"], false);
+    }
+    #[test]
+    fn antigravity_existing_binding_uses_room_folder_and_shows_label() {
+        let mut entry = bind(Value::Null);
+        entry["harness"] = json!("agy");
+        let shown = item(&entry).unwrap();
+        assert_eq!(row(&shown, "Harness"), "Antigravity");
+        assert_eq!(row(&shown, "Working folder"), "The room's own folder (Antigravity wakes work there)");
+        assert_eq!(shown["canApprove"], true);
     }
     fn bind(cwd: Value) -> Value {
         json!({ "id": BIND, "kind": "bind-existing", "identityId": AGENT, "roomId": ROOM,

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "meshrooms": {
+      "command": "bun",
+      "args": [
+        "--no-env-file",
+        "${PLUGIN_ROOT}/bin/meshrooms-mcp-app.ts"
+      ]
+    }
+  }
+}

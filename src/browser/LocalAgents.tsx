@@ -247,7 +247,7 @@ export function LocalAgentsSection({ api, state, roomId, selfName, focus }: { ap
           {harnesses && !usable.length && <option value="">None found on this computer</option>}
           {harnesses?.map(h => <option key={h.harness} value={h.harness} disabled={h.harness === 'exec' || !h.detected || h.enabled === false}>{harnessOption(h)}</option>)}</select></label>
         {exec && <p>Custom command: Set up custom commands in the Meshrooms app.</p>}
-        {harnesses && !usable.length && <p>Install Claude Code, Codex or Hermes on this computer to make an agent here.</p>}
+        {harnesses && !usable.length && <p>Install Claude Code, Codex, Antigravity or Hermes on this computer to make an agent here.</p>}
         <label><span>Model <span className="browser-optional">(optional)</span></span><input value={model} onChange={e => setModel(e.target.value)} maxLength={100} placeholder="The harness’s default" autoComplete="off" spellCheck={false} /></label>
         <button className="secondary" disabled={busy || !name.trim() || !harness || !usable.some(h => h.harness === harness)}>Create agent</button>
       </form>

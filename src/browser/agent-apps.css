@@ -22,6 +22,7 @@
 .agent-app-symbol { width: 42px; height: 42px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; background: #e5eddf; color: #32563e; font-size: 24px; font-weight: 600; }
 .agent-app-symbol.is-claude { background: #f3e5d9; color: #b87354; }
 .agent-app-symbol.is-hermes { background: #e5e8f2; color: #596b94; }
+.agent-app-symbol.is-agy { background: #e1eef2; color: #2b6478; }
 .agent-app-symbol.is-exec { background: #ecece6; color: #64705f; font-size: 20px; }
 .agent-app-card-title h2 { font-size: 19px; margin: 0 0 3px; letter-spacing: -.025em; }
 .agent-app-card-title div > span { font-size: 11px; color: #75806e; }

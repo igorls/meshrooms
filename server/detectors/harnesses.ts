@@ -14,18 +14,20 @@
  * Hermes: hermes.ts, which already holds its own version gate and parser; this file only finds the program first.
  * exec ("custom command") needs no program and has no sessions.
  */
+import { Database } from 'bun:sqlite';
 import { spawn } from 'node:child_process';
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, type Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { recentClaudeSessions, claudeConfigDir, claudeProjectDir } from '../agent-live';
 import { compareVersions, isVersion } from '../agent-install';
 import { locateProgram, resolveProgram, type Program } from '../agent-watch';
 import { detectHermes, runHermesCommand, type HermesRunner } from './hermes';
 
-export type HarnessId = 'claude' | 'codex' | 'hermes' | 'exec';
-export const HARNESS_IDS: HarnessId[] = ['claude', 'codex', 'hermes', 'exec'];
-export const HARNESS_LABELS: Record<HarnessId, string> = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes', exec: 'Custom command' };
+export type HarnessId = 'claude' | 'codex' | 'hermes' | 'agy' | 'exec';
+export const HARNESS_IDS: HarnessId[] = ['claude', 'codex', 'hermes', 'agy', 'exec'];
+export const HARNESS_LABELS: Record<HarnessId, string> = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes', agy: 'Antigravity', exec: 'Custom command' };
 /** Why sessions are unavailable (or the harness not detected). Never a raw error, path or output. */
 export type ScanReason = 'not-found' | 'version-command-failed' | 'unsupported-version' | 'listing-command-failed' | 'unsupported-schema' | 'custom-command';
 export type HarnessScan = { harness: HarnessId; label: string; detected: boolean; version?: string; sessionsAvailable: boolean; reason?: ScanReason };
@@ -71,9 +73,11 @@ export const CODEX_INDEX_BYTES = 2 * 1024 * 1024;
  * prompt and `cwd`). Codex CLI: >= 0.159.0 (sessions/YYYY/MM/DD/rollout-*-<id>.jsonl with a session_meta first line, and
  * session_index.jsonl with thread names; the structural parser ignores unrecognized layouts).
  */
-export const CLAUDE_VERIFIED = /^2\.\d+\.\d+$/, CODEX_MIN_VERSION = '0.159.0';
+export const CLAUDE_VERIFIED = /^2\.\d+\.\d+$/, CODEX_MIN_VERSION = '0.159.0', AGY_MIN_VERSION = '1.2.0';
 export const codexVersionSupported = (version: string | null): version is string =>
   version !== null && isVersion(version) && compareVersions(version, CODEX_MIN_VERSION) >= 0;
+export const agyVersionSupported = (version: string | null): version is string =>
+  version !== null && isVersion(version) && compareVersions(version, AGY_MIN_VERSION) >= 0;
 
 /** The output of a command, or why there is none. Never stderr, never an exception's text. */
 export type CommandResult = { ok: true; stdout: string } | { ok: false; reason: 'not-found' | 'failed' | 'timeout' | 'output-limit' };
@@ -106,6 +110,10 @@ export function parseClaudeVersion(output: string): string | null {
 /** `codex --version` prints `codex-cli 0.159.2`. */
 export function parseCodexVersion(output: string): string | null {
   return /^codex-cli (\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)\s*$/.exec(output.split(/\r?\n/)[0] ?? '')?.[1] ?? null;
+}
+/** `agy --version` prints bare semver such as `1.5.17`. */
+export function parseAgyVersion(output: string): string | null {
+  return /^(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)\s*$/.exec(output.split(/\r?\n/)[0] ?? '')?.[1] ?? null;
 }
 
 /** Text from a harness's storage as the page may show it: one line, no control, format or bidi characters, capped. */
@@ -263,6 +271,133 @@ export function listCodexThreads(codexHome = process.env.CODEX_HOME || join(home
   return { sessions, truncated: more || (files.length > CODEX_INSPECT_LIMIT && sessions.length >= limit) };
 }
 
+/** Antigravity CLI's own folder ($AGY_CLI_HOME, else ~/.gemini/antigravity-cli). */
+export const agyCliDir = (env: Record<string, string | undefined> = process.env, home = homedir()) =>
+  env.AGY_CLI_HOME || join(home, '.gemini', 'antigravity-cli');
+
+/** Parses Antigravity's `workspace_uris` (JSON array or comma-separated `file://` URIs / paths) into local paths. */
+function agyWorkspacePaths(raw: unknown): string[] {
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  let items: unknown[] = [];
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('[')) {
+    try { const parsed = JSON.parse(trimmed); if (Array.isArray(parsed)) items = parsed; } catch { /* Fallback below. */ }
+  }
+  if (!items.length) items = trimmed.split(',').map(s => s.trim()).filter(Boolean);
+  return items.flatMap(entry => {
+    if (typeof entry !== 'string' || !entry.trim()) return [];
+    if (entry.startsWith('file://')) {
+      try { return [fileURLToPath(entry)]; } catch { return [entry.replace(/^file:\/\//, '')]; }
+    }
+    return [entry];
+  });
+}
+
+/** Parses an Antigravity SQLite timestamp (`2026-11-25 13:48:04.45751403+00:00`) into epoch ms. */
+function parseAgyTimestamp(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value : value * 1000;
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const isoLike = value.trim().replace(' ', 'T').replace(/(\.\d{3})\d+/, '$1');
+  const ms = Date.parse(isoLike);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * Antigravity CLI sessions from `~/.gemini/antigravity-cli/conversation_summaries.db`, newest first,
+ * top-level user conversations only (subagents and killed sessions excluded).
+ */
+export function listAgySessions(cliDir = agyCliDir(), limit = SESSION_LIMIT): { sessions: HarnessSession[]; truncated: boolean } {
+  const dbPath = join(cliDir, 'conversation_summaries.db');
+  if (!existsSync(dbPath)) return { sessions: [], truncated: false };
+  let db: Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const rows = db.query<{
+      conversation_id: string;
+      title: string | null;
+      workspace_uris: string | null;
+      last_modified_time: string | number | null;
+    }, [number]>(
+      `SELECT conversation_id, title, workspace_uris, last_modified_time
+       FROM conversation_summaries
+       WHERE COALESCE(nesting_depth, 0) = 0
+         AND COALESCE(parent_conversation_id, '') = ''
+         AND COALESCE(killed, 0) = 0
+       ORDER BY last_modified_time DESC
+       LIMIT ?`,
+    ).all(limit + 1);
+    const truncated = rows.length > limit;
+    const sessions = rows.slice(0, limit).flatMap(row => {
+      if (typeof row.conversation_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.conversation_id)) return [];
+      const firstPath = agyWorkspacePaths(row.workspace_uris)[0];
+      const at = parseAgyTimestamp(row.last_modified_time);
+      return [{
+        id: row.conversation_id,
+        title: plainText(row.title, TITLE_CODE_POINTS),
+        folder: folderLabel(firstPath),
+        lastActiveAt: at !== undefined ? new Date(at).toISOString() : null,
+      }];
+    });
+    return { sessions, truncated };
+  } catch {
+    return { sessions: [], truncated: false };
+  } finally {
+    try { db?.close(); } catch { /* Already closed. */ }
+  }
+}
+
+/** Whether Antigravity CLI recorded session `id` in `cwd` since `since`. */
+export function freshAgySession(id: string, cwd: string, since: number, cliDir = agyCliDir()): boolean {
+  const dbPath = join(cliDir, 'conversation_summaries.db');
+  if (!existsSync(dbPath)) return false;
+  let db: Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const row = db.query<{ workspace_uris: string | null; last_modified_time: string | number | null }, [string]>(
+      `SELECT workspace_uris, last_modified_time
+       FROM conversation_summaries
+       WHERE conversation_id = ? AND COALESCE(nesting_depth, 0) = 0 AND COALESCE(killed, 0) = 0
+       LIMIT 1`,
+    ).get(id);
+    if (!row) return false;
+    const at = parseAgyTimestamp(row.last_modified_time);
+    if (at === undefined || at < since - FRESH_SLACK_MS) return false;
+    const paths = agyWorkspacePaths(row.workspace_uris);
+    return paths.length === 0 || paths.some(p => sameFolder(p, cwd));
+  } catch {
+    return false;
+  } finally {
+    try { db?.close(); } catch { /* Already closed. */ }
+  }
+}
+
+/** The newest Antigravity CLI session recorded for `cwd`, if any. */
+export function newestAgySession(cwd: string, cliDir = agyCliDir()): string | undefined {
+  const dbPath = join(cliDir, 'conversation_summaries.db');
+  if (!existsSync(dbPath)) return undefined;
+  let db: Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const rows = db.query<{ conversation_id: string; workspace_uris: string | null }, []>(
+      `SELECT conversation_id, workspace_uris
+       FROM conversation_summaries
+       WHERE COALESCE(nesting_depth, 0) = 0
+         AND COALESCE(parent_conversation_id, '') = ''
+         AND COALESCE(killed, 0) = 0
+       ORDER BY last_modified_time DESC
+       LIMIT 200`,
+    ).all();
+    for (const row of rows) {
+      if (agyWorkspacePaths(row.workspace_uris).some(p => sameFolder(p, cwd))) return row.conversation_id;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* Already closed. */ }
+  }
+}
+
 /** What the scan needs from the machine; tests give fakes. */
 export type ScanDeps = {
   /** resolveProgram: throws when the program isn't on PATH (or is a batch file only a shell could run). */
@@ -271,6 +406,7 @@ export type ScanDeps = {
   hermes: HermesRunner;
   claudeDir: string;
   codexHome: string;
+  agyCliDir?: string;
 };
 export const machineScanDeps = (): ScanDeps => ({
   resolve: name => resolveHarnessProgram(name),
@@ -278,6 +414,7 @@ export const machineScanDeps = (): ScanDeps => ({
   hermes: args => runHermesCommand(args, () => resolveProgram('hermes')),
   claudeDir: claudeConfigDir(),
   codexHome: process.env.CODEX_HOME || join(homedir(), '.codex'),
+  agyCliDir: agyCliDir(),
 });
 
 async function versionOf(deps: ScanDeps, name: string, parseVersion: (output: string) => string | null) {
@@ -288,12 +425,13 @@ async function versionOf(deps: ScanDeps, name: string, parseVersion: (output: st
   if (!result.ok) return { found: result.reason !== 'not-found', failed: true as const };
   return { found: true as const, version: parseVersion(result.stdout) };
 }
-async function scanVersioned(deps: ScanDeps, harness: 'claude' | 'codex'): Promise<HarnessScan> {
+async function scanVersioned(deps: ScanDeps, harness: 'claude' | 'codex' | 'agy'): Promise<HarnessScan> {
   const base = { harness, label: HARNESS_LABELS[harness] };
-  const probe = await versionOf(deps, harness, harness === 'claude' ? parseClaudeVersion : parseCodexVersion);
+  const parser = harness === 'claude' ? parseClaudeVersion : harness === 'codex' ? parseCodexVersion : parseAgyVersion;
+  const probe = await versionOf(deps, harness, parser);
   if (!probe.found) return { ...base, detected: false, sessionsAvailable: false, reason: 'not-found' };
   if ('failed' in probe) return { ...base, detected: true, sessionsAvailable: false, reason: 'version-command-failed' };
-  const verified = probe.version !== null && (harness === 'claude' ? CLAUDE_VERIFIED.test(probe.version) : codexVersionSupported(probe.version));
+  const verified = probe.version !== null && (harness === 'claude' ? CLAUDE_VERIFIED.test(probe.version) : harness === 'codex' ? codexVersionSupported(probe.version) : agyVersionSupported(probe.version));
   return { ...base, detected: true, ...(probe.version ? { version: probe.version } : {}), sessionsAvailable: verified, ...(verified ? {} : { reason: 'unsupported-version' as const }) };
 }
 async function scanHermes(deps: ScanDeps) {
@@ -305,8 +443,8 @@ async function scanHermes(deps: ScanDeps) {
 
 /** Every harness, scanned at once: what is installed, its version, and whether its sessions can be listed. */
 export async function scanHarnesses(deps: ScanDeps = machineScanDeps()): Promise<HarnessScan[]> {
-  const [claude, codex, hermes] = await Promise.all([scanVersioned(deps, 'claude'), scanVersioned(deps, 'codex'), scanHermes(deps)]);
-  return [claude, codex, hermes.scan, { harness: 'exec', label: HARNESS_LABELS.exec, detected: true, sessionsAvailable: false, reason: 'custom-command' }];
+  const [claude, codex, hermes, agy] = await Promise.all([scanVersioned(deps, 'claude'), scanVersioned(deps, 'codex'), scanHermes(deps), scanVersioned(deps, 'agy')]);
+  return [claude, codex, hermes.scan, agy, { harness: 'exec', label: HARNESS_LABELS.exec, detected: true, sessionsAvailable: false, reason: 'custom-command' }];
 }
 
 /** The sessions of one harness, or why there are none to list (its scan's reason). */
@@ -320,7 +458,7 @@ export async function listSessions(harness: HarnessId, deps: ScanDeps = machineS
   }
   const scan = scanned ?? await scanVersioned(deps, harness);
   if (!scan.sessionsAvailable) return { harness, sessionsAvailable: false, ...(scan.reason ? { reason: scan.reason } : {}), sessions: [], truncated: false };
-  const listed = harness === 'claude' ? listClaudeSessions(deps.claudeDir) : listCodexThreads(deps.codexHome);
+  const listed = harness === 'claude' ? listClaudeSessions(deps.claudeDir) : harness === 'codex' ? listCodexThreads(deps.codexHome) : listAgySessions(deps.agyCliDir ?? agyCliDir());
   return { harness, sessionsAvailable: true, ...listed };
 }
 
@@ -405,7 +543,7 @@ export function harnessScanner(deps: () => ScanDeps = machineScanDeps, ttlMs = 3
     async sessions(harness: HarnessId) {
       const known = listings.get(harness);
       if (fresh(known)) return known!.value;
-      const value = (async () => listSessions(harness, deps(), harness === 'claude' || harness === 'codex' ? (await scanAll()).find(s => s.harness === harness) : undefined))();
+      const value = (async () => listSessions(harness, deps(), harness === 'claude' || harness === 'codex' || harness === 'agy' ? (await scanAll()).find(s => s.harness === harness) : undefined))();
       listings.set(harness, { at: now(), value });
       value.catch(() => { if (listings.get(harness)?.value === value) listings.delete(harness); });
       return value;

@@ -39,6 +39,7 @@ export const HARNESS_DESCRIPTIONS: Record<HarnessId, { description: string; deli
   codex: { description: 'Keep working in your existing Codex desktop chat while room messages arrive.', delivery: 'Existing desktop chat', setup: 'Open Codex, then choose an existing chat when binding an agent in a room.' },
   claude: { description: 'Connect a Claude Code session to your rooms.', delivery: 'Bound session wake', setup: 'Install Claude Code and sign in, then choose a session in a room.' },
   hermes: { description: 'Connect a Hermes session through its room toolset.', delivery: 'Bound session wake', setup: 'Install Hermes and register the Meshrooms toolset for each room.' },
+  agy: { description: 'Connect an Antigravity CLI session with workspace pre-tool hook confinement.', delivery: 'Bound session wake', setup: 'Install the Antigravity CLI (`agy`) and sign in, then choose or start a session in a room.' },
   exec: { description: 'Use another agent through an operator-configured command.', delivery: 'Custom command', setup: 'Create a custom-command agent in the Meshrooms app or from your terminal.' },
 };
 export async function desktopAvailability() {

@@ -973,7 +973,7 @@ test('the CLI peeks without consuming, and checks watch options before starting 
     expect(await agentCli(['listen', '--room', r.roomId, '--peek'])).toMatchObject({ work: true, addressed: [mention] });
     expect(r.cursor()).toBe(cursor);
     expect(await agentCli(['watch-status', '--room', r.roomId])).toMatchObject({ state: 'never-started', pid: null, paused: null, lastResult: null });
-    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'nope'])).rejects.toThrow('--harness claude, codex, hermes, dsh, or exec');
+    await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'nope'])).rejects.toThrow('--harness claude, codex, hermes, agy, dsh, or exec');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'exec'])).rejects.toThrow('Give --command');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'exec', '--command', 'my-agent --go'])).rejects.toThrow('{prompt_file}');
     await expect(agentCli(['watch', '--room', r.roomId, '--harness', 'codex', '--last', '--allow-tools', 'Read'])).rejects.toThrow('--allow-tools is for --harness claude');
@@ -1303,8 +1303,9 @@ test('H-4/M-3/M-4: parsePsOutput trims leading whitespace, .dsh and realpathSync
   });
   expect(parsePsOutput('   \n')).toBeUndefined();
 
-  // M-3: .dsh is in HOME_SECRETS, and symlinked secrets add both symlink path and realpathSync target.
+  // M-3: .dsh and .gemini are in HOME_SECRETS, and symlinked secrets add both symlink path and realpathSync target.
   expect(HOME_SECRETS).toContain('.dsh');
+  expect(HOME_SECRETS).toContain('.gemini');
   const home = realpathSync(tempHome()), roomDir = join(home, '.meshrooms', 'agents', 'browser-agents', 'r1'), binDir = join(home, '.meshrooms', 'bin');
   const realTarget = join(home, 'real-dsh-secrets');
   mkdirSync(roomDir, { recursive: true }); mkdirSync(binDir, { recursive: true }); mkdirSync(realTarget, { recursive: true });
@@ -1462,3 +1463,64 @@ out(JSON.stringify({ type: 'result', session_id: '20260101_000000_abcdef', exit_
   expect(fileTail(huge, 10_000, 30_000).length).toBe(30_000);
   expect(STDOUT_MAX_BYTES).toBe(2 * 1024 * 1024);
 }, 30_000);
+
+test('Antigravity (agy): invocation, heredoc prompt, stream-json parsing, hook denials, confinement breach, sessionKey, and wakeEnv', () => {
+  expect(HARNESSES).toContain('agy');
+  const session = '5ec101c5-9db2-4dba-8aea-24ff3ff798e0';
+  const cfg = watchConfig({ harness: 'agy', session, model: 'gemini-3.8-flash-low' });
+  const wake = join(cfg.roomDir, 'wake');
+  const prompt = watchPrompt({ roomId: cfg.roomId, launcher: cfg.launcher, harness: 'agy', requestIds: ['id-1', 'id-2'], wakeDir: wake, delimiter: 'AGY_EOF' });
+  expect(prompt).toContain('(run commands with your run_command tool)');
+  expect(prompt).toContain("--text - <<'AGY_EOF'");
+  expect(prompt).toContain(wake);
+
+  const run = harnessInvocation(cfg, prompt, '/tmp/p', found);
+  expect(run).toEqual({
+    file: '/usr/bin/agy',
+    args: ['-p', prompt, '--conversation', session, '--add-dir', cfg.roomDir, '--add-dir', cfg.binDir, '--disable-slash-commands', '--output-format', 'stream-json', '--print-timeout', `${cfg.runTimeoutMinutes}m`, '--model', 'gemini-3.8-flash-low'],
+    cwd: wake,
+  });
+
+  // Orphan-run detection: prompt embeds wakeDir inside roomDir, so sameRun recognizes the agy command line.
+  const fp = runFingerprint(cfg), started = '2026-01-01T10:00:00.0000000Z';
+  expect(sameRun({ fingerprint: fp, started }, { command: `/usr/bin/agy -p ${JSON.stringify(prompt)} --conversation ${session}`, started })).toBe(true);
+
+  // Clean stream-json with allowed run_command and a hook-denied stray command: NOT a confinement breach.
+  const okStream = [
+    JSON.stringify({ event: 'step_update', step_update: { step_type: 'tool', state: 'DONE', tool_name: 'run_command' } }),
+    JSON.stringify({ event: 'step_update', step_update: { step_type: 'tool', state: 'ERROR', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'cat /etc/passwd' }, error: { message: 'tool call denied by pre-tool hook: nope' } } } }),
+    JSON.stringify({ event: 'result', result: { conversation_id: session, status: 'SUCCESS', response: 'Replied cleanly.' } }),
+  ].join('\n');
+  expect(readHarnessOutput('agy', okStream, '', 0)).toEqual({
+    sessionId: session,
+    denied: ['cat /etc/passwd'],
+    tools: ['run_command'],
+    summary: 'Replied cleanly.',
+  });
+
+  // Completed stray tool outside [run_command, view_file] triggers hard confinementBroken.
+  const breachStream = [
+    JSON.stringify({ event: 'step_update', step_update: { step_type: 'tool', state: 'DONE', tool_name: 'write_to_file' } }),
+    JSON.stringify({ event: 'result', result: { conversation_id: session, status: 'SUCCESS', response: 'Wrote file.' } }),
+  ].join('\n');
+  expect(readHarnessOutput('agy', breachStream, '', 0)).toMatchObject({
+    sessionId: session,
+    confinementBroken: true,
+    tools: ['write_to_file'],
+  });
+
+  // WAITING status is classified as an approvalWall.
+  const waitingStream = JSON.stringify({ event: 'result', result: { conversation_id: session, status: 'WAITING', response: '' } });
+  expect(readHarnessOutput('agy', waitingStream, '', 0)).toMatchObject({
+    sessionId: session,
+    approvalWall: true,
+  });
+
+  // sessionKey normalizes UUIDs and uses AGY_CLI_HOME.
+  expect(sessionKey({ harness: 'agy', cwd: wake, session: session.toUpperCase() }, { AGY_CLI_HOME: '/tmp/agy-cli' })).toBe(`agy:/tmp/agy-cli:id:${session}`);
+
+  // wakeEnv keeps GEMINI_*, GOOGLE_*, ANTIGRAVITY_* and withholds unrelated secrets.
+  const agyEnv = wakeEnv({ PATH: '/bin', GEMINI_API_KEY: 'gk', GOOGLE_CLOUD_API_KEY: 'gc', ANTIGRAVITY_API_TOKEN: 'at', OPENAI_API_KEY: 'o', GH_TOKEN: 'g' }, 'agy');
+  expect(agyEnv.env).toEqual({ PATH: '/bin', GEMINI_API_KEY: 'gk', GOOGLE_CLOUD_API_KEY: 'gc', ANTIGRAVITY_API_TOKEN: 'at' });
+  expect(agyEnv.withheld).toEqual(['GH_TOKEN', 'OPENAI_API_KEY']);
+});

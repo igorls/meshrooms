@@ -73,7 +73,7 @@ export interface RoomSession {
  * identities, putting them into rooms and binding them to sessions. Every string in these shapes comes from the machine
  * (titles, folder labels, names, errors) and is shown as plain text only.
  */
-export type HarnessId = 'claude' | 'codex' | 'hermes' | 'exec';
+export type HarnessId = 'claude' | 'codex' | 'hermes' | 'agy' | 'exec';
 export type HarnessScan = { harness: HarnessId; label: string; detected: boolean; version?: string; sessionsAvailable: boolean; reason?: string; enabled?: boolean; codexDelivery?: 'desktop' | 'headless' };
 export type HarnessSession = { id: string; title: string | null; folder: string | null; lastActiveAt: string | null; lastActiveLabel?: string | null };
 export type SessionListing = { harness: HarnessId; sessionsAvailable: boolean; reason?: string; truncated: boolean; sessions: HarnessSession[] };
