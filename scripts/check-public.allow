@@ -18,3 +18,7 @@ server/markdown.test.tsx mailto:a@github.com  # a mailto link the test proves is
 server/browser/admin.test.ts meshrooms.example.ts.net  # synthetic Tailnet hostname used to test the private admin origin, not a deployed host
 server/browser/admin.test.ts machine.example.ts.net  # synthetic hostname used to prove plain HTTP admin origins are refused
 server/browser/admin.test.ts 100.64.1.2  # synthetic Tailnet peer address used to prove the loopback admin backend refuses direct peer access
+server/browser/bridge-runner.test.ts 0b1c2d3e-0000-4000-8000-1234567890ab.local  # a synthetic browser mDNS candidate name the relay-only runner must drop
+server/interfaces-eperm.fixture.ts 0b1c2d3e-0000-4000-8000-1234567890ab.local  # a synthetic browser mDNS candidate name that triggers the multicast-dns EPERM crash
+server/interfaces.test.ts 0b1c2d3e-0000-4000-8000-1234567890ab.local  # a synthetic browser mDNS candidate name the stripping must drop
+server/interfaces.test.ts ABCDEF.LOCAL  # an upper-case mDNS candidate name the stripping must also drop

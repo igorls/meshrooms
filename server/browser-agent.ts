@@ -14,6 +14,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { tryLock } from './locks';
+import { guardNetworkInterfaces, interfacesUnavailable, withoutMdnsCandidates } from './interfaces';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
@@ -720,12 +721,26 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     now?: () => number;
     gatherMs?: number;
     gatherDeadlineMs?: number;
-    createPeerConnection?: (config: { iceServers: { urls: string; username?: string; credential?: string }[] }) => RTCPeerConnection;
+    createPeerConnection?: (config: { iceServers: { urls: string; username?: string; credential?: string }[]; iceTransportPolicy?: 'all' | 'relay' }) => RTCPeerConnection;
+    /** Where network interfaces are listed (node:os); tests pass one that fails. */
+    interfaces?: { networkInterfaces: typeof import('node:os').networkInterfaces };
   } = {}) {
   const deadlines: PassDeadlines = { ...PASS_DEADLINES, ...options.deadlines }, pause = options.pause ?? ((ms: number) => Bun.sleep(ms));
   const now = options.now ?? (() => Date.now()), gatherMs = options.gatherMs ?? 1500;
   const gatherDeadlineMs = options.gatherDeadlineMs ?? GATHER_DEADLINE_MS;
   const makePc = options.createPeerConnection ?? (config => new RTCPeerConnection(config));
+  // Where interfaces can't be listed (a sandbox denying getifaddrs), connect through the room's relay only instead of
+  // crashing in werift or multicast-dns (see ./interfaces).
+  guardNetworkInterfaces(log, options.interfaces);
+  const relayOnly = () => interfacesUnavailable(options.interfaces);
+  const policy = (): { iceTransportPolicy?: 'relay' } => relayOnly() ? { iceTransportPolicy: 'relay' } : {};
+  /** A remote description as werift should see it: with no interfaces, without the `.local` candidates it can't resolve. */
+  const remote = <T extends { sdp?: string }>(id: string, description: T): T => {
+    if (!relayOnly() || typeof description.sdp !== 'string') return description;
+    const { sdp, dropped } = withoutMdnsCandidates(description.sdp);
+    if (dropped) log(`relay-only: skipped ${dropped} mDNS candidate(s) from ${id.slice(0, 8)}`);
+    return { ...description, sdp };
+  };
   const identity = await agent.ensureIdentity();
   const session = randomUUID(); const peers = new Map<string, Peer>();
   let status: RoomStatus | undefined; let epoch = ''; let cursor = 0;
@@ -1153,7 +1168,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const makePeer = (device: BrowserDevice & { session?: string }) => {
     // werift takes one URL per entry: expand each server so TURN udp/tcp/tls all stay available.
-    const pc = makePc({ iceServers: expandIceServers(iceServers) });
+    const pc = makePc({ iceServers: expandIceServers(iceServers), ...policy() });
     const peer: Peer = { pc, session: device.session!, started: now(), iceKey, sent: new Map(), resync: new Resync() };
     peers.set(device.id, peer);
     pc.onDataChannel?.subscribe(channel => channel.label === FILE_CHANNEL_LABEL
@@ -1421,7 +1436,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             if (peer.iceKey === iceKey) continue;
             if (typeof peer.pc.setConfiguration === 'function' && peer.pc.connectionState !== 'closed') {
               try {
-                peer.pc.setConfiguration({ iceServers: expanded });
+                peer.pc.setConfiguration({ iceServers: expanded, ...policy() });
                 peer.iceKey = iceKey;
               } catch {
                 if (peer.pc.connectionState === 'disconnected' || peer.pc.iceConnectionState === 'disconnected') void retire(id, peer);
@@ -1480,7 +1495,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           work.push({ id: device.id, peer, kind: 'offer-in', done: (async () => {
             const isClosed = () => peer.pc.connectionState === 'closed';
             if (peers.get(device.id) !== peer || isClosed()) return;
-            await peer.pc.setRemoteDescription(signal.description as any);
+            await peer.pc.setRemoteDescription(remote(device.id, signal.description) as any);
             if (peers.get(device.id) !== peer || isClosed()) return;
             await describe(device.id, peer, false);
           })() });
@@ -1492,7 +1507,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           peer.remoteUfrag = sdpIceUfrag(signal.description.sdp);
           work.push({ id: device.id, peer, kind: 'answer', done: (async () => {
             if (peers.get(device.id) !== peer || peer.pc.connectionState === 'closed' || peer.pc.signalingState !== 'have-local-offer') return;
-            await peer.pc.setRemoteDescription(signal.description as any);
+            await peer.pc.setRemoteDescription(remote(device.id, signal.description) as any);
           })() });
         }
       }

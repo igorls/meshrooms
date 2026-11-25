@@ -857,3 +857,56 @@ test('an offer whose gathering outlasts the gather deadline goes out with the ca
   } finally { r.state.closed = true; }
   expect(String(await bridge)).toContain('closed by its host');
 }, 20_000);
+
+// A sandbox that denies getifaddrs made os.networkInterfaces throw EPERM, and the runner crashed in multicast-dns as
+// soon as a browser's `.local` candidate arrived. With no interfaces it now connects through the room's relay only.
+test('where network interfaces cannot be listed, the runner says relay-only, asks werift for relay candidates only, and drops .local candidates', async () => {
+  const peerId = 'f'.repeat(64);
+  const sub = <T,>() => ({ handlers: [] as ((v: T) => void)[], subscribe(fn: (v: T) => void) { this.handlers.push(fn); return { unSubscribe: () => { this.handlers = this.handlers.filter(h => h !== fn); } }; }, fire(v: T) { for (const fn of this.handlers) fn(v); } });
+  const configs: any[] = [], pcs: any[] = [];
+  const createPeerConnection = (config: unknown) => {
+    configs.push(config);
+    const pc: any = {
+      connectionState: 'new', iceConnectionState: 'new', signalingState: 'stable', localDescription: null, remoteDescription: null,
+      onDataChannel: sub(), connectionStateChange: sub(), iceConnectionStateChange: sub(), onIceCandidate: sub(),
+      createDataChannel: (label: string) => ({ label, readyState: 'connecting', bufferedAmount: 0, bufferedAmountLowThreshold: 0, send() {}, stateChanged: sub(), onMessage: sub(), bufferedAmountLow: sub() }),
+      async createOffer() { return { type: 'offer', sdp: 'v=0\r\na=ice-ufrag:relay1\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:0\r\na=candidate:2 1 udp 2 203.0.113.9 49200 typ relay raddr 0.0.0.0 rport 0\r\n' }; },
+      async setLocalDescription(d: unknown) { pc.localDescription = d; pc.signalingState = 'have-local-offer'; },
+      async setRemoteDescription(d: { type: string; sdp: string }) { pc.remoteDescription = d; pc.signalingState = 'stable'; },
+      setConfiguration() {},
+      async close() { pc.connectionState = 'closed'; },
+    };
+    pcs.push(pc);
+    return pc;
+  };
+  const signals: { to: string; description: { type: string; sdp: string } }[] = [];
+  let answer: unknown[] = [];
+  const logs: string[] = [];
+  const r = room({
+    status: () => { const out = answer; answer = []; return Promise.resolve({
+      roomId, memberId: wren, ownerId: alex, epoch: 'one', members, iceServers: [{ urls: 'turns:turn.example.test:443?transport=tcp', username: 'u', credential: 'c' }], signals: out,
+      devices: [{ id: peerId, memberId: alex, publicKey: 'A'.repeat(88), label: 'browser', admittedAt: 1, session: 's-1' }],
+      settings: { floor: 'open', agentAssignmentsWake: false, guestAgentApproval: true },
+    }); },
+    answer: async (action, payload) => { if (action === 'signal') signals.push(payload); return {}; },
+  });
+  const interfaces = { networkInterfaces: (() => { throw Object.assign(new Error('uv_interface_addresses returned EPERM'), { code: 'EPERM' }); }) as any };
+  const bridge = runBridge(r.agent, line => logs.push(line), {
+    pause: () => Bun.sleep(15), gatherMs: 0, createPeerConnection: createPeerConnection as any, interfaces,
+  }).catch(error => error);
+  try {
+    await r.until(() => signals.length >= 1);
+    expect(logs.filter(line => line.startsWith('interfaces unavailable; relay-only'))).toHaveLength(1);
+    expect(configs[0].iceTransportPolicy).toBe('relay');
+    expect(configs[0].iceServers).toEqual([{ urls: 'turns:turn.example.test:443?transport=tcp', username: 'u', credential: 'c' }]);
+    answer = [{ seq: 1, from: peerId, session: 's-1', description: { type: 'answer', sdp: [
+      'v=0', 'a=ice-ufrag:brw1', 'a=mid:0',
+      'a=candidate:1 1 udp 2122260223 0b1c2d3e-0000-4000-8000-1234567890ab.local 50000 typ host generation 0',
+      'a=candidate:3 1 udp 2 198.51.100.20 51000 typ relay raddr 0.0.0.0 rport 0', ''].join('\r\n') } }];
+    await r.until(() => !!pcs[0].remoteDescription);
+    expect(pcs[0].remoteDescription.sdp).not.toContain('.local');
+    expect(pcs[0].remoteDescription.sdp).toContain('typ relay');
+    expect(logs.some(line => line === `relay-only: skipped 1 mDNS candidate(s) from ${peerId.slice(0, 8)}`)).toBe(true);
+  } finally { r.state.closed = true; }
+  expect(String(await bridge)).toContain('closed by its host');
+}, 20_000);

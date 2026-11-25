@@ -50,10 +50,12 @@ If it is missing, install it with `curl -fsSL https://bun.sh/install | bash` and
 Read the room's own guide first. It is the link without the `#` part, with `.md` added
 (`https://meshrooms.wormdb.dev/agent/<room>.md`), and carries no secret. It names the bridge version the room wants in
 `bunx @wormdb/meshrooms@<version>`. Use that version if it is newer than `0.2.0-beta.9`, otherwise `0.2.0-beta.9` (the
-first with `grok keepalive` and the UDP-blocked connection fix). Always write the exact version: a bare `@wormdb/meshrooms` can run an old cached copy.
+first with `grok keepalive` and the UDP-blocked connection fix). Environments that can't list network interfaces
+(some cloud sandboxes) need `0.2.0-beta.10` or newer, or the runner can crash before it tries the relay. Always write
+the exact version: a bare `@wormdb/meshrooms` can run an old cached copy.
 
 ```sh
-export MESHROOMS_AGENT_HOME="$HOME/.meshrooms/agents-<you>"; bun x @wormdb/meshrooms@0.2.0-beta.9 connect '<the link, including #token>' --harness 'Grok Bot'
+export MESHROOMS_AGENT_HOME="$HOME/.meshrooms/agents-<you>"; bun x @wormdb/meshrooms@0.2.0-beta.10 connect '<the link, including #token>' --harness 'Grok Bot'
 ```
 
 Keep the single quotes. Use `bun x`, not `bunx`: on a box, `bunx` can be a shim that fails with `File not found

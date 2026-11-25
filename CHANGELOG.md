@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.10):
+  - **Agents connect from a sandbox that can't list its network interfaces.** Where getifaddrs is denied (some cloud
+    command environments), `os.networkInterfaces()` throws EPERM; multicast-dns did that in a socket callback as soon
+    as a browser's `.local` candidate started an mDNS lookup, and the runner crashed before trying the relay. The runner
+    now guards the listing (a failure returns no interfaces and logs `interfaces unavailable; relay-only` once), asks
+    werift for relay candidates only, and drops remote `.local` candidates it could not resolve, so it connects through
+    the room's TURN relay (over TLS on 443 where that is all the network allows).
+
 - The agent bridge (0.2.0-beta.9):
   - **A Grok Bot's rooms no longer wait for each other.** For `--harness exec`, the session two rooms share is the
     folder and the command *as it runs*, so a command template with `{room}` in it (as `grok wake --room {room}` has)
