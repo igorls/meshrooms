@@ -297,7 +297,50 @@ describeMac('Runtime Packaging on macOS arm64 (packageRuntime)', () => {
   });
 });
 
-const describeBridge = (process.platform === 'win32' && process.arch === 'x64') || (process.platform === 'darwin' && process.arch === 'arm64') ? describe : describe.skip;
+const describeLinux = process.platform === 'linux' && (process.arch === 'x64' || process.arch === 'arm64') ? describe : describe.skip;
+
+describeLinux('Runtime Packaging on Linux (packageRuntime)', () => {
+  function createLinuxFixture(baseDir: string) {
+    createMockSourceFixture(baseDir);
+    writeFileSync(join(baseDir, '.local', 'native', 'libwormdb_ffi.so'), 'MOCK_SO_BINARY_CONTENT');
+  }
+
+  it('fails closed when the native shared library is missing', async () => {
+    const root = makeDir('linux-missing-so');
+    const sourceDir = join(root, 'source'); createMockSourceFixture(sourceDir);
+    await expect(packageRuntime({ sourceDir, outputDir: join(root, 'out') })).rejects.toThrow(/WormDB native library is missing: .*libwormdb_ffi\.so/);
+    expect(existsSync(join(root, 'out'))).toBe(false);
+  });
+
+  it('packages a linux bundle with an executable bun and .so library', async () => {
+    const root = makeDir('linux-package');
+    const sourceDir = join(root, 'source'); createLinuxFixture(sourceDir);
+    const result = await packageRuntime({ sourceDir, outputDir: join(root, 'out') });
+    const out = result.directory;
+    expect(existsSync(join(out, 'bun'))).toBe(true);
+    expect(statSync(join(out, 'bun')).mode & 0o777).toBe(0o755);
+    expect(existsSync(join(out, 'bun.exe'))).toBe(false);
+    expect(readFileSync(join(out, '.local', 'native', 'libwormdb_ffi.so'), 'utf8')).toBe('MOCK_SO_BINARY_CONTENT');
+    expect(existsSync(join(out, '.local', 'native', 'wormdb_ffi.dll'))).toBe(false);
+    for (const excluded of ['control.key', 'runtime.json', '.env', 'daemon.log', 'node_modules', 'server/daemon.test.ts', 'server/mockRoom.ts']) {
+      expect(existsSync(join(out, excluded))).toBe(false);
+    }
+    const manifest: PackageManifest = JSON.parse(readFileSync(result.manifestPath, 'utf8'));
+    expect(manifest.platform).toBe('linux');
+    expect(manifest.arch).toBe(process.arch as PackageManifest['arch']);
+    expect(manifest.entry).toBe('bun run server/cli.ts');
+    expect(manifest.bun.bundled).toBe(true);
+    expect(manifest.files['bun']).toBe(createHash('sha256').update(readFileSync(process.execPath)).digest('hex'));
+    expect(manifest.files['.local/native/libwormdb_ffi.so']).toBeDefined();
+    for (const [relPath, expectedHash] of Object.entries(manifest.files)) {
+      expect(createHash('sha256').update(readFileSync(join(out, relPath))).digest('hex')).toBe(expectedHash);
+    }
+  });
+});
+
+const describeBridge = (process.platform === 'win32' && process.arch === 'x64')
+  || (process.platform === 'darwin' && process.arch === 'arm64')
+  || (process.platform === 'linux' && (process.arch === 'x64' || process.arch === 'arm64')) ? describe : describe.skip;
 
 describeBridge('Desktop bridge packaging (packageBridge)', () => {
   function bridgeSource(root: string) {

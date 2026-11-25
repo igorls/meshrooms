@@ -31,6 +31,8 @@ export type PackageResult = {
 const TARGETS = {
   'win32-x64': { platform: 'win32', arch: 'x64', library: 'wormdb_ffi.dll', libraryLabel: 'WormDB native DLL', bun: 'bun.exe' },
   'darwin-arm64': { platform: 'darwin', arch: 'arm64', library: 'libwormdb_ffi.dylib', libraryLabel: 'WormDB native library', bun: 'bun' },
+  'linux-x64': { platform: 'linux', arch: 'x64', library: 'libwormdb_ffi.so', libraryLabel: 'WormDB native library', bun: 'bun' },
+  'linux-arm64': { platform: 'linux', arch: 'arm64', library: 'libwormdb_ffi.so', libraryLabel: 'WormDB native library', bun: 'bun' },
 } as const;
 type PackageTarget = (typeof TARGETS)[keyof typeof TARGETS];
 
@@ -99,7 +101,7 @@ function copyRecursive(src: string, dest: string, filesToHash: string[], rootDes
 export async function packageRuntime(options: PackageOptions): Promise<PackageResult> {
   const target: PackageTarget | undefined = TARGETS[`${process.platform}-${process.arch}` as keyof typeof TARGETS];
   if (!target) {
-    throw new Error(`packageRuntime currently targets Windows x64 and macOS arm64 only. Detected: ${process.platform}-${process.arch}`);
+    throw new Error(`packageRuntime currently targets Windows x64, macOS arm64, and Linux x64/arm64 only. Detected: ${process.platform}-${process.arch}`);
   }
 
   if (options.codesignIdentity && target.platform !== 'darwin') {
@@ -323,7 +325,7 @@ export type BridgeOptions = {
  */
 export async function packageBridge(options: BridgeOptions): Promise<PackageResult> {
   const target: PackageTarget | undefined = TARGETS[`${process.platform}-${process.arch}` as keyof typeof TARGETS];
-  if (!target) throw new Error(`packageBridge currently targets Windows x64 and macOS arm64 only. Detected: ${process.platform}-${process.arch}`);
+  if (!target) throw new Error(`packageBridge currently targets Windows x64, macOS arm64, and Linux x64/arm64 only. Detected: ${process.platform}-${process.arch}`);
   if (options.codesignIdentity && target.platform !== 'darwin') throw new Error('Code signing during packaging is only supported for macOS bundles.');
   const sourceDir = resolve(options.sourceDir), outputDir = resolve(options.outputDir);
   const packageDir = join(sourceDir, 'packages', 'meshrooms');

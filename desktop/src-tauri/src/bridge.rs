@@ -161,10 +161,15 @@ fn bridge_variable(key: &str) -> bool {
 }
 
 /// Login-launched apps get a system-only PATH. Append standard user/tool locations without reading shell profiles.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn desktop_search_path(home: &Path, original: Option<&std::ffi::OsStr>) -> Result<std::ffi::OsString, String> {
     let mut paths: Vec<PathBuf> = env::split_paths(original.unwrap_or(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"))).collect();
-    for dir in [home.join(".local/bin"), home.join(".bun/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")] {
+    let mut extras = vec![home.join(".local/bin"), home.join(".bun/bin"), PathBuf::from("/usr/local/bin")];
+    #[cfg(target_os = "macos")]
+    extras.push(PathBuf::from("/opt/homebrew/bin"));
+    #[cfg(target_os = "linux")]
+    extras.push(PathBuf::from("/snap/bin"));
+    for dir in extras {
         if !paths.contains(&dir) { paths.push(dir); }
     }
     env::join_paths(paths).map_err(|error| format!("Cannot prepare the desktop command search path: {error}"))
@@ -181,7 +186,7 @@ pub fn cli(bridge: &Bridge, args: &[&str]) -> Result<Value, String> {
 pub fn cli_with_input(bridge: &Bridge, args: &[&str], input: Option<&[u8]>) -> Result<Value, String> {
     let mut command = hidden(&bridge.bun);
     command.arg("--no-env-file").arg(&bridge.script).args(args).current_dir(workdir()?);
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     command.env("PATH", desktop_search_path(&home()?, env::var_os("PATH").as_deref())?);
     for (key, _) in env::vars_os() {
         if bridge_variable(&key.to_string_lossy()) {
@@ -346,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn login_launch_finds_user_tools_without_overriding_an_operator_path() {
         let home = Path::new("/test-home");
         let defaults = desktop_search_path(home, None).unwrap();

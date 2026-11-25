@@ -203,8 +203,23 @@ fn show_personal_rooms(app: &AppHandle, result: Result<Vec<home::Room>, String>)
     *shown = Some(signature);
 }
 
+#[cfg(target_os = "linux")]
+fn linux_app_exe(exe: PathBuf, appimage: Option<&std::ffi::OsStr>, appdir: Option<&std::ffi::OsStr>) -> PathBuf {
+    // Inside an AppImage, current_exe() points into a temporary FUSE mount (/tmp/.mount_*) that disappears on reboot.
+    // Prefer $APPIMAGE only when it is an absolute existing file and current_exe() lives inside $APPDIR.
+    if let (Some(image), Some(dir)) = (appimage.map(PathBuf::from), appdir.map(PathBuf::from)) {
+        if image.is_absolute() && image.is_file() && dir.is_absolute() && exe.starts_with(&dir) {
+            return image;
+        }
+    }
+    exe
+}
+
 fn app_exe() -> Result<PathBuf, String> {
-    env::current_exe().map_err(|error| format!("Cannot locate the Meshrooms app: {error}"))
+    let exe = env::current_exe().map_err(|error| format!("Cannot locate the Meshrooms app: {error}"))?;
+    #[cfg(target_os = "linux")]
+    let exe = linux_app_exe(exe, env::var_os("APPIMAGE").as_deref(), env::var_os("APPDIR").as_deref());
+    Ok(exe)
 }
 
 fn show_login(app: &AppHandle) {
@@ -474,6 +489,7 @@ fn show_window(app: &AppHandle) {
     };
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    let _ = window.unminimize();
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -607,6 +623,11 @@ fn main() {
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() { live.offer(url.as_str()); }
             });
+            #[cfg(target_os = "linux")]
+            if app.env().appimage.is_some() {
+                // AppImage runs without package-manager .desktop installation; register meshrooms:// on launch.
+                let _ = app.deep_link().register_all();
+            }
             if let Ok(Some(urls)) = app.deep_link().get_current() {
                 for url in urls { dispatcher.offer(url.as_str()); }
             }
@@ -677,9 +698,16 @@ fn main() {
                 stop,
                 login,
             });
+            // macOS uses a monochrome template icon; Linux panels ignore template inversion and are often dark,
+            // so Linux uses the full-color app icon for reliable contrast on both light and dark bars.
+            let tray_icon = if cfg!(target_os = "linux") {
+                Image::from_bytes(include_bytes!("../icons/32x32.png"))?
+            } else {
+                Image::from_bytes(include_bytes!("../icons/tray.png"))?
+            };
             TrayIconBuilder::with_id("main")
-                .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
-                .icon_as_template(true)
+                .icon(tray_icon)
+                .icon_as_template(!cfg!(target_os = "linux"))
                 .tooltip("Meshrooms")
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -797,5 +825,23 @@ mod tests {
         assert_eq!(rows[2].0, "Old: closed");
         assert_eq!(rows[3].1[0], "Wakes: unreadable (bad watch.json)");
         assert!(room_rows(&json!({})).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_app_exe_prefers_appimage_only_when_running_inside_its_appdir() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = env::temp_dir().join(format!("meshrooms-appimage-{}-{nanos}", std::process::id()));
+        let appdir = root.join("mount");
+        let exe = appdir.join("usr").join("bin").join("meshrooms-desktop");
+        let image = root.join("Meshrooms.AppImage");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "bin").unwrap();
+        std::fs::write(&image, "appimage").unwrap();
+        assert_eq!(linux_app_exe(exe.clone(), Some(image.as_os_str()), Some(appdir.as_os_str())), image);
+        assert_eq!(linux_app_exe(exe.clone(), Some(image.as_os_str()), Some(std::ffi::OsStr::new("/other/dir"))), exe);
+        assert_eq!(linux_app_exe(exe.clone(), Some(std::ffi::OsStr::new("relative.AppImage")), Some(appdir.as_os_str())), exe);
+        assert_eq!(linux_app_exe(exe.clone(), None, None), exe);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

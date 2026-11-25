@@ -1,6 +1,6 @@
 # Desktop app
 
-Status: development preview (0.1.0-alpha.8). Windows x64 builds an NSIS installer; macOS arm64 builds an app and DMG.
+Status: development preview (0.1.0-alpha.8). Windows x64 builds an NSIS installer; macOS arm64 builds an app and DMG; Linux x64/arm64 builds `.deb` and AppImage bundles.
 
 `desktop/` is a small Tauri 2 tray app that keeps the agent bridge's machine daemon running, so the daemon no longer
 lives inside individual agent sessions. It follows the one-owner rule of the machine daemon: the app never runs the
@@ -10,8 +10,10 @@ daemon itself. It drives the bridge's own CLI (`meshrooms daemon start|stop|stat
 ## Lifecycle
 
 - **With the app:** the app owns start at login through the OS login item (Windows: the per-user Run key value
-  `Meshrooms` = `"<app exe>" --background`; macOS: a Login Item, no Dock icon). The login item starts the app; the
-  app starts the daemon whenever `daemon status` says it isn't running, unless the person stopped it from the tray.
+  `Meshrooms` = `"<app exe>" --background`; macOS: a Login Item, no Dock icon; Linux: an XDG Autostart entry at
+  `$XDG_CONFIG_HOME/autostart/dev.wormdb.meshrooms.desktop.desktop`, falling back to `~/.config/autostart/`). The login
+  item starts the app; the app starts the daemon whenever `daemon status` says it isn't running, unless the person
+  stopped it from the tray.
 - **Headless:** without the app, `meshrooms daemon install` registers the bridge's own login item.
 - **Never both:** turning on *Start at login* in the app registers the app's login item and then runs `daemon
   uninstall`, which removes the bridge's own. If registering fails, nothing is removed; if removing fails, the tray
@@ -93,7 +95,13 @@ from a terminal.
 bun install --frozen-lockfile
 bun run desktop:dev            # debug app on this checkout (builds the bridge first)
 bun run desktop:bridge         # bridge bundle: Bun, meshrooms.js, notices, manifest.json
-bun run desktop:build          # Windows: NSIS installer; macOS: Meshrooms.app and .dmg
+bun run desktop:build          # Windows: NSIS installer; macOS: Meshrooms.app and .dmg; Linux: .deb and AppImage
+```
+
+On Debian/Ubuntu Linux, building the Tauri shell requires system development headers:
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libdbus-1-dev
 ```
 
 `desktop:bridge` refuses to overwrite `.local/packages/desktop-bridge`; move the previous bundle aside first.
@@ -135,8 +143,8 @@ default `HEAD`), signs, notarizes and staples the app and the DMG.
 
 ## Not yet done
 
-Windows code signing, bridge upgrades beyond installing a new version directory, Linux, and a login item on Linux
-(use `meshrooms daemon install` there).
+Windows code signing, bridge upgrades beyond installing a new version directory, and clickable desktop notifications on
+macOS and Linux.
 
 ### Browser connection recovery
 
