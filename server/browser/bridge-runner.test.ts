@@ -11,6 +11,7 @@ import {
 } from '../browser-agent';
 import { CONNECT_TIMEOUT_MS, FILE_CHANNEL_LABEL, PRIMARY_CHANNEL_LABEL, UNHEALTHY_GRACE_MS } from '../../src/browser/pacer';
 import { fakeRunner } from './fake-runner';
+import { mentionedIds } from '../../src/collab';
 
 const roomId = crypto.randomUUID(), alex = crypto.randomUUID(), wren = crypto.randomUUID();
 const members = [{ id: alex, name: 'Alex', role: 'human' as const }, { id: wren, name: 'Wren', role: 'agent' as const, operatorId: alex }];
@@ -82,6 +83,32 @@ test('a pass step that never finishes is cut off by its deadline, reported once,
     expect(proof.pid).toBe(process.pid);
     expect(proof.failingSince).toBeUndefined();
     expect(runnerTrouble(r.agent, 0)).toBeUndefined();
+  } finally { r.state.closed = true; }
+  expect(String(await bridge)).toContain('closed by its host');
+}, 40_000);
+
+test('an agent renamed in the room takes the new name from the next status: its members file, mentions and own participant follow, the old @name stops matching', async () => {
+  const renamed = members.map(m => m.id === wren ? { ...m, name: 'Scout' } : m);
+  let current = members;
+  const r = room({ status: () => ({ roomId, memberId: wren, ownerId: alex, epoch: 'one', members: current, devices: [], settings: { floor: 'open', agentAssignmentsWake: false, guestAgentApproval: true } }) as unknown as Promise<unknown> });
+  const logs: string[] = [];
+  const bridge = runBridge(r.agent, line => logs.push(line), { pause: r.pause }).catch(error => error);
+  const nameOnDisk = () => JSON.parse(readFileSync(join(r.agent.dir, 'members.json'), 'utf8')).members.find((m: { id: string }) => m.id === wren).name as string;
+  const me = () => r.agent.view().participants.find(p => p.id === wren)!;
+  try {
+    await r.until(() => r.state.polls >= 2);
+    expect(nameOnDisk()).toBe('Wren');
+    expect(mentionedIds('@Wren hello', r.agent.view().participants)).toEqual([wren]);
+
+    current = renamed;
+    await r.until(() => nameOnDisk() === 'Scout');
+    // The agent's own participant, and so every rule that matches by name, uses the new name from then on.
+    expect(me()).toMatchObject({ name: 'Scout', role: 'agent', state: 'local' });
+    expect(mentionedIds('@Scout hello', r.agent.view().participants)).toEqual([wren]);
+    expect(mentionedIds('@agents hello', r.agent.view().participants)).toEqual([wren]);
+    expect(mentionedIds('@Wren hello', r.agent.view().participants)).toEqual([]);
+    // What it said under the old name is still its own: messages point at the member, not at a name.
+    expect(r.agent.members().memberId).toBe(wren);
   } finally { r.state.closed = true; }
   expect(String(await bridge)).toContain('closed by its host');
 }, 40_000);

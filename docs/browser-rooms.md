@@ -21,6 +21,50 @@ host approved the person, and the person adds their own devices (up to four). Th
 host still admits a device that was removed from the room before, and every new
 device when **Approve new devices** is on in Room settings.
 
+**Connect your phone.** On the hosted page, **Invite → My phone** (also the ⋮ menu, the
+sidebar phone button and Room details) shows a one-time QR code that lasts five minutes
+and holds up to eight of the person's rooms. The phone scans it with its camera, opens
+`/rooms#pair=…` (the secret is in the URL fragment and is removed from the address bar
+at once), and asks to join each room as a companion only after the person taps
+**Connect this phone**. Both screens then show the same four words and the person confirms on the trusted
+device, which links the phone in every room with the one-time secret (the same
+`request {pairing}` / `link {pairing}` convention as the desktop app, see
+`src/browser/pairing.ts`). Room settings still apply: with **Approve new devices** on, a
+room waits for its host. The words are bound to the phone's key: the phone computes
+`pairingSas(secret, its own key)`, and the trusted device asks the room service which
+request answers the secret (`link {pairing, preview}`) and computes the words from that
+request's key, so a copy of the code on another device shows different words, and when
+two devices answer one code the room service links neither. **Not my phone**, starting
+over, leaving the screen and expiry withdraw the unused requests (`link {pairing,
+revoke}`), and the phone shows that its request was withdrawn; the code is spent by the
+first confirmation, expires after five minutes, and the device list shows the phone's
+label and key fingerprint so it can be removed. For a phone that cannot scan, **Type a
+code instead** files a typed code (`pair-offer`, below) and shows `XXXXX-XXXXX`; the phone
+types it under **Connect this phone with a code** on `/rooms` (`pair-redeem`), then
+follows the same consent and four-word steps. `scripts/phone-pairing-smoke.mjs`
+runs the flow end to end.
+
+Three room-service additions make the phone flow stronger and shorter (the browser uses
+all of them):
+
+- `link {pairing, preview: true}` shows the one waiting request that answers the secret
+  (label, the key the room service holds, device id, expiry) without linking it, to any
+  person in the room, not only the host. The trusted device shows the **key-bound words**
+  `pairingSas(N, that key)` and the phone shows `pairingSas(N, its own key)`; a request
+  from another key (someone who photographed the code) gets other words. A preview that
+  matches nothing counts against the same wrong-code budget as a link.
+- `link {pairing, revoke: true}` withdraws the unused requests that answer the secret in
+  that room (closing a pairing early). Nothing to withdraw is not an error and costs no budget.
+- `pair-offer`, `pair-redeem` and `pair-cancel` replace the long QR secret with a short
+  typed code (10 characters of Crockford base32, `XXXXX-XXXXX`). The code and the secret
+  made from it never reach the room service: both devices derive N and a lookup from the
+  code with HKDF-SHA256 (`offerSecret`, `offerLookup` in `src/browser/pairing.ts`), and the
+  service holds only sha256 of the lookup, in memory, for five minutes, with the person's
+  name, device id and up to eight rooms they are a person in. One open offer per device; a
+  redeem is one use (the device that read it may read it again), 8 wrong lookups per device
+  and per address per 10 minutes answer 429, and the service holds at most 512 offers.
+  Because offers live in memory, a restart costs a person one new code; there is no schema change.
+
 The loopback HTTP URL is for local development. Another physical device needs an
 HTTPS deployment with the configured public origin. A LAN HTTP address does not
 satisfy the browser crypto/storage requirements.
@@ -201,6 +245,15 @@ Agents are unaffected: bridges keep their own connections.
 - **Transferring host (`transfer-host`):** the host can choose **Room details → Make host**
   on another admitted human member (never an agent) to hand over room ownership
   atomically. The former host becomes a regular member and may then leave the room.
+- **Renaming an agent (`rename`, payload `{ memberId, name }`):** the host, or the person who operates the agent, chooses
+  **Room details → Rename** on an agent's row. The name follows the rules of joining (cleaned, at most 64 characters,
+  unique among the room's members and open agent links by case- and width-folded name, and `agents` is reserved). The
+  agent itself, other members and people (who keep the name they joined with) are refused. The change is a member name,
+  which the roster does not carry (its entries hold ids, keys, roles and operators), so no new roster is published and the
+  host-signed roster floor is untouched. Members see it in `status.members`, and the service lists the latest 20 renames
+  in `status.renames` (`{ id, at, memberId, by, from, to }`) for the room's timeline line. A running agent takes the new
+  name from its next status: @mentions use it from then on and the old name no longer matches. Older bridges and
+  browsers ignore `renames` and read the name from `members` as before.
 - **Deleting a room:** the host chooses **Room details → Delete room**. The room, its
   admission records, `retired_devices`, and member pictures are deleted from the service. Every later
   request for it answers 410 with `code: "room-closed"`; members' rooms show "This

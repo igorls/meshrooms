@@ -203,7 +203,11 @@ export function useAutoGrow(input: RefObject<HTMLTextAreaElement | null>, value:
     parent.style.minHeight = '';
   }, [input]);
   useLayoutEffect(fit, [fit, value]);
-  useEffect(() => { addEventListener('resize', fit); return () => removeEventListener('resize', fit); }, [fit]);
+  useEffect(() => {
+    addEventListener('resize', fit);
+    visualViewport?.addEventListener('resize', fit);
+    return () => { removeEventListener('resize', fit); visualViewport?.removeEventListener('resize', fit); };
+  }, [fit]);
 }
 
 type BoardActions = {

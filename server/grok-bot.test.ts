@@ -292,6 +292,12 @@ describe('grok keepalive', () => {
     for (const line of result.attention) { expect(line).not.toContain(ROOM); expect(line).not.toContain(OTHER_ROOM); expect(line).not.toContain('/workspace'); }
   });
 
+  test('a running daemon that does not look after this agent folder is reported, never ok', async () => {
+    const result = await grokKeepalive({ ...deps().d, startDaemon: async () => ({ running: true, started: false, supervisesAgentHome: false }) }, '/tmp');
+    expect(result.ok).toBe(false);
+    expect(result.attention).toEqual(["The machine's Meshrooms daemon does not look after this agent folder; run connect for it again so the daemon takes it on."]);
+  });
+
   test('a daemon that will not start, or an agent in no room, is reported, never ok', async () => {
     const failed = await grokKeepalive(deps({ daemon: new Error('The daemon did not start.\nmore detail') }).d, '/tmp');
     expect(failed).toMatchObject({ ok: false, daemon: { running: false }, attention: ['The Meshrooms daemon would not start: The daemon did not start.'] });

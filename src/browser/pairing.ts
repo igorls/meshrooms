@@ -72,3 +72,46 @@ export function pairLink(input: { origin: string; name: string; device: string; 
     secret: encodeSecret(input.secret) });
   return `meshrooms://pair?${query}`;
 }
+
+/**
+ * Key-bound words (the words the person compares when linking a phone, replacing `pairingPhrase` for it): four words of
+ * pair-words.json, word i being byte i of sha256("meshrooms-sas-v1:" ++ N ++ the requesting device's raw public key). The
+ * phone computes them from its own key, the trusted device from the key `link {pairing, preview: true}` returns for the
+ * request that answers N. Someone who photographed the code and asks from another key gets other words than the phone shows.
+ */
+export async function pairingSas(secret: Uint8Array, publicKey: string) {
+  const key = Uint8Array.from(atob(publicKey), c => c.charCodeAt(0));
+  const digest = await sha256(new Uint8Array([...new TextEncoder().encode('meshrooms-sas-v1:'), ...secret, ...key]));
+  return [0, 1, 2, 3].map(i => PAIR_WORDS[digest[i]]).join(' ');
+}
+
+/**
+ * A typed pairing code (`pair-offer` in the room service): 10 characters of Crockford base32 (50 bits), shown as XXXXX-XXXXX.
+ * Neither the code nor the secret it makes ever reaches the room service: the trusted device sends `offerLookup(code)` to
+ * file the offer, the phone sends the same lookup to redeem it, and both derive the pairing secret N from the code
+ * itself, so the `request {pairing}` / `link {pairing}` convention above is unchanged.
+ */
+export const OFFER_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+export const OFFER_CODE_LENGTH = 10;
+/** How long the room service keeps an offer, and the most rooms one names (the phone asks in each). */
+export const OFFER_TTL_MS = 5 * 60_000;
+export const OFFER_MAX_ROOMS = 8;
+/** The lookup the room service files an offer under: 64 lowercase hex. */
+export const OFFER_LOOKUP = /^[a-f0-9]{64}$/;
+export function newOfferCode() {
+  // 32 symbols, so one random byte masked to five bits is uniform.
+  return [...crypto.getRandomValues(new Uint8Array(OFFER_CODE_LENGTH))].map(b => OFFER_ALPHABET[b & 31]).join('');
+}
+export const showOfferCode = (code: string) => `${code.slice(0, 5)}-${code.slice(5)}`;
+/** A typed code as compared: case and separators ignored, I and L read as 1, O as 0 (Crockford); undefined when it can't be one. */
+export function normalOfferCode(typed: string) {
+  const code = typed.toUpperCase().replace(/[\s.-]+/g, '').replace(/[IL]/g, '1').replace(/O/g, '0');
+  return code.length === OFFER_CODE_LENGTH && [...code].every(c => OFFER_ALPHABET.includes(c)) ? code : undefined;
+}
+async function offerKey(code: string, purpose: 'secret' | 'lookup') {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(code), 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode('meshrooms-offer-v1'), info: new TextEncoder().encode(purpose) }, base, 256));
+}
+/** N for a typed code: the same 32 bytes on both devices, never sent anywhere. */
+export const offerSecret = (code: string) => offerKey(code, 'secret');
+export const offerLookup = async (code: string) => hex(await offerKey(code, 'lookup'));

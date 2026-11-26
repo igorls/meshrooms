@@ -1028,3 +1028,138 @@ test('SEC-13: declining a request enforces a 5-minute cooldown; decline & block 
     await expect(banned.send('request', room, { name: 'Still Blocked', label: 'Browser', kind: 'person' })).rejects.toMatchObject({ status: 403 });
   } finally { lobby.close(); }
 });
+
+test('the host and an agent’s operator rename it by the rules of joining; nobody else, and not people', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const sam = await admitPerson(lobby, host, room, 'Sam'), pat = await admitPerson(lobby, host, room, 'Pat');
+    const codex = await client(lobby), wren = await client(lobby);
+    await codex.send('agent-redeem', room, { token: ((await sam.send('agent-invite', room, { name: 'Codex' })) as { token: string }).token, label: 'Node' });
+    await wren.send('agent-redeem', room, { token: ((await pat.send('agent-invite', room, { name: 'Wren' })) as { token: string }).token, label: 'Node' });
+    const members = async () => (await host.status(room)).members!;
+    const idOf = async (name: string) => (await members()).find(m => m.name === name)!.id;
+    const codexId = await idOf('Codex'), wrenId = await idOf('Wren'), samId = await idOf('Sam');
+    const named = async (id: string) => (await members()).find(m => m.id === id)!.name;
+
+    // The operator renames their own agent (spaces and case are cleaned up like a joining name).
+    await sam.send('rename', room, { memberId: codexId, name: '  Scout   One ' });
+    expect(await named(codexId)).toBe('Scout One');
+    // The host renames anyone's agent.
+    await host.send('rename', room, { memberId: wrenId, name: 'Finch' });
+    expect(await named(wrenId)).toBe('Finch');
+    // Someone else's operator, another agent, and the agent itself are refused, and nothing changes.
+    await expect(pat.send('rename', room, { memberId: codexId, name: 'Mine' })).rejects.toThrow('host or the agent’s operator');
+    await expect(wren.send('rename', room, { memberId: codexId, name: 'Mine' })).rejects.toThrow('host or the agent’s operator');
+    await expect(codex.send('rename', room, { memberId: codexId, name: 'Self' })).rejects.toThrow('host or the agent’s operator');
+    expect(await named(codexId)).toBe('Scout One');
+    // A device outside the room cannot ask at all; people keep their names; unknown members are not found.
+    await expect((await client(lobby)).send('rename', room, { memberId: codexId, name: 'Out' })).rejects.toThrow('Join this room first');
+    await expect(host.send('rename', room, { memberId: samId, name: 'Samuel' })).rejects.toThrow('Only agents');
+    await expect(host.send('rename', room, { memberId: crypto.randomUUID(), name: 'Ghost' })).rejects.toThrow('not in this room');
+    await expect(host.send('rename', room, { name: 'No member' })).rejects.toThrow('not in this room');
+  } finally { lobby.close(); }
+});
+
+test('a rename is checked like a join: cleaned, 64 characters at most, unique by folded name, “agents” reserved', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const sam = await admitPerson(lobby, host, room, 'Sam');
+    const codex = await client(lobby), wren = await client(lobby);
+    await codex.send('agent-redeem', room, { token: ((await sam.send('agent-invite', room, { name: 'Codex' })) as { token: string }).token, label: 'Node' });
+    await wren.send('agent-redeem', room, { token: ((await sam.send('agent-invite', room, { name: 'Wren' })) as { token: string }).token, label: 'Node' });
+    const pending = (await sam.send('agent-invite', room, { name: 'Later' })) as { token: string };
+    expect(pending.token).toBeTruthy();
+    const members = async () => (await host.status(room)).members!;
+    const codexId = (await members()).find(m => m.name === 'Codex')!.id;
+    const rename = (name: unknown) => sam.send('rename', room, { memberId: codexId, name });
+
+    await expect(rename('Wren')).rejects.toThrow('already uses that name');
+    await expect(rename(' wren ')).rejects.toThrow('already uses that name');
+    await expect(rename('ＷＲＥＮ')).rejects.toThrow('already uses that name');
+    await expect(rename('sam')).rejects.toThrow('already uses that name');
+    await expect(rename('Later')).rejects.toThrow('already uses that name');
+    await expect(rename('Agents')).rejects.toThrow('reserved');
+    await expect(rename(' AGENTS ')).rejects.toThrow('reserved');
+    await expect(rename('')).rejects.toThrow('valid name');
+    await expect(rename('\u202e\u200b')).rejects.toThrow('valid name');
+    await expect(rename('x'.repeat(65))).rejects.toThrow('valid name');
+    await expect(rename(42)).rejects.toThrow('valid name');
+    await expect(rename('Codex')).rejects.toThrow('already its name');
+    expect((await members()).find(m => m.id === codexId)!.name).toBe('Codex');
+    expect((await host.status(room)).renames).toBeUndefined();
+
+    // 64 characters is fine, and a change of case alone is a rename (its own name does not collide with itself).
+    await rename('x'.repeat(64));
+    await rename('CODEX');
+    expect((await members()).find(m => m.id === codexId)!.name).toBe('CODEX');
+    // The name it left is free again.
+    await rename('Quill');
+    await sam.send('rename', room, { memberId: (await members()).find(m => m.name === 'Wren')!.id, name: 'Codex' });
+    expect((await members()).map(m => m.name)).toEqual(['Alex', 'Sam', 'Quill', 'Codex']);
+  } finally { lobby.close(); }
+});
+
+test('a rename is kept with the room, answered again on a retry, and reported to members as a notice that older clients ignore', async () => {
+  const dir = testDirectory('agent-rename'), path = join(dir.path, 'state.sqlite');
+  let now = 1_000_000;
+  const lobby = new BrowserLobby(path, { origin, now: () => now });
+  let room = '', codexId = '', samId = '', host!: Awaited<ReturnType<typeof client>>;
+  try {
+    host = await client(lobby, () => now);
+    room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const sam = await admitPerson(lobby, host, room, 'Sam', () => now), codex = await client(lobby, () => now);
+    await codex.send('agent-redeem', room, { token: ((await sam.send('agent-invite', room, { name: 'Codex' })) as { token: string }).token, label: 'Node' });
+    const before = await host.status(room);
+    codexId = before.members!.find(m => m.name === 'Codex')!.id; samId = before.members!.find(m => m.name === 'Sam')!.id;
+    expect(before.renames).toBeUndefined();
+
+    now += 5_000;
+    const signed = await sam.signed('rename', room, { memberId: codexId, name: 'Scout' });
+    await lobby.execute(signed);
+    // The same signed request again is a retry: answered the same, not applied (or refused as already its name) twice.
+    await lobby.execute(signed);
+    const after = await host.status(room);
+    expect(after.renames).toEqual([{ id: expect.stringMatching(/^[a-f0-9-]{36}$/), at: now, memberId: codexId, by: samId, from: 'Codex', to: 'Scout' }]);
+    // Every member sees it, the agent too; a device outside the room sees nothing of the room.
+    expect((await codex.status(room)).renames).toHaveLength(1);
+    expect((await (await client(lobby, () => now)).status(room)).renames).toBeUndefined();
+  } finally { lobby.close(); }
+  // A restarted service has the new name and the notice.
+  const again = new BrowserLobby(path, { origin, now: () => now });
+  try {
+    const status = await again.execute(await host.signed('status', room, { session: host.session })) as RoomStatus;
+    expect(status.members!.map(m => m.name)).toEqual(['Alex', 'Sam', 'Scout']);
+    expect(status.renames).toMatchObject([{ memberId: codexId, from: 'Codex', to: 'Scout' }]);
+  } finally { again.close(); dir.cleanup(); }
+});
+
+test('notices are capped, drop agents that left, and keep the most recent first-in order', async () => {
+  const lobby = new BrowserLobby(':memory:', { origin });
+  try {
+    const host = await client(lobby), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const agents = [await client(lobby), await client(lobby)];
+    for (const [i, a] of agents.entries()) await a.send('agent-redeem', room, { token: ((await host.send('agent-invite', room, { name: `Bot${i}` })) as { token: string }).token, label: 'Node' });
+    const ids = (await host.status(room)).members!.filter(m => m.role === 'agent').map(m => m.id);
+    for (let i = 0; i < 25; i++) await host.send('rename', room, { memberId: ids[0], name: `Name ${i}` });
+    const kept = (await host.status(room)).renames!;
+    expect(kept).toHaveLength(20);
+    expect(kept.map(r => r.to)).toEqual(Array.from({ length: 20 }, (_, i) => `Name ${i + 5}`));
+    // A notice about an agent that left goes the next time anyone is renamed.
+    await host.send('rename', room, { memberId: ids[1], name: 'Other' });
+    await host.send('remove', room, { memberId: ids[1] });
+    await host.send('rename', room, { memberId: ids[0], name: 'Final' });
+    const last = (await host.status(room)).renames!;
+    expect(last.every(r => r.memberId === ids[0])).toBe(true);
+    expect(last.at(-1)!.to).toBe('Final');
+  } finally { lobby.close(); }
+});

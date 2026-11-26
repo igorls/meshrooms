@@ -1,6 +1,22 @@
 import { base64, deviceId, encode } from './protocol';
+import {
+  decryptRelayEnvelope,
+  exportRawPublicKey,
+  generateEncKeyPair,
+  importEncPublicKey,
+  signEncBinding,
+  type DecryptedRelayEnvelope,
+} from './relay-crypto';
 
-type Identity = { id: string; publicKey: string; keys: CryptoKeyPair };
+export type Identity = {
+  id: string;
+  publicKey: string;
+  keys: CryptoKeyPair;
+  encKeys: CryptoKeyPair;
+  encPublicKey: string;
+  encVersion: number;
+  encSig: string;
+};
 
 /** Local saving failed (out of space, evicted or closed storage). The room shows it until a later save succeeds. */
 export class StorageError extends Error { override name = 'StorageError'; }
@@ -27,7 +43,7 @@ function db() {
   if (database) return database;
   const opening: Promise<IDBDatabase> = new Promise((resolve, reject) => {
     // A failed, closed or upgraded database is opened again by the next read or write, without a reload.
-    const forget = () => { if (database === opening) database = undefined; };
+    const forget = () => { if (database === opening) { database = undefined; current = undefined; } };
     const open = indexedDB.open('meshrooms-browser-v1', 1);
     open.onupgradeneeded = () => {
       if (!open.result.objectStoreNames.contains('records')) open.result.createObjectStore('records');
@@ -157,23 +173,83 @@ export async function claimFence(key: string): Promise<Fence> {
 export function persistStorage() {
   try { void navigator.storage?.persist?.().catch(() => {}); } catch { /* Not offered here. */ }
 }
-const isIdentity = (value: unknown): value is Identity =>
+type BaseIdentity = { id: string; publicKey: string; keys: CryptoKeyPair };
+const isBaseIdentity = (value: unknown): value is BaseIdentity =>
   isPlainObject(value) && typeof value.id === 'string' && typeof value.publicKey === 'string'
   && isPlainObject(value.keys) && 'privateKey' in value.keys && 'publicKey' in value.keys;
+const hasEncIdentity = (value: BaseIdentity): value is Identity => {
+  const v = value as Record<string, unknown>;
+  return isPlainObject(v.encKeys) && 'privateKey' in v.encKeys && 'publicKey' in v.encKeys
+    && typeof v.encPublicKey === 'string' && v.encPublicKey.length === 88
+    && typeof v.encVersion === 'number' && Number.isInteger(v.encVersion) && v.encVersion >= 1
+    && typeof v.encSig === 'string' && v.encSig.length === 88;
+};
 let current: Promise<Identity> | undefined;
-export function identity() {
+/** Clears the in-memory cached identity promise so the next `identity()` call re-reads IndexedDB (used after storage reset/tests). */
+export function resetIdentityCache() {
+  current = undefined;
+}
+export function identity(): Promise<Identity> {
   return current ||= (async () => {
     if (!crypto.subtle || !navigator.locks) throw new Error('Open this room over HTTPS in a browser with Web Crypto and Web Locks support.');
     return navigator.locks.request('meshrooms-identity', async () => {
-      const existing = await read<Identity>('identity', isIdentity); if (existing) return existing;
-      const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
-      const publicKey = base64(await crypto.subtle.exportKey('raw', keys.publicKey));
-      const created = { id: await deviceId(publicKey), publicKey, keys };
-      await write('identity', created); return created;
+      const existing = await read<BaseIdentity>('identity', isBaseIdentity);
+      if (existing && hasEncIdentity(existing)) return existing;
+      const keys = existing?.keys ?? await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+      const publicKey = existing?.publicKey ?? base64(await crypto.subtle.exportKey('raw', keys.publicKey));
+      const id = existing?.id ?? await deviceId(publicKey);
+      // Separate non-exportable P-256 ECDH keypair for E2E relay envelopes (never reuses the ECDSA signing key).
+      const encKeys = await generateEncKeyPair(false);
+      const encPublicKey = await exportRawPublicKey(encKeys.publicKey);
+      const encVersion = 1;
+      const signWithKeys = async (value: unknown) =>
+        base64(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, encode(value)));
+      const encSig = await signEncBinding(signWithKeys, {
+        room: '*',
+        deviceId: id,
+        enc: encPublicKey,
+        encVersion,
+      });
+      const complete: Identity = { id, publicKey, keys, encKeys, encPublicKey, encVersion, encSig };
+      await write('identity', complete);
+      return complete;
     });
   })().catch(error => { current = undefined; throw error; }); // Retry opens storage again rather than repeating the failure.
 }
 export async function sign(value: unknown) {
   const i = await identity();
   return base64(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, i.keys.privateKey, encode(value)));
+}
+/** Signs a room-scoped `{ room, deviceId, enc, encVersion }` binding for this browser device's ECDH key. */
+export async function signDeviceEncKey(roomId: string): Promise<{ enc: string; encVersion: number; encSig: string }> {
+  const i = await identity();
+  const encSig = await signEncBinding(sign, {
+    room: roomId,
+    deviceId: i.id,
+    enc: i.encPublicKey,
+    encVersion: i.encVersion,
+  });
+  return { enc: i.encPublicKey, encVersion: i.encVersion, encSig };
+}
+/** Derives a 256-bit ECDH shared secret with a peer's raw base64 P-256 public key using this device's encryption key. */
+export async function deriveSharedSecret(peerEncPublicKey: string): Promise<ArrayBuffer> {
+  const i = await identity();
+  const peerPub = await importEncPublicKey(peerEncPublicKey);
+  return crypto.subtle.deriveBits({ name: 'ECDH', public: peerPub }, i.encKeys.privateKey, 256);
+}
+/** Decrypts an incoming E2E relay envelope using this browser device's non-exportable ECDH private key. */
+export async function decryptWithEncKey<T = unknown>(
+  envelope: unknown,
+  options: { room: string; senderSignKey: string; minRosterVersion?: number; expectedFrom?: string },
+): Promise<DecryptedRelayEnvelope<T>> {
+  const i = await identity();
+  return decryptRelayEnvelope<T>(envelope, {
+    room: options.room,
+    selfDeviceId: i.id,
+    selfEncPrivateKey: i.encKeys.privateKey,
+    selfEncVersion: i.encVersion,
+    senderSignKey: options.senderSignKey,
+    minRosterVersion: options.minRosterVersion,
+    expectedFrom: options.expectedFrom,
+  });
 }

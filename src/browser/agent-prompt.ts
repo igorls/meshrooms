@@ -2,6 +2,33 @@
 export const PROMPT_HARNESSES = { claude: 'Claude Code', codex: 'Codex CLI', codexApp: 'Codex app', agy: 'Antigravity', hermes: 'Hermes Agent', dsh: 'DeepSeek Harness', grok: 'Grok Bot', other: '' } as const;
 export type PromptHarness = keyof typeof PROMPT_HARNESSES;
 
+/** What the invite dialog shows for each harness: its chip label and the short badge in the chip. Same keys and labels as `PROMPT_HARNESSES`. */
+export const PROMPT_HARNESS_META: { id: PromptHarness; label: string; badge: string }[] = [
+  { id: 'claude', label: PROMPT_HARNESSES.claude, badge: 'C' },
+  { id: 'codex', label: PROMPT_HARNESSES.codex, badge: 'Cx' },
+  { id: 'codexApp', label: PROMPT_HARNESSES.codexApp, badge: 'Ca' },
+  { id: 'agy', label: PROMPT_HARNESSES.agy, badge: 'A' },
+  { id: 'grok', label: PROMPT_HARNESSES.grok, badge: 'G' },
+  { id: 'hermes', label: PROMPT_HARNESSES.hermes, badge: 'H' },
+  { id: 'dsh', label: PROMPT_HARNESSES.dsh, badge: 'D' },
+  { id: 'other', label: 'Something else', badge: '·' },
+];
+export const isPromptHarness = (value: unknown): value is PromptHarness => typeof value === 'string' && Object.prototype.hasOwnProperty.call(PROMPT_HARNESSES, value);
+
+/** The name an agent gets in the room when the person hasn't typed one: the harness's own name; "Something else" has none. */
+export const defaultAgentName = (harness: PromptHarness): string => PROMPT_HARNESSES[harness];
+
+/** A name that says which harness it is picks that harness (the person can still change it). */
+export function harnessFromName(name: string): PromptHarness | undefined {
+  if (/codex/i.test(name)) return 'codex';
+  if (/claude/i.test(name)) return 'claude';
+  if (/antigravity|\bagy\b/i.test(name)) return 'agy';
+  if (/hermes/i.test(name)) return 'hermes';
+  if (/dsh|deepseek/i.test(name)) return 'dsh';
+  if (/grok/i.test(name)) return 'grok';
+  return undefined;
+}
+
 const VERSION = /^\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z.-]{1,32})?$/;
 
 /**

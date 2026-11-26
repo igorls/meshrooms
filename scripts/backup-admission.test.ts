@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { backup, rotate, STATUS_FILE, verify } from '../deploy/backup/backup-admission';
 import { BACKUP_STATUS_FILE, backupFreshness } from '../server/browser/backup-status';
 import { BrowserLobby } from '../server/browser/lobby';
+import { CURRENT_SCHEMA_VERSION } from '../server/browser/store';
 
 test('backs up a live WAL admission database into a verified standalone copy', () => {
   const dir = mkdtempSync(join(tmpdir(), 'meshrooms-backup-'));
@@ -21,10 +22,10 @@ test('backs up a live WAL admission database into a verified standalone copy', (
     const file = backup({ db, out, keepDays: 14, keepMin: 3, now: new Date('2026-09-29T03:15:00Z') });
     expect(file.endsWith('admission-20260929T031500Z.sqlite')).toBe(true);
     const checked = verify(file);
-    expect(checked.schemaVersion).toBe(2);
+    expect(checked.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(checked.counts).toEqual({
       rooms: 1, receipts: 0, avatars: 0, room_activity: 0, closed_rooms: 0, service_state: 1, creation_invites: 0, beta_admissions: 0,
-      room_devices: 0, retired_devices: 0, beta_revocations: 0,
+      room_devices: 0, retired_devices: 0, beta_revocations: 0, room_rosters: 0,
     });
     expect(readdirSync(out).filter(name => name.endsWith('.partial'))).toEqual([]);
     if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600);

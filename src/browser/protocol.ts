@@ -1,3 +1,6 @@
+import type { SignedRoster } from './relay-crypto';
+export type { SignedRoster } from './relay-crypto';
+
 /** Browser-room v1 is independent of the native node's credentials and grants. */
 export const browserProtocol = 'meshrooms-browser-v1';
 /** Numeric wire protocol version advertised on `/api/lobby/health` and optionally sent via `PROTOCOL_HEADER`. */
@@ -10,15 +13,36 @@ export const PROTOCOL_HEADER = 'x-meshrooms-protocol';
 export const UPGRADE_REQUIRED = 'upgrade-required';
 export type Command = {
   protocol: typeof browserProtocol; origin: string; id: string; at: number;
-  action: 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal' | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'repositories' | 'transfer-host' | 'close';
+  action:
+    | 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal'
+    | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'rename' | 'repositories' | 'transfer-host' | 'close'
+    | 'pair-offer' | 'pair-redeem' | 'pair-cancel'
+    | 'roster-publish' | 'relay-open' | 'relay-send' | 'relay-poll' | 'relay-wake-register' | 'relay-state-get' | 'relay-state-put';
   roomId: string; payload: Record<string, unknown>;
 };
 export type SignedCommand = { command: Command; publicKey: string; signature: string };
-export type BrowserDevice = { id: string; publicKey: string; label: string; memberId: string; admittedAt: number };
+export type BrowserDevice = {
+  id: string; publicKey: string; label: string; memberId: string; admittedAt: number;
+  /** Raw uncompressed P-256 ECDH public key (base64, 88 chars) for E2E relay envelopes. */
+  enc?: string;
+  /** Monotonic encryption key version; increments when the device rotates `enc`. */
+  encVersion?: number;
+  /** Device ECDSA signature binding `{ room, deviceId, enc, encVersion }`. */
+  encSig?: string;
+  /** True for cloud/ephemeral agents that registered a relay inbox and wake trigger. */
+  wakeable?: true;
+};
 /** Members without a role joined before agents existed and are people. An agent's operator is the member who confirmed it. */
 /** `avatar` is a short hash of the member's picture; fetch it from /api/lobby/rooms/:room/avatars/:member?h=<hash>. */
 /** Agents report `harness` (e.g. Claude Code) and `model` themselves; the room cannot verify either. */
 export type BrowserMember = { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; avatar?: string; harness?: string; model?: string };
+/**
+ * A rename of an agent after it joined, as the room service reports it. `by` is the member who renamed it (the host or the
+ * agent's operator), shown by that member's current name. The service keeps only the latest few, for members still here.
+ */
+export type RenameNotice = { id: string; at: number; memberId: string; by: string; from: string; to: string };
+/** Renames the room service reports at once; older ones fall off. */
+export const MAX_RENAME_NOTICES = 20;
 /**
  * `agent` requests come only from a redeemed agent link while the host requires approval for guests' agents. A companion
  * request carries either a `code` its person enters on another device, or `pairing`, a proof made with a secret the
@@ -34,6 +58,18 @@ export type JoinRequest = {
  * counts against the linking device's wrong codes like any miss, so the browser links once the app says it has asked.
  */
 export const PAIRING_NOT_FOUND = 'pairing-not-found';
+/** `pair-redeem` found no open offer under that code: it was mistyped, used, cancelled or expired (the answer never says which). */
+export const PAIR_OFFER_NOT_FOUND = 'pair-offer-not-found';
+/**
+ * `link {pairing, preview: true}`: the one request in the room that answers the secret, shown without linking it, so a
+ * trusted device that isn't the host (hosts see requests in `RoomStatus.requests`) can show the phone's label and the
+ * key-bound words (pairingSas) before it links.
+ */
+export type PairingPreview = { requestId: string; label: string; publicKey: string; deviceId: string; expiresAt: number };
+/** What `pair-redeem` gives the phone: the person's name, the trusted device's id and the rooms the offer names. */
+export type PairingOffer = { name: string; device: string; rooms: string[]; expiresAt: number };
+/** What a command can add to its answer: `link` (admitted, preview, revoked), `pair-offer`, `pair-redeem` and `pair-cancel`. */
+export type CommandAnswer = { admitted?: boolean; preview?: PairingPreview; revoked?: number; offer?: PairingOffer | { expiresAt: number }; cancelled?: boolean };
 /** The public room service (docs/browser-rooms.md): where the desktop app makes new rooms unless told otherwise. */
 export const PUBLIC_ROOM_SERVICE = 'https://meshrooms.wormdb.dev';
 /** Host-controlled room rules. Agents' own bridges enforce the floor and wake rules; the room service enforces admission. */
@@ -55,7 +91,7 @@ export type Signal = { seq: number; from: string; session: string; targetSession
 export type RoomStatus = {
   roomId: string; title: string; epoch: string; hostOnline: boolean; memberId?: string; ownerId?: string;
   deviceId: string; request?: JoinRequest; requests?: JoinRequest[];
-  members?: BrowserMember[]; devices?: (BrowserDevice & { session?: string })[];
+  members?: BrowserMember[]; renames?: RenameNotice[]; devices?: (BrowserDevice & { session?: string })[];
   signals?: Signal[]; iceServers?: RTCIceServer[]; agentInvites?: AgentInvite[];
   /** Keys of devices that have left, so their earlier signed records still verify for people who join later (see signerOf). */
   formerDevices?: FormerDevice[];
@@ -64,6 +100,10 @@ export type RoomStatus = {
   repositories?: string[];
   /** When the room service removes this room if no admitted device opens it again (idle expiry). */
   expiresAt?: number;
+  /** Host-signed monotonic device roster used as the authoritative recipient set for E2E relay encryption. */
+  roster?: SignedRoster;
+  /** WebSocket relay endpoint URL advertised by the room service when the relay is enabled. */
+  relayUrl?: string;
 };
 /** Status of a room the host closed, or the service removed: every command for it answers 410 with this `code`. */
 export const ROOM_CLOSED = 'room-closed';

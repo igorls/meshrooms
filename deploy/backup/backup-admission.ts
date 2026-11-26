@@ -24,6 +24,7 @@ export const VERSIONED_TABLES = [
   { minVersion: 1, table: 'room_devices' },
   { minVersion: 2, table: 'retired_devices' },
   { minVersion: 2, table: 'beta_revocations' },
+  { minVersion: 3, table: 'room_rosters' },
 ] as const;
 const DAY = 86_400_000;
 /** Must match BACKUP_STATUS_FILE in server/browser/backup-status.ts (a test checks both sides). */

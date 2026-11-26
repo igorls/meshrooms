@@ -29,15 +29,15 @@
  * code is installed in ~/.meshrooms/bin (see agent-install.ts), and background runners start from there.
  */
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { basename, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { MCP_TOOLS, serveMcp } from './mcp';
-import { GROK_DEFAULTS, grokKeepalive, grokPing, grokSetup, grokWake, grokWakeGuard, grokWebhookFile, readGrokWebhook } from './grok-bot';
+import { GROK_DEFAULTS, grokKeepalive, grokPing, grokSetup, grokWake, grokWakeGuard, grokWebhookFile, normalizeKey, readGrokWebhook, webhookUrlProblem } from './grok-bot';
 import { watchDesktop } from './desktop-watch';
 import { defaultCodexDelivery, harnessPreferences } from './harness-apps';
-import { BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, replaceFile, roomClosed, runnerStuck, runnerTrouble, serviceSilence, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, peekWork, reactBrowser, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
+import { BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, replaceFile, roomClosed, runnerStuck, runnerTrouble, serviceSilence, attachmentBrowser, decisionBrowser, describeDecision, pickDecision, listenRemembering, parseConnectLink, peekWork, reactBrowser, relayListenOnce, relaySendOnce, relayWakeRegister, runBridge, sendBrowser, taskBrowser, waitDecision } from './browser-agent';
 import {
   DEFAULT_DSH_PROFILE, DSH_PROFILE_NAME, DEFAULT_MAX_AGENT_WAKES_PER_HOUR, DEFAULT_HERMES_MAX_TURNS, DEFAULT_HERMES_RUN_BUDGET_SECONDS, HERMES_TOOLSET, HERMES_EXPECTED_TOOLS, hermesToolsProblem, toolsetNameProblem, DEFAULT_MAX_WAKES_PER_HOUR, DEFAULT_RUN_TIMEOUT_MINUTES, HARNESSES, WAKE_COMMANDS, WAKE_WRITABLE, WATCH_TIMING, CODEX_DISABLED, INSPECT_TIMEOUT_MS, wakeEnv, ENV_NAME, CLAUDE_SETTING_SOURCES, type ClaudeSettingSource, codexEnvDenies, envProjectProblem, killDeps, recordAgentHome, CODEX_PROFILE, HOME_SECRETS, clearDir, codexBase, codexConfig, heredocMarker, inspectProcess, killTree, processInfo, runFingerprint, sameRun,
   wakeReadDenies, type WakeContext,
@@ -46,7 +46,7 @@ import {
   type Harness, type WatchConfig, type WatchState, WATCH_LOCK, agentHomesFile, knownAgentHomes,
 } from './agent-watch';
 import {
-  DAEMON_LOCK, DAEMON_LOG, DAEMON_OUT, DAEMON_TIMING, LEGACY_OFF, ROOM_RETIRED, ROOM_STOPPED, RUNNER_LOG, StartSkipped, WATCHER_LOG, createSupervisor, daemonDir, daemonSupervises, readBinding,
+  DAEMON_LOCK, DAEMON_LOG, adoptAgentHome, DAEMON_OUT, DAEMON_TIMING, LEGACY_OFF, ROOM_RETIRED, ROOM_STOPPED, RUNNER_LOG, StartSkipped, WATCHER_LOG, createSupervisor, daemonDir, daemonSupervises, readBinding,
   readDaemonRecord, rotateLog, runningDaemon, locksDir, disableBinding, authorizeBinding, bindingFence, migrateLegacyBinding, withProcessLog, BUN_NO_ENV_FILE, bridgeEnv, writeDaemonRecord, type DaemonRecord, type Handle, type RoomRef, type SupervisorDeps,
 } from './agent-daemon';
 import { loginItemManager } from './startup';
@@ -227,7 +227,7 @@ function reportWokenRuns(agent: BrowserAgent) {
 function args(argv: string[]) {
   const [command = 'help', ...rest] = argv; const values: Record<string, string> = {}; const positional: string[] = []; const attach: string[] = []; const options: string[] = [];
   for (let i = 0; i < rest.length; i++) {
-    if (['--clear', '--all', '--withdraw', '--from-start', '--peek', '--last', '--json', '--until-addressed', '--check', '--anyway', '--approvals', '--ping'].includes(rest[i])) values[rest[i]] = 'true';
+    if (['--clear', '--all', '--withdraw', '--from-start', '--peek', '--last', '--json', '--until-addressed', '--check', '--anyway', '--approvals', '--ping', '--relay-once'].includes(rest[i])) values[rest[i]] = 'true';
     else if (rest[i] === '--allow-tools') { if (rest[i + 1] === undefined) throw new Error('Give a tool rule for --allow-tools.'); options.push(rest[++i]); }
     else if (rest[i] === '--attach') { if (rest[i + 1] === undefined) throw new Error('Give a file path for --attach.'); attach.push(rest[++i]); }
     else if (rest[i] === '--option' && command === 'ask') { if (rest[i + 1] === undefined) throw new Error('Give a label for --option.'); options.push(rest[++i]); }
@@ -288,13 +288,18 @@ export function freshRemoval(proof: unknown, since: number): boolean {
   return typeof p?.removedSince === 'number' && typeof p.at === 'number' && p.at >= since;
 }
 
-/** Rooms this machine's agents belong to, by id, with their origins. */
-function knownRoom(roomId: string): BrowserAgent {
+/** Rooms this machine's agents belong to, by id, with their origins. Uses `MESHROOMS_AGENT_KEY` in-memory when set. */
+function knownRoom(roomId?: string): BrowserAgent {
+  const envSecret = process.env.MESHROOMS_AGENT_KEY;
+  if (envSecret !== undefined && envSecret.trim()) {
+    if (roomId !== undefined && !uuid(roomId)) throw new Error('Use --room with the room id printed by connect.');
+    return BrowserAgent.fromEnvSecret(envSecret, roomId);
+  }
   if (!uuid(roomId)) throw new Error('Use --room with the room id printed by connect.');
   const config = join(home(), 'browser-agents', roomId, 'room.json');
   if (!existsSync(config)) throw new CliError('This agent has not connected to that room. Run connect with the link first.', 'ROOM_NOT_FOUND');
-  const { origin } = JSON.parse(readFileSync(config, 'utf8'));
-  return new BrowserAgent(home(), origin, roomId);
+  const { origin, hostPin } = JSON.parse(readFileSync(config, 'utf8')) as { origin: string; hostPin?: string };
+  return new BrowserAgent(home(), origin, roomId, { ...(hostPin ? { hostPin } : {}) });
 }
 
 /**
@@ -1615,6 +1620,17 @@ async function awaitDaemon(dir: string, timeoutMs = 15_000, pid?: number, exited
   return undefined;
 }
 /**
+ * Adds to a `daemon start` result whether the machine's one daemon looks after this command's agent folder
+ * (MESHROOMS_AGENT_HOME). A folder it did not know yet is added to its registry, which it re-reads every tick; if it
+ * can't be, `supervisesAgentHome` is false and `warning` says so.
+ */
+function withSupervision<T extends object>(result: T, dir: string): T & { supervisesAgentHome?: boolean; registeredAgentHome?: boolean; warning?: string } {
+  const { supervised, registered, nothingToSupervise } = adoptAgentHome(home(), running, dir);
+  if (nothingToSupervise) return result;
+  return { ...result, supervisesAgentHome: supervised, ...(registered ? { registeredAgentHome: true } : {}),
+    ...(supervised ? {} : { warning: "The running daemon does not look after this agent folder and its registry couldn't take it on, so this agent has no supervisor. Run connect for this folder again, or check daemon status." }) };
+}
+/**
  * `daemon start`: starts the daemon in the background, unless one runs: always the user's own daemon (its default folder
  * and registry), from the installed launcher, with --no-env-file and none of this shell's MESHROOMS_* overrides.
  * `approvals`: with the app-only approval routes on (`daemon run --approvals`), as the Meshrooms app starts it, whose
@@ -1622,7 +1638,8 @@ async function awaitDaemon(dir: string, timeoutMs = 15_000, pid?: number, exited
  */
 async function startDaemon(bin?: string, approvals = false) {
   const dir = daemonDir({}), live = runningDaemon(running, dir);
-  if (live) return { running: true, started: false, pid: live.pid };
+  // One daemon per machine: a running one is not replaced or duplicated, it takes this agent folder on (see adoptAgentHome).
+  if (live) return withSupervision({ running: true, started: false, pid: live.pid }, dir);
   const checked = bin ? trustedBinDir(bin) : undefined;
   const bundle = runningBundle(), launcher = bundle ? installBridge(bundle, BRIDGE_VERSION, checked ?? binDir({}, homedir())).launcher : process.argv[1];
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -1632,9 +1649,9 @@ async function startDaemon(bin?: string, approvals = false) {
   child.once('exit', () => { exited = true; });
   child.unref();
   const started = await awaitDaemon(dir, 15_000, child.pid, () => exited);
-  if (started) return { running: true, started: true, pid: started.pid, ...(checked ? { binDir: checked } : {}) };
+  if (started) return withSupervision({ running: true, started: true, pid: started.pid, ...(checked ? { binDir: checked } : {}) }, dir);
   const other = runningDaemon(running, dir);
-  if (other) return { running: true, started: false, pid: other.pid };
+  if (other) return withSupervision({ running: true, started: false, pid: other.pid }, dir);
   let tail = ''; try { tail = readFileSync(join(dir, DAEMON_OUT), 'utf8').slice(-1_000).trim(); } catch { /* No output. */ }
   throw new Error(`The daemon did not start.${tail ? ` It said: ${tail}` : ''} See ${join(dir, DAEMON_LOG)}.`);
 }
@@ -1925,7 +1942,7 @@ async function grokCommand(sub: string | undefined, values: Record<string, strin
   if (sub === 'keepalive') {
     const agentHome = home();
     const { exitCode, ...result } = await grokKeepalive({
-      agentHome, startDaemon: () => startDaemon(), bunVersion: Bun.version, now: Date.now, sleep: ms => Bun.sleep(ms),
+      agentHome, startDaemon: async () => { const d = await startDaemon(); return { running: d.running, started: d.started, supervisesAgentHome: d.supervisesAgentHome }; }, bunVersion: Bun.version, now: Date.now, sleep: ms => Bun.sleep(ms),
       webhookProblem: () => { try { readGrokWebhook(file); return undefined; } catch (error) { return existsSync(file) ? (error instanceof Error ? error.message : String(error)) : 'none is saved'; } },
       rooms: () => listBindings().bindings.filter(row => resolve(String(row.agentHome)) === agentHome).map(row => {
         const r = row as { roomId: string; title?: string | null; wakes: { state: string; reason?: string | null }; runner?: unknown; closed?: unknown; retired?: unknown; stopped?: unknown };
@@ -2261,8 +2278,8 @@ export function wakeGuard(command: string, values: Record<string, string>, attac
  * link the person device just made (agents.ts), so no link is ever copied. `label` names the device in the room's
  * device list; `wait: false` returns without waiting for the daemon to start the runner.
  */
-export async function connectAgent(input: { agentHome: string; origin: string; roomId: string; token: string; harness?: string; model?: string; session?: string; label?: string; wait?: boolean }) {
-  const { agentHome, origin, roomId, token } = input;
+export async function connectAgent(input: { agentHome: string; origin: string; roomId: string; token: string; hostPin?: string; harness?: string; model?: string; session?: string; label?: string; wait?: boolean }) {
+  const { agentHome, origin, roomId, token, hostPin } = input;
   // The harness session this agent runs in, recorded so a watcher resumes exactly it (never a bare --continue).
   const sessionGiven = input.session, sessionKind = sessionHarness(input.harness);
   const sessionWrong = sessionGiven === undefined ? undefined : sessionProblem(sessionKind, sessionGiven);
@@ -2270,8 +2287,9 @@ export async function connectAgent(input: { agentHome: string; origin: string; r
   // Before anything touches the link: a bridge the room service no longer accepts must not use it up.
   const service = await checkBridgeVersion(origin, 'connect');
   const target = runnerTarget();
-  const agent = new BrowserAgent(agentHome, origin, roomId);
+  const agent = new BrowserAgent(agentHome, origin, roomId, { ...(hostPin ? { hostPin } : {}) });
   const identity = await agent.ensureIdentity();
+  const encBinding = await agent.encBinding();
   const config = join(agent.dir, 'room.json'), link = createHash('sha256').update(token).digest('hex');
   let status: any = await withConnectLock(agent.dir, async () => {
     let saved: string | undefined, previous: string | undefined;
@@ -2287,10 +2305,10 @@ export async function connectAgent(input: { agentHome: string; origin: string; r
     if (conflict) throw new CliError(conflict, 'CONNECT_CONFLICT');
     // A session recorded before stays unless a new one is given.
     const session = sessionGiven !== undefined ? { id: sessionGiven, harness: sessionKind } : roomSession(agent.dir);
-    writeFileSync(config, JSON.stringify({ origin, roomId, link, ...(session ? { session } : {}) }), { mode: 0o600 });
+    writeFileSync(config, JSON.stringify({ origin, roomId, link, ...(hostPin ? { hostPin } : {}), ...(session ? { session } : {}) }), { mode: 0o600 });
     try { recordAgentHome(agentHome); } catch { /* Only narrows what wakes can read; never blocks a connect. */ }
     if (current.memberId) return current;
-    try { await agent.command('agent-redeem', { token, label: input.label ?? `Agent on ${hostname().slice(0, 40) || 'this machine'}` }); }
+    try { await agent.command('agent-redeem', { token, label: input.label ?? `Agent on ${hostname().slice(0, 40) || 'this machine'}`, ...encBinding }); }
     catch (error) {
       // Roll back only when the room refused the link. After a timeout or a server error the redeem may have gone
       // through, so the record stays and a retry with this same link carries on.
@@ -2331,6 +2349,68 @@ export async function connectAgent(input: { agentHome: string; origin: string; r
     ] };
 }
 
+/**
+ * Serves a one-time loopback page on 127.0.0.1 displaying `MESHROOMS_AGENT_KEY` once for the operator to copy into
+ * their cloud environment secret settings (Section 6.3). The secret is NEVER printed to stdout, stderr, or chat.
+ */
+export async function exportIdentityLoopback(options: {
+  secret: string;
+  roomId: string;
+  deviceId: string;
+  port?: number;
+  timeoutMs?: number;
+  announce: (line: object) => void;
+}) {
+  const token = randomBytes(24).toString('base64url');
+  const path = `/export/${token}`;
+  let viewed = false;
+  let done: (result: { exported: boolean; roomId: string; deviceId: string; message?: string }) => void = () => {};
+  const finished = new Promise<{ exported: boolean; roomId: string; deviceId: string; message?: string }>(r => { done = r; });
+  const same = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  const escaped = options.secret.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const html = (body: string, status = 200) => new Response(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Meshrooms · Export MESHROOMS_AGENT_KEY</title><style>body{font:16px system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#1d2433}textarea{width:100%;height:9rem;font:13px monospace;padding:.6rem;border:1px solid #9aa3b5;border-radius:6px;box-sizing:border-box}p.note{color:#4a5468}</style></head><body><main>${body}</main></body></html>`,
+    {
+      status,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'referrer-policy': 'same-origin',
+        'x-frame-options': 'DENY',
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+      },
+    },
+  );
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: options.port ?? 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (viewed) return new Response('This one-time export page has already been viewed.', { status: 410 });
+      if (!same(url.pathname, path)) return new Response('Not found', { status: 404 });
+      if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+      viewed = true;
+      queueMicrotask(() => done({ exported: true, roomId: options.roomId, deviceId: options.deviceId }));
+      return html(`<h1>MESHROOMS_AGENT_KEY</h1><p class="note">Copy this value into your cloud agent environment secret settings as <code>MESHROOMS_AGENT_KEY</code>. This page can only be opened once; never paste this value into chat.</p><textarea readonly spellcheck="false">${escaped}</textarea>`);
+    },
+  });
+  options.announce({
+    state: 'open',
+    exportUrl: `http://127.0.0.1:${server.port}${path}`,
+    roomId: options.roomId,
+    deviceId: options.deviceId,
+    next: 'Open exportUrl in your local browser once to copy MESHROOMS_AGENT_KEY into your cloud environment secrets.',
+  });
+  const timeoutMs = options.timeoutMs ?? 5 * 60_000;
+  const timer = setTimeout(() => done({
+    exported: false,
+    roomId: options.roomId,
+    deviceId: options.deviceId,
+    message: `Export page was not opened within ${Math.round(timeoutMs / 60_000)} min; run export-identity again.`,
+  }), timeoutMs);
+  try { return await finished; } finally { clearTimeout(timer); server.stop(true); }
+}
+
 export async function agentCli(argv: string[], stdin?: () => Promise<string>): Promise<unknown> {
   const parsed = args(argv), { values, positional, attach, options } = parsed;
   let command = parsed.command;
@@ -2359,6 +2439,9 @@ export async function agentCli(argv: string[], stdin?: () => Promise<string>): P
     "profile --room ROOM [--harness 'Claude Code'] [--model 'claude-opus-5-5'] | --clear (what you run on; shown to everyone)",
     "status --room ROOM [--note 'ONE LINE, UP TO 140 CHARACTERS' | --note '']  (people see the note next to your activity)",
     'listen --room ROOM --peek  (whether a listen would return work now, without consuming it)',
+    'listen --room ROOM --relay-once [--wait-seconds N] [--min-roster-version N] [--from-start]  (ephemeral cloud agent: connects over WSS or HTTPS fallback, verifies roster, drains inbox, persists sealed state before receipts/ack, exits cleanly)',
+    'export-identity --room ROOM [--out FILE] [--timeout-minutes N]  (operators only, never during a wake: exports MESHROOMS_AGENT_KEY to a 0600 file or one-time 127.0.0.1 page)',
+    'relay-wake-register --room ROOM (--url HTTPS_URL [--key-file FILE | --key -] | --clear)  (registers or clears a content-free wake webhook signed by the room device key)',
     'listen --room ROOM --until-addressed [--session SESSION_ID] [--pickup-minutes 10] [--max-wait-hours 24] [--parent PID]  (the live mode: run it as a background command; it costs nothing while idle,',
     '  waits cleanly during pending admission, and exits only on work (0, the same JSON as listen), a closed room (3), removal/rejection (4), a runner it could not get repaired (5), or parent exit (6))',
     "watch --room ROOM --harness claude|codex|hermes|agy|dsh|exec [--cwd DIR] [--session ID | --last] [--profile NAME for dsh] [--model MODEL] [--harness-bin PATH] [--command 'PROGRAM ... {prompt_file}'] [--max-wakes-per-hour 20] [--run-timeout-minutes 20] [--allow-tools RULE]... [--claude-settings user,project,local] [--pass-env NAME,NAME] [--max-turns 12] [--run-budget 240]  (both hermes only)",
@@ -2402,8 +2485,8 @@ export async function agentCli(argv: string[], stdin?: () => Promise<string>): P
     const raw = positional[0] || values['--link'] || '';
     if (raw === '-' && TEXT_OPTIONS.some(key => values[key] === '-')) throw new Error('Only one option can read from stdin (-); give the others with -file.');
     const link = await readConnectLink(raw, stdin);
-    const { origin, roomId, token } = parseConnectLink(link);
-    return connectAgent({ agentHome: home(), origin, roomId, token, harness: values['--harness'], model: values['--model'], session: values['--session'] });
+    const { origin, roomId, token, hostPin } = parseConnectLink(link);
+    return connectAgent({ agentHome: home(), origin, roomId, token, ...(hostPin ? { hostPin } : {}), harness: values['--harness'], model: values['--model'], session: values['--session'] });
   }
   if (command === 'mcp') {
     // A stdio MCP server, so a harness with no per-invocation allowlist of its own (Hermes, via
@@ -2421,6 +2504,96 @@ export async function agentCli(argv: string[], stdin?: () => Promise<string>): P
   }
   const agent = knownRoom(values['--room']);
   await readTextOptions(values, stdin);
+  if (command === 'export-identity') {
+    if (wake !== undefined || process.env.MESHROOMS_WAKE_ROOM !== undefined) {
+      throw new CliError('export-identity cannot be run during a wake.', 'WAKE_FORBIDDEN', 403);
+    }
+    if (agent.stateless) {
+      throw new CliError('Identity is already loaded from MESHROOMS_AGENT_KEY; refusing to export secrets from memory.', 'STATELESS_EXPORT_FORBIDDEN', 403);
+    }
+    const identity = await agent.ensureIdentity();
+    const secret = await agent.exportKeySecret(agent.hostPin);
+    if (values['--out'] !== undefined) {
+      const outPath = resolve(values['--out']);
+      mkdirSync(dirname(outPath), { recursive: true, mode: 0o700 });
+      replaceFile(outPath, `${secret}\n`);
+      return { exported: true, roomId: agent.roomId, deviceId: identity.id, file: outPath, mode: '0600' };
+    }
+    const minutes = Number(values['--timeout-minutes'] ?? 5);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) throw new Error('Use --timeout-minutes between 1 and 60.');
+    const result = await exportIdentityLoopback({
+      secret,
+      roomId: agent.roomId,
+      deviceId: identity.id,
+      timeoutMs: minutes * 60_000,
+      announce: line => console.log(JSON.stringify(line)),
+    });
+    return result.exported ? result : { ...result, [EXIT_CODE]: 1 };
+  }
+  if (command === 'relay-wake-register') {
+    if (wake !== undefined || process.env.MESHROOMS_WAKE_ROOM !== undefined) {
+      throw new CliError('relay-wake-register cannot be run during a wake.', 'WAKE_FORBIDDEN', 403);
+    }
+    if (values['--clear'] !== undefined) {
+      return relayWakeRegister(agent, null);
+    }
+    const rawUrl = values['--url'];
+    const problem = webhookUrlProblem(rawUrl);
+    if (problem) throw new Error(problem);
+    let rawKey: string | undefined;
+    if (values['--key-file'] !== undefined) {
+      if (values['--key'] !== undefined) throw new Error('Use --key-file or --key -, not both.');
+      const keyPath = resolve(values['--key-file']);
+      if (!existsSync(keyPath) || !lstatSync(keyPath).isFile()) throw new Error(`Cannot read key file ${keyPath}.`);
+      rawKey = readFileSync(keyPath, 'utf8');
+    } else if (values['--key'] !== undefined) {
+      if (values['--key'] !== '-') throw new Error('Do not pass secrets directly in --key; use --key-file <file> or --key - (stdin).');
+      rawKey = await (stdin ? stdin() : Bun.stdin.text());
+    }
+    const key = rawKey !== undefined ? normalizeKey(rawKey) : undefined;
+    if (rawKey !== undefined && !key) throw new Error('The webhook key is invalid or empty.');
+    const registered = await relayWakeRegister(agent, rawUrl.trim(), key);
+    const webhookHost = (() => { try { return new URL(rawUrl.trim()).host; } catch { return undefined; } })();
+    return { ...registered, ...(webhookHost ? { webhookHost } : {}) };
+  }
+  if (command === 'listen' && (values['--relay-once'] !== undefined || agent.stateless)) {
+    const waitSeconds = values['--wait-seconds'] === undefined ? 0 : Number(values['--wait-seconds']);
+    if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 60) throw new Error('Use --wait-seconds between 0 and 60 with --relay-once.');
+    const board = values['--board-after'] === undefined ? undefined : Number(values['--board-after']);
+    if (board !== undefined && (!Number.isSafeInteger(board) || board < 0)) throw new Error('Use --board-after with the boardCursor from the last listen.');
+    const decided = values['--decisions-after'] === undefined ? undefined : Number(values['--decisions-after']);
+    if (decided !== undefined && (!Number.isSafeInteger(decided) || decided < 0)) throw new Error('Use --decisions-after with the decisionCursor from the last listen.');
+    const minRosterVersion = values['--min-roster-version'] === undefined ? undefined : Number(values['--min-roster-version']);
+    if (minRosterVersion !== undefined && (!Number.isSafeInteger(minRosterVersion) || minRosterVersion < 1)) {
+      throw new Error('Use --min-roster-version with a positive integer.');
+    }
+    return relayListenOnce(agent, {
+      waitSeconds,
+      after: values['--after'],
+      boardAfter: board,
+      decisionsAfter: decided,
+      fromStart: values['--from-start'] !== undefined,
+      ...(minRosterVersion !== undefined ? { minRosterVersion } : {}),
+    });
+  }
+  if (command === 'send' && (values['--relay-once'] !== undefined || agent.stateless)) {
+    if (!uuid(values['--request-id'])) throw new Error('Use --request-id with a new UUID; reuse it only to retry the same message.');
+    if (!values['--text']?.trim()) throw new Error('Use --text with the message (or --text-file FILE, or --text - to read it from stdin).');
+    if (attach.length) throw new Error('Attachments are not supported in --relay-once stateless mode.');
+    const waitSeconds = values['--wait-seconds'] === undefined ? 30 : Number(values['--wait-seconds']);
+    if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 60) throw new Error('Use --wait-seconds between 0 and 60.');
+    const minRosterVersion = values['--min-roster-version'] === undefined ? undefined : Number(values['--min-roster-version']);
+    if (minRosterVersion !== undefined && (!Number.isSafeInteger(minRosterVersion) || minRosterVersion < 1)) {
+      throw new Error('Use --min-roster-version with a positive integer.');
+    }
+    return relaySendOnce(agent, {
+      text: values['--text'] || '',
+      replyTo: values['--reply-to'],
+      requestId: values['--request-id'].toLowerCase(),
+      waitReceiptMs: waitSeconds * 1000,
+      ...(minRosterVersion !== undefined ? { minRosterVersion } : {}),
+    });
+  }
   if (command === 'run') { await runRunner(agent); return; }
   if (command === 'status') {
     // People see whether this agent is idle (in listen) or working on what woke it; the note says more until it listens again.

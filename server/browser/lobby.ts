@@ -1,16 +1,17 @@
 import type { Database } from 'bun:sqlite';
 import { sniff } from '../attachments';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { browserProtocol, cleanDisplayName, deviceId, foldDisplayName, MAX_REPOSITORIES, MIN_PROTOCOL_VERSION, validRepository, verify, type BrowserDevice, type BrowserMember, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, DEFAULT_ROOM_SETTINGS, PAIRING_NOT_FOUND, ROOM_CLOSED } from '../../src/browser/protocol';
-import { PAIRING_PROOF, PAIRING_SECRET, pairingMessage } from '../../src/browser/pairing';
+import { browserProtocol, cleanDisplayName, deviceId, foldDisplayName, MAX_REPOSITORIES, MAX_RENAME_NOTICES, MIN_PROTOCOL_VERSION, validRepository, verify, type BrowserDevice, type BrowserMember, type RenameNotice, type Command, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, type SignedRoster, DEFAULT_ROOM_SETTINGS, PAIR_OFFER_NOT_FOUND, PAIRING_NOT_FOUND, ROOM_CLOSED, type CommandAnswer, type PairingOffer } from '../../src/browser/protocol';
+import { importEncPublicKey, verifyEncBinding, verifyRoster } from '../../src/browser/relay-crypto';
+import { OFFER_LOOKUP, OFFER_MAX_ROOMS, OFFER_TTL_MS, PAIRING_PROOF, PAIRING_SECRET, pairingMessage } from '../../src/browser/pairing';
 import { admitBetaDevice, betaDevices, betaPerson, betaRevoked, consumeInvite, inviteMessages } from './invites';
-import { deleteRetiredDevice, getRetiredDevice, listRetiredDevices, openAdmission, retireRoom, revokeRetiredDevice, ROOM_META_VERSION, saveRoom, upsertRetiredDevice, type ClosedReason } from './store';
+import { deleteRetiredDevice, getRetiredDevice, getRoomRoster, listRetiredDevices, openAdmission, retireRoom, revokeRetiredDevice, ROOM_META_VERSION, saveRoom, saveRoomRoster, upsertRetiredDevice, type ClosedReason } from './store';
 
 /** Only a hash of an agent link's token is kept; the link itself is shown once to the person who made it. */
 type StoredInvite = { tokenHash: string; operatorId: string; name: string; expiresAt: number };
 /** Cooldown (`until` timestamp) or permanent block (`until: null`) recorded when the host declines a join request. */
 type BlockedDevice = { deviceId: string; until: number | null };
-type Room = { id: string; title: string; ownerId: string; ownerPerson?: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; blocked?: BlockedDevice[]; settings?: Partial<RoomSettings>; repositories?: string[] };
+type Room = { id: string; title: string; ownerId: string; ownerPerson?: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; blocked?: BlockedDevice[]; settings?: Partial<RoomSettings>; repositories?: string[]; renames?: RenameNotice[] };
 /** How long a declined device waits before asking to join the same room again. */
 export const DECLINE_COOLDOWN_MS = 5 * 60_000;
 /** Maximum decline cooldown / block entries retained per room. */
@@ -20,6 +21,9 @@ const INVITE_TTL = 900_000, INVITES_PER_PERSON = 4, AGENTS_PER_OPERATOR = 4;
 export const DEVICES_PER_MEMBER = 4;
 /** Device codes a device may get wrong in a room per window before `link` answers 429 (codes are 64 bits and expire anyway). */
 export const LINK_FAILURES = 8, LINK_FAILURE_WINDOW = 600_000;
+/** Pairing offers (`pair-offer`) the service holds at once, and the wrong lookups one device or address may try per window. */
+export const MAX_OFFERS = 512, OFFER_FAILURES = 8;
+type Offer = { device: string; name: string; rooms: string[]; expiresAt: number; redeemedBy?: string };
 /** Requests that wait in a room at once, per kind (people, companions, agents), so no kind can crowd out another. */
 export const WAITING_PER_KIND = 16;
 /** Requests from one address that wait in a room at once, so one network can't fill a kind's share on its own. */
@@ -48,9 +52,9 @@ function isPerson(room: Room, memberId: string) { return room.members.some(m => 
 /** Active members currently holding at least one device in the room. */
 function activeMembers(room: Room) { return room.members.filter(m => room.devices.some(d => d.memberId === m.id)); }
 /** Mentions and approval views resolve by name, so active members and open agent invites keep NFKC+case-folded unique names. */
-function nameAvailable(room: Room, name: string, pending: StoredInvite[] = []) {
+function nameAvailable(room: Room, name: string, pending: StoredInvite[] = [], except?: string) {
   const target = foldDisplayName(name);
-  const taken = [...activeMembers(room).map(m => m.name), ...pending.map(i => i.name)];
+  const taken = [...activeMembers(room).filter(m => m.id !== except).map(m => m.name), ...pending.map(i => i.name)];
   if (taken.some(n => foldDisplayName(n) === target)) fail(409, 'Someone in this room already uses that name. Choose a different name.');
 }
 /** New rooms store their settings; rooms created before hosts approved guests' agents by default keep it off. */
@@ -66,7 +70,7 @@ function runtimeLabel(value: unknown, key: 'harness' | 'model') {
  * `idleDays` is how long a room lives without an admitted device opening it (default 30).
  */
 export type LobbyOptions = { origin: string; now?: () => number; stunUrls?: string[]; turnUrls?: string[]; turnSecret?: string;
-  maxRooms?: number; invites?: 'required' | 'off'; idleDays?: number; maxSignalChars?: number; minProtocolVersion?: number };
+  relayUrl?: string; /** Advertise and accept the E2E relay (relay URL, host-signed rosters, device encryption keys). Default true here; the coordinator process passes its `MESHROOMS_RELAY_ENABLED` flag, which defaults to off. */ relayEnabled?: boolean; maxRooms?: number; invites?: 'required' | 'off'; idleDays?: number; maxSignalChars?: number; minProtocolVersion?: number };
 /**
  * Connection offers wait in memory for up to 30 seconds. One queue holds at most 32 of 16,000 characters, but there
  * is a queue per device of every room: 256 full rooms could queue about 2 GB, far past the service's memory limit.
@@ -128,6 +132,10 @@ export class BrowserLobby {
   /** Last time expired rows were pruned from `receipts`, and any prune performed by the transaction in progress. */
   private lastReceiptPrune: number;
   private pendingReceiptPrune: number | undefined;
+  /** Subscribers notified synchronously after a device is removed from a room (used by RelayService). */
+  private deviceRemovedListeners = new Set<(roomId: string, deviceId: string) => void>();
+  /** Subscribers notified synchronously after a room is closed or expired (used by RelayService). */
+  private roomClosedListeners = new Set<(roomId: string) => void>();
   constructor(path: string, private options: LobbyOptions) {
     this.now = options.now || Date.now;
     this.lastMemoryPrune = this.now();
@@ -140,6 +148,74 @@ export class BrowserLobby {
   close() { try { this.heartbeat(); } finally { this.db.close(); } }
   get inviteRequired() { return this.options.invites === 'required'; }
   get minProtocolVersion() { return this.options.minProtocolVersion ?? MIN_PROTOCOL_VERSION; }
+  get relayEnabled() { return this.options.relayEnabled !== false; }
+  get relayUrl() { return this.options.relayUrl ?? `${this.options.origin.replace(/^http/, 'ws')}/api/relay/v1`; }
+  /** Registers a hook fired immediately after a device is removed from a room. Returns an unsubscribe function. */
+  onDeviceRemoved(listener: (roomId: string, deviceId: string) => void): () => void {
+    this.deviceRemovedListeners.add(listener);
+    return () => { this.deviceRemovedListeners.delete(listener); };
+  }
+  /** Registers a hook fired immediately after a room is closed or retired. Returns an unsubscribe function. */
+  onRoomClosed(listener: (roomId: string) => void): () => void {
+    this.roomClosedListeners.add(listener);
+    return () => { this.roomClosedListeners.delete(listener); };
+  }
+  /**
+   * Verifies a SignedCommand's envelope (protocol, origin, uuid ids, ±60s clock window, expected action(s), ECDSA
+   * signature) without opening an IMMEDIATE write lock or writing a receipt row. Used by RelayService for WSS auth
+   * and HTTPS fallback routes.
+   */
+  async verifySignedCommand(
+    input: SignedCommand,
+    expectedAction: Command['action'] | readonly Command['action'][],
+  ): Promise<{ command: Command; deviceId: string; publicKey: string }> {
+    const c = input?.command;
+    if (!c || c.protocol !== browserProtocol || c.origin !== this.options.origin || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) {
+      fail(400, 'This request has expired or is invalid. Try again.');
+    }
+    const allowed = Array.isArray(expectedAction) ? expectedAction : [expectedAction];
+    if (!allowed.includes(c.action)) fail(400, 'Unexpected command action.');
+    if (typeof input.publicKey !== 'string' || typeof input.signature !== 'string' || !await verify(input.publicKey, c, input.signature)) {
+      fail(401, 'This device could not be authenticated.');
+    }
+    const id = await deviceId(input.publicKey);
+    return { command: c, deviceId: id, publicKey: input.publicKey };
+  }
+  /** Returns true when `deviceId` is currently an admitted (non-retired) device in `roomId`. */
+  isAdmittedDevice(roomId: string, id: string): boolean {
+    return !!this.db.query('SELECT 1 FROM room_devices WHERE room_id = ? AND device_id = ? AND retired = 0').get(roomId, id);
+  }
+  /** Throws 410 if room closed, 404 if room missing, or 403 if device is not admitted. */
+  assertAdmittedDevice(roomId: string, id: string): void {
+    if (!this.db.query('SELECT 1 FROM rooms WHERE id = ?').get(roomId)) this.roomUnavailable(roomId);
+    if (!this.isAdmittedDevice(roomId, id)) fail(403, 'Room admission is required.');
+    this.touchStatus(roomId, this.now());
+  }
+  /** Returns the set of currently admitted device ids in `roomId`. */
+  admittedDeviceIds(roomId: string): Set<string> {
+    const rows = this.db.query('SELECT device_id FROM room_devices WHERE room_id = ? AND retired = 0').all(roomId) as { device_id: string }[];
+    return new Set(rows.map(r => r.device_id));
+  }
+  /** Returns true when `deviceId` is an admitted device in `roomId` with `wakeable: true`. */
+  isWakeableDevice(roomId: string, id: string): boolean {
+    const row = this.db.query('SELECT wakeable FROM room_devices WHERE room_id = ? AND device_id = ? AND retired = 0').get(roomId, id) as { wakeable: number } | null;
+    return !!row && row.wakeable === 1;
+  }
+  /** Persists `wakeable` on an admitted device in both `rooms.body` and `room_devices`. */
+  setDeviceWakeable(roomId: string, id: string, wakeable: boolean): void {
+    this.db.transaction(() => {
+      const room = this.load(roomId);
+      const device = room.devices.find(d => d.id === id);
+      if (!device) fail(403, 'Room admission is required.');
+      if (wakeable) device.wakeable = true;
+      else delete device.wakeable;
+      saveRoom(this.db, room, true);
+    }).immediate();
+  }
+  /** Reads the latest persisted host-signed roster for `roomId`, or null if none has been published yet. */
+  getRoomRoster(roomId: string): SignedRoster | null {
+    return getRoomRoster<SignedRoster>(this.db, roomId);
+  }
   private get idleMs() { return (this.options.idleDays ?? 30) * DAY; }
   private activityInterval() { return Math.min(ACTIVITY_WRITE_INTERVAL, this.idleMs / 4); }
   /** Records that the service is running, so a later start knows how long it was down. */
@@ -296,6 +372,9 @@ export class BrowserLobby {
       for (const s of queue) this.signalChars -= s.description.sdp?.length ?? 0;
       this.signals.delete(key);
     }
+    for (const listener of this.roomClosedListeners) {
+      try { listener(roomId); } catch { /* listener errors must not break lobby cleanup */ }
+    }
   }
   /** Removes presence and all queued signals addressed to or sent by `deviceIds` in `roomId`, keeping `signalChars` exact. */
   private dropDevices(roomId: string, deviceIds: Set<string>) {
@@ -320,6 +399,11 @@ export class BrowserLobby {
       if (dropped > 0 || kept.length !== queue.length) {
         this.signalChars -= dropped;
         if (kept.length) this.signals.set(key, kept); else this.signals.delete(key);
+      }
+    }
+    for (const deviceId of deviceIds) {
+      for (const listener of this.deviceRemovedListeners) {
+        try { listener(roomId, deviceId); } catch { /* listener errors must not break lobby cleanup */ }
       }
     }
   }
@@ -370,7 +454,27 @@ export class BrowserLobby {
    * `admit`, when given, runs once the request is valid and its device authenticated, right before the command, with no
    * await in between: a quota it takes (see http.ts) is taken by exactly the requests that run. It may throw a LobbyError.
    */
-  async execute(input: SignedCommand, address?: string, admit?: () => void): Promise<RoomStatus | { roomId: string; token?: string; admitted?: boolean }> {
+  /** Validates optional ECDH `enc` + `encVersion` + `encSig` fields before entering the synchronous write transaction. */
+  private async parseEncFields(
+    publicKey: string,
+    id: string,
+    roomId: string,
+    payload: Record<string, unknown>,
+  ): Promise<{ enc: string; encVersion: number; encSig: string } | undefined> {
+    const { enc, encVersion, encSig } = payload;
+    if (enc === undefined && encVersion === undefined && encSig === undefined) return undefined;
+    if (typeof enc !== 'string' || enc.length !== 88 || typeof encVersion !== 'number' || !Number.isInteger(encVersion) || encVersion < 1 || typeof encSig !== 'string' || encSig.length !== 88) {
+      fail(400, 'Invalid device encryption key metadata.');
+    }
+    try { await importEncPublicKey(enc); } catch { fail(400, 'Invalid device encryption public key.'); }
+    const roomBound = await verifyEncBinding(publicKey, { room: roomId, deviceId: id, enc, encVersion }, encSig);
+    if (!roomBound) {
+      const profileBound = await verifyEncBinding(publicKey, { room: '*', deviceId: id, enc, encVersion }, encSig);
+      if (!profileBound) fail(400, 'Invalid device encryption key signature.');
+    }
+    return { enc, encVersion, encSig };
+  }
+  async execute(input: SignedCommand, address?: string, admit?: () => void): Promise<RoomStatus | ({ roomId: string; token?: string } & CommandAnswer)> {
     const c = input?.command;
     if (!c || c.protocol !== browserProtocol || c.origin !== this.options.origin || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) fail(400, 'This request has expired or is invalid. Try again.');
     if (typeof input.publicKey !== 'string' || typeof input.signature !== 'string' || !await verify(input.publicKey, c, input.signature)) fail(401, 'This device could not be authenticated.');
@@ -379,10 +483,32 @@ export class BrowserLobby {
     // Read-only commands run outside any BEGIN IMMEDIATE write lock so routine status polls never block writers or each other.
     if (c.action === 'creation-status') return { roomId: c.roomId, admitted: !this.inviteRequired || !!betaPerson(this.db, id) };
     if (c.action === 'status') return this.snapshot(this.load(c.roomId), id, c.payload);
+    if (c.action === 'pair-offer' || c.action === 'pair-redeem' || c.action === 'pair-cancel') return this.pairOffer(c, id, address);
+    // Async cryptographic validation of optional device `enc` keys or `roster-publish` runs before the synchronous IMMEDIATE transaction.
+    let prevalidatedEnc: { enc: string; encVersion: number; encSig: string } | undefined;
+    if (c.action === 'create' || c.action === 'request' || c.action === 'agent-redeem' || c.action === 'profile') {
+      if (c.action === 'profile') {
+        const room = this.load(c.roomId);
+        if (!room.devices.some(d => d.id === id)) fail(403, 'Join this room first.');
+      }
+      // With the relay off these fields are ignored, as they were before the relay existed: no encryption key is stored or advertised.
+      if (this.relayEnabled) prevalidatedEnc = await this.parseEncFields(input.publicKey, id, c.roomId, c.payload);
+    }
+    let prevalidatedRoster: { roster: SignedRoster; expectedPrevVersion: number } | undefined;
+    if (c.action === 'roster-publish') {
+      if (!this.relayEnabled) fail(404, 'The relay is not enabled on this server.');
+      // Ensure room exists (404/410) and caller is admitted (403) BEFORE running verifyRoster crypto.
+      const room = this.load(c.roomId);
+      if (!room.devices.some(d => d.id === id)) fail(403, 'Room admission is required.');
+      const existing = getRoomRoster<SignedRoster>(this.db, c.roomId);
+      const verdict = await verifyRoster(c.payload.roster, { roomId: c.roomId, previous: existing ?? undefined });
+      if (!verdict.ok) fail(400, `Invalid roster: ${verdict.reason}`);
+      prevalidatedRoster = { roster: c.payload.roster as SignedRoster, expectedPrevVersion: existing?.body.version ?? 0 };
+    }
     // After verification, all mutating read/modify/write work is synchronous in one IMMEDIATE transaction so an operator
     // command writing the same file in between can't invalidate what this one read.
     try {
-      const result = this.run(c, id, input, address);
+      const result = this.run(c, id, input, address, prevalidatedEnc, prevalidatedRoster);
       for (const [room, at] of this.pending) { this.active.set(room, at); this.liveRooms.add(room); }
       for (const room of this.pendingForget) this.forget(room);
       for (const { roomId, deviceIds } of this.pendingDropDevices) this.dropDevices(roomId, deviceIds);
@@ -395,11 +521,18 @@ export class BrowserLobby {
       this.pendingReceiptPrune = undefined;
     }
   }
-  private run(c: SignedCommand['command'], id: string, input: SignedCommand, address?: string): RoomStatus | { roomId: string; token?: string; admitted?: boolean } {
+  private run(
+    c: SignedCommand['command'],
+    id: string,
+    input: SignedCommand,
+    address?: string,
+    prevalidatedEnc?: { enc: string; encVersion: number; encSig: string },
+    prevalidatedRoster?: { roster: SignedRoster; expectedPrevVersion: number },
+  ): RoomStatus | ({ roomId: string; token?: string } & CommandAnswer) {
     return this.db.transaction(() => {
       const serialized = fingerprint(c);
       /** What an action adds to its answer (and to its receipt, so a retry gets the same). */
-      const answer: { admitted?: boolean } = {};
+      const answer: CommandAnswer = {};
       const previous = this.db.query('SELECT body,result FROM receipts WHERE device=? AND id=?').get(id, c.id) as { body: string; result: string } | null;
       if (previous) {
         if (previous.body !== serialized) fail(409, 'That request ID was already used.');
@@ -421,7 +554,7 @@ export class BrowserLobby {
         const memberId = crypto.randomUUID();
         const room: Room = { id: c.roomId, title: label(c.payload.title), ownerId: memberId,
           members: [{ id: memberId, name: memberName(c.payload.name) }],
-          devices: [{ id, publicKey: input.publicKey, label: label(c.payload.label), memberId, admittedAt: this.now() }], requests: [],
+          devices: [{ id, publicKey: input.publicKey, label: label(c.payload.label), memberId, admittedAt: this.now(), ...prevalidatedEnc }], requests: [],
           settings: { guestAgentApproval: DEFAULT_ROOM_SETTINGS.guestAgentApproval } };
         // Last, so nothing above can fail after a use was taken; the transaction rolls it back if anything below does.
         let ownerPerson = person;
@@ -503,7 +636,7 @@ export class BrowserLobby {
               this.liveRooms.add(room.id);
             }
             room.requests.push({ id: c.id, name, kind, state: 'pending', expiresAt: now + 600_000,
-              device: { id, publicKey: input.publicKey, label: label(c.payload.label), memberId: '', admittedAt: 0 },
+              device: { id, publicKey: input.publicKey, label: label(c.payload.label), memberId: '', admittedAt: 0, ...prevalidatedEnc },
               ...(kind === 'companion' ? typeof pairing === 'string' ? { pairing } : { code: randomBytes(8).toString('hex') } : {}) });
             break;
           }
@@ -520,8 +653,11 @@ export class BrowserLobby {
               this.linkFailures.set(failures, { count: (current?.count ?? 0) + 1, since: current?.since ?? this.now() });
               return fail(404, message, code);
             };
-            const { code, pairing } = c.payload;
+            const { code, pairing, preview, revoke } = c.payload;
             if (code !== undefined && pairing !== undefined) fail(400, 'Link with a device code or a pairing secret, not both.');
+            // `preview` shows the request that answers the secret without linking it; `revoke` drops the unused ones. Both
+            // need the secret (a device code is shown to the person on the device that asks, nothing to preview there).
+            if ((preview !== undefined && preview !== true) || (revoke !== undefined && revoke !== true) || (preview && revoke) || ((preview || revoke) && pairing === undefined)) fail(400, 'Preview or revoke a pairing secret, one at a time.');
             let r: JoinRequest | undefined;
             if (pairing !== undefined) {
               // The browser that made the secret links the app's request by it. Each waiting pairing's proof is made again
@@ -537,10 +673,21 @@ export class BrowserLobby {
               });
               // Every link that matches nothing counts against this device's own budget in this room, whatever other devices
               // asked: their requests can neither spend it nor spare it. The browser links once the app says it has asked.
+              if (revoke) {
+                // Closing a pairing early: whoever holds N may withdraw the requests that answer it, in this room. Nothing to
+                // find is not a failure (N is 256 bits; a revoke guesses nothing), so a retry or a second tab is harmless.
+                if (matches.length) { const gone = new Set(matches.map(m => m.id)); room.requests = room.requests.filter(r => !gone.has(r.id)); }
+                answer.revoked = matches.length;
+                break;
+              }
               if (!matches.length) miss('The desktop app has not asked to join this room yet, or the pairing expired.', PAIRING_NOT_FOUND);
               // Two requests can't hold proofs from one secret unless something is wrong: link neither.
               if (matches.length > 1) fail(409, 'More than one device answers this pairing, so none was linked. Pair again.');
               r = matches[0];
+              if (preview) {
+                answer.preview = { requestId: r.id, label: r.device.label, publicKey: r.device.publicKey, deviceId: r.device.id, expiresAt: r.expiresAt };
+                break;
+              }
             } else {
               r = typeof code === 'string' && /^[a-f0-9]{16}$/.test(code)
                 ? room.requests.find(r => r.kind === 'companion' && r.code === code && r.state === 'pending' && r.expiresAt > this.now()) : undefined;
@@ -589,7 +736,7 @@ export class BrowserLobby {
             if (room.devices.length >= 16) fail(429, 'This room has reached its device limit.');
             room.invites = remainingInvites;
             room.requests = room.requests.filter(r => r.device.id !== id);
-            const device = { id, publicKey: input.publicKey, label: label(c.payload.label), memberId: '', admittedAt: 0 };
+            const device = { id, publicKey: input.publicKey, label: label(c.payload.label), memberId: '', admittedAt: 0, ...prevalidatedEnc };
             if (settingsOf(room).guestAgentApproval && invite.operatorId !== room.ownerId) {
               // The link was used, but the host decides whether a guest's agent enters.
               if (room.requests.filter(r => r.kind === 'agent' && r.state === 'pending' && r.expiresAt > this.now()).length >= WAITING_PER_KIND) fail(429, 'The waiting room is full. Please try again later.');
@@ -725,7 +872,17 @@ export class BrowserLobby {
             const member = room.members.find(m => m.id === target) || fail(404, 'That person is not in this room.');
             const own = member.id === actor.memberId, operated = member.role === 'agent' && member.operatorId === actor.memberId;
             const { avatar: encoded, harness, model } = c.payload;
-            if (encoded === undefined && harness === undefined && model === undefined) fail(400, 'Choose what to change.');
+            if (encoded === undefined && harness === undefined && model === undefined && !prevalidatedEnc) fail(400, 'Choose what to change.');
+            if (prevalidatedEnc) {
+              if (!own) fail(403, 'A device can only update its own encryption key.');
+              if (actor.encVersion !== undefined && prevalidatedEnc.encVersion < actor.encVersion) {
+                fail(409, 'Encryption key version cannot move backwards.');
+              }
+              actor.enc = prevalidatedEnc.enc;
+              actor.encVersion = prevalidatedEnc.encVersion;
+              actor.encSig = prevalidatedEnc.encSig;
+              devicesChanged = true;
+            }
             if (harness !== undefined || model !== undefined) {
               // Agents say which harness and model they run on; people have neither. Clearing follows the picture rule.
               if (member.role !== 'agent') fail(400, 'Only agents report a harness and model.');
@@ -754,6 +911,21 @@ export class BrowserLobby {
             const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
             this.db.query('INSERT OR REPLACE INTO avatars VALUES (?,?,?,?,?)').run(room.id, member.id, hash, image.type, bytes);
             member.avatar = hash;
+            break;
+          }
+          case 'rename': {
+            // An agent's name is what people @mention, so it changes by the same rules as when it joined, and only at the
+            // hand of the host or the person who operates it. People keep the name they joined with.
+            if (!actor) fail(403, 'Join this room first.');
+            const member = activeMembers(room).find(m => m.id === c.payload.memberId) || fail(404, 'That agent is not in this room.');
+            if (member.role !== 'agent') fail(400, 'Only agents can be renamed.');
+            if (!isHost && member.operatorId !== actor.memberId) fail(403, 'Only the host or the agent’s operator can rename it.');
+            const name = memberName(c.payload.name, 64);
+            if (name === member.name) fail(400, 'That is already its name.');
+            nameAvailable(room, name, activeInvites(), member.id);
+            const notice: RenameNotice = { id: crypto.randomUUID(), at: this.now(), memberId: member.id, by: actor.memberId, from: member.name, to: name };
+            member.name = name;
+            room.renames = [...(room.renames || []).filter(r => room.members.some(m => m.id === r.memberId)), notice].slice(-MAX_RENAME_NOTICES);
             break;
           }
           case 'repositories': {
@@ -842,6 +1014,26 @@ export class BrowserLobby {
             devicesChanged = true;
             break;
           }
+          case 'roster-publish': {
+            if (!actor) fail(403, 'Room admission is required.');
+            if (!prevalidatedRoster) fail(400, 'Invalid roster.');
+            const { roster, expectedPrevVersion } = prevalidatedRoster;
+            const current = getRoomRoster<SignedRoster>(this.db, room.id);
+            if ((current?.body.version ?? 0) !== expectedPrevVersion) {
+              fail(409, 'A newer roster was already published. Refresh and try again.');
+            }
+            // Genesis roster (v1) must be published by the host and name an active host device.
+            // Subsequent versions are already cryptographically chained to the host via verifyRoster.
+            const hostDevice = room.devices.find(d => d.id === roster.body.host);
+            if (!hostDevice) fail(400, 'Roster host must be an admitted device in this room.');
+            if (!current) {
+              if (!isHost || hostDevice.memberId !== room.ownerId) {
+                fail(403, 'Only the host can publish the initial room roster.');
+              }
+            }
+            saveRoomRoster(this.db, room.id, roster.body.version, roster, this.now());
+            break;
+          }
           case 'close': {
             // The room, its admission records and pictures are deleted; members' browsers keep their own copies.
             if (!isHost) fail(403, 'Only the host can delete this room.');
@@ -851,7 +1043,7 @@ export class BrowserLobby {
           }
           default: fail(400, 'Unknown room action.');
         }
-        if (c.action !== 'signal' && c.action !== 'close') saveRoom(this.db, room, devicesChanged);
+        if (c.action !== 'signal' && c.action !== 'close' && c.action !== 'roster-publish') saveRoom(this.db, room, devicesChanged);
       }
       const now = this.now();
       const result = { roomId: c.roomId, ...answer };
@@ -862,6 +1054,57 @@ export class BrowserLobby {
       this.db.query('INSERT INTO receipts VALUES (?,?,?,?,?)').run(id, c.id, serialized, JSON.stringify(result), now);
       return result;
     }).immediate();
+  }
+  /** Offers the service holds for pairing a person's new device, by sha256 of the lookup the devices derive from the typed code. Memory only: they live five minutes, so a restart costs a person one new code. */
+  private offers = new Map<string, Offer>();
+  private offerFailures = new Map<string, { count: number; since: number }>();
+  /**
+   * `pair-offer` (a person's device files an offer naming up to eight of its rooms), `pair-redeem` (any device that knows
+   * the code reads it once) and `pair-cancel` (the filer withdraws it). The service never sees the code, or the pairing
+   * secret made from it: it holds only sha256 of a lookup derived from the code (src/browser/pairing.ts, `offerLookup`).
+   * Rooms are named only to devices that are people there; a redeem answers 404 alike for a wrong, used, cancelled or expired code.
+   */
+  private pairOffer(c: SignedCommand['command'], id: string, address?: string): { roomId: string } & CommandAnswer {
+    const now = this.now();
+    for (const [key, offer] of this.offers) if (offer.expiresAt <= now) this.offers.delete(key);
+    for (const [key, value] of this.offerFailures) if (now - value.since > LINK_FAILURE_WINDOW) this.offerFailures.delete(key);
+    const lookup = c.payload.lookup;
+    if (typeof lookup !== 'string' || !OFFER_LOOKUP.test(lookup)) fail(400, 'This pairing code is not valid.');
+    const key = createHash('sha256').update(lookup).digest('hex');
+    if (c.action === 'pair-cancel') {
+      const offer = this.offers.get(key);
+      const cancelled = !!offer && offer.device === id && this.offers.delete(key);
+      return { roomId: c.roomId, cancelled };
+    }
+    if (c.action === 'pair-redeem') {
+      const budgets = [`d:${id}`, ...(address !== undefined ? [`a:${address}`] : [])];
+      if (budgets.some(b => (this.offerFailures.get(b)?.count ?? 0) >= OFFER_FAILURES)) fail(429, 'Too many wrong pairing codes. Wait a few minutes, then try again.');
+      const offer = this.offers.get(key);
+      if (!offer || (offer.redeemedBy !== undefined && offer.redeemedBy !== id)) {
+        for (const b of budgets) { const current = this.offerFailures.get(b); this.offerFailures.set(b, { count: (current?.count ?? 0) + 1, since: current?.since ?? now }); }
+        fail(404, 'This pairing code was not found. It may have been mistyped, used or expired.', PAIR_OFFER_NOT_FOUND);
+      }
+      // One use, but the device that read it may read it again (a retry after a lost answer): nobody else can.
+      offer.redeemedBy = id;
+      const { name, device, rooms, expiresAt } = offer;
+      const answer: PairingOffer = { name, device, rooms: [...rooms], expiresAt };
+      return { roomId: c.roomId, offer: answer };
+    }
+    const rooms = c.payload.rooms;
+    if (!Array.isArray(rooms) || !rooms.length || rooms.length > OFFER_MAX_ROOMS || !rooms.every(uuid) || new Set(rooms).size !== rooms.length) fail(400, `Name between one and ${OFFER_MAX_ROOMS} rooms.`);
+    let name = '';
+    for (const roomId of rooms as string[]) {
+      const room = this.load(roomId), actor = room.devices.find(d => d.id === id);
+      if (!actor || !isPerson(room, actor.memberId)) fail(403, 'Only people can pair a new device, and only to rooms they are in.');
+      if (roomId === c.roomId || !name) name = room.members.find(m => m.id === actor.memberId)?.name ?? '';
+    }
+    if (!(rooms as string[]).includes(c.roomId)) fail(400, 'Name the room this command is sent in.');
+    // One open offer per device: a new code replaces the last one.
+    for (const [other, offer] of this.offers) if (offer.device === id) this.offers.delete(other);
+    if (this.offers.size >= MAX_OFFERS) fail(429, 'Too many pairing codes are open right now. Try again in a few minutes.');
+    const expiresAt = now + OFFER_TTL_MS;
+    this.offers.set(key, { device: id, name, rooms: rooms as string[], expiresAt });
+    return { roomId: c.roomId, offer: { expiresAt } };
   }
   /** Drops expired offers across every queue and recounts `signalChars`, so closed rooms and removed devices never leave it high. */
   private pruneSignals(now = this.now()) {
@@ -907,6 +1150,7 @@ export class BrowserLobby {
     this.presence.set(`${room.id}:${id}`, { session: payload.session, at: now });
     result.memberId = actor.memberId; result.ownerId = room.ownerId;
     result.members = room.members.filter(m => room.devices.some(d => d.memberId === m.id));
+    if (room.renames?.length) result.renames = room.renames;
     result.devices = room.devices.map(d => ({ ...d, session: online(d) }));
     if (actor.memberId === room.ownerId) result.requests = room.requests.filter(r => r.state === 'pending' && r.expiresAt > now).map(r => { const { code, pairing, ...rest } = r; return rest; });
     const formerDevices = listRetiredDevices(this.db, room.id);
@@ -936,6 +1180,11 @@ export class BrowserLobby {
       result.signals = [];
     }
     result.iceServers = this.iceServers(room);
+    if (this.relayEnabled) {
+      result.relayUrl = this.relayUrl;
+      const roster = getRoomRoster<SignedRoster>(this.db, room.id);
+      if (roster) result.roster = roster;
+    }
     return result;
   }
   /**

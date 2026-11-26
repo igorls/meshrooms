@@ -13,10 +13,10 @@
  * bounded logs and bindings. agent-cli.ts wires the real processes in.
  */
 import { createHash } from 'node:crypto';
-import { closeSync, constants, copyFileSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, truncateSync, unlinkSync } from 'node:fs';
+import { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, truncateSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { agentHomesFile, knownAgentHomes, WATCH_CONFIG, type WatchConfig } from './agent-watch';
+import { agentHomesFile, knownAgentHomes, recordAgentHome, WATCH_CONFIG, type WatchConfig } from './agent-watch';
 import { replaceFile } from './browser-agent';
 import { terminalSafe } from './terminal-text';
 
@@ -506,4 +506,22 @@ export function daemonSupervises(agentHome: string, alive: (pid: number) => bool
   if (!record || typeof record.registry !== 'string') return false;
   const home = foldKey(agentHome);
   return [...(Array.isArray(record.homes) ? record.homes : []), ...knownAgentHomes(record.registry)].some(known => typeof known === 'string' && foldKey(known) === home);
+}
+
+/**
+ * One daemon per machine looks after every agent folder. Makes sure the running daemon looks after `agentHome`: if it
+ * does already, nothing changes; otherwise the folder is added to the registry that daemon reads (its record names
+ * it), which it re-reads every tick, so it picks the folder up without a restart. No second daemon is ever started.
+ * Only a folder an agent connected into (it holds `browser-agents`) is added, so the tray app's own `daemon start` (no agent
+ * folder of its own) never registers an empty one: that is `nothingToSupervise`. `supervised: false` otherwise means no
+ * daemon runs, or its registry couldn't be written (the caller should say so).
+ */
+export function adoptAgentHome(agentHome: string, alive: (pid: number) => boolean, dir = daemonDir(), now = Date.now()): { supervised: boolean; registered: boolean; nothingToSupervise?: boolean } {
+  if (!existsSync(join(agentHome, 'browser-agents'))) return { supervised: false, registered: false, nothingToSupervise: true };
+  const record = runningDaemon(alive, dir, now);
+  if (!record) return { supervised: false, registered: false };
+  if (daemonSupervises(agentHome, alive, dir, now)) return { supervised: true, registered: false };
+  if (typeof record.registry !== 'string' || !record.registry.endsWith('.json')) return { supervised: false, registered: false };
+  try { recordAgentHome(agentHome, record.registry); } catch { return { supervised: false, registered: false }; }
+  return { supervised: true, registered: true };
 }

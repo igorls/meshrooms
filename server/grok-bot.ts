@@ -235,7 +235,7 @@ export type GrokRoomHealth = {
 };
 export type GrokKeepaliveDeps = {
   agentHome: string;
-  startDaemon: () => Promise<{ running: boolean; started: boolean }>;
+  startDaemon: () => Promise<{ running: boolean; started: boolean; supervisesAgentHome?: boolean }>;
   /** This agent folder's rooms, read again each time it is called (the daemon brings runners and watchers up). */
   rooms: () => GrokRoomHealth[];
   /** Whether the wake routine's webhook is saved and usable: undefined if so, else why not (never the URL or key). */
@@ -281,7 +281,10 @@ const roomOk = (room: GrokRoomHealth) => room.wakes === 'on' && room.runner && !
 export async function grokKeepalive(deps: GrokKeepaliveDeps, tmp: string): Promise<GrokKeepaliveResult> {
   const attention: string[] = [];
   let daemon = { running: false, started: false };
-  try { const d = await deps.startDaemon(); daemon = { running: d.running, started: d.started }; }
+  try {
+    const d = await deps.startDaemon(); daemon = { running: d.running, started: d.started };
+    if (d.running && d.supervisesAgentHome === false) attention.push("The machine's Meshrooms daemon does not look after this agent folder; run connect for it again so the daemon takes it on.");
+  }
   catch (error) { attention.push(`The Meshrooms daemon would not start: ${error instanceof Error ? error.message.split('\n')[0].slice(0, 200) : String(error)}`); }
   let rooms = deps.rooms();
   if (daemon.started) {

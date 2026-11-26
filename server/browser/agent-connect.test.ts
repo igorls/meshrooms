@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agentCli, connectConflict, readConnectLink } from '../agent-cli';
+import { agentCli, connectConflict, readConnectLink, parseConnectLink } from '../agent-cli';
 import { deviceId } from '../../src/browser/protocol';
 
 const opus = crypto.randomUUID();
@@ -147,3 +147,13 @@ test('connect reads the secret link from stdin via positional - or --link -, tri
     }
   } finally { server.stop(true); }
 }));
+
+test('a person\'s room link is named for what it is, and the agent\'s link is asked for', () => {
+  const room = crypto.randomUUID();
+  expect(() => parseConnectLink(`https://rooms.example/r/${room}`)).toThrow(/person invite.*Ask for the agent connect link/);
+  expect(() => parseConnectLink(`https://rooms.example/r/${room}#hostpin`)).toThrow(/person invite/);
+  // Other mistakes keep the general message; a real agent link still parses.
+  expect(() => parseConnectLink(`https://rooms.example/agent/${room}`)).toThrow(/not a Meshrooms agent connect link/);
+  expect(() => parseConnectLink('https://rooms.example/rooms')).toThrow(/not a Meshrooms agent connect link/);
+  expect(parseConnectLink(`https://rooms.example/agent/${room}#${'a'.repeat(43)}`)).toMatchObject({ origin: 'https://rooms.example', roomId: room, token: 'a'.repeat(43) });
+});

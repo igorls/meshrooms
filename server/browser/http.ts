@@ -3,7 +3,8 @@ import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { BrowserLobby, LobbyError } from './lobby';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
-import { MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_VERSION, UPGRADE_REQUIRED } from '../../src/browser/protocol';
+import { MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_VERSION, UPGRADE_REQUIRED, type SignedCommand } from '../../src/browser/protocol';
+import { RELAY_SEND_MAX_BODY_BYTES, RELAY_STATE_MAX_BODY_BYTES, type RelayService, type RelaySocketData } from './relay';
 
 const explainer = fileURLToPath(new URL('./agent-join.md', import.meta.url));
 const escape = (text: string) => text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -44,12 +45,12 @@ export function wideKey(key: string): string | undefined {
  * staying well under the site-wide Nginx ceiling (behind the proxy, 1,200/min * 5 = 6,000/min = 100 r/s vs 400 r/s).
  */
 const WIDE_API = 5, WIDE_CREATE = 4;
-const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'repositories', 'transfer-host', 'close']);
+const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'pair-offer', 'pair-redeem', 'pair-cancel', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'rename', 'repositories', 'transfer-host', 'roster-publish', 'close']);
 /** Route shape for logs: room and member ids are replaced, so a log line never names a room. */
 const route = (path: string) => path.replace(/[a-f0-9-]{36}/g, ':id').slice(0, 120);
 
 /** `log` receives one JSON line per lobby command (status polls answered 200 or 410 excepted) and per 5xx. */
-export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; rateKeys?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void };
+export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; rateKeys?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void; relay?: RelayService };
 export function browserHandler(lobby: BrowserLobby, origin: string, distDir: string, options: BrowserHttpOptions = {}) {
   const allowed = new URL(origin);
   const root = resolve(distDir);
@@ -109,14 +110,35 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
   };
   /** Gives a reserved creation back. A counter whose window has since restarted is no longer in the map, so this is a no-op for it. */
   const releaseCreate = (held: { count: number }[]) => { for (const rate of held) rate.count = Math.max(0, rate.count - 1); };
+  const wsOrigins = new Set<string>([origin.replace(/^http/, 'ws')]);
+  try {
+    if (lobby.relayEnabled && lobby.relayUrl) wsOrigins.add(new URL(lobby.relayUrl).origin);
+  } catch { /* ignore invalid test stub */ }
   const headers = {
     'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'Content-Security-Policy': `default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self' ${[...wsOrigins].join(' ')}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`,
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   };
   const json = (body: unknown, status = 200) => Response.json(body, { status, headers });
   const failure = (error: unknown, status: number, request: string, path: string) =>
     log({ event: 'error', request, status, route: route(path), message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
+  /** Streams and parses a JSON request body under a strict byte ceiling, independent of Content-Length. */
+  async function readJsonBody(request: Request, maxBytes: number): Promise<{ ok: true; value: unknown } | { ok: false; response: Response }> {
+    const reader = request.body?.getReader();
+    if (!reader) return { ok: false, response: json({ error: 'Request body required.' }, 400) };
+    const chunks: Uint8Array[] = []; let length = 0;
+    try {
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        length += part.value.length;
+        if (length > maxBytes) { await reader.cancel(); return { ok: false, response: json({ error: 'Request too large.' }, 413) }; }
+        chunks.push(part.value);
+      }
+    } finally { reader.releaseLock(); }
+    try { return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString('utf8')) }; }
+    catch { return { ok: false, response: json({ error: 'Invalid request.' }, 400) }; }
+  }
   /** A signed room command. Logged with its action and outcome; the body is never logged. */
   async function command(request: Request, address: string, requestId: string): Promise<Response> {
     if (request.headers.get('origin') !== origin || request.headers.get('content-type')?.split(';')[0] !== 'application/json') return json({ error: 'Use the room application to submit requests.' }, 403);
@@ -135,15 +157,9 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
         }, 426);
       }
     }
-    // Enforce the streamed limit, not only a client-supplied Content-Length.
-    const reader = request.body?.getReader();
-    if (!reader) return json({ error: 'Request body required.' }, 400);
-    const chunks: Uint8Array[] = []; let length = 0;
-    try {
-      while (true) { const part = await reader.read(); if (part.done) break; length += part.value.length; if (length > 24_000) { await reader.cancel(); return json({ error: 'Request too large.' }, 413); } chunks.push(part.value); }
-    } finally { reader.releaseLock(); }
-    let input: unknown;
-    try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return json({ error: 'Invalid request.' }, 400); }
+    const parsed = await readJsonBody(request, 24_000);
+    if (!parsed.ok) return parsed.response;
+    const input = parsed.value;
     const named = (input as { command?: { action?: unknown } })?.command?.action;
     const action = typeof named === 'string' && ACTIONS.has(named) ? named : 'unknown';
     const started = performance.now();
@@ -174,7 +190,11 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
       if (action !== 'status' || (status !== 200 && status !== 410)) log({ event: 'lobby', request: requestId, action, status, ms: Math.round((performance.now() - started) * 10) / 10 });
     }
   }
-  return async (request: Request, remoteAddress = 'local'): Promise<Response> => {
+  return async (
+    request: Request,
+    remoteAddress = 'local',
+    upgrade?: (request: Request, data: RelaySocketData) => boolean,
+  ): Promise<Response> => {
     const url = new URL(request.url);
     const requestId = crypto.randomUUID().slice(0, 8);
     if ((request.headers.get('host') || url.host) !== allowed.host) return json({ error: 'Unexpected host.' }, 403);
@@ -189,11 +209,35 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     if (url.pathname === '/api/lobby/health' && request.method === 'GET') {
       const body = { revision: options.revision || 'development', inviteRequired: lobby.inviteRequired, minAgentVersion: MIN_AGENT_VERSION,
         currentAgentVersion: CURRENT_AGENT_VERSION, protocolVersion: PROTOCOL_VERSION, minProtocolVersion: lobby.minProtocolVersion ?? MIN_PROTOCOL_VERSION,
+        ...(options.relay && { relayEnabled: true }),
         ...(options.backupFresh && { backupFresh: options.backupFresh() }) };
       try { return json({ ok: lobby.healthy(), ...body }); }
       catch (error) { failure(error, 503, requestId, url.pathname); return json({ ok: false, ...body }, 503); }
     }
     try {
+      if (url.pathname === '/api/relay/v1') {
+        if (!options.relay) return json({ error: 'Relay not enabled.' }, 404);
+        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket' || !upgrade) {
+          return json({ error: 'WebSocket upgrade required.' }, 426);
+        }
+        const upgraded = upgrade(request, options.relay.createSocketData(addressKey(address)));
+        if (!upgraded) return json({ error: 'WebSocket upgrade failed.' }, 400);
+        return undefined as unknown as Response;
+      }
+      if (url.pathname.startsWith('/api/relay/v1/')) {
+        if (!options.relay) return json({ error: 'Not found.' }, 404);
+        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (request.method !== 'POST') return json({ error: 'Method not allowed.' }, 405);
+        if (request.headers.get('origin') !== origin || request.headers.get('content-type')?.split(';')[0] !== 'application/json') {
+          return json({ error: 'Use the room application to submit requests.' }, 403);
+        }
+        const maxBytes = url.pathname === '/api/relay/v1/state' ? RELAY_STATE_MAX_BODY_BYTES : RELAY_SEND_MAX_BODY_BYTES;
+        const parsed = await readJsonBody(request, maxBytes);
+        if (!parsed.ok) return parsed.response;
+        const result = await options.relay.handleHttp(url.pathname, parsed.value as SignedCommand, request.signal);
+        return json(result);
+      }
       if (url.pathname.startsWith('/api/lobby')) {
         if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
         if (request.method === 'GET' && /^\/api\/lobby\/rooms\/[a-f0-9-]{36}$/.test(url.pathname)) return json(lobby.publicRoom(url.pathname.split('/').at(-1)!));

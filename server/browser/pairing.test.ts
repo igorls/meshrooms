@@ -3,8 +3,8 @@
 import { expect, test } from 'bun:test';
 import { createHmac } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
-import { PAIRING_NOT_FOUND, deviceId, type JoinRequest } from '../../src/browser/protocol';
-import { pairingMessage } from '../../src/browser/pairing';
+import { PAIRING_NOT_FOUND, deviceId, type JoinRequest, type PairingPreview } from '../../src/browser/protocol';
+import { pairingMessage, pairingPhrase, pairingSas } from '../../src/browser/pairing';
 import { BrowserLobby, LINK_FAILURES, LINK_FAILURE_WINDOW, WAITING_PER_ADDRESS, WAITING_PER_KIND } from './lobby';
 import { admitPerson, client, type TestClient } from './test-client';
 
@@ -232,5 +232,79 @@ test('a device asking again with a new proof replaces its waiting request; the s
     expect(await outcome(sam.send('link', room, { pairing: n64(old) }))).toBe(PAIRING_NOT_FOUND);
     await sam.send('link', room, { pairing: n64(n) });
     expect((await app.status(room)).memberId).toBe((await sam.status(room)).memberId!);
+  } finally { lobby.close(); }
+});
+
+test('preview shows the phone behind a secret to a person who is not the host, links nothing, and spends nothing but misses', async () => {
+  const { lobby, host, room, sam, samId } = await roomWithSam();
+  try {
+    const app = await client(lobby), n = secret();
+    await ask(app, room, await proof(n, room, app, sam));
+    // A host sees waiting requests itself; a member could not, until now.
+    expect((await sam.status(room)).requests).toBeUndefined();
+    const shown = await sam.send('link', room, { pairing: n64(n), preview: true }) as { preview?: PairingPreview };
+    expect(shown.preview).toMatchObject({ label: 'Meshrooms app', publicKey: await keyOf(app), deviceId: await deviceId(await keyOf(app)) });
+    // The words both sides can compute from N and that key: the same on the phone, and on the trusted device from the preview.
+    expect(await pairingSas(n, await keyOf(app))).toBe(await pairingSas(n, shown.preview!.publicKey));
+    // Nothing was linked or spent: the same request is still there, and links once the person says so, however often it was previewed.
+    for (let i = 0; i < 3; i++) await sam.send('link', room, { pairing: n64(n), preview: true });
+    expect((await app.status(room)).memberId).toBeUndefined();
+    expect(await sam.send('link', room, { pairing: n64(n) })).toEqual({ roomId: room, admitted: true });
+    expect((await app.status(room)).memberId).toBe(samId);
+    // Only the device the pairing named sees it, and only people: the host holding N sees nothing, and counts a miss.
+    const other = await client(lobby), m = secret();
+    await ask(other, room, await proof(m, room, other, sam));
+    expect(await outcome(host.send('link', room, { pairing: n64(m), preview: true }))).toBe(PAIRING_NOT_FOUND);
+    expect(await outcome(sam.send('link', room, { pairing: n64(secret()), preview: true }))).toBe(PAIRING_NOT_FOUND);
+  } finally { lobby.close(); }
+});
+
+test('words made from the phone\'s own key tell a copied code from the real phone', async () => {
+  const { lobby, room, sam } = await roomWithSam();
+  try {
+    const phone = await client(lobby), thief = await client(lobby), n = secret();
+    // Someone who photographed the code asks first, from another key, with a valid proof for it.
+    await ask(thief, room, await proof(n, room, thief, sam));
+    const shown = await sam.send('link', room, { pairing: n64(n), preview: true }) as { preview: PairingPreview };
+    // The phone shows words from its key and N; the trusted device shows words from the key the room service holds.
+    expect(await pairingSas(n, await keyOf(phone))).not.toBe(await pairingSas(n, shown.preview.publicKey));
+    expect(await pairingSas(n, await keyOf(thief))).toBe(await pairingSas(n, shown.preview.publicKey));
+    // The old, N-only phrase could not tell them apart.
+    expect(await pairingSas(n, await keyOf(phone))).not.toBe(await pairingPhrase(n));
+    // Two requests answering N: preview refuses like link does.
+    await ask(phone, room, await proof(n, room, phone, sam));
+    expect(await outcome(sam.send('link', room, { pairing: n64(n), preview: true }))).toBe('More than one device answers this pairing, so none was linked. Pair again.');
+  } finally { lobby.close(); }
+});
+
+test('revoke closes an unused pairing early, in the room it is sent in, for whoever holds the secret', async () => {
+  const { lobby, room, sam, samId } = await roomWithSam();
+  try {
+    const app = await client(lobby), n = secret(), other = secret(), bystander = await client(lobby);
+    await ask(app, room, await proof(n, room, app, sam));
+    await ask(bystander, room, await proof(other, room, bystander, sam));
+    expect(await sam.send('link', room, { pairing: n64(n), revoke: true })).toEqual({ roomId: room, revoked: 1 });
+    // Gone: it can no longer be linked, and the other pairing is untouched.
+    expect((await app.status(room)).request).toBeUndefined();
+    expect(await outcome(sam.send('link', room, { pairing: n64(n) }))).toBe(PAIRING_NOT_FOUND);
+    expect((await bystander.status(room)).request?.state).toBe('pending');
+    // Revoking again, or nothing at all, is fine and spends no wrong-code budget.
+    for (let i = 0; i < LINK_FAILURES + 2; i++) expect(await sam.send('link', room, { pairing: n64(secret()), revoke: true })).toEqual({ roomId: room, revoked: 0 });
+    expect(await sam.send('link', room, { pairing: n64(other) })).toEqual({ roomId: room, admitted: true });
+    expect((await bystander.status(room)).memberId).toBe(samId);
+    // The phone can ask again with the same key under a new secret (the rooms it asked in forgot the old one).
+    await ask(app, room, await proof(secret(), room, app, sam));
+    expect((await app.status(room)).request?.state).toBe('pending');
+  } finally { lobby.close(); }
+});
+
+test('preview and revoke are for a pairing secret only, one at a time', async () => {
+  const { lobby, room, sam } = await roomWithSam();
+  try {
+    const n = n64(secret());
+    for (const payload of [{ pairing: n, preview: true, revoke: true }, { pairing: n, preview: 'yes' }, { pairing: n, preview: false }, { pairing: n, revoke: 1 }, { code: 'a'.repeat(16), preview: true }, { preview: true }, { revoke: true }]) {
+      expect(await outcome(sam.send('link', room, payload))).not.toBe('ok');
+    }
+    expect(await outcome(sam.send('link', room, { pairing: n, preview: true }))).toBe(PAIRING_NOT_FOUND);
   } finally { lobby.close(); }
 });

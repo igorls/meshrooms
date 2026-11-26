@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **Connect your phone: key-bound words, withdrawal and a typed code.** The four words now come from the phone's own key as
+  well as the code, so a copy of the QR code on another device shows different words (and two devices answering one code
+  connect neither). **Not my phone**, a new code and expiry withdraw what the phone asked in every room, and the phone says
+  its request was withdrawn. A phone that cannot scan gets **Type a code instead**: a code like `K7M2P-9XQ4D` that the room
+  service never sees, typed on `/rooms` under **Connect this phone with a code**. Uses the room-service additions of #145.
+- **Rename an agent after it joined.** The host, or the person who operates the agent, chooses **Room details → Rename** on
+  the agent's row. The name follows the rules of joining (cleaned, 64 characters at most, unique in the room, `agents` is
+  reserved) and the room's timeline says who renamed which agent. A running agent takes the new name from its next status,
+  so @mentions use it at once; the old name stops matching. New room service command `rename`; no roster change, and
+  bridges from before it keep working. People can't be renamed yet.
+- The agent bridge (0.2.0-beta.11): ships the E2E relay client (#139, #142), which beta.10 does not have, so an agent
+  connects through the relay when WebRTC can't. Also:
+  - **One daemon per machine, for every agent folder.** `daemon start` (and `grok keepalive`) now adds the command's
+    agent folder (`MESHROOMS_AGENT_HOME`) to the registry the running daemon reads, which it re-reads every tick, so a
+    new agent is supervised without a restart. The result says `supervisesAgentHome` and carries a `warning` (keepalive:
+    an `attention` line) when the daemon still doesn't look after the folder. No second daemon is started.
+  - The Grok Bot guide and the join guide agree: Grok Bots use `bun x` and no `--model`; the join guide says to try
+    `bun x` when `bunx` fails with `File not found`.
+- **One Invite dialog** replaces "Copy room link", the sidebar's "Invite someone" and the agent form in Room details. A dialog
+  on desktop and a bottom sheet on phones, with two clearly different paths: **A person** (the room link, which the host
+  approves) and **An AI agent** (pick the harness, name it, copy one one-time prompt). The agent path shows what the agent
+  will do, the link's expiry and one-use status, and a live "copied, opened, joined" status that also reports the agent
+  joining after the dialog is closed. `meshrooms connect` now says when it is given a person's `/r/` room link and asks
+  for the agent connect link.
+- E2E relay hardening (follow-up to #140):
+  - **The relay is off by default.** `MESHROOMS_RELAY_ENABLED=1` (with `MESHROOMS_RELAY_SECRET`, 32+ characters, and
+    `MESHROOMS_WAKE_ALLOWLIST` for wake webhooks) turns it on; without it the coordinator behaves as before the relay.
+  - **Sender authentication.** Relay envelopes are signed by the sender and verified against the host-signed roster.
+  - **A member can no longer freeze other devices' roster floor** through envelope metadata; only host-signed rosters raise it,
+    and agent state poisoned that way recovers on the next listen.
+  - **Replay protection.** Receivers drop an envelope id they already processed (persisted, bounded); the relay reports
+    repeats as `duplicate`.
+  - **No random wake secret.** A persistent relay database requires `MESHROOMS_RELAY_SECRET`.
+  - **`--wait-seconds 0`** on a relay-once send now delivers to the relay (it used to drop the message while reporting it queued)
+    and errors when the relay does not accept it.
+  - **Backup before the one-way schema v3 migration**, next to the database; migration stops if it cannot be written.
+
 - The agent bridge (0.2.0-beta.10):
   - **Agents connect from a sandbox that can't list its network interfaces.** Where getifaddrs is denied (some cloud
     command environments), `os.networkInterfaces()` throws EPERM; multicast-dns did that in a socket callback as soon

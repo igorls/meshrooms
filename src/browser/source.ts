@@ -106,7 +106,7 @@ export interface LocalAgents {
   unbind(roomId: string, member: string): Promise<{ wakes: string }>;
 }
 /** The room service actions the screens send, besides what a RoomSession does. */
-export type RoomAction = Extract<Command['action'], 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'agent-invite' | 'settings' | 'profile' | 'repositories' | 'transfer-host' | 'close'>;
+export type RoomAction = Extract<Command['action'], 'create' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'agent-invite' | 'settings' | 'profile' | 'rename' | 'repositories' | 'transfer-host' | 'close' | 'pair-offer' | 'pair-redeem' | 'pair-cancel'>;
 export type MessageNotificationLevel = 'mentions' | 'all' | 'off';
 /** Message notifications for this person's room on this computer, available from the desktop app's local page only. */
 export interface RoomNotifications {

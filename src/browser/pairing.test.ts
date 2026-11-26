@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { createHmac } from 'node:crypto';
-import { PAIR_WORDS, decodeSecret, encodeSecret, newSecret, normalPhrase, pairLink, pairingName, pairingPhrase, pairingProof } from './pairing';
+import { createHash, createHmac, hkdfSync } from 'node:crypto';
+import { PAIR_WORDS, decodeSecret, encodeSecret, newSecret, normalPhrase, pairLink, pairingName, pairingPhrase, pairingProof, pairingSas, offerSecret, offerLookup } from './pairing';
 
 // The phrase vectors are also in desktop/src-tauri/src/pair.rs: the browser and the app must show the same phrase.
 const ZERO = new Uint8Array(32), COUNT = Uint8Array.from({ length: 32 }, (_, i) => i);
@@ -50,5 +50,18 @@ describe('pairing convention', () => {
     expect(link.searchParams.get('name')).toBe('Robin Lee');
     expect(link.searchParams.get('rooms')).toBe(rooms.join(','));
     expect(link.searchParams.get('secret')).toBe(encodeSecret(ZERO));
+  });
+  test('key-bound words are the first four bytes of sha256 over a domain tag, N and the raw key, so another key shows other words', async () => {
+    const secret = newSecret(), key = Buffer.alloc(65, 7).toString('base64'), other = Buffer.alloc(65, 8).toString('base64');
+    const digest = createHash('sha256').update('meshrooms-sas-v1:').update(secret).update(Buffer.from(key, 'base64')).digest();
+    expect(await pairingSas(secret, key)).toBe([0, 1, 2, 3].map(i => PAIR_WORDS[digest[i]]).join(' '));
+    expect(await pairingSas(secret, other)).not.toBe(await pairingSas(secret, key));
+    expect(await pairingSas(newSecret(), key)).not.toBe(await pairingSas(secret, key));
+    expect(await pairingSas(ZERO, key)).toBe(await pairingSas(ZERO, key));
+  });
+  test('a typed code makes the secret and the lookup with HKDF-SHA256 (salt meshrooms-offer-v1, info secret or lookup)', async () => {
+    const derive = (code: string, info: string) => Buffer.from(hkdfSync('sha256', code, 'meshrooms-offer-v1', info, 32));
+    expect(Buffer.from(await offerSecret('ABCDE12345'))).toEqual(derive('ABCDE12345', 'secret'));
+    expect(await offerLookup('ABCDE12345')).toBe(derive('ABCDE12345', 'lookup').toString('hex'));
   });
 });

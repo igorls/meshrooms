@@ -1,4 +1,5 @@
-import type { Task } from '../collab';
+import { assignmentWakes, authorWakes, mentionedIds, wakes, type Task } from '../collab';
+import type { Message, Participant } from '../room';
 import { COMPACT_AT, MAX_TASK_OPS, capLiveTasks, compactBoard, foldBoard, mayAddTask, syncChunks, taskBody, validTaskBody, withinRevisionJump, type TaskBody, type TaskChange, type TaskPacket } from './board';
 import { signerOf, verify, type BrowserDevice, type RoomStatus } from './protocol';
 import { BrowserApi } from './client';
@@ -6,14 +7,14 @@ import {
   COMPACT_DECISIONS_AT, MAX_DECISION_OPS, admissible, castVote, compactDecisions, decisionChunks, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
   type Decision, type DecisionBody, type DecisionPacket, type VoteBody,
 } from './decisions';
-import { FileTransfers, IMAGE_TYPES, LOW_WATER, MAX_MESSAGE_ATTACHMENTS, attachmentText, autoFetchFiles, isFilePacket, isSha256, retainedFiles, validAttachments, type AttachmentRef, type TransferState } from './files';
+import { FileTransfers, IMAGE_TYPES, LOW_WATER, MAX_MESSAGE_ATTACHMENTS, attachmentText, autoFetchFiles, isFilePacket, isSha256, retainedFiles, shownText, validAttachments, type AttachmentRef, type TransferState } from './files';
 import {
   COMPACT_REACTIONS_AT, MAX_PENDING_PER_MEMBER, MAX_PENDING_REACTIONS, MAX_REACTION_OPS, capReactions, compactReactions, currentRevision,
   foldReactions, isReactionEmoji, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody,
   type ReactionChip, type ReactionEmoji, type ReactionPacket,
 } from './reactions';
 import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket } from './retractions';
-import { FenceError, StorageError, isPlainObject, read, readArray, readRecord, sign, update, type Fence } from './storage';
+import { FenceError, StorageError, decryptWithEncKey, identity, isPlainObject, read, readArray, readRecord, sign, signDeviceEncKey, update, type Fence } from './storage';
 import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRecord } from './activity';
 import { awaitingDelivery, windowHistory } from './history';
 import {
@@ -22,6 +23,12 @@ import {
   type PeerHealthState, type SyncRequest,
 } from './pacer';
 import { QuotaDrops, ReceiveQuota, type QuotaKind } from './quota';
+import {
+  canonicalJson, hashRosterBody, parseHostPin, signRoster, verifyEncBinding, verifyRoster,
+  type DecryptedRelayEnvelope, type RelayEnvelope, type RelayLane, type RemovedRosterEntry, type RosterBody, type RosterEntry, type SignedRoster,
+} from './relay-crypto';
+import { RelayClient, type RelayClientOptions } from './relay-client';
+import { RelayReplayGuard } from './relay-replay';
 
 /** `replyTo` and `attachments` are optional so browsers from before them keep verifying and storing these packets. */
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
@@ -41,6 +48,8 @@ type Peer = {
 };
 /** An unconfirmed message is sent to a peer again after this long. */
 const RESEND_MS = 5000;
+/** Online hosts periodically re-sign the roster so cold cloud senders have fresh host-authenticated membership. */
+export const ROSTER_REFRESH_MS = 5 * 60_000;
 /** A file of this room as this browser sees it: a blob URL once verified and stored, else how fetching goes. */
 export type FileView = { url?: string; type?: string; transfer?: TransferState };
 /** Stored files by hash, with the type sniffed from their bytes. */
@@ -122,23 +131,228 @@ export class BrowserPeers {
   private fence?: Fence;
   /** A fenced write found that another tab claimed the room: this engine stopped for good. */
   private fencedOut = false;
+  /** Verified host-signed roster (authoritative recipient & signer set for E2E relay). */
+  private verifiedRoster?: SignedRoster;
+  /** Highest roster version seen in a verified HOST-SIGNED roster; prevents rollback. Never raised from envelope metadata. */
+  private highestRosterVersion = 0;
+  /** Relay envelopes (sender + id) already processed and persisted; a repeat is dropped as a replay. Persisted per room. */
+  private relaySeen = new RelayReplayGuard();
+  private relaySeenKey: string;
+  /** Envelopes being processed right now, so a second copy of the same id cannot race the first. */
+  private relayInflight = new Set<string>();
+  /** File chunks and activity are not persisted state, so their replay record stays in memory (larger, to cover chunk bursts). */
+  private relaySeenVolatile = new RelayReplayGuard(8192, 4096);
+  /** Pinned host deviceId (or 16-hex prefix from `#h=` URL fragment, else TOFU on first verified roster). */
+  private pinnedHost?: string;
+  /** Optional WSS+HTTPS E2E relay client; started when `status.relayUrl` is advertised. */
+  private relayClient?: RelayClient;
+  /** When each outbox message was last sent over the relay, to obey `RESEND_MS`. */
+  private relaySent = new Map<string, number>();
+  /** Guard against overlapping encryption-key or roster publication requests. */
+  private publishingEnc = false;
+  private lastEncPublishAt = 0;
+  private publishingRoster = false;
+  private lastRosterPublishAt = 0;
+  /** Injectable relay decryptor for tests (defaults to browser storage's `decryptWithEncKey`). */
+  private decryptRelay: (envelope: unknown, options: { room: string; senderSignKey: string; minRosterVersion?: number; expectedFrom?: string }) => Promise<DecryptedRelayEnvelope<unknown>> = decryptWithEncKey;
+  /** Injectable relay client factory for tests. */
+  private createRelayClient?: (options: RelayClientOptions) => RelayClient;
   constructor(private api: BrowserApi, private roomId: string, private deviceId: string, private session: string,
     private changed: (messages: SavedMessage[], connected: string[], added?: SavedMessage) => void, private error: (message: string) => void,
     private boardChanged: (tasks: Task[], ops: TaskBody[]) => void = () => {}, private filesChanged: (files: Record<string, FileView>) => void = () => {},
     private activityChanged: (activity: Record<string, ActivityRecord>) => void = () => {},
     private decisionsChanged: (ops: (DecisionBody | VoteBody)[]) => void = () => {},
     private reactionsChanged: (chips: ReactionChip[]) => void = () => {},
-    private now: () => number = () => Date.now()) {
+    private now: () => number = () => Date.now(),
+    relayOptions?: {
+      hostPin?: string;
+      createRelayClient?: (options: RelayClientOptions) => RelayClient;
+      decryptRelay?: (envelope: unknown, options: { room: string; senderSignKey: string; minRosterVersion?: number; expectedFrom?: string }) => Promise<DecryptedRelayEnvelope<unknown>>;
+    }) {
     this.key = `messages:${deviceId}:${roomId}`;
     this.boardKey = `board:${deviceId}:${roomId}`;
     this.decisionKey = `decisions:${deviceId}:${roomId}`;
     this.reactionKey = `reactions:${deviceId}:${roomId}`;
     this.retractKey = `retractions:${deviceId}:${roomId}`;
+    this.relaySeenKey = `relay-seen:${deviceId}:${roomId}`;
     this.filesKey = `files:${deviceId}:${roomId}`;
+    this.pinnedHost = relayOptions?.hostPin ?? (typeof location !== 'undefined' ? parseHostPin(location.hash) : undefined);
+    this.createRelayClient = relayOptions?.createRelayClient;
+    if (relayOptions?.decryptRelay) this.decryptRelay = relayOptions.decryptRelay;
     this.files = new FileTransfers({ roomId, referenced: sha => this.refs.get(sha), changed: () => this.notifyFiles(), now: () => this.now(),
       store: { has: sha => sha in this.index, get: sha => this.readFile(sha), put: (sha, bytes, type) => this.storeFile(sha, bytes, type) },
-      channel: id => { const peer = this.peers.get(id); return peer?.fileChannel?.readyState === 'open' ? peer.fileChannel : peer?.channel; },
-      peers: () => [...this.peers].filter(([id, p]) => (p.fileChannel?.readyState === 'open' || p.channel?.readyState === 'open') && this.status?.devices?.some(d => d.id === id)).map(([id]) => id) });
+      channel: id => {
+        const peer = this.peers.get(id);
+        if (peer?.fileChannel?.readyState === 'open') return peer.fileChannel;
+        if (peer?.channel?.readyState === 'open') return peer.channel;
+        if (this.relayClient?.isConnected() && this.verifiedRoster?.body.devices.some(d => d.id === id)) {
+          return this.relayFileChannel(id);
+        }
+        return undefined;
+      },
+      peers: () => {
+        const set = new Set<string>();
+        for (const [id, p] of this.peers) {
+          if ((p.fileChannel?.readyState === 'open' || p.channel?.readyState === 'open') && this.status?.devices?.some(d => d.id === id)) set.add(id);
+        }
+        if (this.relayClient?.isConnected() && this.verifiedRoster) {
+          for (const entry of this.verifiedRoster.body.devices) {
+            if (entry.id !== this.deviceId && this.status?.devices?.some(d => d.id === entry.id && d.session)) set.add(entry.id);
+          }
+        }
+        return [...set];
+      } });
+  }
+  /** Currently verified host-signed roster, if any. */
+  roster(): SignedRoster | undefined { return this.verifiedRoster; }
+  /** Active relay client instance, if started. */
+  relay(): RelayClient | undefined { return this.relayClient; }
+  /** Explicitly pin the expected host key prefix (e.g. from `#h=` fragment). */
+  setHostPin(pin: string | undefined) { if (pin) this.pinnedHost = pin; }
+  /** Whether a peer currently has a live open WebRTC DataChannel (Section 5.4 WebRTC-first rule). */
+  private hasLiveWebRtc(id: string): boolean {
+    const peer = this.peers.get(id);
+    return !!peer && isLiveOpenPeer(peer.pc.connectionState, peer.pc.iceConnectionState, peer.channel?.readyState);
+  }
+  /** Virtual file-lane channel for a verified-roster peer without a live WebRTC channel. */
+  private relayFileChannel(targetId: string) {
+    const self = this;
+    return {
+      get readyState() { return self.relayClient?.isConnected() ? 'open' : 'closed'; },
+      get bufferedAmount() { return self.relayClient?.currentFileInFlightBytes ?? 0; },
+      send(data: string) {
+        try {
+          const parsed = JSON.parse(data);
+          self.sendViaRelay(parsed, 'file', [targetId]);
+        } catch { /* Ignore unparseable data. */ }
+      },
+    } as unknown as RTCDataChannel;
+  }
+  /**
+   * Signer lookup that uses the verified host-signed roster when available (and strictly for relay frames),
+   * preventing coordinator key substitution while remaining backwards-compatible with legacy WebRTC rooms.
+   */
+  private signerFor(deviceId: unknown, at: unknown, fromRelay: boolean): { publicKey: string; memberId: string } | undefined {
+    if (this.verifiedRoster) {
+      const active = this.verifiedRoster.body.devices.find(d => d.id === deviceId);
+      if (active) return { publicKey: active.sign, memberId: active.memberId };
+      const removed = this.verifiedRoster.body.removed.find(r => r.id === deviceId);
+      if (removed?.revoked) return undefined;
+      if (fromRelay) {
+        // For relayed historical board/decision/reaction/retract records from a non-revoked departed device.
+        const former = this.status?.formerDevices?.find(d => d.id === deviceId);
+        if (!former || former.revoked) return undefined;
+        return former.retiredAt === undefined || (typeof at === 'number' && at <= former.retiredAt) ? former : undefined;
+      }
+    }
+    if (fromRelay) return undefined;
+    return signerOf(this.status, deviceId, at);
+  }
+  /** Recipients from the verified roster that do NOT have a live WebRTC channel (WebRTC-first routing). */
+  private relayRecipients(targetIds?: readonly string[]): RosterEntry[] {
+    if (!this.verifiedRoster) return [];
+    const filter = targetIds ? new Set(targetIds) : undefined;
+    return this.verifiedRoster.body.devices.filter(entry =>
+      entry.id !== this.deviceId
+      && (!filter || filter.has(entry.id))
+      && !this.hasLiveWebRtc(entry.id));
+  }
+  /** Computes wake targets and inbox hold flag for a primary-lane packet (Sections 6.1 & 6.2). */
+  private computeRelayMeta(packet: unknown, recipients: RosterEntry[]): { wake?: string[]; hold?: true } {
+    const selfWakeable = !!this.verifiedRoster?.body.devices.find(d => d.id === this.deviceId)?.wakeable;
+    const anyRecipientWakeable = recipients.some(r => r.wakeable === true);
+    const hold = selfWakeable || anyRecipientWakeable ? true as const : undefined;
+    const wakeableAgents = recipients.filter(r => r.wakeable === true && r.role === 'agent');
+    if (!wakeableAgents.length || !this.status?.members) return hold ? { hold } : {};
+
+    const participants: Participant[] = this.status.members.map(m => ({
+      id: m.id, name: m.name, role: m.role ?? 'human', state: 'remote', detail: '',
+      ...(m.operatorId ? { operatorId: m.operatorId } : {}),
+    }));
+    const floor = this.status.settings?.floor ?? 'humans-first';
+    const agentAssignmentsWake = !!this.status.settings?.agentAssignmentsWake;
+    const history: Message[] = this.messages.map(({ packet: { body }, retracted }) => {
+      const author = participants.find(p => p.id === body.memberId);
+      const text = retracted ? 'Message deleted' : shownText(body);
+      const mentions = mentionedIds(text, participants);
+      return {
+        id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human',
+        text, time: new Date(body.at).toISOString(),
+        ...(retracted ? { deleted: true } : {}),
+        ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+        ...(mentions.length ? { mentions } : {}),
+      };
+    });
+    const roomView = { floor, agentAssignmentsWake, participants, messages: history };
+    const body = (packet as { body?: Record<string, unknown> } | null)?.body;
+    if (!body || typeof body !== 'object') return hold ? { hold } : {};
+
+    const wake = new Set<string>();
+    if (body.kind === 'message' && typeof body.text === 'string' && typeof body.memberId === 'string' && typeof body.id === 'string') {
+      const author = participants.find(p => p.id === body.memberId);
+      const mentions = mentionedIds(body.text, participants);
+      const msg: Message = {
+        id: body.id,
+        authorId: body.memberId,
+        author: author?.name ?? 'Member',
+        role: author?.role ?? 'human',
+        text: body.text,
+        time: new Date(typeof body.at === 'number' ? body.at : this.now()).toISOString(),
+        ...(typeof body.replyTo === 'string' ? { replyTo: body.replyTo } : {}),
+        ...(mentions.length ? { mentions } : {}),
+      };
+      for (const entry of wakeableAgents) {
+        if (wakes(roomView, msg, entry.memberId)) wake.add(entry.id);
+      }
+    } else if (body.kind === 'task' && typeof body.assigneeId === 'string' && typeof body.memberId === 'string') {
+      const task: Task = {
+        id: String(body.taskId ?? body.id ?? ''),
+        title: String(body.title ?? ''),
+        notes: String(body.notes ?? ''),
+        status: (body.status === 'doing' || body.status === 'done' ? body.status : 'todo'),
+        assigneeId: body.assigneeId,
+        assignedBy: body.memberId,
+        createdBy: body.memberId,
+        updatedBy: body.memberId,
+        updatedAt: new Date(typeof body.at === 'number' ? body.at : this.now()).toISOString(),
+        revision: typeof body.revision === 'number' ? body.revision : 1,
+      };
+      for (const entry of wakeableAgents) {
+        if (assignmentWakes(roomView, task, entry.memberId)) wake.add(entry.id);
+      }
+    } else if (body.kind === 'decision' && typeof body.memberId === 'string') {
+      const askAgents = body.askAgents;
+      for (const entry of wakeableAgents) {
+        const asked = askAgents === true || (Array.isArray(askAgents) && askAgents.includes(entry.memberId));
+        if (asked && authorWakes(roomView, entry.memberId, body.memberId)) wake.add(entry.id);
+      }
+    }
+    return { ...(wake.size ? { wake: [...wake] } : {}), ...(hold ? { hold } : {}) };
+  }
+  /** Encrypts and queues `packet` onto the relay for non-WebRTC verified-roster peers. */
+  private sendViaRelay(packet: unknown, lane: RelayLane, targetIds?: readonly string[]) {
+    if (!this.relayClient || !this.verifiedRoster || this.stopped) return;
+    const recipients = this.relayRecipients(targetIds);
+    if (!recipients.length) return;
+    const meta = lane === 'primary' ? this.computeRelayMeta(packet, recipients) : {};
+    try {
+      this.relayClient.enqueuePacket(packet, {
+        rosterVersion: this.verifiedRoster.body.version,
+        lane,
+        recipients,
+        ...meta,
+      });
+    } catch { /* Outbox or resync retries later. */ }
+  }
+  /** Broadcasts a primary packet to open WebRTC channels AND via relay to verified-roster peers without live WebRTC. */
+  private broadcastPacket(packet: unknown) {
+    const encoded = JSON.stringify(packet);
+    for (const [id, peer] of this.peers) {
+      if (this.hasLiveWebRtc(id) && peer.channel?.readyState === 'open') {
+        try { peer.channel.send(encoded); } catch { /* Exchanged again on reconnect. */ }
+      }
+    }
+    this.sendViaRelay(packet, 'primary');
   }
   /** Write only while this claim on the room is current: once another tab claims it, every write aborts unwritten. */
   fenced(fence: Fence) { this.fence = fence; }
@@ -165,6 +379,7 @@ export class BrowserPeers {
     this.decisionOps = await readArray(this.decisionKey, (v): v is DecisionPacket => isDecisionPacket(v, this.roomId));
     this.reactionOps = await readArray(this.reactionKey, (v): v is ReactionPacket => isReactionPacket(v, this.roomId));
     this.retractOps = await readArray(this.retractKey, (v): v is RetractPacket => isRetractPacket(v, this.roomId));
+    this.relaySeen = RelayReplayGuard.from(await read<unknown>(this.relaySeenKey));
     this.index = await readRecord(this.filesKey, isFileIndexEntry);
     for (const sha of Object.keys(this.index)) await this.fileUrl(sha);
     this.notify(); this.notifyBoard(); this.notifyDecisions(); this.notifyReactions(); this.syncFiles();
@@ -259,7 +474,7 @@ export class BrowserPeers {
       }
       const packet: TaskPacket = { body, signature: await sign(body) };
       await this.addOps([packet]);
-      for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* The board is exchanged again on reconnect. */ } }
+      this.broadcastPacket(packet);
     });
   }
   private prunePendingReactions(now = this.now()) {
@@ -340,9 +555,7 @@ export class BrowserPeers {
       };
       const packet: ReactionPacket = { body, signature: await sign(body) };
       await this.addReactionOps([packet]);
-      for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') {
-        try { peer.channel.send(JSON.stringify(packet)); } catch { /* Reactions are exchanged again on reconnect. */ }
-      }
+      this.broadcastPacket(packet);
     });
   }
   /** Keep verified retractions and remove what they name. The log and the messages are written together. */
@@ -374,25 +587,23 @@ export class BrowserPeers {
       const body: RetractBody = { kind: 'retract', roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId, memberId: this.status.memberId, at: Date.now(), target: messageId };
       const packet: RetractPacket = { body, signature: await sign(body) };
       await this.addRetractionOps([packet]);
-      for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') {
-        try { peer.channel.send(JSON.stringify(packet)); } catch { /* Retractions are exchanged again on reconnect. */ }
-      }
+      this.broadcastPacket(packet);
     });
   }
   /** A retraction relayed in an exchange is checked against its author's own device (see signerOf), not the sender's. */
-  private async acceptRetractions(sync: { roomId?: unknown; ops?: unknown }) {
+  private async acceptRetractions(sync: { roomId?: unknown; ops?: unknown }, fromRelay = false) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
     const accepted: RetractPacket[] = [];
     const held = new Set(this.retractOps.map(op => op.body.id));
     for (const op of sync.ops as RetractPacket[]) {
       if (held.has(op?.body?.id)) continue;
-      const author = signerOf(this.status, op?.body?.deviceId, op?.body?.at);
+      const author = this.signerFor(op?.body?.deviceId, op?.body?.at, fromRelay);
       if (!author || !validRetractBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
       if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
     }
     await this.addRetractionOps(accepted);
   }
-  private async acceptReactions(sync: { roomId?: unknown; ops?: unknown }) {
+  private async acceptReactions(sync: { roomId?: unknown; ops?: unknown }, fromRelay = false) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
     const accepted: ReactionPacket[] = [];
     // Held operations and retracted targets are skipped before signatures are checked.
@@ -400,7 +611,7 @@ export class BrowserPeers {
     const retracted = new Set(this.messages.filter(isRetracted).map(m => m.packet.body.id));
     for (const op of sync.ops as ReactionPacket[]) {
       if (held.has(op?.body?.id) || retracted.has(op?.body?.messageId)) continue;
-      const author = signerOf(this.status, op?.body?.deviceId, op?.body?.at);
+      const author = this.signerFor(op?.body?.deviceId, op?.body?.at, fromRelay);
       if (!author || !validReactionBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
       if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
     }
@@ -408,14 +619,14 @@ export class BrowserPeers {
     catch { /* Cap full: keep the local log; peers retry after compaction elsewhere. */ }
   }
   /** Operations relayed in a board exchange are checked against each author's own device, not the sender's. */
-  private async acceptBoard(sync: { roomId?: unknown; ops?: unknown }) {
+  private async acceptBoard(sync: { roomId?: unknown; ops?: unknown }, fromRelay = false) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
     const accepted: TaskPacket[] = [];
     const held = new Set(this.ops.map(op => op.body.id));
     for (const op of sync.ops as TaskPacket[]) {
       if (held.has(op?.body?.id)) continue;
       // A change by someone who has since left still verifies against the key the room service keeps for them (see signerOf).
-      const author = signerOf(this.status, op?.body?.deviceId, op?.body?.at);
+      const author = this.signerFor(op?.body?.deviceId, op?.body?.at, fromRelay);
       if (!author || !validTaskBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
       if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
     }
@@ -453,7 +664,7 @@ export class BrowserPeers {
     if (!admissible(this.decisionOps.map(op => op.body), [body]).length) throw new Error('You have reached this room’s limit for decision changes.');
     const packet: DecisionPacket = { body, signature: await sign(body) };
     await this.addDecisionOps([packet]);
-    for (const peer of this.peers.values()) if (peer.channel?.readyState === 'open') { try { peer.channel.send(JSON.stringify(packet)); } catch { /* Decisions are exchanged again on reconnect. */ } }
+    this.broadcastPacket(packet);
   }
   private author() {
     if (!this.status?.memberId || this.stopped) throw new Error('Join the room before taking part in decisions.');
@@ -475,13 +686,13 @@ export class BrowserPeers {
     });
   }
   /** Decision operations relayed in an exchange are checked against each author's own device, not the sender's. */
-  private async acceptDecisions(sync: { roomId?: unknown; ops?: unknown }) {
+  private async acceptDecisions(sync: { roomId?: unknown; ops?: unknown }, fromRelay = false) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
     const held = new Set(this.decisionOps.map(op => op.body.id));
     const candidates = (sync.ops as DecisionPacket[]).filter(op => (validDecisionBody(op?.body, this.roomId) || validVoteBody(op?.body, this.roomId))
       && typeof op.signature === 'string' && !held.has(op.body.id));
     const authentic = async ({ body: b, signature }: DecisionPacket) => {
-      const author = signerOf(this.status, b.deviceId, b.at);
+      const author = this.signerFor(b.deviceId, b.at, fromRelay);
       return !!author && b.memberId === author.memberId && await verify(author.publicKey, b, signature);
     };
     // Decisions first, so a vote is admitted only against a decision held or just verified (a forged decision in the
@@ -565,11 +776,11 @@ export class BrowserPeers {
       await this.save(saved); this.flush();
     });
   }
-  /** Send each connected peer up to 16 of its unconfirmed messages, oldest first; ones sent in the last few seconds wait. */
+  /** Send each connected peer up to 16 of its unconfirmed messages, oldest first; WebRTC first, else encrypted relay. */
   private flush() {
     const now = Date.now();
     for (const [id, peer] of this.peers) {
-      if (peer.channel?.readyState !== 'open') continue;
+      if (!this.hasLiveWebRtc(id) || peer.channel?.readyState !== 'open') continue;
       let sent = 0;
       for (const message of this.messages) {
         if (sent >= 16) break;
@@ -581,71 +792,183 @@ export class BrowserPeers {
       }
       if (peer.sent.size > 4096) peer.sent.clear();
     }
+    if (this.relayClient?.isConnected() && this.verifiedRoster) {
+      let relaySentCount = 0;
+      for (const message of this.messages) {
+        if (relaySentCount >= 16) break;
+        const messageId = message.packet.body.id;
+        if (message.packet.body.deviceId !== this.deviceId) continue;
+        if (now - (this.relaySent.get(messageId) ?? 0) < RESEND_MS) continue;
+        const pendingTargets = message.targets.filter(id => !message.receipts.includes(id));
+        if (!pendingTargets.length) continue;
+        const recipients = this.relayRecipients(pendingTargets);
+        if (!recipients.length) continue;
+        this.sendViaRelay(message.packet, 'primary', recipients.map(r => r.id));
+        this.relaySent.set(messageId, now);
+        relaySentCount++;
+      }
+      if (this.relaySent.size > 4096) this.relaySent.clear();
+    }
+  }
+  /** Sends a signed receipt back to `senderId` over live WebRTC if available, else over the E2E relay. */
+  private async sendReceiptTo(senderId: string, messageId: string, channel?: RTCDataChannel) {
+    const receipt: ReceiptBody = { kind: 'receipt', roomId: this.roomId, id: messageId, deviceId: this.deviceId };
+    const packet = { body: receipt, signature: await sign(receipt) };
+    if (channel && channel.readyState === 'open') {
+      try { channel.send(JSON.stringify(packet)); return; } catch { /* Fall through to relay if available. */ }
+    }
+    const peer = this.peers.get(senderId);
+    if (this.hasLiveWebRtc(senderId) && peer?.channel?.readyState === 'open') {
+      try { peer.channel.send(JSON.stringify(packet)); return; } catch { /* Fall through to relay. */ }
+    }
+    this.sendViaRelay(packet, 'primary', [senderId]);
+  }
+  /**
+   * Shared receive pipeline for BOTH WebRTC DataChannel packets and decrypted E2E relay envelopes:
+   * runs every packet through `IncomingGate`, `ReceiveQuota`, verified signer lookup, ECDSA verification,
+   * and dedupe-by-id so WebRTC + WSS/HTTPS frames are handled identically.
+   */
+  private handleIncomingPacket(
+    id: string,
+    packet: Packet,
+    fromRelay: boolean,
+    peer?: Peer,
+    channel?: RTCDataChannel,
+    relayMeta?: { cursor?: number; replay?: { from: string; id: string } },
+  ): Promise<void> | undefined {
+    // File transfers bypass the message queue: chunks arrive by the hundred and are cheap to check.
+    if (isFilePacket(packet)) {
+      const authorized = fromRelay
+        ? !!this.verifiedRoster?.body.devices.some(d => d.id === id)
+        : this.peers.get(id) === peer && !!this.status?.devices?.some(d => d.id === id);
+      if (!this.stopped && authorized) {
+        this.files.handle(id, packet);
+        if (relayMeta?.cursor !== undefined) this.relayClient?.ackCursor(relayMeta.cursor);
+      }
+      return;
+    }
+    if (isActivityPacket(packet)) {
+      if (!this.stopped && (fromRelay ? !!this.verifiedRoster?.body.devices.some(d => d.id === id) : this.peers.get(id) === peer)) {
+        this.acceptActivity(id, packet);
+        if (relayMeta?.cursor !== undefined) this.relayClient?.ackCursor(relayMeta.cursor);
+      }
+      return;
+    }
+    // Cheap and never queued: answered from the tick, at most once per interval.
+    if (isSyncRequest(packet, this.roomId)) {
+      if (!this.stopped && !fromRelay && peer && this.peers.get(id) === peer && this.status?.devices?.some(d => d.id === id)) {
+        peer.resync.request(); this.resyncDue(peer);
+      }
+      return;
+    }
+    if (!this.incoming.admit(id)) return;
+    return this.transaction(async () => {
+      if (this.stopped || !this.status?.memberId) return false;
+      if (!fromRelay && peer && this.peers.get(id) !== peer) return false;
+      const device = fromRelay
+        ? (() => {
+            const entry = this.verifiedRoster?.body.devices.find(d => d.id === id);
+            return entry ? { id: entry.id, publicKey: entry.sign, memberId: entry.memberId } : undefined;
+          })()
+        : this.status.devices?.find(d => d.id === id);
+      if (!device) return false;
+      if ((packet as unknown as { kind?: unknown })?.kind === 'board') { await this.acceptBoard(packet as never, fromRelay); return true; }
+      if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never, fromRelay); return true; }
+      if ((packet as unknown as { kind?: unknown })?.kind === 'reactions') { await this.acceptReactions(packet as never, fromRelay); return true; }
+      if ((packet as unknown as { kind?: unknown })?.kind === 'retractions') { await this.acceptRetractions(packet as never, fromRelay); return true; }
+      const b = packet?.body;
+      if (!b || b.roomId !== this.roomId || b.deviceId !== id || !isId(b.id) || typeof packet.signature !== 'string' || !await verify(device.publicKey, b, packet.signature)) return false;
+      if (b.kind === 'message') {
+        if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > 8_640_000_000_000_000) return false;
+        // The replied-to message may predate this browser's admission, so only its form is checked.
+        if (b.replyTo !== undefined && !isId(b.replyTo)) return false;
+        if (b.attachments !== undefined && !validAttachments(b.attachments)) return false;
+        const existing = this.messages.find(m => m.packet.body.id === b.id);
+        // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
+        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return false;
+        // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
+        if (!existing) {
+          if (!this.allowed(device.memberId, 'message', id)) return false; // Unconfirmed, so its sender retries later.
+          const saved: SavedMessage = { packet: packet as SavedMessage['packet'], targets: [], receipts: [] };
+          await this.save(this.retractOps.some(op => mayRetract(op.body, b)) ? retractedStub(saved) : saved);
+        }
+        // A receipt means an IndexedDB transaction completed, not that a person read it.
+        await this.sendReceiptTo(id, b.id, fromRelay ? undefined : channel);
+        return true;
+      } else if (b.kind === 'receipt') {
+        const m = this.messages.find(m => m.packet.body.id === b.id && m.packet.body.deviceId === this.deviceId);
+        if (m?.targets.includes(id) && !m.receipts.includes(id)) this.receipt(m, id);
+        return true;
+      } else if (b.kind === 'task') {
+        if (validTaskBody(b, this.roomId) && b.memberId === device.memberId && !this.ops.some(op => op.body.id === b.id)
+          && this.allowed(device.memberId, 'task', id)) await this.addOps([{ body: b, signature: packet.signature }]);
+        return true;
+      } else if (b.kind === 'decision' || b.kind === 'vote') {
+        if ((validDecisionBody(b, this.roomId) || validVoteBody(b, this.roomId)) && b.memberId === device.memberId && !this.decisionOps.some(op => op.body.id === b.id)
+          && admissible(this.decisionOps.map(op => op.body), [b]).length && this.allowed(device.memberId, 'decision', id)) await this.addDecisionOps([{ body: b, signature: packet.signature }]);
+        return true;
+      } else if (b.kind === 'reaction') {
+        if (validReactionBody(b, this.roomId) && b.memberId === device.memberId && ![...this.reactionOps, ...this.pendingReactions].some(op => op.body.id === b.id)
+          && this.allowed(device.memberId, 'reaction', id)) await this.addReactionOps([{ body: b, signature: packet.signature }]);
+        return true;
+      } else if (b.kind === 'retract') {
+        if (validRetractBody(b, this.roomId) && b.memberId === device.memberId && !this.retractOps.some(op => op.body.id === b.id)
+          && this.allowed(device.memberId, 'retract', id)) await this.addRetractionOps([{ body: b, signature: packet.signature }]);
+        return true;
+      }
+      return false;
+    }).then(async persisted => {
+      if (!persisted) return;
+      // Persist the replay guard BEFORE acknowledging the inbox cursor so a crash cannot allow a replay.
+      if (relayMeta?.replay) await this.rememberRelayEnvelope(relayMeta.replay.from, relayMeta.replay.id);
+      if (relayMeta?.cursor !== undefined) this.relayClient?.ackCursor(relayMeta.cursor);
+    }).catch(e => this.fail(e)).finally(() => { for (const from of this.incoming.done()) this.requestSync(from); });
+  }
+  /** Remembers a processed envelope in memory at once and persists the record behind the room's other writes. */
+  private rememberRelayEnvelope(from: string, id: string) {
+    this.relaySeen.add(from, id);
+    return this.transaction(() => this.put([[this.relaySeenKey, this.relaySeen.export()]]));
   }
   private handleDataMessage(peer: Peer, id: string, channel: RTCDataChannel, raw: unknown) {
     if (typeof raw !== 'string' || raw.length > 20_000) return;
     let packet: Packet;
     try { packet = JSON.parse(raw); } catch { return; }
-    // File transfers bypass the message queue: chunks arrive by the hundred and are cheap to check.
-    if (isFilePacket(packet)) {
-      if (!this.stopped && this.peers.get(id) === peer && this.status?.devices?.some(d => d.id === id)) this.files.handle(id, packet);
+    this.handleIncomingPacket(id, packet, false, peer, channel);
+  }
+  /**
+   * Authenticates, deduplicates and decrypts an incoming `RelayEnvelope`, then feeds it into the shared receive pipeline.
+   * The envelope signature is checked against the sender's key in the verified host-signed roster, so a forged `from` is dropped.
+   */
+  async handleRelayEnvelope(envelope: RelayEnvelope, cursor?: number) {
+    if (this.stopped || !this.verifiedRoster) return;
+    if (envelope.from === this.deviceId) return;
+    const sender = this.verifiedRoster.body.devices.find(d => d.id === envelope.from);
+    if (!sender) return;
+    const key = `${envelope.from}:${envelope.id}`;
+    // A repeat of something already processed and persisted: nothing more to do, and the inbox copy can be acknowledged.
+    if (this.relaySeen.seen(envelope.from, envelope.id) || this.relaySeenVolatile.seen(envelope.from, envelope.id)) {
+      if (cursor !== undefined) this.relayClient?.ackCursor(cursor);
       return;
     }
-    if (isActivityPacket(packet)) { if (!this.stopped && this.peers.get(id) === peer) this.acceptActivity(id, packet); return; }
-    // Cheap and never queued: answered from the tick, at most once per interval.
-    if (isSyncRequest(packet, this.roomId)) {
-      if (!this.stopped && this.peers.get(id) === peer && this.status?.devices?.some(d => d.id === id)) { peer.resync.request(); this.resyncDue(peer); }
+    if (this.relayInflight.has(key)) return;
+    let decrypted: DecryptedRelayEnvelope<unknown>;
+    try {
+      // Do NOT reject frames encrypted under an earlier roster version (e.g. queued in inbox before v(N) published).
+      // The roster version in an envelope is sender-chosen metadata and never moves `highestRosterVersion`.
+      decrypted = await this.decryptRelay(envelope, { room: this.roomId, senderSignKey: sender.sign });
+    } catch {
       return;
     }
-    if (!this.incoming.admit(id)) return;
-    void this.transaction(async () => {
-      if (this.stopped || !this.status?.memberId || this.peers.get(id) !== peer) return;
-      const device = this.status.devices?.find(d => d.id === id); if (!device) return;
-      if ((packet as unknown as { kind?: unknown })?.kind === 'board') { await this.acceptBoard(packet as never); return; }
-      if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never); return; }
-      if ((packet as unknown as { kind?: unknown })?.kind === 'reactions') { await this.acceptReactions(packet as never); return; }
-      if ((packet as unknown as { kind?: unknown })?.kind === 'retractions') { await this.acceptRetractions(packet as never); return; }
-      const b = packet?.body;
-      if (!b || b.roomId !== this.roomId || b.deviceId !== id || !isId(b.id) || typeof packet.signature !== 'string' || !await verify(device.publicKey, b, packet.signature)) return;
-      if (b.kind === 'message') {
-        if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > 8_640_000_000_000_000) return;
-        // The replied-to message may predate this browser's admission, so only its form is checked.
-        if (b.replyTo !== undefined && !isId(b.replyTo)) return;
-        if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
-        const existing = this.messages.find(m => m.packet.body.id === b.id);
-        // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
-        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
-        // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
-        if (!existing) {
-          if (!this.allowed(device.memberId, 'message', id)) return; // Unconfirmed, so its sender retries later.
-          const saved: SavedMessage = { packet: packet as SavedMessage['packet'], targets: [], receipts: [] };
-          await this.save(this.retractOps.some(op => mayRetract(op.body, b)) ? retractedStub(saved) : saved);
-        }
-        // A receipt means an IndexedDB transaction completed, not that a person read it.
-        const receipt: ReceiptBody = { kind: 'receipt', roomId: this.roomId, id: b.id, deviceId: this.deviceId };
-        if (channel.readyState === 'open') {
-          const encoded = JSON.stringify({ body: receipt, signature: await sign(receipt) });
-          if (channel.readyState === 'open') {
-            try { channel.send(encoded); } catch { /* The sender retries on reconnect and receives a receipt then. */ }
-          }
-        }
-      } else if (b.kind === 'receipt') {
-        const m = this.messages.find(m => m.packet.body.id === b.id && m.packet.body.deviceId === this.deviceId);
-        if (m?.targets.includes(id) && !m.receipts.includes(id)) this.receipt(m, id);
-      } else if (b.kind === 'task') {
-        if (validTaskBody(b, this.roomId) && b.memberId === device.memberId && !this.ops.some(op => op.body.id === b.id)
-          && this.allowed(device.memberId, 'task', id)) await this.addOps([{ body: b, signature: packet.signature }]);
-      } else if (b.kind === 'decision' || b.kind === 'vote') {
-        if ((validDecisionBody(b, this.roomId) || validVoteBody(b, this.roomId)) && b.memberId === device.memberId && !this.decisionOps.some(op => op.body.id === b.id)
-          && admissible(this.decisionOps.map(op => op.body), [b]).length && this.allowed(device.memberId, 'decision', id)) await this.addDecisionOps([{ body: b, signature: packet.signature }]);
-      } else if (b.kind === 'reaction') {
-        if (validReactionBody(b, this.roomId) && b.memberId === device.memberId && ![...this.reactionOps, ...this.pendingReactions].some(op => op.body.id === b.id)
-          && this.allowed(device.memberId, 'reaction', id)) await this.addReactionOps([{ body: b, signature: packet.signature }]);
-      } else if (b.kind === 'retract') {
-        if (validRetractBody(b, this.roomId) && b.memberId === device.memberId && !this.retractOps.some(op => op.body.id === b.id)
-          && this.allowed(device.memberId, 'retract', id)) await this.addRetractionOps([{ body: b, signature: packet.signature }]);
-      }
-    }).catch(e => this.fail(e)).finally(() => { for (const from of this.incoming.done()) this.requestSync(from); });
+    if (!decrypted.packet || typeof decrypted.packet !== 'object') return;
+    const packet = decrypted.packet as Packet;
+    if (isFilePacket(packet) || isActivityPacket(packet)) {
+      if (!this.relaySeenVolatile.add(envelope.from, envelope.id)) return;
+      this.handleIncomingPacket(envelope.from, packet, true, undefined, undefined, { cursor });
+      return;
+    }
+    this.relayInflight.add(key);
+    const done = this.handleIncomingPacket(envelope.from, packet, true, undefined, undefined, { cursor, replay: { from: envelope.from, id: envelope.id } });
+    void Promise.resolve(done).finally(() => this.relayInflight.delete(key));
   }
   private connectChannel(peer: Peer, id: string, channel: RTCDataChannel) {
     peer.channel = channel;
@@ -787,6 +1110,12 @@ export class BrowserPeers {
       }
     }
     this.status = status;
+    await this.verifyIncomingRoster(status);
+    if (status.memberId) {
+      void this.maybePublishEncKey(status);
+      void this.maybePublishRoster(status);
+      void this.ensureRelayClient(status);
+    }
     const now = this.now();
     const devices = (status.devices || []).filter(d => d.id !== this.deviceId);
     const available = devices.filter(d => d.session);
@@ -854,9 +1183,197 @@ export class BrowserPeers {
     this.tick();
     this.flush(); this.notify();
   }
+  /** Verifies `status.roster` against the pinned host key (or TOFU at first sight) and rejects rollbacks/tampering. */
+  private async verifyIncomingRoster(status: RoomStatus) {
+    const incoming = status.roster;
+    if (!incoming) return;
+    if (this.verifiedRoster && incoming.body.version === this.verifiedRoster.body.version && incoming.signature === this.verifiedRoster.signature) {
+      return;
+    }
+    if (incoming.body.version <= (this.verifiedRoster?.body.version ?? 0) || incoming.body.version < this.highestRosterVersion) {
+      return;
+    }
+    const consecutive = !!this.verifiedRoster && incoming.body.version === this.verifiedRoster.body.version + 1;
+    const minVersion = Math.max(this.highestRosterVersion, this.verifiedRoster ? this.verifiedRoster.body.version + 1 : 0);
+    const result = await verifyRoster(incoming, {
+      roomId: this.roomId,
+      expectedHostPin: this.pinnedHost,
+      ...(consecutive ? { previous: this.verifiedRoster } : {}),
+      ...(minVersion > 0 ? { minVersion } : {}),
+    });
+    if (!result.ok) return;
+    this.verifiedRoster = incoming;
+    this.highestRosterVersion = Math.max(this.highestRosterVersion, incoming.body.version);
+    this.pinnedHost = result.hostDeviceId;
+  }
+  /** Publishes this browser device's ECDH public key (`enc`, `encVersion`, `encSig`) to a relay-capable lobby when missing or rotated. */
+  private async maybePublishEncKey(status: RoomStatus) {
+    if (this.stopped || this.publishingEnc || !status.memberId || (!status.relayUrl && !status.roster) || typeof this.api?.command !== 'function') return;
+    const now = this.now();
+    if (now - this.lastEncPublishAt < 5_000) return;
+    try {
+      const id = await identity();
+      const selfDev = status.devices?.find(d => d.id === this.deviceId);
+      if (!selfDev || (selfDev.enc === id.encPublicKey && selfDev.encVersion === id.encVersion && selfDev.encSig)) return;
+      this.publishingEnc = true;
+      this.lastEncPublishAt = now;
+      const binding = await signDeviceEncKey(this.roomId);
+      await this.api.command('profile', this.roomId, binding);
+    } catch {
+      // Retried on a later status poll.
+    } finally {
+      this.publishingEnc = false;
+    }
+  }
+  /** When this device is the room host, publishes a monotonic host-signed `SignedRoster` whenever devices/removals change. */
+  private async maybePublishRoster(status: RoomStatus) {
+    if (this.stopped || this.publishingRoster || !status.memberId || status.ownerId !== status.memberId) return;
+    if (typeof this.api?.command !== 'function') return;
+    const now = this.now();
+    if (now - this.lastRosterPublishAt < 2_000) return;
+    // Only the current roster host (or the first host device if no roster exists yet) publishes.
+    const currentRoster = this.verifiedRoster;
+    if (currentRoster && currentRoster.body.host !== this.deviceId) {
+      const currentHostStillPresent = status.devices?.some(d => d.id === currentRoster.body.host && d.memberId === status.ownerId);
+      if (currentHostStillPresent) return;
+    }
+    const selfDev = status.devices?.find(d => d.id === this.deviceId);
+    if (!selfDev?.enc || !selfDev.encVersion || !selfDev.encSig) return;
+
+    this.publishingRoster = true;
+    try {
+      const entries: RosterEntry[] = [];
+      for (const dev of status.devices || []) {
+        if (!dev.enc || !dev.encVersion || !dev.encSig) continue;
+        const okRoom = await verifyEncBinding(dev.publicKey, { room: this.roomId, deviceId: dev.id, enc: dev.enc, encVersion: dev.encVersion }, dev.encSig);
+        const okWild = okRoom || await verifyEncBinding(dev.publicKey, { room: '*', deviceId: dev.id, enc: dev.enc, encVersion: dev.encVersion }, dev.encSig);
+        if (!okWild) continue;
+        const member = status.members?.find(m => m.id === dev.memberId);
+        const role: 'human' | 'agent' = member?.role === 'agent' ? 'agent' : 'human';
+        entries.push({
+          id: dev.id,
+          sign: dev.publicKey,
+          enc: dev.enc,
+          encVersion: dev.encVersion,
+          encSig: dev.encSig,
+          memberId: dev.memberId,
+          role,
+          ...(member?.operatorId ? { operatorId: member.operatorId } : {}),
+          ...(dev.wakeable ? { wakeable: true as const } : {}),
+        });
+      }
+      if (!entries.some(e => e.id === this.deviceId)) return;
+      entries.sort((a, b) => a.id.localeCompare(b.id));
+
+      const activeIds = new Set(entries.map(e => e.id));
+      const removedMap = new Map<string, RemovedRosterEntry>();
+      for (const prev of currentRoster?.body.removed || []) {
+        if (!activeIds.has(prev.id)) removedMap.set(prev.id, prev);
+      }
+      for (const former of status.formerDevices || []) {
+        if (!activeIds.has(former.id)) {
+          removedMap.set(former.id, {
+            id: former.id,
+            at: former.retiredAt ?? now,
+            revoked: !!former.revoked,
+          });
+        }
+      }
+      const removed = [...removedMap.values()].sort((a, b) => a.id.localeCompare(b.id));
+
+      const sameDevices = currentRoster
+        && currentRoster.body.host === this.deviceId
+        && canonicalJson(currentRoster.body.devices) === canonicalJson(entries)
+        && canonicalJson(currentRoster.body.removed) === canonicalJson(removed);
+      const stale = !currentRoster || now - currentRoster.body.at >= ROSTER_REFRESH_MS;
+      if (sameDevices && !stale) return;
+
+      const body: RosterBody = {
+        v: 1,
+        room: this.roomId,
+        version: (currentRoster?.body.version ?? 0) + 1,
+        prev: currentRoster ? await hashRosterBody(currentRoster.body) : '',
+        at: now,
+        host: this.deviceId,
+        devices: entries,
+        removed,
+      };
+      const roster = await signRoster(body, sign);
+      this.lastRosterPublishAt = now;
+      const updated = await this.api.command('roster-publish', this.roomId, { roster });
+      if (updated?.roster) await this.verifyIncomingRoster(updated);
+      else await this.verifyIncomingRoster({ ...status, roster });
+    } catch {
+      // Retried on a later status poll.
+    } finally {
+      this.publishingRoster = false;
+    }
+  }
+  /** Signs and publishes roster version N+1 transferring host authority to `newHostDeviceId` (Section 5.2). */
+  async publishHostTransfer(newHostDeviceId: string): Promise<SignedRoster> {
+    if (!this.verifiedRoster || !this.status) throw new Error('No verified roster available for host transfer.');
+    if (this.verifiedRoster.body.host !== this.deviceId) throw new Error('Only the current host device can sign a host transfer.');
+    if (!this.verifiedRoster.body.devices.some(d => d.id === newHostDeviceId)) {
+      throw new Error('New host device must be present in the verified roster.');
+    }
+    const body: RosterBody = {
+      v: 1,
+      room: this.roomId,
+      version: this.verifiedRoster.body.version + 1,
+      prev: await hashRosterBody(this.verifiedRoster.body),
+      at: this.now(),
+      host: newHostDeviceId,
+      devices: this.verifiedRoster.body.devices,
+      removed: this.verifiedRoster.body.removed,
+    };
+    const roster = await signRoster(body, sign);
+    await this.api.command('roster-publish', this.roomId, { roster });
+    await this.verifyIncomingRoster({ ...this.status, roster });
+    return roster;
+  }
+  /** Starts the optional WSS+HTTPS relay client once `status.relayUrl` is advertised and this device is admitted. */
+  private async ensureRelayClient(status: RoomStatus) {
+    if (this.stopped || !status.relayUrl || !status.memberId || this.relayClient) return;
+    if (!this.createRelayClient && typeof WebSocket === 'undefined') return;
+    try {
+      const id = await identity();
+      if (this.stopped || this.relayClient) return;
+      const origin = typeof location !== 'undefined' && location.origin && location.origin !== 'null'
+        ? location.origin
+        : status.relayUrl.replace(/^ws/, 'http').replace(/\/api\/relay\/v1.*$/, '');
+      const opts: RelayClientOptions = {
+        origin,
+        relayUrl: status.relayUrl,
+        roomId: this.roomId,
+        deviceId: this.deviceId,
+        publicKey: id.publicKey,
+        session: this.session,
+        sign,
+        rosterVersion: () => this.verifiedRoster?.body.version ?? 1,
+        onEnvelope: (envelope, meta) => this.handleRelayEnvelope(envelope, meta.cursor),
+        onStateChange: state => {
+          if (state === 'wss' || state === 'https') {
+            this.flush();
+            this.notify();
+          }
+        },
+        onAuthError: () => {
+          this.relayClient?.stop();
+        },
+      };
+      this.relayClient = this.createRelayClient ? this.createRelayClient(opts) : new RelayClient(opts);
+      this.relayClient.start();
+    } catch {
+      // Relay unavailable; WebRTC continues unaffected.
+    }
+  }
   private disconnect() {
     for (const [id, peer] of [...this.peers]) this.dropPeer(id, peer);
     this.peers.clear();
+    if (this.relayClient) {
+      this.relayClient.stop();
+      this.relayClient = undefined;
+    }
   }
   stop() {
     this.stopped = true; this.disconnect();

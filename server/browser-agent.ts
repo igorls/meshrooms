@@ -34,7 +34,7 @@ import {
   type ReactionBody, type ReactionEmoji, type ReactionPacket,
 } from '../src/browser/reactions';
 import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket, type RetractionSync } from '../src/browser/retractions';
-import { authorWakes, evaluateWake, mayAgentSpeak, mentionedIds, type Floor, type Task } from '../src/collab';
+import { assignmentWakes, authorWakes, evaluateWake, mayAgentSpeak, mentionedIds, wakes, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
 import { releaseIssueTask } from './github-issues';
 import { whileBusy } from './agent-install';
@@ -45,8 +45,26 @@ import {
   type PeerHealthState, type SyncRequest,
 } from '../src/browser/pacer';
 import { QuotaDrops, ReceiveQuota, type QuotaKind } from '../src/browser/quota';
+import {
+  SEALED_STATE_MAX_BYTES, canonicalJson, decodeAgentKeySecret, decryptRelayEnvelope, encodeAgentKeySecret, encryptRelayEnvelope,
+  exportRawPublicKey, generateEncKeyPair, hashRosterBody, importEncPrivateJwk, parseHostPin, sealAgentState,
+  signEncBinding, signRoster, stripHostPinFromFragment, unsealAgentState, verifyEncBinding, verifyRoster,
+  type AgentKeySecret, type DecryptedRelayEnvelope, type RelayEnvelope, type RelayLane, type RemovedRosterEntry,
+  type RosterBody, type RosterEntry, type SignedRoster,
+} from '../src/browser/relay-crypto';
+import { RelayClient, type RelayClientOptions } from '../src/browser/relay-client';
+import { RelayReplayGuard, type RelayReplayRecord } from '../src/browser/relay-replay';
 
-type Identity = { id: string; publicKey: string; privateJwk: JsonWebKey };
+export type AgentIdentity = {
+  id: string;
+  publicKey: string;
+  privateJwk: JsonWebKey;
+  encPublicKey: string;
+  encPrivateJwk: JsonWebKey;
+  encVersion: number;
+  encSig: string;
+};
+type Identity = AgentIdentity;
 type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody | ReactionBody | RetractBody; signature: string };
@@ -141,17 +159,21 @@ export function parseRoomUrl(url: string) {
   const match = /^\/r\/([a-f0-9-]{36})$/.exec(parsed.pathname);
   if (parsed.protocol !== 'https:' && !['127.0.0.1', 'localhost'].includes(parsed.hostname)) throw new Error('Use the HTTPS room link.');
   if (!match) throw new Error('Use a browser room link like https://host/r/<room id>.');
-  return { origin: parsed.origin, roomId: match[1] };
+  const hostPin = parseHostPin(parsed.hash);
+  return { origin: parsed.origin, roomId: match[1], ...(hostPin ? { hostPin } : {}) };
 }
 
-/** An agent connect link made by a person in the room: https://host/agent/<room>#<one-time token>. */
+/** An agent connect link made by a person in the room: https://host/agent/<room>#<one-time token>[&h=<hostPin>]. */
 export function parseConnectLink(link: string) {
   const url = new URL(link);
   const match = /^\/agent\/([a-f0-9-]{36})$/.exec(url.pathname);
-  const token = url.hash.slice(1);
+  const hostPin = parseHostPin(url.hash);
+  const token = stripHostPinFromFragment(url.hash);
   if (url.protocol !== 'https:' && !['127.0.0.1', 'localhost'].includes(url.hostname)) throw new Error('Use the HTTPS connect link.');
+  // A person pasted the room link they share with people: say what it is and where the agent's link comes from.
+  if (/^\/r\/[a-f0-9-]{36}$/.test(url.pathname)) throw new Error('This is a person invite (a /r/ room link), not an agent connect link. Ask for the agent connect link: in the room, choose Invite, then An AI agent.');
   if (!match || !/^[A-Za-z0-9_-]{32,64}$/.test(token)) throw new Error('This is not a Meshrooms agent connect link (https://host/agent/<room>#<token>).');
-  return { origin: url.origin, roomId: match[1], token };
+  return { origin: url.origin, roomId: match[1], token, ...(hostPin ? { hostPin } : {}) };
 }
 
 /** settings.json. `checkedAt`: when the runner last had them from the room service (this machine's clock). */
@@ -175,23 +197,86 @@ export function personStatusOf(next: RoomStatus, connected: string[], activity: 
   return { ...rest, ...(devices ? { devices: devices.map(({ session, ...d }) => ({ ...d, online: !!session })) } : {}), connected, activity };
 }
 
+type MemoryRoomState = {
+  messages: Stored[];
+  members: Members;
+  settings: RoomRules;
+  taskOps: StoredOp[];
+  boardSeq: number;
+  decisionOps: StoredDecisionOp[];
+  decisionSeq: number;
+  compactedDecisionIds: string[];
+  reactionOps: ReactionPacket[];
+  retractOps: RetractPacket[];
+  listenCursor?: ListenCursor;
+  activity?: Activity;
+};
+
+function emptyMemoryRoomState(): MemoryRoomState {
+  return {
+    messages: [],
+    members: { members: [], devices: [] },
+    settings: { floor: 'humans-first' as Floor },
+    taskOps: [],
+    boardSeq: 0,
+    decisionOps: [],
+    decisionSeq: 0,
+    compactedDecisionIds: [],
+    reactionOps: [],
+    retractOps: [],
+  };
+}
+
 /**
  * One agent's membership in one browser room, or (with `person`) one room of the machine's person device: the same
  * peer, store and runner, signing with the person's one key (`person.identityFile`) and speaking as a person, so the
  * agents' floor rules don't apply to what it sends.
+ *
+ * When constructed with `stateless` (from `MESHROOMS_AGENT_KEY`), all identity and room state stays strictly in memory
+ * and nothing is created or written on local disk.
  */
 export class BrowserAgent {
   readonly dir: string;
   readonly person: boolean;
+  readonly stateless: boolean;
+  readonly hostPin?: string;
   private readonly identityFile: string;
+  private readonly secret?: AgentKeySecret;
+  private readonly mem?: MemoryRoomState;
   private identity?: Identity;
   private key?: CryptoKey;
+  private encKey?: CryptoKey;
   /** `mkdir: false` only reads the room folder as it is (`bindings` lists rooms without changing them). */
-  constructor(dataDir: string, readonly origin: string, readonly roomId: string, options: { mkdir?: boolean; person?: { identityFile: string } } = {}) {
-    this.dir = resolve(dataDir, 'browser-agents', roomId);
+  constructor(dataDir: string, readonly origin: string, readonly roomId: string,
+    options: { mkdir?: boolean; person?: { identityFile: string }; stateless?: AgentKeySecret; hostPin?: string } = {}) {
+    this.stateless = !!options.stateless;
+    this.secret = options.stateless;
+    this.hostPin = options.hostPin ?? options.stateless?.hostPin;
+    this.dir = this.stateless ? '' : resolve(dataDir, 'browser-agents', roomId);
     this.person = !!options.person;
-    this.identityFile = options.person ? resolve(options.person.identityFile) : join(this.dir, 'identity.json');
-    if (options.mkdir !== false) for (const sub of ['outbox', 'files', 'wants', LIVE]) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
+    this.identityFile = this.stateless ? '' : options.person ? resolve(options.person.identityFile) : join(this.dir, 'identity.json');
+    if (this.stateless) {
+      this.mem = emptyMemoryRoomState();
+    } else if (options.mkdir !== false) {
+      for (const sub of ['outbox', 'files', 'wants', LIVE]) mkdirSync(join(this.dir, sub), { recursive: true, mode: 0o700 });
+    }
+  }
+  /** Constructs a stateless in-memory agent from `MESHROOMS_AGENT_KEY` without creating or writing any local files. */
+  static fromEnvSecret(secretB64: string, expectedRoomId?: string): BrowserAgent {
+    const secret = decodeAgentKeySecret(secretB64);
+    if (expectedRoomId && secret.roomId !== expectedRoomId) {
+      throw new Error(`MESHROOMS_AGENT_KEY is for room ${secret.roomId}, not ${expectedRoomId}.`);
+    }
+    return new BrowserAgent('', secret.origin, secret.roomId, { mkdir: false, stateless: secret, hostPin: secret.hostPin });
+  }
+  /** Hydrates in-memory room state for stateless (`MESHROOMS_AGENT_KEY`) runs. */
+  hydrateMemoryState(patch: Partial<MemoryRoomState>) {
+    if (!this.mem) return;
+    Object.assign(this.mem, patch);
+  }
+  /** Snapshot of in-memory room state for stateless (`MESHROOMS_AGENT_KEY`) runs. */
+  memoryState(): MemoryRoomState | undefined {
+    return this.mem;
   }
   private path(name: string) { return join(this.dir, name); }
   /**
@@ -259,17 +344,137 @@ export class BrowserAgent {
   }
   transfers(): Record<string, TransferState> { return readJson(this.path('transfers.json'), {}); }
   async ensureIdentity(): Promise<Identity> {
-    if (this.identity) return this.identity;
+    if (this.identity && this.key && this.encKey) return this.identity;
+    const signWith = async (ecdsaKey: CryptoKey, value: unknown) =>
+      b64(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, ecdsaKey, encode(value)));
+    if (this.secret) {
+      const signJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x: this.secret.signJwk.x, y: this.secret.signJwk.y, d: this.secret.signJwk.d };
+      const signPubJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x: this.secret.signJwk.x, y: this.secret.signJwk.y };
+      const encPubJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x: this.secret.encJwk.x, y: this.secret.encJwk.y };
+      const signKey = await crypto.subtle.importKey('jwk', signJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+      const signPubKey = await crypto.subtle.importKey('jwk', signPubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+      const publicKey = b64(await crypto.subtle.exportKey('raw', signPubKey));
+      const id = createHash('sha256').update(Buffer.from(publicKey, 'base64')).digest('hex');
+      const encKey = await importEncPrivateJwk(this.secret.encJwk, false);
+      const encPubKey = await crypto.subtle.importKey('jwk', encPubJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+      const encPublicKey = await exportRawPublicKey(encPubKey);
+      const encVersion = this.secret.encVersion;
+      const encSig = await signEncBinding(v => signWith(signKey, v), { room: this.roomId, deviceId: id, enc: encPublicKey, encVersion });
+      this.key = signKey;
+      this.encKey = encKey;
+      this.identity = { id, publicKey, privateJwk: signJwk, encPublicKey, encPrivateJwk: this.secret.encJwk, encVersion, encSig };
+      return this.identity;
+    }
     const file = this.identityFile;
     if (!existsSync(file)) {
       const keys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']) as CryptoKeyPair;
       const publicKey = b64(await crypto.subtle.exportKey('raw', keys.publicKey));
       const id = createHash('sha256').update(Buffer.from(publicKey, 'base64')).digest('hex');
-      writeFileSync(file, JSON.stringify({ id, publicKey, privateJwk: await crypto.subtle.exportKey('jwk', keys.privateKey) }), { mode: 0o600, flag: 'wx' });
+      const privateJwk = await crypto.subtle.exportKey('jwk', keys.privateKey);
+      const encKeys = await generateEncKeyPair(true);
+      const encPublicKey = await exportRawPublicKey(encKeys.publicKey);
+      const encPrivateJwk = await crypto.subtle.exportKey('jwk', encKeys.privateKey);
+      const encVersion = 1;
+      const encSig = await signEncBinding(v => signWith(keys.privateKey, v), {
+        room: this.person ? '*' : this.roomId,
+        deviceId: id,
+        enc: encPublicKey,
+        encVersion,
+      });
+      const created: Identity = { id, publicKey, privateJwk, encPublicKey, encPrivateJwk, encVersion, encSig };
+      writeFileSync(file, JSON.stringify(created), { mode: 0o600, flag: 'wx' });
     }
-    this.identity = JSON.parse(readFileSync(file, 'utf8'));
-    this.key = await crypto.subtle.importKey('jwk', this.identity!.privateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-    return this.identity!;
+    const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<Identity> & { id: string; publicKey: string; privateJwk: JsonWebKey };
+    const signKey = await crypto.subtle.importKey('jwk', raw.privateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+    let upgraded: Identity;
+    if (
+      typeof raw.encPublicKey === 'string' && raw.encPublicKey.length === 88
+      && raw.encPrivateJwk && typeof raw.encPrivateJwk.d === 'string'
+      && typeof raw.encVersion === 'number' && Number.isInteger(raw.encVersion) && raw.encVersion >= 1
+      && typeof raw.encSig === 'string' && raw.encSig.length === 88
+    ) {
+      upgraded = raw as Identity;
+    } else {
+      // Seamlessly upgrade legacy identity.json files with a separate persistent P-256 ECDH encryption keypair.
+      const encKeys = await generateEncKeyPair(true);
+      const encPublicKey = await exportRawPublicKey(encKeys.publicKey);
+      const encPrivateJwk = await crypto.subtle.exportKey('jwk', encKeys.privateKey);
+      const encVersion = 1;
+      const encSig = await signEncBinding(v => signWith(signKey, v), {
+        room: this.person ? '*' : this.roomId,
+        deviceId: raw.id,
+        enc: encPublicKey,
+        encVersion,
+      });
+      upgraded = { id: raw.id, publicKey: raw.publicKey, privateJwk: raw.privateJwk, encPublicKey, encPrivateJwk, encVersion, encSig };
+      replaceFile(file, JSON.stringify(upgraded));
+    }
+    this.identity = upgraded;
+    this.key = signKey;
+    this.encKey = await importEncPrivateJwk(upgraded.encPrivateJwk, false);
+    return this.identity;
+  }
+  /** Room-scoped `{ enc, encVersion, encSig }` binding signed by this device's ECDSA key. */
+  async encBinding(roomId = this.roomId): Promise<{ enc: string; encVersion: number; encSig: string }> {
+    const id = await this.ensureIdentity();
+    const encSig = await signEncBinding(v => this.sign(v), {
+      room: roomId,
+      deviceId: id.id,
+      enc: id.encPublicKey,
+      encVersion: id.encVersion,
+    });
+    return { enc: id.encPublicKey, encVersion: id.encVersion, encSig };
+  }
+  /** Decrypts an incoming E2E `RelayEnvelope` using this device's persistent ECDH private key. */
+  async decryptRelay<T = unknown>(
+    envelope: unknown,
+    options: { senderSignKey: string; minRosterVersion?: number; expectedFrom?: string },
+  ): Promise<DecryptedRelayEnvelope<T>> {
+    const id = await this.ensureIdentity();
+    return decryptRelayEnvelope<T>(envelope, {
+      room: this.roomId,
+      selfDeviceId: id.id,
+      selfEncPrivateKey: this.encKey!,
+      selfEncVersion: id.encVersion,
+      senderSignKey: options.senderSignKey,
+      minRosterVersion: options.minRosterVersion,
+      expectedFrom: options.expectedFrom,
+    });
+  }
+  /** Encrypts opaque agent state (<= 256 KB) to this device's own ECDH key for relay storage. */
+  async sealState(state: unknown): Promise<string> {
+    const id = await this.ensureIdentity();
+    return sealAgentState(state, this.encKey!, { room: this.roomId, deviceId: id.id });
+  }
+  /** Decrypts opaque agent state previously sealed by this device. */
+  async unsealState<T = unknown>(blob: string): Promise<T> {
+    const id = await this.ensureIdentity();
+    return unsealAgentState<T>(blob, this.encKey!, { room: this.roomId, deviceId: id.id });
+  }
+  /** Encodes this room agent's persistent identity as a `MESHROOMS_AGENT_KEY` secret value. */
+  async exportKeySecret(hostPin?: string): Promise<string> {
+    const id = await this.ensureIdentity();
+    const pin = hostPin ?? this.hostPin;
+    return encodeAgentKeySecret({
+      origin: this.origin,
+      roomId: this.roomId,
+      signJwk: id.privateJwk,
+      encJwk: id.encPrivateJwk,
+      encVersion: id.encVersion,
+      ...(pin ? { hostPin: pin } : {}),
+    });
+  }
+  /** Builds a `RelayClient` configured for this agent's device identity and room. */
+  async createRelayClient(options: Partial<RelayClientOptions> = {}): Promise<RelayClient> {
+    const id = await this.ensureIdentity();
+    return new RelayClient({
+      origin: this.origin,
+      roomId: this.roomId,
+      deviceId: id.id,
+      publicKey: id.publicKey,
+      sign: v => this.sign(v),
+      ...options,
+    });
   }
   async sign(value: unknown) {
     await this.ensureIdentity();
@@ -304,38 +509,54 @@ export class BrowserAgent {
     }
     return result;
   }
-  messages(): Stored[] { return readJson(this.path('messages.json'), []); }
-  members(): Members { return readJson(this.path('members.json'), { members: [], devices: [] }); }
+  messages(): Stored[] { return this.mem ? this.mem.messages : readJson(this.path('messages.json'), []); }
+  members(): Members { return this.mem ? this.mem.members : readJson(this.path('members.json'), { members: [], devices: [] }); }
   /** The room's rules as the host set them, copied from the room service by `run`. */
-  settings(): RoomRules { return readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
+  settings(): RoomRules { return this.mem ? this.mem.settings : readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
   /** Verified task operations in arrival order, each with the board cursor at which it arrived. */
-  taskOps(): StoredOp[] { return readJson<StoredOp[]>(this.path('tasks.json'), []).map((p, i) => ({ ...p, seq: p.seq ?? i + 1 })); }
+  taskOps(): StoredOp[] {
+    const raw = this.mem ? this.mem.taskOps : readJson<StoredOp[]>(this.path('tasks.json'), []);
+    return raw.map((p, i) => ({ ...p, seq: p.seq ?? i + 1 }));
+  }
   /** Arrivals so far. Compaction drops operations but never moves the cursor back, so later assignments still wake. */
-  boardCursor(ops = this.taskOps()) { return Math.max(readJson(this.path('board.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
+  boardCursor(ops = this.taskOps()) {
+    const seq = this.mem ? this.mem.boardSeq : readJson(this.path('board.json'), { seq: 0 }).seq;
+    return Math.max(seq, ops.at(-1)?.seq ?? 0);
+  }
   /** Verified decision and vote operations in arrival order, each with the decision cursor at which it arrived. */
-  decisionOps(): StoredDecisionOp[] { return readJson<StoredDecisionOp[]>(this.path('decisions.json'), []); }
+  decisionOps(): StoredDecisionOp[] { return this.mem ? this.mem.decisionOps : readJson<StoredDecisionOp[]>(this.path('decisions.json'), []); }
   /** Arrivals so far; compaction drops votes but never moves the cursor back, so later wakes still fire. */
   /** Ids of this agent's own decision changes that compaction dropped, so a retried request is never signed twice. */
-  compactedDecisionIds(): Set<string> { return new Set(readJson<string[]>(this.path('decisions-done.json'), [])); }
+  compactedDecisionIds(): Set<string> { return new Set(this.mem ? this.mem.compactedDecisionIds : readJson<string[]>(this.path('decisions-done.json'), [])); }
   /** Whether this device already made the change with that request id: still in the log, or dropped by compaction since. */
   madeDecisionOp(id: string, ops = this.decisionOps()) { return ops.some(p => p.body.id === id) || this.compactedDecisionIds().has(id); }
-  decisionCursor(ops = this.decisionOps()) { return Math.max(readJson(this.path('decisions-cursor.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0); }
+  decisionCursor(ops = this.decisionOps()) {
+    const seq = this.mem ? this.mem.decisionSeq : readJson(this.path('decisions-cursor.json'), { seq: 0 }).seq;
+    return Math.max(seq, ops.at(-1)?.seq ?? 0);
+  }
   /** The room's decisions as every device folds them; people's votes count, agents' are advice. */
   decisions(ops = this.decisionOps()): Decision[] {
     const { ownerId, members, former } = this.members();
     return foldDecisions(ops.map(p => p.body), { ownerId, members, former });
   }
   /** Verified reaction operations this device holds (only for messages it also holds). */
-  reactionOps(): ReactionPacket[] { return readJson(this.path('reactions.json'), []); }
+  reactionOps(): ReactionPacket[] { return this.mem ? this.mem.reactionOps : readJson(this.path('reactions.json'), []); }
   reactionChips() { return foldReactions(this.reactionOps().map(p => p.body)); }
   /** Verified retractions, including those of messages this device doesn't hold (yet, or any more). */
-  retractOps(): RetractPacket[] { return readJson(this.path('retractions.json'), []); }
+  retractOps(): RetractPacket[] { return this.mem ? this.mem.retractOps : readJson(this.path('retractions.json'), []); }
   /** Where a plain `listen` continues from: the cursors the last `listen` returned. */
   listenCursor(): ListenCursor | undefined {
-    const c = readJson<Partial<ListenCursor> | undefined>(this.live(LISTEN_CURSOR), undefined), n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+    const c = this.mem ? this.mem.listenCursor : readJson<Partial<ListenCursor> | undefined>(this.live(LISTEN_CURSOR), undefined);
+    const n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
     return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
   }
   saveListenCursor(cursor: ListenCursor, expected?: string, options: { monotonic?: boolean } = {}) {
+    if (this.mem) {
+      const current = this.listenCursor();
+      if (expected !== undefined && JSON.stringify(current ?? null) !== expected) return false;
+      this.mem.listenCursor = cursor;
+      return true;
+    }
     mkdirSync(join(this.dir, LIVE), { recursive: true, mode: 0o700 });
     const lock = join(this.dir, LIVE, 'listen-cursor.lock');
     if (!tryLock(lock, 'the listen cursor', undefined, { maxAgeMs: 30_000 })) throw new Error('The listen cursor is busy. Try again.');
@@ -364,23 +585,34 @@ export class BrowserAgent {
     } finally { try { unlinkSync(lock); } catch { /* Released already. */ } }
   }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
-  activity(): Activity | undefined { const a = readJson<unknown>(this.live('activity.json'), undefined); return validActivity(a) ? a : undefined; }
+  activity(): Activity | undefined {
+    const a = this.mem ? this.mem.activity : readJson<unknown>(this.live('activity.json'), undefined);
+    return validActivity(a) ? a : undefined;
+  }
   /** A change of state starts a new `since` and drops the note, which described the previous state. */
   recordActivity(state: Activity['state'], on?: ActivityOn, now = Date.now()) {
     const current = this.activity(), same = current?.state === state;
     const messages = on?.messages?.length ? { messages: on.messages } : {}, tasks = on?.tasks?.length ? { tasks: on.tasks } : {};
     const next: Activity = { state, since: same ? current!.since : now, heartbeat: now,
       ...(state === 'working' && (messages.messages || tasks.tasks) ? { on: { ...messages, ...tasks } } : {}), ...(same && current!.note ? { note: current!.note } : {}) };
+    if (this.mem) { this.mem.activity = next; return next; }
     writeJson(join(this.dir, LIVE, 'activity.json'), next); return next;
   }
   /** The agent is still at it: refresh the heartbeat without changing what it is doing. */
-  touchActivity(now = Date.now()) { const current = this.activity(); if (current) writeJson(join(this.dir, LIVE, 'activity.json'), { ...current, heartbeat: now }); }
+  touchActivity(now = Date.now()) {
+    const current = this.activity();
+    if (!current) return;
+    const next = { ...current, heartbeat: now };
+    if (this.mem) { this.mem.activity = next; return; }
+    writeJson(join(this.dir, LIVE, 'activity.json'), next);
+  }
   /** Set (or clear, with an empty note) the agent's note. Before any `listen`, a note means it is working. */
   noteActivity(note: string, now = Date.now()) {
     const text = note.trim();
     if (text && !validNote(text)) throw new Error('Keep the note to one line of up to 140 characters.');
     const { note: _, ...current } = this.activity() ?? { state: 'working' as const, since: now, heartbeat: now };
     const next: Activity = { ...current, heartbeat: now, ...(text ? { note: text } : {}) };
+    if (this.mem) { this.mem.activity = next; return next; }
     writeJson(join(this.dir, LIVE, 'activity.json'), next); return next;
   }
 
@@ -724,6 +956,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     createPeerConnection?: (config: { iceServers: { urls: string; username?: string; credential?: string }[]; iceTransportPolicy?: 'all' | 'relay' }) => RTCPeerConnection;
     /** Where network interfaces are listed (node:os); tests pass one that fails. */
     interfaces?: { networkInterfaces: typeof import('node:os').networkInterfaces };
+    /** Disable or customize the optional WSS+HTTPS relay client (enabled automatically when `status.relayUrl` is advertised). */
+    relay?: boolean;
+    relayOptions?: Partial<RelayClientOptions>;
+    /** Expected host key pin prefix (`#h=...`); falls back to `agent.hostPin` or `room.json`'s `hostPin`. */
+    hostPin?: string;
+    /** Optional abort signal for graceful shutdown. */
+    signal?: AbortSignal;
   } = {}) {
   const deadlines: PassDeadlines = { ...PASS_DEADLINES, ...options.deadlines }, pause = options.pause ?? ((ms: number) => Bun.sleep(ms));
   const now = options.now ?? (() => Date.now()), gatherMs = options.gatherMs ?? 1500;
@@ -745,6 +984,21 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const session = randomUUID(); const peers = new Map<string, Peer>();
   let status: RoomStatus | undefined; let epoch = ''; let cursor = 0;
   let iceServers: RTCIceServer[] = []; let iceKey = '[]';
+  let verifiedRoster: SignedRoster | undefined;
+  /** Highest version of a HOST-SIGNED roster this loop verified. Never raised from envelope metadata. */
+  let highestRosterVersion = 0;
+  // Relay envelopes already processed (sender + id): persisted so a restart cannot be replayed, with a memory-only record for file chunks and activity.
+  const relaySeenFile = join(agent.dir, 'relay-seen.json');
+  const relaySeen = RelayReplayGuard.from(readJson<unknown>(relaySeenFile, undefined));
+  const relaySeenVolatile = new RelayReplayGuard(8192, 4096);
+  const relayInflight = new Set<string>();
+  let pinnedHost: string | undefined = options.hostPin ?? agent.hostPin ?? (() => {
+    try { return (JSON.parse(readFileSync(join(agent.dir, 'room.json'), 'utf8')) as { hostPin?: string }).hostPin; } catch { return undefined; }
+  })();
+  let relayClient: RelayClient | undefined;
+  const relaySent = new Map<string, number>();
+  let lastEncPublishAt = 0;
+  let lastRosterPublishAt = 0;
   const retiredUfrags = new Map<string, Set<string>>();
   let pollBackoff = 0;
   let serial: Promise<unknown> = Promise.resolve();
@@ -886,10 +1140,79 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const referenced = () => referencedCache ??= new Map(agent.messages().flatMap(m => m.packet.body.attachments || []).map(ref => [ref.sha256, ref]));
   const fileWantLimiter = new FileWantLimiter();
   let transfersDirty = true;
+  const hasLiveWebRtc = (id: string) => {
+    const p = peers.get(id);
+    return !!p && isLiveOpenPeer(p.pc.connectionState, p.pc.iceConnectionState, p.channel?.readyState);
+  };
+  const signerFor = (deviceId: unknown, at: unknown, fromRelay: boolean): { publicKey: string; memberId: string } | undefined => {
+    if (verifiedRoster) {
+      const active = verifiedRoster.body.devices.find(d => d.id === deviceId);
+      if (active) return { publicKey: active.sign, memberId: active.memberId };
+      const removed = verifiedRoster.body.removed.find(r => r.id === deviceId);
+      if (removed?.revoked) return undefined;
+      if (fromRelay) {
+        const former = status?.formerDevices?.find(d => d.id === deviceId);
+        if (!former || former.revoked) return undefined;
+        return former.retiredAt === undefined || (typeof at === 'number' && at <= former.retiredAt) ? former : undefined;
+      }
+    }
+    if (fromRelay) return undefined;
+    return signerOf(status, deviceId, at);
+  };
+  const relayRecipients = (targetIds?: readonly string[]): RosterEntry[] => {
+    if (!verifiedRoster) return [];
+    const filter = targetIds ? new Set(targetIds) : undefined;
+    return verifiedRoster.body.devices.filter(entry =>
+      entry.id !== identity.id
+      && (!filter || filter.has(entry.id))
+      && !hasLiveWebRtc(entry.id));
+  };
+  const sendViaRelay = (packet: unknown, lane: RelayLane, targetIds?: readonly string[]) => {
+    if (!relayClient || !verifiedRoster) return;
+    const recipients = relayRecipients(targetIds);
+    if (!recipients.length) return;
+    const meta = lane === 'primary'
+      ? computeRelayWakeMeta(packet, recipients, verifiedRoster, status, readMessages(), now)
+      : {};
+    try {
+      relayClient.enqueuePacket(packet, {
+        rosterVersion: verifiedRoster.body.version,
+        lane,
+        recipients,
+        ...meta,
+      });
+    } catch (error) {
+      log(`relay enqueue (${lane}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const relayFileChannel = (targetId: string) => ({
+    get readyState() { return relayClient?.isConnected() ? 'open' : 'closed'; },
+    get bufferedAmount() { return relayClient?.currentFileInFlightBytes ?? 0; },
+    send(data: string) {
+      try { sendViaRelay(JSON.parse(data), 'file', [targetId]); } catch { /* Ignore unparseable data. */ }
+    },
+  }) as unknown as RTCDataChannel;
   const transfers = new FileTransfers({ roomId: agent.roomId, store: agent.files, referenced: sha => referenced().get(sha), now,
-    channel: id => { const p = peers.get(id); return p?.fileChannel?.readyState === 'open' ? p.fileChannel : p?.channel; },
+    channel: id => {
+      const p = peers.get(id);
+      if (p?.fileChannel?.readyState === 'open') return p.fileChannel;
+      if (p?.channel?.readyState === 'open') return p.channel;
+      if (relayClient?.isConnected() && verifiedRoster?.body.devices.some(d => d.id === id)) return relayFileChannel(id);
+      return undefined;
+    },
     changed: () => { transfersDirty = true; },
-    peers: () => [...peers].filter(([id, p]) => (p.fileChannel?.readyState === 'open' || p.channel?.readyState === 'open') && status?.devices?.some(d => d.id === id)).map(([id]) => id) });
+    peers: () => {
+      const set = new Set<string>();
+      for (const [id, p] of peers) {
+        if ((p.fileChannel?.readyState === 'open' || p.channel?.readyState === 'open') && status?.devices?.some(d => d.id === id)) set.add(id);
+      }
+      if (relayClient?.isConnected() && verifiedRoster) {
+        for (const entry of verifiedRoster.body.devices) {
+          if (entry.id !== identity.id && status?.devices?.some(d => d.id === entry.id && d.session)) set.add(entry.id);
+        }
+      }
+      return [...set];
+    } });
   const retractions = retractionLog(agent, () => status, save, released => {
     const gone = new Set(released);
     transfers.keep(sha => !gone.has(sha));
@@ -963,13 +1286,37 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   prove();
   const ticking = setInterval(() => { if (sleeping) loopAt = Date.now(); prove(); activity.tick(); }, 1000);
 
-  const flush = () => flushOutbox(agent.messages(), identity.id, peers, log);
-  /** Send one signed operation to every open channel; a failing channel gets it again in the next exchange. */
+  const flush = () => {
+    const messages = agent.messages();
+    const at = Date.now();
+    // WebRTC-first: send directly on live open WebRTC DataChannels.
+    flushOutbox(messages, identity.id, peers, log, at);
+    // Relay fallback: only for verified-roster targets that do NOT have a live WebRTC channel.
+    if (relayClient?.isConnected() && verifiedRoster) {
+      let sent = 0;
+      for (const m of messages) {
+        if (sent >= 16) break;
+        const messageId = m.packet.body.id;
+        if (m.packet.body.deviceId !== identity.id) continue;
+        if (at - (relaySent.get(messageId) ?? 0) < 5000) continue;
+        const pending = m.targets.filter(id => !m.receipts.includes(id));
+        if (!pending.length) continue;
+        const recipients = relayRecipients(pending);
+        if (!recipients.length) continue;
+        sendViaRelay(m.packet, 'primary', recipients.map(r => r.id));
+        relaySent.set(messageId, at);
+        sent++;
+      }
+      if (relaySent.size > 4096) relaySent.clear();
+    }
+  };
+  /** Send one signed operation to every open WebRTC channel AND via E2E relay to non-WebRTC verified-roster peers. */
   const broadcast = (packet: unknown) => {
     const text = JSON.stringify(packet);
-    for (const [id, peer] of peers) if (peer.channel?.readyState === 'open') {
+    for (const [id, peer] of peers) if (hasLiveWebRtc(id) && peer.channel?.readyState === 'open') {
       try { peer.channel.send(text); } catch (error) { log(`send to ${id.slice(0, 8)} failed: ${(error as Error).message}`); }
     }
+    sendViaRelay(packet, 'primary');
   };
   /** This agent's board, decisions and reactions, paced onto the peer's channel (on open, and when it asks again). */
   const sendState = (peer: Peer) => {
@@ -1027,50 +1374,106 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     set.add(ufrag);
     if (set.size > 32) set.delete(set.values().next().value!);
   };
-  const attachMessageHandler = (peer: Peer, id: string, channel: RTCDataChannel) => {
-    const incoming = (packet: Packet) => transaction(async () => {
-      if (peers.get(id) !== peer) return;
-      const device = status?.devices?.find(d => d.id === id); if (!device) return;
+  const sendReceipt = async (toId: string, messageId: string, channel?: RTCDataChannel) => {
+    const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: messageId, deviceId: identity.id };
+    const signed = { body: receipt, signature: await agent.sign(receipt) };
+    if (channel && channel.readyState === 'open') {
+      try { channel.send(JSON.stringify(signed)); return; } catch { /* Fall through to relay. */ }
+    }
+    const peer = peers.get(toId);
+    if (hasLiveWebRtc(toId) && peer?.channel?.readyState === 'open') {
+      try { peer.channel.send(JSON.stringify(signed)); return; } catch { /* Fall through to relay. */ }
+    }
+    sendViaRelay(signed, 'primary', [toId]);
+  };
+  const handlePacket = (
+    id: string,
+    packet: Packet,
+    fromRelay: boolean,
+    peer?: Peer,
+    channel?: RTCDataChannel,
+    relayMeta?: { cursor?: number; replay?: { from: string; id: string } },
+  ): Promise<void> | undefined => {
+    // File transfers bypass the serialized queue: chunks arrive by the hundred and are cheap to check.
+    if (isFilePacket(packet)) {
+      const authorized = fromRelay
+        ? !!verifiedRoster?.body.devices.some(d => d.id === id)
+        : peers.get(id) === peer && !!status?.devices?.some(d => d.id === id);
+      if (authorized) {
+        if ((packet as { kind?: unknown }).kind === 'file-want' && !fileWantLimiter.take(id)) {
+          if (fileWantLimiter.report(id)) log(`over file-want quota: dropping file-want packets from ${id.slice(0, 8)}`);
+          return;
+        }
+        transfers.handle(id, packet);
+        if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
+      }
+      return;
+    }
+    // For people's rosters; agents learn nothing from each other's activity. A person device keeps it for its page.
+    if (isActivityPacket(packet)) {
+      const authorized = fromRelay ? !!verifiedRoster?.body.devices.some(d => d.id === id) : peers.get(id) === peer;
+      if (agent.person && authorized && validActivityPacket(packet, agent.roomId)) heard.set(id, receiveActivity(packet));
+      if (authorized && relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
+      return;
+    }
+    // Cheap and never queued: answered from the loop, at most once per interval.
+    if (isSyncRequest(packet, agent.roomId)) {
+      if (!fromRelay && peer && peers.get(id) === peer && status?.devices?.some(d => d.id === id)) { peer.resync.request(); resyncDue(peer); }
+      return;
+    }
+    if (!gate.admit(id)) {
+      if (Date.now() - droppedLogged > 60_000) { log(`incoming backlog full: dropping packets from ${id.slice(0, 8)}; will ask for its state again`); droppedLogged = Date.now(); }
+      return;
+    }
+    return transaction(async () => {
+      if (!fromRelay && peer && peers.get(id) !== peer) return false;
+      const device = fromRelay
+        ? (() => {
+            const entry = verifiedRoster?.body.devices.find(d => d.id === id);
+            return entry ? { id: entry.id, publicKey: entry.sign, memberId: entry.memberId } : undefined;
+          })()
+        : status?.devices?.find(d => d.id === id);
+      if (!device) return false;
       const sync = packet as unknown as BoardSync;
-      if (sync?.kind === 'board') { if (sync.roomId === agent.roomId && Array.isArray(sync.ops) && sync.ops.length <= 500) await acceptOps(sync.ops); return; }
+      if (sync?.kind === 'board') { if (sync.roomId === agent.roomId && Array.isArray(sync.ops) && sync.ops.length <= 500) await acceptOps(sync.ops); return true; }
       if ((packet?.body as { kind?: string })?.kind === 'task') {
-        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return false;
         if (!fresh(readTaskOps(), packet) || allowed(device.memberId, 'task', id)) await acceptOps([packet]);
-        return;
+        return true;
       }
       const decisions = packet as unknown as DecisionSync;
-      if (decisions?.kind === 'decisions') { if (decisions.roomId === agent.roomId && Array.isArray(decisions.ops) && decisions.ops.length <= 500) await acceptDecisionOps(decisions.ops); return; }
+      if (decisions?.kind === 'decisions') { if (decisions.roomId === agent.roomId && Array.isArray(decisions.ops) && decisions.ops.length <= 500) await acceptDecisionOps(decisions.ops); return true; }
       if (['decision', 'vote'].includes((packet?.body as { kind?: string })?.kind ?? '')) {
-        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return false;
         if (!fresh(readDecisionOps(), packet) || allowed(device.memberId, 'decision', id)) await acceptDecisionOps([packet]);
-        return;
+        return true;
       }
       const reactions = packet as unknown as { kind?: string; roomId?: string; ops?: unknown };
-      if (reactions?.kind === 'reactions') { if (reactions.roomId === agent.roomId && Array.isArray(reactions.ops) && reactions.ops.length <= 500) await acceptReactions(reactions.ops); return; }
+      if (reactions?.kind === 'reactions') { if (reactions.roomId === agent.roomId && Array.isArray(reactions.ops) && reactions.ops.length <= 500) await acceptReactions(reactions.ops); return true; }
       if ((packet?.body as { kind?: string })?.kind === 'reaction') {
-        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return false;
         if (!fresh([...readReactionOps(), ...pendingReactions], packet) || allowed(device.memberId, 'reaction', id)) await acceptReactions([packet]);
-        return;
+        return true;
       }
       const retracted = packet as unknown as RetractionSync;
-      if (retracted?.kind === 'retractions') { if (retracted.roomId === agent.roomId && Array.isArray(retracted.ops) && retracted.ops.length <= 500) await retractions.accept(retracted.ops); return; }
+      if (retracted?.kind === 'retractions') { if (retracted.roomId === agent.roomId && Array.isArray(retracted.ops) && retracted.ops.length <= 500) await retractions.accept(retracted.ops); return true; }
       if ((packet?.body as { kind?: string })?.kind === 'retract') {
-        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return;
+        if ((packet?.body as { deviceId?: string })?.deviceId !== id) return false;
         if (!fresh(readRetractOps(), packet) || allowed(device.memberId, 'retract', id)) await retractions.accept([packet]);
-        return;
+        return true;
       }
       const b = packet?.body;
       if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
-        || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return;
+        || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return false;
       if (b.kind === 'message') {
-        if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > MAX_TIME) return;
-        if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !/^[a-f0-9-]{36}$/.test(b.replyTo))) return;
-        if (b.attachments !== undefined && !validAttachments(b.attachments)) return;
+        if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > MAX_TIME) return false;
+        if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !/^[a-f0-9-]{36}$/.test(b.replyTo))) return false;
+        if (b.attachments !== undefined && !validAttachments(b.attachments)) return false;
         const messages = readMessages(); const existing = messages.find(m => m.packet.body.id === b.id);
         // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
-        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return;
+        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return false;
         // Over quota: not stored and not confirmed, so its sender retries later.
-        if (!existing && !allowed(device.memberId, 'message', id)) return;
+        if (!existing && !allowed(device.memberId, 'message', id)) return false;
         // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
         if (!existing) {
           const arrived = retractions.arriving({ packet: packet as Stored['packet'], targets: [], receipts: [] });
@@ -1079,36 +1482,56 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             else flushPendingReactions(b.id);
           }
         }
-        const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: b.id, deviceId: identity.id };
-        if (channel.readyState === 'open') channel.send(JSON.stringify({ body: receipt, signature: await agent.sign(receipt) }));
+        await sendReceipt(id, b.id, fromRelay ? undefined : channel);
+        return true;
       } else if (b.kind === 'receipt') {
         const messages = readMessages(); const m = messages.find(m => m.packet.body.id === b.id && m.packet.body.deviceId === identity.id);
         if (m?.targets.includes(id) && !m.receipts.includes(id)) save(messages.map(x => x === m ? { ...x, receipts: [...x.receipts, id] } : x));
+        return true;
       }
-    });
+      return false;
+    }).then(persisted => {
+      if (!persisted) return;
+      // Persist the replay guard BEFORE acknowledging the inbox cursor so a crash cannot allow a replay.
+      if (relayMeta?.replay && relaySeen.add(relayMeta.replay.from, relayMeta.replay.id)) writeJson(relaySeenFile, relaySeen.export());
+      if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
+    }).catch(error => log(`incoming: ${error.message}`)).finally(() => { for (const from of gate.done()) requestSync(from); });
+  };
+  const handleRelayEnvelope = async (envelope: RelayEnvelope, envCursor?: number) => {
+    if (!verifiedRoster || envelope.from === identity.id) return;
+    const sender = verifiedRoster.body.devices.find(d => d.id === envelope.from);
+    if (!sender) return;
+    const key = `${envelope.from}:${envelope.id}`;
+    // A repeat of something already processed and persisted: drop it, and let the inbox copy be acknowledged.
+    if (relaySeen.seen(envelope.from, envelope.id) || relaySeenVolatile.seen(envelope.from, envelope.id)) {
+      if (envCursor !== undefined) relayClient?.ackCursor(envCursor);
+      return;
+    }
+    if (relayInflight.has(key)) return;
+    let decrypted: DecryptedRelayEnvelope<unknown>;
+    try {
+      // Do NOT reject legitimate inbox/in-flight frames encrypted under an earlier roster version. The envelope's roster
+      // version is sender-chosen metadata and never moves `highestRosterVersion`; the sender signature is checked against the roster key.
+      decrypted = await agent.decryptRelay(envelope, { senderSignKey: sender.sign });
+    } catch {
+      return;
+    }
+    if (!decrypted.packet || typeof decrypted.packet !== 'object') return;
+    const packet = decrypted.packet as Packet;
+    if (isFilePacket(packet) || isActivityPacket(packet)) {
+      if (!relaySeenVolatile.add(envelope.from, envelope.id)) return;
+      handlePacket(envelope.from, packet, true, undefined, undefined, { cursor: envCursor });
+      return;
+    }
+    relayInflight.add(key);
+    const done = handlePacket(envelope.from, packet, true, undefined, undefined, { cursor: envCursor, replay: { from: envelope.from, id: envelope.id } });
+    void Promise.resolve(done).finally(() => relayInflight.delete(key));
+  };
+  const attachMessageHandler = (peer: Peer, id: string, channel: RTCDataChannel) => {
     channel.onMessage?.subscribe(raw => {
       const text = raw.toString(); if (text.length > 20_000) return;
       let packet: Packet; try { packet = JSON.parse(text); } catch { return; }
-      // File transfers bypass the serialized queue: chunks arrive by the hundred and are cheap to check.
-      if (isFilePacket(packet)) {
-        if (peers.get(id) === peer && status?.devices?.some(d => d.id === id)) {
-          if ((packet as { kind?: unknown }).kind === 'file-want' && !fileWantLimiter.take(id)) {
-            if (fileWantLimiter.report(id)) log(`over file-want quota: dropping file-want packets from ${id.slice(0, 8)}`);
-            return;
-          }
-          transfers.handle(id, packet);
-        }
-        return;
-      }
-      // For people's rosters; agents learn nothing from each other's activity. A person device keeps it for its page.
-      if (isActivityPacket(packet)) { if (agent.person && peers.get(id) === peer && validActivityPacket(packet, agent.roomId)) heard.set(id, receiveActivity(packet)); return; }
-      // Cheap and never queued: answered from the loop, at most once per interval.
-      if (isSyncRequest(packet, agent.roomId)) { if (peers.get(id) === peer && status?.devices?.some(d => d.id === id)) { peer.resync.request(); resyncDue(peer); } return; }
-      if (!gate.admit(id)) {
-        if (Date.now() - droppedLogged > 60_000) { log(`incoming backlog full: dropping packets from ${id.slice(0, 8)}; will ask for its state again`); droppedLogged = Date.now(); }
-        return;
-      }
-      void incoming(packet).catch(error => log(`incoming: ${error.message}`)).finally(() => { for (const from of gate.done()) requestSync(from); });
+      handlePacket(id, packet, false, peer, channel);
     });
   };
   const connectChannel = (peer: Peer, id: string, channel: RTCDataChannel) => {
@@ -1202,7 +1625,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     }
   };
   /** Every peer, as the room closes or runner stops; waits for the closes at most `deadlines.close`. */
-  const retireAll = () => within(Promise.allSettled([...peers].map(([id, peer]) => retire(id, peer))), deadlines.close);
+  const retireAll = () => {
+    if (relayClient) { relayClient.stop(); relayClient = undefined; }
+    return within(Promise.allSettled([...peers].map(([id, peer]) => retire(id, peer))), deadlines.close);
+  };
   /**
    * One step of the pass, waited on for at most `ms`. A step still running from an earlier pass is neither started again
    * nor waited on again: the outbox and closing decisions then never run twice at once, so nothing is signed or sent
@@ -1372,8 +1798,91 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     }
   };
   let pruned = 0;
+  const syncRosterAndRelay = async (next: RoomStatus) => {
+    // 1. Verify incoming host-signed roster (rejecting rollbacks & substituted keys).
+    if (next.roster) {
+      const same = verifiedRoster && next.roster.body.version === verifiedRoster.body.version && next.roster.signature === verifiedRoster.signature;
+      if (!same && next.roster.body.version > (verifiedRoster?.body.version ?? 0) && next.roster.body.version >= highestRosterVersion) {
+        const consecutive = !!verifiedRoster && next.roster.body.version === verifiedRoster.body.version + 1;
+        const minVersion = Math.max(highestRosterVersion, verifiedRoster ? verifiedRoster.body.version + 1 : 0);
+        const verified = await verifyRoster(next.roster, {
+          roomId: agent.roomId,
+          expectedHostPin: pinnedHost,
+          ...(consecutive ? { previous: verifiedRoster } : {}),
+          ...(minVersion > 0 ? { minVersion } : {}),
+        });
+        if (verified.ok) {
+          verifiedRoster = next.roster;
+          highestRosterVersion = Math.max(highestRosterVersion, next.roster.body.version);
+          pinnedHost = verified.hostDeviceId;
+        } else {
+          log(`roster rejected: ${verified.reason}`);
+        }
+      }
+    }
+    // 2. Publish this device's ECDH key binding if missing or rotated on a relay-capable coordinator.
+    const selfDev = next.devices?.find(d => d.id === identity.id);
+    if ((next.relayUrl || next.roster) && next.memberId && selfDev && (!selfDev.enc || selfDev.enc !== identity.encPublicKey || selfDev.encVersion !== identity.encVersion) && now() - lastEncPublishAt >= 5_000) {
+      lastEncPublishAt = now();
+      try {
+        const binding = await agent.encBinding();
+        await agent.command('profile', binding);
+      } catch (error) {
+        log(`enc publish: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    // 3. When this device is a host device, publish host-signed monotonic SignedRoster on changes.
+    if (agent.person && next.memberId && next.ownerId === next.memberId && selfDev?.enc && selfDev.encVersion && selfDev.encSig && now() - lastRosterPublishAt >= 2_000) {
+      const canPublish = !verifiedRoster || verifiedRoster.body.host === identity.id
+        || !next.devices?.some(d => d.id === verifiedRoster!.body.host && d.memberId === next.ownerId);
+      if (canPublish) {
+        const built = await buildNextHostRoster(next, identity.id, verifiedRoster, v => agent.sign(v), now());
+        if (built) {
+          lastRosterPublishAt = now();
+          try {
+            const updated = await agent.command('roster-publish', { roster: built });
+            const check = await verifyRoster(updated?.roster ?? built, {
+              roomId: agent.roomId,
+              expectedHostPin: pinnedHost,
+              previous: verifiedRoster,
+            });
+            if (check.ok) {
+              verifiedRoster = updated?.roster ?? built;
+              highestRosterVersion = Math.max(highestRosterVersion, verifiedRoster!.body.version);
+              pinnedHost = check.hostDeviceId;
+            }
+          } catch (error) {
+            log(`roster publish: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+    }
+    // 4. Start optional WSS+HTTPS relay client when advertised.
+    if (options.relay !== false && next.relayUrl && next.memberId && !relayClient) {
+      relayClient = await agent.createRelayClient({
+        relayUrl: next.relayUrl,
+        session,
+        rosterVersion: () => verifiedRoster?.body.version ?? 1,
+        onEnvelope: (envelope, meta) => handleRelayEnvelope(envelope, meta.cursor),
+        onStateChange: state => {
+          if (state === 'wss' || state === 'https') {
+            syncedAt ??= Date.now();
+            flush();
+          }
+        },
+        onError: err => log(`relay: ${err.message}`),
+        onAuthError: (code, msg) => {
+          log(`relay auth (${code}): ${msg}`);
+          relayClient?.stop();
+          relayClient = undefined;
+        },
+        ...options.relayOptions,
+      });
+      relayClient.start();
+    }
+  };
   log(`bridge running as device ${identity.id.slice(0, 12)} in ${agent.roomId}`);
-  while (true) {
+  while (!options.signal?.aborted) {
     loopAt = Date.now();
     // A step that never finishes holds the serialized work (incoming packets, the outbox) behind it: the runner would
     // stay present but deaf. It stops instead, so whoever owns the runner starts a fresh one.
@@ -1448,6 +1957,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         }
       }
       epoch = next.epoch; status = next;
+      await step('relay', () => syncRosterAndRelay(next), left(deadlines.profile));
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
@@ -1567,6 +2077,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     sleeping = true;
     try { await pause(pollBackoff || 1000); } finally { sleeping = false; }
   }
+  clearInterval(ticking);
+  await retireAll();
 }
 
 /**
@@ -2008,4 +2520,754 @@ function superseded(agent: BrowserAgent, decisionId: string, me: string | undefi
   const decision = pickDecision(agent.decisions(), decisionId, me);
   return { status: 'superseded', reason: 'This change was made earlier and a later change of yours has replaced it; nothing was signed again.',
     decision: decision ? describeDecision(agent, decision) : null };
+}
+
+/**
+ * Computes `{ wake, hold }` metadata for a primary-lane relay envelope using the room's standard wake rules
+ * (`wakes`, `mentionedIds`, `authorWakes`, `assignmentWakes`, `floor`, `agentAssignmentsWake`).
+ */
+export function computeRelayWakeMeta(
+  packet: unknown,
+  recipients: readonly RosterEntry[],
+  roster: SignedRoster,
+  status: RoomStatus | undefined,
+  messages: Stored[],
+  now: () => number = () => Date.now(),
+): { wake?: string[]; hold?: true } {
+  const senderId = (packet as { body?: { deviceId?: string } } | null)?.body?.deviceId;
+  const selfWakeable = !!(senderId && roster.body.devices.find(d => d.id === senderId)?.wakeable);
+  const anyRecipientWakeable = recipients.some(r => r.wakeable === true);
+  const hold = selfWakeable || anyRecipientWakeable ? true as const : undefined;
+  const wakeableAgents = recipients.filter(r => r.wakeable === true && r.role === 'agent');
+  if (!wakeableAgents.length || !status?.members) return hold ? { hold } : {};
+
+  const participants: Participant[] = status.members.map(m => ({
+    id: m.id, name: m.name, role: m.role ?? 'human', state: 'remote', detail: '',
+    ...(m.operatorId ? { operatorId: m.operatorId } : {}),
+  }));
+  const floor = status.settings?.floor ?? 'humans-first';
+  const agentAssignmentsWake = !!status.settings?.agentAssignmentsWake;
+  const history: Message[] = messages.map(({ packet: { body }, retracted }) => {
+    const author = participants.find(p => p.id === body.memberId);
+    const text = retracted ? 'Message deleted' : shownText(body);
+    const mentions = mentionedIds(text, participants);
+    return {
+      id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human',
+      text, time: safeIso(body.at),
+      ...(retracted ? { deleted: true } : {}),
+      ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+      ...(mentions.length ? { mentions } : {}),
+    };
+  });
+  const roomView = { floor, agentAssignmentsWake, participants, messages: history };
+  const body = (packet as { body?: Record<string, unknown> } | null)?.body;
+  if (!body || typeof body !== 'object') return hold ? { hold } : {};
+
+  const wake = new Set<string>();
+  if (body.kind === 'message' && typeof body.text === 'string' && typeof body.memberId === 'string' && typeof body.id === 'string') {
+    const author = participants.find(p => p.id === body.memberId);
+    const mentions = mentionedIds(body.text, participants);
+    const msg: Message = {
+      id: body.id,
+      authorId: body.memberId,
+      author: author?.name ?? 'Member',
+      role: author?.role ?? 'human',
+      text: body.text,
+      time: safeIso(typeof body.at === 'number' ? body.at : now()),
+      ...(typeof body.replyTo === 'string' ? { replyTo: body.replyTo } : {}),
+      ...(mentions.length ? { mentions } : {}),
+    };
+    for (const entry of wakeableAgents) {
+      if (wakes(roomView, msg, entry.memberId)) wake.add(entry.id);
+    }
+  } else if (body.kind === 'task' && typeof body.assigneeId === 'string' && typeof body.memberId === 'string') {
+    const task: Task = {
+      id: String(body.taskId ?? body.id ?? ''),
+      title: String(body.title ?? ''),
+      notes: String(body.notes ?? ''),
+      status: body.status === 'doing' || body.status === 'done' ? body.status : 'todo',
+      assigneeId: body.assigneeId,
+      assignedBy: body.memberId,
+      createdBy: body.memberId,
+      updatedBy: body.memberId,
+      updatedAt: safeIso(typeof body.at === 'number' ? body.at : now()),
+      revision: typeof body.revision === 'number' ? body.revision : 1,
+    };
+    for (const entry of wakeableAgents) {
+      if (assignmentWakes(roomView, task, entry.memberId)) wake.add(entry.id);
+    }
+  } else if (body.kind === 'decision' && typeof body.memberId === 'string') {
+    const askAgents = body.askAgents;
+    for (const entry of wakeableAgents) {
+      const asked = askAgents === true || (Array.isArray(askAgents) && askAgents.includes(entry.memberId));
+      if (asked && authorWakes(roomView, entry.memberId, body.memberId)) wake.add(entry.id);
+    }
+  }
+  return { ...(wake.size ? { wake: [...wake] } : {}), ...(hold ? { hold } : {}) };
+}
+
+/** How long a relay-once send waits for the relay to accept the frame when it is not waiting for peer receipts. */
+const RELAY_ACCEPT_TIMEOUT_MS = 10_000;
+/** Maximum age of a host-signed roster accepted for cold stateless sends without local disk state. */
+export const ROSTER_FRESHNESS_MS = 15 * 60_000;
+/** Maximum allowed forward clock skew on a host-signed roster timestamp. */
+export const ROSTER_MAX_FUTURE_SKEW_MS = 60_000;
+/** Interval at which an online host device refreshes its signed roster so cold senders see a fresh `at`. */
+export const ROSTER_REFRESH_MS = 5 * 60_000;
+
+/** Reads optional independent `MESHROOMS_MIN_ROSTER_VERSION` floor outside the relay's rollback domain. */
+export function parseEnvMinRosterVersion(env: Record<string, string | undefined> = process.env): number | undefined {
+  const raw = env.MESHROOMS_MIN_ROSTER_VERSION;
+  if (raw === undefined || !raw.trim()) return undefined;
+  const n = Number(raw.trim());
+  if (!Number.isSafeInteger(n) || n < 1) {
+    throw new Error('MESHROOMS_MIN_ROSTER_VERSION must be a positive integer.');
+  }
+  return n;
+}
+
+/** Builds and signs the next monotonic host-signed `SignedRoster` if devices/removals changed or refresh is due. */
+export async function buildNextHostRoster(
+  status: RoomStatus,
+  hostDeviceId: string,
+  currentRoster: SignedRoster | undefined,
+  signFn: (value: unknown) => Promise<string>,
+  now = Date.now(),
+  refreshMs = ROSTER_REFRESH_MS,
+): Promise<SignedRoster | undefined> {
+  const entries: RosterEntry[] = [];
+  for (const dev of status.devices || []) {
+    if (!dev.enc || !dev.encVersion || !dev.encSig) continue;
+    const okRoom = await verifyEncBinding(dev.publicKey, { room: status.roomId, deviceId: dev.id, enc: dev.enc, encVersion: dev.encVersion }, dev.encSig);
+    const okWild = okRoom || await verifyEncBinding(dev.publicKey, { room: '*', deviceId: dev.id, enc: dev.enc, encVersion: dev.encVersion }, dev.encSig);
+    if (!okWild) continue;
+    const member = status.members?.find(m => m.id === dev.memberId);
+    const role: 'human' | 'agent' = member?.role === 'agent' ? 'agent' : 'human';
+    entries.push({
+      id: dev.id,
+      sign: dev.publicKey,
+      enc: dev.enc,
+      encVersion: dev.encVersion,
+      encSig: dev.encSig,
+      memberId: dev.memberId,
+      role,
+      ...(member?.operatorId ? { operatorId: member.operatorId } : {}),
+      ...(dev.wakeable ? { wakeable: true as const } : {}),
+    });
+  }
+  if (!entries.some(e => e.id === hostDeviceId)) return undefined;
+  entries.sort((a, b) => a.id.localeCompare(b.id));
+
+  const activeIds = new Set(entries.map(e => e.id));
+  const removedMap = new Map<string, RemovedRosterEntry>();
+  for (const prev of currentRoster?.body.removed || []) {
+    if (!activeIds.has(prev.id)) removedMap.set(prev.id, prev);
+  }
+  for (const former of status.formerDevices || []) {
+    if (!activeIds.has(former.id)) {
+      removedMap.set(former.id, {
+        id: former.id,
+        at: former.retiredAt ?? now,
+        revoked: !!former.revoked,
+      });
+    }
+  }
+  const removed = [...removedMap.values()].sort((a, b) => a.id.localeCompare(b.id));
+
+  const unchanged = currentRoster
+    && currentRoster.body.host === hostDeviceId
+    && canonicalJson(currentRoster.body.devices) === canonicalJson(entries)
+    && canonicalJson(currentRoster.body.removed) === canonicalJson(removed);
+  const stale = !currentRoster || now - currentRoster.body.at >= refreshMs;
+  if (unchanged && !stale) return undefined;
+
+  const body: RosterBody = {
+    v: 1,
+    room: status.roomId,
+    version: (currentRoster?.body.version ?? 0) + 1,
+    prev: currentRoster ? await hashRosterBody(currentRoster.body) : '',
+    at: now,
+    host: hostDeviceId,
+    devices: entries,
+    removed,
+  };
+  return signRoster(body, signFn);
+}
+
+/** Opaque per-device state sealed to the agent's own ECDH key and stored on the relay (<= 256 KB, Section 6.4). */
+export type SealedAgentState = {
+  v: 1;
+  /**
+   * Highest version of a HOST-SIGNED roster this agent verified. The only persisted rollback floor: it is read back from
+   * here and nowhere else, so a value that did not come from a verified roster can never freeze the agent.
+   */
+  verifiedRosterVersion?: number;
+  /** In-run rollback floor (verified roster version and any operator `--min-roster-version`). Written for readers of older state, never trusted on load. */
+  highestRosterVersion: number;
+  pinnedHost?: string;
+  cursor?: ListenCursor;
+  messages: Stored[];
+  taskOps: StoredOp[];
+  decisionOps: StoredDecisionOp[];
+  reactionOps: ReactionPacket[];
+  retractOps: RetractPacket[];
+  /** Relay envelopes (sender + id) already processed, so a replayed envelope is dropped. */
+  relaySeen?: RelayReplayRecord;
+};
+
+function emptySealedState(): SealedAgentState {
+  return {
+    v: 1,
+    highestRosterVersion: 0,
+    messages: [],
+    taskOps: [],
+    decisionOps: [],
+    reactionOps: [],
+    retractOps: [],
+  };
+}
+
+/** Seals `state` into a base64 blob guaranteed <= `SEALED_STATE_MAX_BYTES`, trimming oldest history only if needed. */
+async function sealBoundedState(agent: BrowserAgent, state: SealedAgentState): Promise<string> {
+  const copy: SealedAgentState = {
+    ...state,
+    messages: [...state.messages],
+    taskOps: [...state.taskOps],
+    decisionOps: [...state.decisionOps],
+    reactionOps: [...state.reactionOps],
+    retractOps: [...state.retractOps],
+  };
+  let replayTrimmed = false;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      const blob = await agent.sealState(copy);
+      if (Buffer.byteLength(blob, 'utf8') <= SEALED_STATE_MAX_BYTES) return blob;
+    } catch {
+      // Exceeded SEALED_STATE_MAX_BYTES; trim oldest records below.
+    }
+    if (copy.relaySeen && !replayTrimmed) { copy.relaySeen = RelayReplayGuard.from(copy.relaySeen, 256, 64).export(); replayTrimmed = true; }
+    else if (copy.messages.length > 20) copy.messages.splice(0, Math.ceil(copy.messages.length / 4));
+    else if (copy.reactionOps.length > 20) copy.reactionOps.splice(0, Math.ceil(copy.reactionOps.length / 2));
+    else if (copy.decisionOps.length > 20) copy.decisionOps.splice(0, Math.ceil(copy.decisionOps.length / 2));
+    else if (copy.taskOps.length > 20) copy.taskOps.splice(0, Math.ceil(copy.taskOps.length / 2));
+    else if (copy.messages.length > 1) copy.messages.shift();
+    else break;
+  }
+  return agent.sealState(copy);
+}
+
+function hydrateAgentFromStatusAndSealed(agent: BrowserAgent, status: RoomStatus, state: SealedAgentState) {
+  const former = [...new Map((status.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...(d.role ? { role: d.role } : {}) }])).values()];
+  const members: Members = {
+    memberId: status.memberId,
+    ownerId: status.ownerId,
+    ...(typeof status.title === 'string' ? { title: status.title } : {}),
+    former,
+    members: status.members || [],
+    devices: (status.devices || []).map(d => ({ id: d.id, memberId: d.memberId })),
+  };
+  const settings: RoomRules = {
+    floor: status.settings?.floor ?? 'humans-first',
+    agentAssignmentsWake: !!status.settings?.agentAssignmentsWake,
+    repositories: status.repositories ?? [],
+    checkedAt: Date.now(),
+  };
+  if (agent.stateless) {
+    agent.hydrateMemoryState({
+      members,
+      settings,
+      messages: state.messages,
+      taskOps: state.taskOps,
+      boardSeq: state.taskOps.at(-1)?.seq ?? 0,
+      decisionOps: state.decisionOps,
+      decisionSeq: state.decisionOps.at(-1)?.seq ?? 0,
+      reactionOps: state.reactionOps,
+      retractOps: state.retractOps,
+      listenCursor: state.cursor,
+    });
+  } else {
+    writeJson(join(agent.dir, 'members.json'), members);
+    writeJson(join(agent.dir, 'settings.json'), settings);
+    writeJson(join(agent.dir, 'messages.json'), state.messages);
+    writeJson(join(agent.dir, 'tasks.json'), state.taskOps);
+    writeJson(join(agent.dir, 'decisions.json'), state.decisionOps);
+    writeJson(join(agent.dir, 'reactions.json'), state.reactionOps);
+    writeJson(join(agent.dir, 'retractions.json'), state.retractOps);
+    if (state.cursor) agent.saveListenCursor(state.cursor);
+  }
+}
+
+async function fetchStatusAndVerifyRoster(
+  agent: BrowserAgent,
+  relayOptions: Partial<RelayClientOptions> | undefined,
+  state: SealedAgentState,
+  verifyOptions: {
+    requireFreshRoster?: boolean;
+    maxRosterAgeMs?: number;
+    minRosterVersion?: number;
+    now?: () => number;
+  } = {},
+): Promise<{ status: RoomStatus; roster: SignedRoster; relay: RelayClient; sealed: SealedAgentState }> {
+  const identity = await agent.ensureIdentity();
+  const session = randomUUID();
+  const status = await agent.command('status', { session }) as RoomStatus;
+  if (!status.memberId || !status.devices?.some(d => d.id === identity.id)) {
+    throw Object.assign(new Error('This agent is no longer admitted to the room (removed or not admitted).'), { status: 403, code: 'REMOVED' });
+  }
+  const selfDev = status.devices.find(d => d.id === identity.id);
+  if (!selfDev?.enc || selfDev.enc !== identity.encPublicKey || selfDev.encVersion !== identity.encVersion) {
+    await agent.command('profile', await agent.encBinding());
+  }
+  const relay = await agent.createRelayClient({
+    relayUrl: status.relayUrl,
+    session,
+    ...relayOptions,
+  });
+  let sealed = state;
+  const remoteState = await relay.getSealedState();
+  if (remoteState.state) {
+    try {
+      const unsealed = await agent.unsealState<Partial<SealedAgentState>>(remoteState.state);
+      if (unsealed && unsealed.v === 1) {
+        // Only `verifiedRosterVersion` (set from host-signed rosters) is trusted. States written before it existed carried a
+        // floor that a member could have inflated through envelope metadata, so their `highestRosterVersion` is ignored.
+        const storedVerified = typeof unsealed.verifiedRosterVersion === 'number' && Number.isSafeInteger(unsealed.verifiedRosterVersion) && unsealed.verifiedRosterVersion > 0
+          ? unsealed.verifiedRosterVersion : 0;
+        sealed = {
+          v: 1,
+          verifiedRosterVersion: Math.max(state.verifiedRosterVersion ?? 0, storedVerified),
+          highestRosterVersion: Math.max(state.highestRosterVersion, storedVerified),
+          relaySeen: unsealed.relaySeen ?? state.relaySeen,
+          pinnedHost: unsealed.pinnedHost ?? state.pinnedHost,
+          cursor: unsealed.cursor ?? state.cursor,
+          messages: Array.isArray(unsealed.messages) ? unsealed.messages : [],
+          taskOps: Array.isArray(unsealed.taskOps) ? unsealed.taskOps : [],
+          decisionOps: Array.isArray(unsealed.decisionOps) ? unsealed.decisionOps : [],
+          reactionOps: Array.isArray(unsealed.reactionOps) ? unsealed.reactionOps : [],
+          retractOps: Array.isArray(unsealed.retractOps) ? unsealed.retractOps : [],
+        };
+      }
+    } catch {
+      // Corrupted or incompatible remote sealed state: proceed with local/empty state.
+    }
+  }
+  if (!status.roster) {
+    relay.stop();
+    throw Object.assign(new Error('This room has no host-signed roster yet.'), { code: 'NO_ROSTER' });
+  }
+  const externalMin = verifyOptions.minRosterVersion ?? parseEnvMinRosterVersion();
+  const effectiveMinVersion = Math.max(sealed.highestRosterVersion, externalMin ?? 0);
+  const expectedHostPin = agent.hostPin ?? sealed.pinnedHost;
+  const check = await verifyRoster(status.roster, {
+    roomId: agent.roomId,
+    expectedHostPin,
+    minVersion: effectiveMinVersion > 0 ? effectiveMinVersion : undefined,
+  });
+  if (!check.ok) {
+    relay.stop();
+    throw Object.assign(new Error(`Roster verification failed: ${check.reason}`), { code: 'INVALID_ROSTER' });
+  }
+  if (verifyOptions.requireFreshRoster) {
+    const nowMs = (verifyOptions.now ?? Date.now)();
+    const maxAge = verifyOptions.maxRosterAgeMs ?? ROSTER_FRESHNESS_MS;
+    if (status.roster.body.at > nowMs + ROSTER_MAX_FUTURE_SKEW_MS) {
+      relay.stop();
+      throw Object.assign(new Error('Host-signed roster timestamp is too far in the future.'), { code: 'STALE_ROSTER' });
+    }
+    if (nowMs - status.roster.body.at > maxAge) {
+      relay.stop();
+      throw Object.assign(
+        new Error(`Host-signed roster is stale (${Math.round((nowMs - status.roster.body.at) / 1000)}s old > ${Math.round(maxAge / 1000)}s limit); refusing cold send until the host refreshes the roster.`),
+        { code: 'STALE_ROSTER' },
+      );
+    }
+  }
+  sealed.verifiedRosterVersion = Math.max(sealed.verifiedRosterVersion ?? 0, status.roster.body.version);
+  sealed.highestRosterVersion = Math.max(sealed.highestRosterVersion, status.roster.body.version, externalMin ?? 0);
+  sealed.pinnedHost = check.hostDeviceId;
+  return { status, roster: status.roster, relay, sealed };
+}
+
+/**
+ * Ephemeral cloud-agent one-shot listen (`listen --relay-once`, Section 6.4):
+ * connects over WSS or HTTPS fallback, verifies the host-signed roster against `hostPin` + sealed state,
+ * drains the ciphertext inbox, decrypts and verifies every frame, persists sealed state FIRST (failing
+ * closed without sending receipts or acknowledging inbox frames if persistence fails), then sends signed
+ * peer receipts and acknowledges the contiguous committed inbox cursor prefix.
+ */
+export async function relayListenOnce(
+  agent: BrowserAgent,
+  options: {
+    waitSeconds?: number;
+    after?: string;
+    boardAfter?: number;
+    decisionsAfter?: number;
+    fromStart?: boolean;
+    preferHttps?: boolean;
+    minRosterVersion?: number;
+    relayOptions?: Partial<RelayClientOptions>;
+  } = {},
+) {
+  const identity = await agent.ensureIdentity();
+  const initialState: SealedAgentState = agent.stateless
+    ? emptySealedState()
+    : {
+        v: 1,
+        highestRosterVersion: 0,
+        pinnedHost: agent.hostPin,
+        cursor: agent.listenCursor(),
+        messages: agent.messages(),
+        taskOps: agent.taskOps(),
+        decisionOps: agent.decisionOps(),
+        reactionOps: agent.reactionOps(),
+        retractOps: agent.retractOps(),
+      };
+  const { status, roster, relay, sealed } = await fetchStatusAndVerifyRoster(agent, options.relayOptions, initialState, {
+    minRosterVersion: options.minRosterVersion,
+  });
+  try {
+    const drained = await relay.drainOnce({
+      waitSeconds: options.waitSeconds ?? 0,
+      ack: false,
+      preferHttps: options.preferHttps,
+    });
+    const receiptEnvelopes: RelayEnvelope[] = [];
+    const rosterDevices = roster.body.devices;
+    const findRosterDevice = (deviceId: string) => rosterDevices.find(d => d.id === deviceId);
+    const awaiting = (m: Stored) => awaitingDelivery(m, identity.id, new Set(rosterDevices.map(d => d.id)));
+    const seen = RelayReplayGuard.from(sealed.relaySeen);
+
+    for (const item of drained.frames) {
+      const env = item.envelope;
+      if (env.from === identity.id) continue;
+      const sender = findRosterDevice(env.from);
+      if (!sender) continue;
+      // Replay: this sender's envelope id was already processed and sealed. Dropped here; the inbox copy is acknowledged below.
+      if (seen.seen(env.from, env.id)) continue;
+      let decrypted: DecryptedRelayEnvelope<unknown>;
+      try {
+        // Do NOT reject legitimate inbox frames encrypted under an earlier roster version (Section 5.2). The sender signature
+        // is verified against the host-signed roster key; the envelope's roster version is sender-chosen and never raises the floor.
+        decrypted = await agent.decryptRelay(env, { senderSignKey: sender.sign });
+      } catch {
+        continue;
+      }
+      seen.add(env.from, env.id);
+      const packet = decrypted.packet as Packet | undefined;
+      if (!packet || typeof packet !== 'object') continue;
+      const b = (packet as { body?: Record<string, unknown> }).body;
+      const sig = (packet as { signature?: unknown }).signature;
+      if (!b || typeof sig !== 'string' || b.roomId !== agent.roomId || b.deviceId !== env.from) continue;
+      if (!await agent.verify(sender.sign, b, sig)) continue;
+
+      if (b.kind === 'message') {
+        const msg = b as unknown as MessageBody;
+        if (typeof msg.id !== 'string' || !UUID.test(msg.id) || msg.memberId !== sender.memberId
+          || typeof msg.text !== 'string' || !msg.text.trim() || msg.text.length > 4000
+          || !Number.isSafeInteger(msg.at) || msg.at < 0 || msg.at > MAX_TIME) continue;
+        if (msg.replyTo !== undefined && (typeof msg.replyTo !== 'string' || !UUID.test(msg.replyTo))) continue;
+        if (msg.attachments !== undefined && !validAttachments(msg.attachments)) continue;
+        const existing = sealed.messages.find(m => m.packet.body.id === msg.id);
+        if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(msg)) continue;
+        if (!existing) {
+          const { kept } = windowHistory([...sealed.messages, { packet: { body: msg, signature: sig }, targets: [], receipts: [] }], awaiting);
+          sealed.messages = kept;
+        }
+        // Build signed peer receipt (NEVER relay accepted) and wrap to the sender device.
+        const receipt: ReceiptBody = { kind: 'receipt', roomId: agent.roomId, id: msg.id, deviceId: identity.id };
+        const receiptPacket = { body: receipt, signature: await agent.sign(receipt) };
+        const selfWakeable = !!findRosterDevice(identity.id)?.wakeable;
+        const receiptEnv = await encryptRelayEnvelope(receiptPacket, {
+          room: agent.roomId,
+          from: identity.id,
+          id: randomUUID(),
+          seq: relay.nextSeq(),
+          rosterVersion: roster.body.version,
+          lane: 'primary',
+          sign: v => agent.sign(v),
+          recipients: [sender],
+          ...(selfWakeable || sender.wakeable ? { hold: true as const } : {}),
+        });
+        receiptEnvelopes.push(receiptEnv);
+      } else if (b.kind === 'receipt') {
+        const rec = b as unknown as ReceiptBody;
+        const m = sealed.messages.find(x => x.packet.body.id === rec.id && x.packet.body.deviceId === identity.id);
+        if (m && m.targets.includes(env.from) && !m.receipts.includes(env.from)) {
+          sealed.messages = sealed.messages.map(x => x === m ? { ...x, receipts: [...x.receipts, env.from] } : x);
+        }
+      } else if (b.kind === 'task') {
+        if (validTaskBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.taskOps.some(op => op.body.id === b.id)) {
+          const nextSeq = (sealed.taskOps.at(-1)?.seq ?? 0) + 1;
+          sealed.taskOps = capLiveTasks([...sealed.taskOps, { body: b as unknown as TaskPacket['body'], signature: sig, seq: nextSeq }]);
+        }
+      } else if (b.kind === 'decision' || b.kind === 'vote') {
+        if ((validDecisionBody(b, agent.roomId) || validVoteBody(b, agent.roomId)) && b.memberId === sender.memberId && !sealed.decisionOps.some(op => op.body.id === b.id)) {
+          const nextSeq = (sealed.decisionOps.at(-1)?.seq ?? 0) + 1;
+          sealed.decisionOps = [...sealed.decisionOps, { body: b as unknown as DecisionPacket['body'], signature: sig, seq: nextSeq }];
+        }
+      } else if (b.kind === 'reaction') {
+        if (validReactionBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.reactionOps.some(op => op.body.id === b.id)) {
+          sealed.reactionOps = capReactions([...sealed.reactionOps, { body: b as unknown as ReactionPacket['body'], signature: sig }]);
+        }
+      } else if (b.kind === 'retract') {
+        if (validRetractBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.retractOps.some(op => op.body.id === b.id)) {
+          const added = addRetractions(sealed.retractOps, [{ body: b as unknown as RetractPacket['body'], signature: sig }], sealed.messages);
+          sealed.retractOps = added.log;
+          const applied = applyRetractions(sealed.messages, added.log.map(op => op.body));
+          sealed.messages = applied.messages;
+        }
+      }
+    }
+
+    sealed.relaySeen = seen.export();
+    // Compute the listen output and updated cursor BEFORE persisting sealed state.
+    hydrateAgentFromStatusAndSealed(agent, status, sealed);
+    const { plan, saved } = listenPlan(agent, {
+      after: options.after,
+      boardAfter: options.boardAfter,
+      decisionsAfter: options.decisionsAfter,
+      fromStart: options.fromStart,
+    });
+    const snapshot = listenSnapshot(agent, plan, true);
+    if (!snapshot) throw Object.assign(new Error('This agent is not admitted to the browser room.'), { status: 403 });
+    const { view, result, wakes: decisionWakeResult, decided, decisionCursor } = snapshot;
+
+    let output: Record<string, unknown>;
+    let nextCursorToPersist: ListenCursor | undefined;
+    if (result.state !== 'waiting') {
+      output = {
+        roomId: agent.roomId,
+        participantId: view.memberId,
+        floor: view.floor,
+        ...result,
+        decisionCursor,
+        ...(decided ? {
+          decisions: {
+            asked: decisionWakeResult.asked.map(d => describeDecision(agent, d)),
+            resolved: decisionWakeResult.resolved.map(d => describeDecision(agent, d)),
+            ...(decisionWakeResult.withdrawn.length ? { withdrawn: decisionWakeResult.withdrawn.map(d => describeDecision(agent, d)) } : {}),
+          },
+        } : {}),
+      };
+      nextCursorToPersist = {
+        ...(result.cursor ? { after: result.cursor } : {}),
+        boardAfter: result.boardCursor ?? 0,
+        decisionsAfter: decisionCursor,
+      };
+      sealed.cursor = nextCursorToPersist;
+    } else {
+      output = {
+        state: 'timeout',
+        roomId: agent.roomId,
+        participantId: view.memberId,
+        floor: view.floor,
+        messages: [],
+        cursor: plan.after,
+        boardCursor: plan.boardAfter ?? view.boardRevision,
+        decisionCursor: plan.decisionsAfter === undefined ? decisionCursor : Math.max(plan.decisionsAfter, plan.outcomesAfter ?? 0),
+        observed: result.messages.filter(m => m.authorId !== view.memberId).length,
+      };
+    }
+
+    // Strict durable commit order:
+    // 1) Persist sealed state FIRST. If this fails, abort without sending receipts or acknowledging/deleting inbox frames!
+    const blob = await sealBoundedState(agent, sealed);
+    await relay.putSealedState(blob);
+    if (!agent.stateless && nextCursorToPersist) {
+      agent.saveListenCursor(nextCursorToPersist, undefined, { monotonic: !options.fromStart });
+    }
+
+    // 2) Only AFTER durable state persistence succeeds, send signed peer receipts and acknowledge the contiguous committed prefix.
+    if (receiptEnvelopes.length) {
+      await relay.sendOnce(receiptEnvelopes);
+    }
+    const committedCursor = drained.frames.reduce((max, item) => (item.cursor > max ? item.cursor : max), 0);
+    if (committedCursor > 0) {
+      await relay.ackInboxCursor(committedCursor);
+    }
+
+    const resumed = !!saved && (options.after === undefined || options.boardAfter === undefined || options.decisionsAfter === undefined);
+    return { ...(resumed ? { ...output, resumed } : output), carrier: drained.carrier, rosterVersion: roster.body.version };
+  } finally {
+    relay.stop();
+  }
+}
+
+/**
+ * Stateless / relay-once send (Section 6.4):
+ * encrypts the signed message to the current verified host-signed roster (enforcing host-authenticated
+ * freshness and optional external `minRosterVersion` floor so a compromised relay cannot roll back both
+ * sealed state and roster to re-include a revoked device), sends over WSS/HTTPS relay (with `hold: true`
+ * for offline recipients per Section 6.2), and waits up to `waitReceiptMs` (default 30s) for signed peer
+ * `receipt` packets from online recipients. Relay `accepted` NEVER counts as a receipt.
+ */
+export async function relaySendOnce(
+  agent: BrowserAgent,
+  input: {
+    text: string;
+    replyTo?: string;
+    requestId: string;
+    waitReceiptMs?: number;
+    maxRosterAgeMs?: number;
+    minRosterVersion?: number;
+    now?: () => number;
+    relayOptions?: Partial<RelayClientOptions>;
+  },
+) {
+  const identity = await agent.ensureIdentity();
+  const initialState: SealedAgentState = agent.stateless
+    ? emptySealedState()
+    : {
+        v: 1,
+        highestRosterVersion: 0,
+        pinnedHost: agent.hostPin,
+        cursor: agent.listenCursor(),
+        messages: agent.messages(),
+        taskOps: agent.taskOps(),
+        decisionOps: agent.decisionOps(),
+        reactionOps: agent.reactionOps(),
+        retractOps: agent.retractOps(),
+      };
+  const { status, roster, relay, sealed } = await fetchStatusAndVerifyRoster(agent, input.relayOptions, initialState, {
+    requireFreshRoster: true,
+    maxRosterAgeMs: input.maxRosterAgeMs,
+    minRosterVersion: input.minRosterVersion,
+    now: input.now,
+  });
+  hydrateAgentFromStatusAndSealed(agent, status, sealed);
+
+  const view = agent.view();
+  if (!view.memberId) throw Object.assign(new Error('This agent is not admitted to the browser room.'), { status: 403 });
+  if (!input.text.trim() || input.text.length > 4000) throw new Error('Write a message of up to 4,000 characters.');
+  if (input.replyTo && !view.messages.some(m => m.id === input.replyTo)) throw new Error('The reply target is not in this browser room.');
+  if (!agent.person && !mayAgentSpeak(view, view.memberId, input.replyTo)) {
+    throw new Error('This room is humans-first: agents speak only when a person addresses them. Reply to a message that mentions you or replies to you.');
+  }
+
+  const recipients = roster.body.devices.filter(d => d.id !== identity.id);
+  const body: MessageBody = {
+    kind: 'message',
+    roomId: agent.roomId,
+    id: input.requestId,
+    deviceId: identity.id,
+    memberId: view.memberId,
+    text: input.text.trim(),
+    at: Date.now(),
+    ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+  };
+  const packet = { body, signature: await agent.sign(body) };
+  const existing = sealed.messages.find(m => m.packet.body.id === input.requestId);
+  if (!existing) {
+    sealed.messages = [...sealed.messages, { packet, targets: recipients.map(r => r.id), receipts: [] }];
+  }
+
+  const receivedReceipts = new Set<string>(existing?.receipts ?? []);
+  const onlineRecipientIds = new Set(
+    recipients
+      .filter(r => status.devices?.some(d => d.id === r.id && d.session))
+      .map(r => r.id),
+  );
+  const meta = computeRelayWakeMeta(packet, recipients, roster, status, sealed.messages);
+  const hold: true | undefined = true; // Ephemeral sender: hold frames for offline recipients per Section 6.2.
+
+  let resolveDone: (() => void) | undefined;
+  let relayAccepted = false;
+  const allOnlineConfirmed = () => onlineRecipientIds.size > 0 && [...onlineRecipientIds].every(id => receivedReceipts.has(id));
+  const waitMs = input.waitReceiptMs ?? 30_000;
+  // With `waitMs === 0` the caller does not want to wait for peer receipts, but the frame must still reach the relay:
+  // stopping the client before it is flushed would drop the message while reporting it as queued.
+  const receiptsWanted = waitMs > 0 && onlineRecipientIds.size > 0;
+
+  const liveRelay = await agent.createRelayClient({
+    relayUrl: status.relayUrl,
+    rosterVersion: () => roster.body.version,
+    ...input.relayOptions,
+    onAccepted: () => {
+      relayAccepted = true;
+      if (!receiptsWanted) resolveDone?.();
+    },
+    onEnvelope: async (env, envMeta) => {
+      if (env.from === identity.id) return;
+      const sender = recipients.find(d => d.id === env.from);
+      if (!sender) return;
+      try {
+        // Do NOT reject legitimate in-flight receipt frames encrypted under an earlier roster version.
+        const decrypted = await agent.decryptRelay<Packet>(env, { senderSignKey: sender.sign });
+        const p = decrypted.packet;
+        const b = p?.body;
+        if (b && b.kind === 'receipt' && b.roomId === agent.roomId && b.deviceId === env.from && b.id === input.requestId
+          && typeof p.signature === 'string' && await agent.verify(sender.sign, b, p.signature)) {
+          receivedReceipts.add(env.from);
+          if (envMeta.cursor !== undefined) liveRelay.ackCursor(envMeta.cursor);
+          if (allOnlineConfirmed()) resolveDone?.();
+        }
+      } catch { /* Ignore non-matching or undecryptable frames. */ }
+    },
+  });
+
+  try {
+    if (recipients.length > 0) {
+      liveRelay.start();
+      liveRelay.enqueuePacket(packet, {
+        rosterVersion: roster.body.version,
+        lane: 'primary',
+        recipients,
+        ...(meta.wake ? { wake: meta.wake } : {}),
+        hold,
+      });
+      await new Promise<void>(resolve => {
+        resolveDone = resolve;
+        if ((receiptsWanted && allOnlineConfirmed()) || (!receiptsWanted && relayAccepted)) { resolve(); return; }
+        setTimeout(resolve, receiptsWanted ? waitMs : RELAY_ACCEPT_TIMEOUT_MS);
+      });
+      if (!relayAccepted && receivedReceipts.size === 0) {
+        throw Object.assign(
+          new Error('The relay did not accept the message in time, so nothing was sent. Retry with the same request id.'),
+          { code: 'RELAY_NOT_ACCEPTED' },
+        );
+      }
+    }
+    sealed.messages = sealed.messages.map(m =>
+      m.packet.body.id === input.requestId
+        ? { ...m, receipts: [...new Set([...m.receipts, ...receivedReceipts])] }
+        : m,
+    );
+    const blob = await sealBoundedState(agent, sealed);
+    await relay.putSealedState(blob);
+    hydrateAgentFromStatusAndSealed(agent, status, sealed);
+    return {
+      messageId: input.requestId,
+      status: receivedReceipts.size > 0 ? 'stored-remotely' : 'queued-for-peers',
+      devices: receivedReceipts.size,
+      accepted: relayAccepted || receivedReceipts.size > 0,
+      held: true,
+    };
+  } finally {
+    liveRelay.stop();
+    relay.stop();
+  }
+}
+
+/** Registers (or clears when `url === null`) a wake webhook signed strictly by this room device key (never an account). */
+export async function relayWakeRegister(
+  agent: BrowserAgent,
+  url: string | null,
+  key?: string,
+  relayOptions?: Partial<RelayClientOptions>,
+): Promise<{ roomId: string; deviceId: string; inboxId: string; wakeable: boolean }> {
+  const identity = await agent.ensureIdentity();
+  const status = await agent.command('status', { session: randomUUID() }) as RoomStatus;
+  if (!status.memberId || !status.devices?.some(d => d.id === identity.id)) {
+    throw Object.assign(new Error('This agent is not admitted to the room.'), { status: 403 });
+  }
+  const relay = await agent.createRelayClient({
+    relayUrl: status.relayUrl,
+    ...relayOptions,
+  });
+  try {
+    const res = await relay.registerWake(url, key);
+    return { roomId: agent.roomId, deviceId: identity.id, inboxId: res.inboxId, wakeable: res.wakeable };
+  } finally {
+    relay.stop();
+  }
 }

@@ -177,6 +177,41 @@ identifiers or payloads:
   `location = /meshguard-web/health` proxy to MeshGuard's authenticated browser transport gateway on loopback
   (`127.0.0.1:4321`), under the same server-level limits and headers. Drop both blocks on a host that does not run it.
 
+## E2E relay (opt-in, off by default)
+
+The encrypted WSS/HTTPS relay (`/api/relay/v1`, host-signed rosters, wakeable cloud agents) ships **dark**. With
+nothing set, the coordinator behaves as it did before the relay: the relay routes answer 404, health does not
+report `relayEnabled`, status carries no `relayUrl` or `roster`, device encryption keys and roster publications are
+ignored or refused, no `relay.sqlite` is opened, and the request body cap is the original 24 KB.
+
+Turn it on in /etc/meshrooms/browser.env, then restart:
+
+| Variable | Needed | Meaning |
+| --- | --- | --- |
+| `MESHROOMS_RELAY_ENABLED=1` | to enable | Any other value except `0` or empty is refused at start. |
+| `MESHROOMS_RELAY_SECRET` | with the flag | At least 32 characters, **stable across restarts**. Derives the key that encrypts stored wake registrations. The process refuses to start without it; there is no random fallback. Rotating it orphans existing registrations (agents re-register). |
+| `MESHROOMS_WAKE_ALLOWLIST` | to use wake webhooks | Comma-separated host names (no wildcards or schemes), e.g. `api.anthropic.com`. Empty means every wake destination is refused. |
+| `MESHROOMS_RELAY_URL` | optional | `wss://` URL advertised to clients; defaults to the origin. |
+
+The relay nginx locations in deploy/nginx/meshrooms.conf are harmless while the flag is off (the app answers 404).
+
+**Schema migration.** The first start of a build with the relay code migrates the admission database from schema v2
+to v3 (new `room_rosters` table and device encryption/wake columns), **whether or not the flag is on**: the schema is
+additive but the migration is one-way, and a server that only knows v2 refuses a v3 database. Before migrating a
+database that already holds rooms, the coordinator writes a consistent owner-only copy (`VACUUM INTO`, so it includes the
+WAL) next to it as `admission.sqlite.pre-v3-from-v2.bak` and refuses to migrate if that copy cannot be written. An
+existing copy is never overwritten. `deploy-browser.sh` also takes its own verified backup before the swap; keep that one
+too. Rolling back to a pre-relay build means stopping the service, restoring a backup over `admission.sqlite` (and
+removing its `-wal`/`-shm`), and starting the old release; anything created after the migration is lost.
+
+**Protocol notes.** Every relay envelope carries the sender's ECDSA signature over all other fields; receivers verify it
+against the sender's key in the host-signed roster, so `from` cannot be forged by the relay or another member. The
+`roster` version inside an envelope is sender-chosen metadata and never raises a receiver's roster floor: only verified
+host-signed rosters do (agent sealed state keeps it as `verifiedRosterVersion`; a state written before that field existed
+is not trusted for its old floor). Receivers remember processed envelope ids per sender (bounded, persisted) and drop
+repeats; the relay reports a repeated id as `duplicate`. This is a breaking wire change relative to the unreleased
+format in #140: sender and receivers must run the same build.
+
 ## State and recovery
 
 The coordinator reconstructs admission after restart. Browsers renegotiate connections against its

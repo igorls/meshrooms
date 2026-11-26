@@ -1,10 +1,13 @@
 import { Database } from 'bun:sqlite';
+import { chmodSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { FormerDevice } from '../../src/browser/protocol';
 
 /** Where the coordinator and the operator commands find admission data. */
 export const dataDirectory = (env: Record<string, string | undefined> = process.env) => resolve(env.MESHROOMS_BROWSER_DATA || '.local/browser-rooms');
 export const admissionPath = (dir: string) => resolve(dir, 'admission.sqlite');
+/** Dedicated SQLite store for encrypted relay ciphertext inbox, sealed agent state, and encrypted wake registrations (zero OAuth/account linkage). */
+export const relayPath = (dir: string) => resolve(dir, 'relay.sqlite');
 
 /**
  * Why a room is gone. The record is kept for good: its link keeps answering "closed", and because clients choose room
@@ -15,7 +18,7 @@ export type ClosedReason = 'closed' | 'expired' | 'retired';
 /** Schema version of the indexed metadata projection stored alongside `rooms.body`. */
 export const ROOM_META_VERSION = 1;
 /** Current SQLite `PRAGMA user_version` managed by `openAdmission()`. */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 /** Maximum retired devices returned in `RoomStatus.formerDevices` per room (prioritizing revoked entries). */
 export const MAX_FORMER_DEVICES = 2000;
 
@@ -26,7 +29,7 @@ export type StoredRoomProjection = {
   ownerId: string;
   ownerPerson?: string;
   members: { id: string; role?: 'human' | 'agent' }[];
-  devices: { id: string; memberId: string }[];
+  devices: { id: string; memberId: string; enc?: string; encVersion?: number; encSig?: string; wakeable?: true }[];
   retired?: FormerDevice[];
 };
 
@@ -91,16 +94,53 @@ export function deleteRetiredDevice(db: Database, roomId: string, deviceId: stri
   db.query('DELETE FROM retired_devices WHERE room_id = ? AND device_id = ?').run(roomId, deviceId);
 }
 
+/** Reads the latest persisted host-signed roster for a room, if any. */
+export function getRoomRoster<T = unknown>(db: Database, roomId: string): T | null {
+  const row = db.query('SELECT body FROM room_rosters WHERE room_id = ?').get(roomId) as { body: string } | null;
+  return row ? JSON.parse(row.body) as T : null;
+}
+
+/** Persists the latest verified host-signed roster for a room. */
+export function saveRoomRoster(db: Database, roomId: string, version: number, roster: unknown, updatedAt: number) {
+  db.query('INSERT OR REPLACE INTO room_rosters (room_id, version, body, updated_at) VALUES (?,?,?,?)')
+    .run(roomId, version, JSON.stringify(roster), updatedAt);
+}
+
 function syncRoomDevices(
   db: Database,
   roomId: string,
   ownerId: string | null,
   members: { id: string; role?: 'human' | 'agent' }[],
-  devices: { id: string; memberId: string }[],
+  devices: { id: string; memberId: string; enc?: string; encVersion?: number; encSig?: string; wakeable?: true }[],
   retiredOverride?: { id: string; memberId: string; role?: 'human' | 'agent' }[],
+  withRelayColumns = true,
 ) {
   db.query('DELETE FROM room_devices WHERE room_id=?').run(roomId);
   const humanMembers = new Set(members.filter(m => (m.role ?? 'human') === 'human').map(m => m.id));
+  if (withRelayColumns) {
+    const insert = db.query(
+      'INSERT OR REPLACE INTO room_devices (room_id, device_id, member_id, is_human, is_host, retired, enc, enc_version, enc_sig, wakeable) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    );
+    for (const d of devices) {
+      if (!d || typeof d.id !== 'string' || typeof d.memberId !== 'string') continue;
+      insert.run(
+        roomId, d.id, d.memberId, humanMembers.has(d.memberId) ? 1 : 0, ownerId !== null && d.memberId === ownerId ? 1 : 0, 0,
+        d.enc ?? null, d.encVersion ?? null, d.encSig ?? null, d.wakeable ? 1 : 0,
+      );
+    }
+    const retired = retiredOverride ?? (db.query(
+      'SELECT device_id AS id, member_id AS memberId, role FROM retired_devices WHERE room_id = ?',
+    ).all(roomId) as { id: string; memberId: string; role: string | null }[]).map(r => ({
+      id: r.id,
+      memberId: r.memberId,
+      ...(r.role === 'human' || r.role === 'agent' ? { role: r.role as 'human' | 'agent' } : {}),
+    }));
+    for (const d of retired) {
+      if (!d || typeof d.id !== 'string' || typeof d.memberId !== 'string') continue;
+      insert.run(roomId, d.id, d.memberId, (d.role ?? 'human') === 'human' ? 1 : 0, ownerId !== null && d.memberId === ownerId ? 1 : 0, 1, null, null, null, 0);
+    }
+    return;
+  }
   const insert = db.query('INSERT OR REPLACE INTO room_devices (room_id, device_id, member_id, is_human, is_host, retired) VALUES (?,?,?,?,?,?)');
   for (const d of devices) {
     if (!d || typeof d.id !== 'string' || typeof d.memberId !== 'string') continue;
@@ -130,7 +170,7 @@ function indexRoomBody(db: Database, id: string, body: string) {
   const retired = Array.isArray(parsed.retired) ? parsed.retired : [];
   db.query('UPDATE rooms SET owner_id=?, owner_person=?, title=?, member_count=?, device_count=?, meta_version=? WHERE id=?')
     .run(ownerId, ownerPerson, title, members.length, devices.length, ROOM_META_VERSION, id);
-  syncRoomDevices(db, id, ownerId, members, devices, retired);
+  syncRoomDevices(db, id, ownerId, members, devices, retired, false);
 }
 
 /** Persists a room and keeps its indexed metadata columns and (when membership/devices changed) `room_devices` in sync. */
@@ -219,9 +259,46 @@ function migrateToV2(db: Database) {
     }
     delete parsed.retired;
     db.query('UPDATE rooms SET body = ? WHERE id = ?').run(JSON.stringify(parsed), row.id);
-    syncRoomDevices(db, row.id, ownerId, members, devices);
+    syncRoomDevices(db, row.id, ownerId, members, devices, undefined, false);
   }
   db.exec('PRAGMA user_version = 2');
+}
+
+/** Version 2 -> 3: persist device encryption/wake columns on `room_devices` and add `room_rosters` for host-signed rosters. */
+function migrateToV3(db: Database) {
+  db.exec(`CREATE TABLE IF NOT EXISTS room_rosters (
+    room_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );`);
+  const columns = new Set((db.query('PRAGMA table_info(room_devices)').all() as { name: string }[]).map(c => c.name));
+  for (const [name, type] of [
+    ['enc', 'TEXT'],
+    ['enc_version', 'INTEGER'],
+    ['enc_sig', 'TEXT'],
+    ['wakeable', 'INTEGER NOT NULL DEFAULT 0'],
+  ] as const) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE room_devices ADD COLUMN ${name} ${type}`);
+  }
+  db.exec('PRAGMA user_version = 3');
+}
+
+/**
+ * Copies the admission database to `<path>.pre-v<target>-from-v<current>.bak` (owner-only) before a schema migration. An
+ * existing backup is never overwritten, so the copy taken from the original schema survives repeated starts. A failed backup stops
+ * the migration: starting without a way back is the worse outcome.
+ */
+function backupBeforeMigration(db: Database, path: string, from: number) {
+  const target = `${resolve(path)}.pre-v${CURRENT_SCHEMA_VERSION}-from-v${from}.bak`;
+  try { if (statSync(target).isFile()) return; } catch { /* no backup yet */ }
+  try {
+    db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+    chmodSync(target, 0o600);
+  } catch (error) {
+    db.close();
+    throw new Error(`Could not back up the admission database before migrating it from schema ${from}: ${(error as Error).message}. Free space or fix permissions, or restore from your own backup and start again.`);
+  }
 }
 
 /**
@@ -229,7 +306,7 @@ function migrateToV2(db: Database) {
  * `BEGIN IMMEDIATE`. Refuses to open a database whose schema version is newer than this server supports.
  * Already-migrated databases perform zero writes and zero room-body scans on open.
  */
-export function openAdmission(path: string, now = Date.now()): Database {
+export function openAdmission(path: string, now = Date.now(), options: { backup?: boolean } = {}): Database {
   const db = new Database(path, { create: true });
   db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
   const version = (db.query('PRAGMA user_version').get() as { user_version: number }).user_version;
@@ -238,9 +315,13 @@ export function openAdmission(path: string, now = Date.now()): Database {
     throw new Error(`Admission database schema version ${version} is newer than this server supports (max ${CURRENT_SCHEMA_VERSION}); refusing to open to avoid downgrade.`);
   }
   if (version < CURRENT_SCHEMA_VERSION) {
+    // The v3 migration is one-way: a server that only knows v2 refuses a v3 database. Before upgrading a database that
+    // already holds rooms, keep a consistent copy (taken through this connection, so it includes the WAL) next to it.
+    if (version >= 1 && options.backup !== false && path !== ':memory:') backupBeforeMigration(db, path, version);
     db.transaction(() => {
       if (version < 1) migrateToV1(db, now);
       if (version < 2) migrateToV2(db);
+      if (version < 3) migrateToV3(db);
     }).immediate();
   }
   return db;
@@ -253,6 +334,7 @@ export function retireRoom(db: Database, id: string, reason: ClosedReason, now =
     db.query('DELETE FROM rooms WHERE id=?').run(id);
     db.query('DELETE FROM room_devices WHERE room_id=?').run(id);
     db.query('DELETE FROM retired_devices WHERE room_id=?').run(id);
+    db.query('DELETE FROM room_rosters WHERE room_id=?').run(id);
     db.query('DELETE FROM avatars WHERE room=?').run(id);
     db.query('DELETE FROM room_activity WHERE id=?').run(id);
     db.query('INSERT OR REPLACE INTO closed_rooms (id, reason, at) VALUES (?,?,?)').run(id, reason, now);
