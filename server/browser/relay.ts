@@ -229,6 +229,10 @@ export class RelayService {
       );
     `);
 
+    // Older databases predate `addressed`: frames already stored count as unaddressed, so they are evicted first.
+    const columns = this.db.query('PRAGMA table_info(relay_inbox)').all() as { name: string }[];
+    if (!columns.some(c => c.name === 'addressed')) this.db.exec('ALTER TABLE relay_inbox ADD COLUMN addressed INTEGER NOT NULL DEFAULT 0');
+
     this.unsubRemoved = this.lobby.onDeviceRemoved((roomId, deviceId) => this.handleDeviceRemoved(roomId, deviceId));
     this.unsubClosed = this.lobby.onRoomClosed(roomId => this.handleRoomClosed(roomId));
     this.unsubChanged = this.lobby.onRoomChanged((roomId, deviceId) => this.handleRoomChanged(roomId, deviceId));
@@ -631,15 +635,20 @@ export class RelayService {
     }
 
     // 4. Offline recipient: bounded ciphertext inbox ONLY when hold === true AND (recipient or sender is wakeable).
-    let pendingCount = 0;
+    // `shouldWake` is the sender's own verdict, made under the room's wake rules, that this frame addresses the
+    // recipient (a mention, a reply, an assignment, a decision asking it). The relay never sees plaintext, so that
+    // flag is the only way it can tell addressed frames from the rest of the room's traffic.
+    let pendingCount = 0, addressedCount = 0;
     if (envelope.hold === true && (recipientWakeable || senderWakeable)) {
-      const stored = this.storeInInbox(roomId, recipientId, senderId, envelope.id, envelopeJson, frameBytes);
+      const stored = this.storeInInbox(roomId, recipientId, senderId, envelope.id, envelopeJson, frameBytes, shouldWake);
       pendingCount = stored.pendingCount;
+      addressedCount = stored.addressedCount;
     }
 
     // 5. Wake trigger ONLY when a frame was actually stored in the inbox (pendingCount > 0), wake lists R, R is wakeable, and R has no live session.
-    if (shouldWake && recipientWakeable && pendingCount > 0 && this.wakeConnector) {
-      void this.wakeConnector.notify(roomId, recipientId, senderId, pendingCount);
+    // Only addressed frames wake, and the count says how many addressed frames wait, not how full the inbox is.
+    if (shouldWake && recipientWakeable && addressedCount > 0 && this.wakeConnector) {
+      void this.wakeConnector.notify(roomId, recipientId, senderId, addressedCount);
     }
   }
 
@@ -675,16 +684,20 @@ export class RelayService {
     frameId: string,
     envelopeJson: string,
     bytes: number,
-  ): { cursor: number; pendingCount: number } {
+    addressed = false,
+  ): { cursor: number; pendingCount: number; addressedCount: number } {
     const now = this.now();
     return this.db.transaction(() => {
       this.db.query('DELETE FROM relay_inbox WHERE expires_at <= ?').run(now);
       const existing = this.db.query(
         'SELECT cursor FROM relay_inbox WHERE room_id = ? AND recipient_id = ? AND frame_id = ?',
       ).get(roomId, recipientId, frameId) as { cursor: number } | null;
+      const counts = () => this.db.query(
+        'SELECT COUNT(*) AS n, COALESCE(SUM(addressed), 0) AS a FROM relay_inbox WHERE room_id = ? AND recipient_id = ?',
+      ).get(roomId, recipientId) as { n: number; a: number };
       if (existing) {
-        const count = (this.db.query('SELECT COUNT(*) AS n FROM relay_inbox WHERE room_id = ? AND recipient_id = ?').get(roomId, recipientId) as { n: number }).n;
-        return { cursor: existing.cursor, pendingCount: count };
+        const now = counts();
+        return { cursor: existing.cursor, pendingCount: now.n, addressedCount: now.a };
       }
 
       // Enforce per-device caps (max 500 frames, max 8 MB): oldest evicted first.
@@ -692,8 +705,9 @@ export class RelayService {
         'SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS total FROM relay_inbox WHERE room_id = ? AND recipient_id = ?',
       ).get(roomId, recipientId) as { n: number; total: number };
       while (stats.n >= this.inboxMaxFrames || stats.total + bytes > this.inboxMaxBytes) {
+        // Oldest unaddressed frame first: room chatter makes room for what is addressed to this device, never the reverse.
         const oldest = this.db.query(
-          'SELECT cursor, bytes FROM relay_inbox WHERE room_id = ? AND recipient_id = ? ORDER BY cursor ASC LIMIT 1',
+          'SELECT cursor, bytes FROM relay_inbox WHERE room_id = ? AND recipient_id = ? ORDER BY addressed ASC, cursor ASC LIMIT 1',
         ).get(roomId, recipientId) as { cursor: number; bytes: number } | null;
         if (!oldest) break;
         this.db.query('DELETE FROM relay_inbox WHERE cursor = ?').run(oldest.cursor);
@@ -706,7 +720,7 @@ export class RelayService {
       ).get(roomId) as { total: number }).total;
       while (roomTotal + bytes > this.inboxMaxRoomBytes) {
         const oldest = this.db.query(
-          'SELECT cursor, bytes FROM relay_inbox WHERE room_id = ? ORDER BY cursor ASC LIMIT 1',
+          'SELECT cursor, bytes FROM relay_inbox WHERE room_id = ? ORDER BY addressed ASC, cursor ASC LIMIT 1',
         ).get(roomId) as { cursor: number; bytes: number } | null;
         if (!oldest) break;
         this.db.query('DELETE FROM relay_inbox WHERE cursor = ?').run(oldest.cursor);
@@ -714,12 +728,10 @@ export class RelayService {
       }
 
       const info = this.db.query(
-        'INSERT INTO relay_inbox (room_id, recipient_id, sender_id, frame_id, envelope_json, bytes, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)',
-      ).run(roomId, recipientId, senderId, frameId, envelopeJson, bytes, now, now + this.inboxTtlMs);
-      const pendingCount = (this.db.query(
-        'SELECT COUNT(*) AS n FROM relay_inbox WHERE room_id = ? AND recipient_id = ?',
-      ).get(roomId, recipientId) as { n: number }).n;
-      return { cursor: Number(info.lastInsertRowid), pendingCount };
+        'INSERT INTO relay_inbox (room_id, recipient_id, sender_id, frame_id, envelope_json, bytes, created_at, expires_at, addressed) VALUES (?,?,?,?,?,?,?,?,?)',
+      ).run(roomId, recipientId, senderId, frameId, envelopeJson, bytes, now, now + this.inboxTtlMs, addressed ? 1 : 0);
+      const after = counts();
+      return { cursor: Number(info.lastInsertRowid), pendingCount: after.n, addressedCount: after.a };
     }).immediate();
   }
 

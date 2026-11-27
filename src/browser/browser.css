@@ -596,7 +596,7 @@
 .invite-pill.is-secret{background:var(--secret-soft);color:var(--warn);border:1px solid var(--secret)}.invite-pill.is-ok{background:var(--agent-soft);color:var(--agent)}.invite-pill.is-bad{background:#fcefeb;color:var(--danger)}
 .invite-card pre{margin:0;padding:12px 14px;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:132px;overflow:hidden;position:relative;color:#d4dde6;background:transparent}
 .invite-card pre::after{content:"";position:absolute;left:0;right:0;bottom:0;height:44px;background:linear-gradient(transparent,var(--rail));pointer-events:none}
-.invite-card pre.is-full{max-height:260px;overflow:auto;user-select:all}.invite-card pre.is-full::after{display:none}
+.invite-card pre.is-full{max-height:260px;overflow:auto;user-select:all}.invite-card pre.is-full::after,.invite-card pre.is-link::after{display:none}
 .invite-card footer{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:8px 14px 12px;font-size:11px;color:#9fb0c1}
 .invite-card footer>span{display:inline-flex;gap:6px;align-items:center}.invite-card footer .browser-text-link{color:#cfe0ff;font-size:12px;margin:0;min-height:0;text-align:right}
 .invite-card.is-dim{opacity:.55;filter:grayscale(.6)}.invite-card.is-dim pre{max-height:72px}
@@ -884,3 +884,128 @@
 @media(prefers-reduced-motion:reduce){
   .browser-rooms .browser-timeline-zoom button,.browser-rooms .browser-stack-author-chip,.browser-rooms .browser-events-fold-toggle,.browser-rooms .browser-details-tabs button{transition:none}
 }
+/* "Needs you": what in this room waits on the person, above the conversation. Opens by growing its row with the
+   content held to its bottom edge, so it slides down like a drawer and the transcript moves instead of jumping; the
+   signal rings twice when it arrives. */
+.browser-attention{flex-shrink:0;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:1fr;overflow-y:clip;padding:0 var(--room-gutter);background:color-mix(in srgb,var(--blue) 4%,var(--paper));border-bottom:1px solid color-mix(in srgb,var(--blue) 12%,var(--line));animation:attention-open 560ms cubic-bezier(.16,1,.3,1)}
+.browser-attention-inner{min-height:0;align-self:end;display:flex;align-items:center;gap:12px 16px;max-width:880px;width:100%;margin-inline:auto}
+.browser-attention-inner>*{margin-block:8px}
+.browser-rooms .browser-attention-title{display:inline-flex;align-items:center;gap:8px;flex-shrink:0;font-size:12px;line-height:1;font-weight:750;color:var(--ink);white-space:nowrap}
+.browser-attention-signal{position:relative;width:8px;height:8px;border-radius:50%;background:#e0912b}
+.browser-attention-signal::after{content:'';position:absolute;inset:0;border-radius:50%;border:2px solid #e0912b;opacity:0;animation:attention-ring 1.8s cubic-bezier(.16,1,.3,1) 360ms 2}
+.browser-attention-count{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--blue);color:#fff;font-size:11px;font-weight:750;font-variant-numeric:tabular-nums;animation:attention-bump 480ms cubic-bezier(.34,1.56,.64,1)}
+.browser-attention-items{display:flex;gap:8px;flex:1;min-width:0;list-style:none;margin:2px -6px;padding:6px;overflow-x:auto;scrollbar-width:none}
+.browser-attention-items::-webkit-scrollbar{display:none}
+/* One line: longer items give up more room (flex-shrink weighs by size) and end in an ellipsis; the title has it all. */
+.browser-attention-items>li{flex:0 1 auto;min-width:min(168px,100%);display:flex}
+.browser-attention-items>li.is-message{flex-shrink:0;max-width:min(280px,100%)}
+.browser-rooms .browser-attention-items button{display:inline-flex;align-items:center;gap:8px;width:100%;min-height:34px;padding:4px 14px 4px 10px;border:1px solid color-mix(in srgb,var(--blue) 20%,var(--line));border-radius:999px;background:var(--paper);color:var(--ink);font-size:13px;font-weight:650;white-space:nowrap;box-shadow:0 1px 2px #1826340d;transition:border-color 160ms ease-out,box-shadow 220ms ease-out,transform 220ms cubic-bezier(.16,1,.3,1)}
+.browser-attention-items button>svg{color:var(--blue);flex-shrink:0}
+.browser-attention-items button>span{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.browser-rooms .browser-attention-items button:hover{border-color:color-mix(in srgb,var(--blue) 55%,var(--line));box-shadow:0 2px 6px #285de524;transform:translateY(-1px)}
+.browser-rooms .browser-attention-items button:active{transform:none;box-shadow:0 1px 2px #1826340d}
+.browser-rooms .browser-attention-items button:focus-visible{outline:2px solid #5b85f2;outline-offset:2px}
+.browser-attention-items q{font-weight:550}
+.browser-attention-items small{font-size:12px;font-weight:500;color:var(--muted)}
+.browser-rooms .browser-attention-clear{flex-shrink:0;display:inline-grid;place-items:center;width:32px;height:32px;min-height:32px;margin-left:auto;padding:0;border:0;border-radius:8px;background:transparent;color:var(--muted);transition:background-color 160ms ease-out,color 160ms ease-out}
+.browser-rooms .browser-attention-clear:hover{background:color-mix(in srgb,var(--blue) 8%,var(--paper));color:var(--ink)}
+.browser-rooms .browser-attention-clear:focus-visible{outline:2px solid #5b85f2;outline-offset:2px}
+@keyframes attention-open{from{grid-template-rows:0fr;opacity:0}}
+@keyframes attention-ring{0%{transform:scale(1);opacity:.65}100%{transform:scale(3.2);opacity:0}}
+@keyframes attention-bump{0%{transform:scale(.55)}}
+@container(max-width:600px){
+  .browser-attention-items{mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent)}
+  .browser-attention-items>li{flex-shrink:0;max-width:min(300px,78cqi)}
+  .browser-attention-items>li:last-child{padding-right:24px}
+}
+@media(pointer:coarse){.browser-rooms .browser-attention-items button{min-height:44px}.browser-rooms .browser-attention-clear{width:44px;height:44px;min-height:44px}}
+@media(prefers-reduced-motion:reduce){.browser-attention,.browser-attention-count,.browser-attention-signal::after{animation:none}.browser-rooms .browser-attention-items button,.browser-rooms .browser-attention-clear{transition:none}}
+
+/* Side pane: "This work" | "Room details". One white pill glides between the two, like the invite dialog's tabs. */
+.browser-details-tabbed .browser-details-heading{gap:8px}
+.browser-details-tabbed.is-work .browser-details-heading{margin-bottom:0}
+.browser-pane-switch{position:relative;isolation:isolate;flex:1;min-width:0;display:grid;grid-template-columns:1fr 1fr;padding:3px;border-radius:10px;background:#e7ebf0}
+.browser-pane-glider{position:absolute;z-index:-1;top:3px;bottom:3px;left:3px;width:calc(50% - 3px);border-radius:7px;background:var(--paper);
+  box-shadow:0 1px 2px #1826341a,0 3px 10px -4px #18263429;transition:transform .44s cubic-bezier(.22,1,.36,1);pointer-events:none}
+.browser-pane-switch[data-tab=room] .browser-pane-glider{transform:translateX(100%)}
+.browser-rooms .browser-pane-switch button{min-height:32px;min-width:0;padding:0 6px;border:0;border-radius:7px;background:transparent;color:#556072;font-size:12.5px;font-weight:650;letter-spacing:-.005em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .25s ease}
+.browser-rooms .browser-pane-switch button:hover{color:var(--ink)}
+.browser-rooms .browser-pane-switch button[aria-selected=true]{color:var(--ink);font-weight:750}
+.browser-rooms .browser-pane-switch button:focus-visible{outline:2px solid #5b85f2;outline-offset:1px}
+
+/* This work: the room's work as a list, or one task or decision. */
+.work-list,.work-view,.work-empty{animation:work-in .34s cubic-bezier(.16,1,.3,1)}
+.work-list{display:grid;gap:22px;--work-in:-10px}
+.work-view{--work-in:10px}
+@keyframes work-in{from{opacity:0;transform:translateX(var(--work-in,0))}}
+.work-group h3,.work-section h4{display:flex;align-items:baseline;gap:6px;font-size:12px;font-weight:700;color:var(--ink);margin:0 0 6px}
+.work-group h3>span,.work-section h4>span{margin-left:0;color:var(--muted);font-weight:500;font-variant-numeric:tabular-nums}
+.work-group ul{list-style:none;margin:0 -10px;padding:0;display:grid;gap:2px}
+.browser-rooms .work-row{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:start;gap:10px;width:100%;min-height:0;padding:8px 10px;border:0;border-radius:10px;background:transparent;color:var(--ink);text-align:left;font:inherit;transition:background-color .16s ease-out,box-shadow .16s ease-out}
+.browser-rooms .work-row:hover{background:var(--paper);box-shadow:0 1px 2px #1826340f,0 2px 8px -4px #1826341f}
+.browser-rooms .work-row:focus-visible{outline:2px solid #5b85f2;outline-offset:-2px;background:var(--paper)}
+.work-row-glyph{display:grid;place-items:center;height:20px}
+.work-row-main{display:grid;gap:2px;min-width:0}
+.work-row-title{font-size:13px;font-weight:650;line-height:1.4;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.work-row-meta{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.work-row-tag{align-self:center;font-size:11px;font-weight:700;color:#8a4d0a;background:#fcf0dc;border-radius:999px;padding:2px 8px;white-space:nowrap}
+.work-glyph{flex-shrink:0}
+.work-glyph.is-todo{color:#8a94a3}.work-glyph.is-doing{color:var(--blue)}.work-glyph.is-done{color:#358573}.work-glyph.is-decision{color:#b4690e}
+.browser-rooms .work-more{min-height:32px;margin-top:4px;padding:0;border:0;background:none;color:var(--blue);font-size:12px;font-weight:650}
+.browser-rooms .work-more:hover{text-decoration:underline;text-underline-offset:3px}
+
+.browser-rooms .work-back{display:inline-flex;align-items:center;gap:2px;min-height:32px;margin:0 0 6px -8px;padding:0 10px 0 4px;border:0;border-radius:8px;background:transparent;color:var(--muted);font-size:12.5px;font-weight:650;transition:background-color .16s,color .16s}
+.browser-rooms .work-back:hover{color:var(--ink);background:#e7ebf0}
+.browser-rooms .work-back:focus-visible{outline:2px solid #5b85f2;outline-offset:1px}
+.browser-rooms .work-title{font-size:17px;font-weight:750;line-height:1.35;letter-spacing:-.015em;margin:0;overflow-wrap:anywhere;text-wrap:balance}
+.browser-rooms .work-title:focus{outline:none}
+.work-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:8px 0 0;font-size:12px;color:var(--muted)}
+.work-state{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 6px;border-radius:999px;font-weight:650}
+.work-state.is-todo{background:#eceff3;color:#4a5462}.work-state.is-todo .work-glyph{color:#7b8593}
+.work-state.is-doing{background:#e8eefc;color:#1f4bbd}
+.work-state.is-done{background:#e5f2ec;color:#294f40}
+.work-status{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2px;margin-top:14px;padding:3px;border:1px solid var(--line);border-radius:10px;background:var(--paper)}
+.browser-rooms .work-status button{min-height:32px;min-width:0;padding:0 4px;border:0;border-radius:7px;background:transparent;color:var(--muted);font-size:12px;font-weight:600;white-space:nowrap;transition:background-color .2s ease-out,color .2s ease-out}
+.browser-rooms .work-status button:not(:disabled):hover{color:var(--ink);background:var(--soft)}
+.browser-rooms .work-status button[aria-pressed=true]{font-weight:700;cursor:default}
+.browser-rooms .work-status button[aria-pressed=true]:nth-child(1){background:#eceff3;color:var(--ink)}
+.browser-rooms .work-status button[aria-pressed=true]:nth-child(2){background:#e8eefc;color:#1f4bbd}
+.browser-rooms .work-status button[aria-pressed=true]:nth-child(3){background:#e5f2ec;color:#294f40}
+.browser-rooms .work-status button.is-busy{animation:work-busy 1s ease-in-out infinite alternate}
+@keyframes work-busy{to{background:#e8eefc}}
+.browser-rooms .work-status button:focus-visible{outline:2px solid #5b85f2;outline-offset:1px}
+.work-facts{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px 14px;margin:16px 0 0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--paper)}
+.work-facts>div{display:contents}
+.work-facts dt{font-size:12px;color:var(--muted);white-space:nowrap}
+.work-facts dd{margin:0;min-width:0;font-size:13px;font-weight:600}
+.work-person{display:flex;align-items:center;gap:8px;min-width:0}
+.work-person>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.work-person .avatar,.work-history-avatar .avatar{width:22px;height:22px;font-size:10px;margin:0}
+.work-none{color:var(--muted);font-weight:500}
+.browser-rooms .work-link{display:inline-flex;align-items:flex-start;gap:6px;max-width:100%;min-height:0;padding:0;border:0;background:none;color:var(--blue);font:inherit;font-weight:600;text-align:left}
+.browser-rooms .work-link>span{overflow-wrap:anywhere}
+.browser-rooms .work-link .work-glyph{margin-top:2px}
+.browser-rooms .work-link:hover>span{text-decoration:underline;text-underline-offset:3px}
+.browser-rooms .work-link:focus-visible{outline:2px solid #5b85f2;outline-offset:2px;border-radius:4px}
+.work-section{margin-top:22px}
+.work-notes{margin:0;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--paper);font-size:13px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+.work-history{list-style:none;margin:0;padding:0;display:grid}
+.work-history>li{position:relative;display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:10px;align-items:start;padding-bottom:12px}
+.work-history>li:not(:last-child)::before{content:"";position:absolute;left:10.5px;top:26px;bottom:2px;width:1px;background:var(--line)}
+.work-history p{margin:2px 0 0;font-size:12.5px;line-height:1.5;overflow-wrap:anywhere}
+.work-history time{margin-top:3px;font-size:11.5px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.work-quiet{margin:0;font-size:12px;color:var(--muted)}
+.work-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
+.browser-rooms .work-actions .secondary{display:inline-flex;align-items:center;gap:8px;min-height:38px;padding:0 14px;font-size:12.5px;font-weight:650}
+.work-decision .browser-decision{margin:0;max-width:none}
+.work-made{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 6px;margin:14px 0 0;font-size:12.5px;color:var(--muted)}
+.work-empty{display:grid;justify-items:start;gap:10px;padding-top:8px}
+.work-empty>svg{color:#8a94a3;margin-bottom:4px}
+.work-empty h3{font-size:15px}
+.work-empty p{margin:0;font-size:13px;line-height:1.6;color:var(--muted);max-width:36ch}
+.browser-rooms .work-empty .secondary{min-height:38px;margin-top:6px;font-size:12.5px}
+@media(pointer:coarse){.browser-rooms .browser-pane-switch button,.browser-rooms .work-status button,.browser-rooms .work-back{min-height:44px}}
+@media(prefers-reduced-motion:reduce){.work-list,.work-view,.work-empty,.browser-rooms .work-status button.is-busy{animation:none}.browser-pane-glider,.browser-rooms .work-row,.browser-rooms .work-status button{transition:none}}
+/* The pane's generic section dividers are for Room details; work groups and sections sit closer, without rules. */
+.browser-details .work-list section+section,.browser-details .work-detail section+section{margin-top:0;padding-top:0;border-top:0}
+.browser-details .work-detail .work-section+.work-section{margin-top:22px}

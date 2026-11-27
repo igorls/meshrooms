@@ -11,7 +11,7 @@
  * wake", and every refusal below is a consequence of it. Nothing outside this file is written.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentCli, insideDir } from './agent-cli';
@@ -113,5 +113,68 @@ describe('wake mode — the refusals hold at the real CLI entry', () => {
       const file = join(dir, 'real.txt'); writeFileSync(file, 'x');
       expect(insideDir(file, dir)).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('all 8 vfs-* commands pass wakeGuard for the wake room, fail for other rooms, and refuse <roomDir>/vfs files', async () => {
+    const vfsCommands = ['vfs-list', 'vfs-read', 'vfs-write', 'vfs-patch', 'vfs-history', 'vfs-diff', 'vfs-revert', 'vfs-delete'] as const;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'wake-vfs-')));
+    const wakeDir = join(root, 'wake');
+    const vfsDir = join(root, 'vfs');
+    mkdirSync(wakeDir, { recursive: true });
+    mkdirSync(vfsDir, { recursive: true });
+    const vfsFile = join(vfsDir, 'wormdb.wal');
+    const wakeText = join(wakeDir, 'draft.md');
+    const wakePatch = join(wakeDir, 'patch.json');
+    writeFileSync(vfsFile, 'sealed-vfs-data');
+    writeFileSync(wakeText, 'hello');
+    writeFileSync(wakePatch, '[]');
+
+    const env = { MESHROOMS_WAKE_ROOM: ROOM, MESHROOMS_WAKE_DIR: wakeDir };
+    try {
+      // Every vfs-* command is allowed past wakeGuard for the pinned wake room (never refused as non-wake or wrong room).
+      for (const cmd of vfsCommands) {
+        const msg = await refuse([cmd, '--room', ROOM], env);
+        expect(msg ?? '').not.toContain("isn't available");
+        expect(msg ?? '').not.toContain('use --room');
+      }
+
+      // Every vfs-* command for another room is refused by wakeGuard.
+      for (const cmd of vfsCommands) {
+        const msg = await refuse([cmd, '--room', OTHER_ROOM], env);
+        expect(msg).toContain('use --room');
+        expect(msg).toContain(ROOM);
+      }
+
+      // Direct file flags pointing into <roomDir>/vfs are strictly refused.
+      for (const argv of [
+        ['vfs-write', '--room', ROOM, '--text-file', vfsFile],
+        ['vfs-patch', '--room', ROOM, '--patch-file', vfsFile],
+        ['send', '--room', ROOM, '--attach', vfsFile],
+      ]) {
+        const msg = await refuse(argv, env);
+        expect(msg).toContain('must be in the wake folder');
+      }
+
+      // Symlink inside wakeDir pointing into <roomDir>/vfs is strictly refused.
+      if (process.platform !== 'win32') {
+        const link = join(wakeDir, 'escape-vfs.wal');
+        symlinkSync(vfsFile, link);
+        expect(insideDir(link, wakeDir)).toBe(false);
+        const msg = await refuse(['vfs-patch', '--room', ROOM, '--patch-file', link], env);
+        expect(msg).toContain('must be in the wake folder');
+      }
+
+      // Regular files inside wakeDir pass the wakeGuard file check.
+      for (const argv of [
+        ['vfs-write', '--room', ROOM, '--text-file', wakeText],
+        ['vfs-patch', '--room', ROOM, '--patch-file', wakePatch],
+      ]) {
+        const msg = await refuse(argv, env);
+        expect(msg ?? '').not.toContain('must be in the wake folder');
+        expect(msg ?? '').not.toContain("isn't available");
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

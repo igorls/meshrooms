@@ -94,7 +94,9 @@ export const HERMES_EXPECTED_TOOLS = ['listen', 'send', 'tasks'] as const;
  * a wake that reached for a tool outside the room — a shell, a file writer — because the confinement
  * was misconfigured or the toolset name resolved to more than the room's server.
  */
-export const HERMES_ROOM_TOOLS = ['listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status'] as const;
+/** Room VFS subcommands exposed to confined wakes (read-only + floor-gated mutations via file-mailbox RPC). */
+export const VFS_WAKE_COMMANDS = ['vfs-list', 'vfs-read', 'vfs-write', 'vfs-patch', 'vfs-history', 'vfs-diff', 'vfs-revert', 'vfs-delete'] as const;
+export const HERMES_ROOM_TOOLS = ['listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status', ...VFS_WAKE_COMMANDS] as const;
 /**
  * Hermes' own name sanitization, mirrored exactly.
  *
@@ -347,7 +349,7 @@ export const emptyState = (): WatchState => ({ wakes: [], noProgress: 0 });
 
 /** What a harness the watcher woke may run: reading the room and taking part in it, nothing that configures the bridge. */
 export const WAKE_COMMANDS = ['help', 'version', 'listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'task-remove', 'decisions', 'decision-wait',
-  'vote', 'ask', 'decision-option', 'decision-close', 'attachment', 'status'] as const;
+  'vote', 'ask', 'decision-option', 'decision-close', 'attachment', 'status', ...VFS_WAKE_COMMANDS] as const;
 /**
  * Bash-tool rules that let Claude Code run those bridge subcommands and nothing else: not the bridge's other
  * commands (watch, connect, profile...), and no pipes, redirects, chains or substitutions.
@@ -535,6 +537,7 @@ export function wakeReadDenies(config: Pick<WatchConfig, 'agentHome' | 'roomDir'
     }
   };
   add(join(config.roomDir, 'identity.json'));
+  add(join(config.roomDir, 'vfs'));
   const meshrooms = join(home, '.meshrooms');
   walk(meshrooms, 0);
   if (!sameOrInside(config.agentHome, meshrooms)) walk(config.agentHome, 0);

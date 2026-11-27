@@ -568,7 +568,7 @@ test('a person connects an agent with a one-time link; it joins as its own membe
 });
 
 test('agent links are capped per person, and agents leave with their operator', async () => {
-  const lobby = new BrowserLobby(':memory:', { origin });
+  const lobby = new BrowserLobby(':memory:', { origin, agentsPerOperator: 4 });
   try {
     const host = await client(lobby), room = crypto.randomUUID();
     await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
@@ -584,7 +584,7 @@ test('agent links are capped per person, and agents leave with their operator', 
     await expect(sam.send('agent-invite', room, { name: 'A5' })).rejects.toThrow('four unused agent links');
     // From review: links made while Sam had fewer agents cannot take Sam past four once they are used.
     for (const token of links.slice(0, 3)) await (await client(lobby)).send('agent-redeem', room, { token, label: 'Extra' });
-    await expect((await client(lobby)).send('agent-redeem', room, { token: links[3], label: 'Extra' })).rejects.toThrow('already has four agents');
+    await expect((await client(lobby)).send('agent-redeem', room, { token: links[3], label: 'Extra' })).rejects.toThrow('already has 4 agents');
     expect((await host.status(room)).members!.map(m => [m.name, m.role ?? 'human'])).toEqual([['Alex', 'human'], ['Sam', 'human'], ['Wren', 'agent'], ['Codex', 'agent'],
       ['A1', 'agent'], ['A2', 'agent'], ['A3', 'agent']]);
 

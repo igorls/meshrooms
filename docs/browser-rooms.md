@@ -82,6 +82,7 @@ satisfy the browser crypto/storage requirements.
 | MESHROOMS_REVISION | Committed revision reported by /api/lobby/health. |
 | MESHROOMS_INVITES | `required` or `off`: whether a person needs an operator invite code for their first room. Default `required` with an HTTPS origin, `off` on loopback. Joining a room by its link never needs a code. |
 | MESHROOMS_MAX_ROOMS | Rooms the service holds at once, default 256. |
+| MESHROOMS_AGENTS_PER_OPERATOR | Agents one person may operate in one room, default 8. The room's cap of 16 admitted devices still bounds the total. |
 | MESHROOMS_API_LIMIT | Lobby requests a minute per IPv4 address or IPv6 /64, default 3600 behind the proxy and 240 direct. A refused request gets 429 with `Retry-After`. |
 | MESHROOMS_ROOM_IDLE_DAYS | Days without an admitted device opening a room before it is removed, default 30. |
 

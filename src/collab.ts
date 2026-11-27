@@ -43,6 +43,11 @@ export type Task = {
   /** Who set the current assignee, and the board revision at which it happened. */
   assignedBy?: string;
   assignedRevision?: number;
+  /**
+   * A done task: who moved it to done, when, and the board revision of that move (browser rooms). Later edits to its
+   * notes or link leave this as it is, so they don't read as finishing it again.
+   */
+  finished?: { by: string; at: string; revision: number };
   createdBy: string;
   updatedBy: string;
   updatedAt: string;

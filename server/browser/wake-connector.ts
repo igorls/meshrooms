@@ -28,6 +28,9 @@ export type WakePayload = {
   source: 'meshrooms';
   event: 'room-has-work';
   inbox: string;
+  /** The room the work is in, so a webhook receiver with several rooms knows which one to listen to. */
+  room: string;
+  /** How many frames addressed to this device wait (a mention, a reply, an assignment, a decision asking it). */
   count: number;
 };
 
@@ -249,19 +252,21 @@ export function parseRetryAfterMs(
 }
 
 /**
- * Builds the strictly content-free HTTP headers and JSON body for a wake dispatch.
- * Never includes `roomId`, `deviceId`, member text, or ciphertext.
+ * Builds the strictly content-free HTTP headers and JSON body for a wake dispatch. It names the room (the receiver is the
+ * device's own operator, who already holds the room id) and counts addressed frames; it never includes `deviceId`,
+ * member text, or ciphertext.
  */
 export function buildWakeRequest(
   provider: WakeProvider,
   inboxId: string,
   count: number,
   bearerKey: string,
+  roomId: string,
 ): { headers: Record<string, string>; body: string } {
   const safeCount = Math.max(1, Math.floor(count));
   if (provider === 'claude-code') {
     const payload: ClaudeCodeWakePayload = {
-      text: `Meshrooms room has work waiting in inbox ${inboxId} (count: ${safeCount}).`,
+      text: `Meshrooms room ${roomId} has work addressed to you waiting in inbox ${inboxId} (count: ${safeCount}).`,
     };
     return {
       headers: {
@@ -277,6 +282,7 @@ export function buildWakeRequest(
     source: 'meshrooms',
     event: 'room-has-work',
     inbox: inboxId,
+    room: roomId,
     count: safeCount,
   };
   return {
@@ -668,7 +674,7 @@ export class WakeConnector {
    * room/agent/sender hourly caps, fail-closed allowlist policy, pinned-IP socket egress (anti-DNS-rebinding),
    * provider-specific adapters (`generic` / `claude-code`), and `Retry-After`-aware retries (429 / 5xx).
    */
-  async notify(roomId: string, deviceId: string, senderId: string, pendingCount: number): Promise<WakeResult> {
+  async notify(roomId: string, deviceId: string, senderId: string, addressedCount: number): Promise<WakeResult> {
     const row = this.db.query(
       'SELECT inbox_id, room_id, device_id, iv, ct, tag, updated_at FROM wake_registrations WHERE room_id = ? AND device_id = ?',
     ).get(roomId, deviceId) as StoredRegistration | null;
@@ -728,7 +734,7 @@ export class WakeConnector {
     let succeeded = false;
     try {
       const hostname = normalizeHostname(parsed.hostname);
-      const { headers, body } = buildWakeRequest(provider, row.inbox_id, pendingCount, decrypted.key);
+      const { headers, body } = buildWakeRequest(provider, row.inbox_id, addressedCount, decrypted.key, roomId);
       let lastStatus = 0;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {

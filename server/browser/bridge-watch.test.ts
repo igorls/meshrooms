@@ -1610,3 +1610,33 @@ test('Antigravity (agy): invocation, heredoc prompt, stream-json parsing, hook d
   expect(agyEnv.env).toEqual({ PATH: '/bin', GEMINI_API_KEY: 'gk', GOOGLE_CLOUD_API_KEY: 'gc', ANTIGRAVITY_API_TOKEN: 'at' });
   expect(agyEnv.withheld).toEqual(['GH_TOKEN', 'OPENAI_API_KEY']);
 });
+
+test('Room VFS confinement: wakeReadDenies denies <roomDir>/vfs across Claude & Codex while launcherRules allows all 8 vfs-* commands', () => {
+  const home = realpathSync(tempHome()), meshrooms = join(home, '.meshrooms'), agentHome = join(meshrooms, 'agents');
+  const roomDir = join(agentHome, 'browser-agents', 'room-vfs'), binDirPath = join(meshrooms, 'bin'), vfsDir = join(roomDir, 'vfs');
+  mkdirSync(vfsDir, { recursive: true });
+  mkdirSync(binDirPath, { recursive: true });
+  writeFileSync(join(roomDir, 'identity.json'), '{}');
+  writeFileSync(join(vfsDir, 'wormdb.wal'), 'sealed');
+
+  const denies = wakeReadDenies({ agentHome, roomDir, binDir: binDirPath }, home, join(home, '.codex'), { knownHomes: [] });
+  const vfsDeny = denies.find(d => d.path === resolve(vfsDir));
+  expect(vfsDeny).toEqual({ path: resolve(vfsDir), dir: true });
+
+  // Claude Code read deny rules cover <roomDir>/vfs/** and allowedTools cover all 8 vfs-* subcommands.
+  const claudeDenies = claudeReadRules(denies, 'linux');
+  expect(claudeDenies).toContain(`Read(${claudeRulePath(resolve(vfsDir), 'linux')}/**)`);
+  const rules = launcherRules('/bin/meshrooms.js');
+  for (const sub of ['vfs-list', 'vfs-read', 'vfs-write', 'vfs-patch', 'vfs-history', 'vfs-diff', 'vfs-revert', 'vfs-delete']) {
+    expect(rules).toContain(`Bash(bun "/bin/meshrooms.js" ${sub} *)`);
+  }
+
+  // Codex profile denies <roomDir>/vfs, keeps network disabled, and allows outbox + live (never vfs) as writable.
+  const codexRun = harnessInvocation(watchConfig({ harness: 'codex', roomDir, agentHome, binDir: binDirPath }), 'p', '/tmp/p', found, { denyRead: denies });
+  const fsArg = codexRun.args.find(a => a.startsWith(`permissions.${CODEX_PROFILE}.filesystem=`)) ?? '';
+  expect(fsArg).toContain(`${JSON.stringify(resolve(vfsDir))} = "deny"`);
+  expect(fsArg).toContain(`${JSON.stringify(join(roomDir, 'outbox'))} = "write"`);
+  expect(fsArg).toContain(`${JSON.stringify(join(roomDir, 'live'))} = "write"`);
+  expect(fsArg).not.toContain(`${JSON.stringify(resolve(vfsDir))} = "write"`);
+  expect(codexRun.args).toContain(`permissions.${CODEX_PROFILE}.network.enabled=false`);
+});

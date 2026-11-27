@@ -10,7 +10,7 @@
  * flood in an envelope; what that can do is bounded by the per-member caps (live reaction keys, decision shares, task
  * revision jumps) and the room-wide log caps, not by this quota.
  */
-export type QuotaKind = 'message' | 'history' | 'task' | 'decision' | 'reaction' | 'retract';
+export type QuotaKind = 'message' | 'history' | 'task' | 'decision' | 'reaction' | 'retract' | 'vfs' | 'vfs-sync';
 export const QUOTA_PER_MINUTE = 60, QUOTA_BURST = 20;
 /**
  * History replication receive quota per author member: a higher burst (512) and refill (600/min) lets a newcomer
@@ -18,6 +18,14 @@ export const QUOTA_PER_MINUTE = 60, QUOTA_BURST = 20;
  * with `QuotaDrops` resuming cleanly if a single author exceeds the burst.
  */
 export const HISTORY_QUOTA_PER_MINUTE = 600, HISTORY_QUOTA_BURST = 512;
+/**
+ * Room VFS receive quotas (`docs/flows/room-vfs.md` §6.2):
+ * - `'vfs'`: live signed `vfs-record` / `vfs-key-*` packets per author/peer (60/min, burst 30)
+ * - `'vfs-sync'`: batched `vfs-ops` catch-up entries per peer (1,024 entries/min, burst 512)
+ * Isolated in separate buckets so an abusive VFS flood never drops or starves chat/history/tasks/decisions.
+ */
+export const VFS_QUOTA_PER_MINUTE = 60, VFS_QUOTA_BURST = 30;
+export const VFS_SYNC_QUOTA_PER_MINUTE = 1024, VFS_SYNC_QUOTA_BURST = 512;
 /** A peer whose state was dropped over quota is asked for it again once no drop has happened for this long. */
 export const QUOTA_QUIET_MS = 5000;
 
@@ -50,11 +58,16 @@ export class ReceiveQuota {
     private maxBuckets = 512,
     private historyPerMinute = HISTORY_QUOTA_PER_MINUTE,
     private historyBurst = HISTORY_QUOTA_BURST,
+    private vfsPerMinute = VFS_QUOTA_PER_MINUTE,
+    private vfsBurst = VFS_QUOTA_BURST,
+    private vfsSyncPerMinute = VFS_SYNC_QUOTA_PER_MINUTE,
+    private vfsSyncBurst = VFS_SYNC_QUOTA_BURST,
   ) {}
   private limits(kind: QuotaKind) {
-    return kind === 'history'
-      ? { perMinute: this.historyPerMinute, burst: this.historyBurst }
-      : { perMinute: this.perMinute, burst: this.burst };
+    if (kind === 'history') return { perMinute: this.historyPerMinute, burst: this.historyBurst };
+    if (kind === 'vfs') return { perMinute: this.vfsPerMinute, burst: this.vfsBurst };
+    if (kind === 'vfs-sync') return { perMinute: this.vfsSyncPerMinute, burst: this.vfsSyncBurst };
+    return { perMinute: this.perMinute, burst: this.burst };
   }
   private bucket(memberId: string, kind: QuotaKind) {
     const key = `${kind}:${memberId}`, at = this.now(), { perMinute, burst } = this.limits(kind);
@@ -67,11 +80,12 @@ export class ReceiveQuota {
     if (this.buckets.size > this.maxBuckets) this.buckets.delete(this.buckets.keys().next().value!);
     return bucket;
   }
-  /** Spend one packet of `kind` from `memberId`; false when over quota (drop the packet). */
-  take(memberId: string, kind: QuotaKind) {
+  /** Spend `cost` packet units of `kind` from `memberId`; false when over quota (drop the packet). */
+  take(memberId: string, kind: QuotaKind, cost = 1) {
     const bucket = this.bucket(memberId, kind);
-    if (bucket.tokens < UNIT) return false;
-    bucket.tokens -= UNIT; return true;
+    const need = Math.max(1, Math.floor(cost)) * UNIT;
+    if (bucket.tokens < need) return false;
+    bucket.tokens -= need; return true;
   }
   /** Whether a drop is worth a log line: the first per member and kind each minute, so a flood doesn't flood the log. */
   report(memberId: string, kind: QuotaKind) {

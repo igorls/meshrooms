@@ -23,7 +23,9 @@ export const MAX_CLAIMS = 64;
 export const MAX_LIVE_CLAIMS = 4;
 /** How long an answered claim is kept, so a late agent still sees who answered. */
 export const CLAIM_KEEP_MS = 24 * 3_600_000;
-const INVITE_TTL = 900_000, INVITES_PER_PERSON = 4, AGENTS_PER_OPERATOR = 4;
+const INVITE_TTL = 900_000, INVITES_PER_PERSON = 4;
+/** Agents one person may operate in one room, by default (LobbyOptions.agentsPerOperator, MESHROOMS_AGENTS_PER_OPERATOR). */
+export const AGENTS_PER_OPERATOR = 8;
 /** Devices one member may hold in a room, under the room's 16: one person can't fill the room with devices of their own. */
 export const DEVICES_PER_MEMBER = 4;
 /** Device codes a device may get wrong in a room per window before `link` answers 429 (codes are 64 bits and expire anyway). */
@@ -76,7 +78,7 @@ const settingsOf = (room: Room): RoomSettings => ({ ...DEFAULT_ROOM_SETTINGS, ..
  * `maxRooms` caps rooms service-wide (default 256). `invites: 'required'` gates room creation behind operator invite codes.
  * `idleDays` is how long a room lives without an admitted device opening it (default 30).
  */
-export type LobbyOptions = { origin: string; /** Other origins of this service, accepted like `origin`. */ aliases?: string[]; now?: () => number; stunUrls?: string[]; turnUrls?: string[]; turnSecret?: string;
+export type LobbyOptions = { origin: string; /** Agents one person may operate in one room (default AGENTS_PER_OPERATOR). */ agentsPerOperator?: number; /** Other origins of this service, accepted like `origin`. */ aliases?: string[]; now?: () => number; stunUrls?: string[]; turnUrls?: string[]; turnSecret?: string;
   relayUrl?: string; /** Advertise and accept the E2E relay (relay URL, host-signed rosters, device encryption keys). Default true here; the coordinator process passes its `MESHROOMS_RELAY_ENABLED` flag, which defaults to off. */ relayEnabled?: boolean; maxRooms?: number; invites?: 'required' | 'off'; idleDays?: number; maxSignalChars?: number; minProtocolVersion?: number };
 /**
  * Connection offers wait in memory for up to 30 seconds. One queue holds at most 32 of 16,000 characters, but there
@@ -161,6 +163,7 @@ export class BrowserLobby {
   get inviteRequired() { return this.options.invites === 'required'; }
   get minProtocolVersion() { return this.options.minProtocolVersion ?? MIN_PROTOCOL_VERSION; }
   get relayEnabled() { return this.options.relayEnabled !== false; }
+  get agentsPerOperator() { return this.options.agentsPerOperator ?? AGENTS_PER_OPERATOR; }
   get relayUrl() { return this.relayUrlFor(this.options.origin); }
   /**
    * The relay a device reaching the service through `origin` is told about: at that origin. A configured relay URL at one
@@ -777,7 +780,7 @@ export class BrowserLobby {
             const name = memberName(c.payload.name, 64);
             nameAvailable(room, name, invites);
             if (invites.filter(i => i.operatorId === actor.memberId).length >= INVITES_PER_PERSON) fail(429, 'You already have four unused agent links. Use one or wait for them to expire.');
-            if (room.members.filter(m => m.role === 'agent' && m.operatorId === actor.memberId).length >= AGENTS_PER_OPERATOR) fail(429, 'You already have four agents in this room.');
+            if (room.members.filter(m => m.role === 'agent' && m.operatorId === actor.memberId).length >= this.agentsPerOperator) fail(429, `You already have ${this.agentsPerOperator} agents in this room.`);
             const token = randomBytes(32).toString('base64url');
             room.invites = [...invites, { tokenHash: tokenHash(token), operatorId: actor.memberId, name, expiresAt: this.now() + INVITE_TTL }];
             saveRoom(this.db, room, false);
@@ -796,7 +799,7 @@ export class BrowserLobby {
             // Checked again here: links made before the operator's earlier agents joined must not exceed the limit.
             const operated = room.members.filter(m => m.role === 'agent' && m.operatorId === invite.operatorId).length
               + room.requests.filter(r => r.kind === 'agent' && r.state === 'pending' && r.expiresAt > this.now() && r.operatorId === invite.operatorId).length;
-            if (operated >= AGENTS_PER_OPERATOR) fail(429, 'The person who made this link already has four agents in this room.');
+            if (operated >= this.agentsPerOperator) fail(429, `The person who made this link already has ${this.agentsPerOperator} agents in this room.`);
             if (room.devices.length >= 16) fail(429, 'This room has reached its device limit.');
             room.invites = remainingInvites;
             room.requests = room.requests.filter(r => r.device.id !== id);

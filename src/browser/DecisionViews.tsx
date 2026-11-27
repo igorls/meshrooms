@@ -26,7 +26,7 @@ export function decisionSummary(decision: Decision) {
   return `${t.voters} of ${t.people} ${t.people === 1 ? 'person' : 'people'} voted`;
 }
 
-function timeLeft(closesAt: number, now: number) {
+export function timeLeft(closesAt: number, now: number) {
   const minutes = Math.ceil((closesAt - now) / 60_000);
   if (minutes <= 0) return 'closing';
   if (minutes < 60) return `${minutes} min left`;
@@ -39,10 +39,12 @@ type CardProps = {
   avatar: (memberId: string) => ReactNode; nameOf: (memberId: string) => string;
   onVote: (optionId: string | null, comment: string) => Promise<void>; onAddOption: (label: string) => Promise<void>;
   onClose: () => Promise<void>; onWithdraw: () => Promise<void>; onTasks?: () => void;
+  /** Prefix of the card's element ids, so a second copy (in the side pane) doesn't repeat the conversation's ids. */
+  idBase?: string;
 };
 
 /** A decision in the conversation: people vote, agents advise, and the card shows the tally and outcome. */
-export function DecisionCard({ decision, viewerId, ownerId, members, participants, now, highlight, avatar, nameOf, onVote, onAddOption, onClose, onWithdraw, onTasks }: CardProps) {
+export function DecisionCard({ decision, viewerId, ownerId, members, participants, now, highlight, avatar, nameOf, onVote, onAddOption, onClose, onWithdraw, onTasks, idBase = 'decision' }: CardProps) {
   const [comment, setComment] = useState('');
   const [adding, setAdding] = useState('');
   const [panel, setPanel] = useState<'none' | 'reason' | 'option'>('none');
@@ -61,7 +63,7 @@ export function DecisionCard({ decision, viewerId, ownerId, members, participant
   const act = (work: () => Promise<void>) => { setBusy(true); setError(''); work().catch(e => setError(e instanceof Error ? e.message : String(e))).finally(() => setBusy(false)); };
   const creator = nameOf(decision.createdBy);
 
-  return <article id={`decision-${decision.key}`} className={`browser-decision ${highlight ? 'browser-message-highlight' : ''} ${open ? '' : 'is-closed'}`} aria-label={`Decision: ${decision.question}`}>
+  return <article id={`${idBase}-${decision.key}`} className={`browser-decision ${highlight ? 'browser-message-highlight' : ''} ${open ? '' : 'is-closed'}`} aria-label={`Decision: ${decision.question}`}>
     <header>
       <span className="browser-decision-kind">{decision.mode === 'plan-review' ? 'Plan review' : 'Decision'}</span>
       <span className="browser-decision-by">asked by {decision.createdBy === viewerId ? 'you' : creator}</span>
@@ -111,15 +113,15 @@ export function DecisionCard({ decision, viewerId, ownerId, members, participant
     {open && viewerId && panel === 'reason' && <form className="browser-decision-inline" onSubmit={(e: FormEvent) => {
       e.preventDefault(); const choice = mine?.optionId; if (choice) act(async () => { await onVote(choice, comment); setPanel('none'); });
     }}>
-      <label className="sr-only" htmlFor={`decision-comment-${decision.key}`}>Reason for your vote</label>
-      <input id={`decision-comment-${decision.key}`} autoFocus value={comment} maxLength={500} placeholder={mine?.optionId ? 'Why you chose it' : 'Saved with your vote when you choose'} onChange={e => setComment(e.target.value)} />
+      <label className="sr-only" htmlFor={`${idBase}-comment-${decision.key}`}>Reason for your vote</label>
+      <input id={`${idBase}-comment-${decision.key}`} autoFocus value={comment} maxLength={500} placeholder={mine?.optionId ? 'Why you chose it' : 'Saved with your vote when you choose'} onChange={e => setComment(e.target.value)} />
       {mine?.optionId && <button type="submit" className="secondary" disabled={busy}>Save</button>}
     </form>}
     {open && viewerId && panel === 'option' && <form className="browser-decision-inline" onSubmit={(e: FormEvent) => {
       e.preventDefault(); if (adding.trim()) act(async () => { await onAddOption(adding); setAdding(''); setPanel('none'); });
     }}>
-      <label className="sr-only" htmlFor={`decision-add-${decision.key}`}>Add an option</label>
-      <input id={`decision-add-${decision.key}`} autoFocus value={adding} maxLength={120} placeholder="New option" onChange={e => setAdding(e.target.value)} />
+      <label className="sr-only" htmlFor={`${idBase}-add-${decision.key}`}>Add an option</label>
+      <input id={`${idBase}-add-${decision.key}`} autoFocus value={adding} maxLength={120} placeholder="New option" onChange={e => setAdding(e.target.value)} />
       <button type="submit" className="secondary" disabled={busy || !adding.trim()}>Add</button>
     </form>}
     {decision.state === 'closed' && !decision.verified && <p className="browser-decision-note">Checking the result against the counted votes as they arrive…</p>}

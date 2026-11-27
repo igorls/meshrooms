@@ -21,6 +21,7 @@ const lobby = new BrowserLobby(admissionPath(config.dataDir), {
   relayUrl: config.relayUrl,
   relayEnabled: config.relayEnabled,
   maxRooms: config.maxRooms,
+  agentsPerOperator: config.agentsPerOperator,
   invites: config.invites,
   idleDays: config.idleDays,
 });

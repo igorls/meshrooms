@@ -15,7 +15,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { tryLock } from './locks';
 import { guardNetworkInterfaces, interfacesUnavailable, withoutMdnsCandidates } from './interfaces';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { browserProtocol, signerOf, type AgentRuntimeProfile, type BrowserDevice, type BrowserMember, type Command, type MessageVisibility, type RoomStatus } from '../src/browser/protocol';
@@ -61,8 +61,37 @@ import {
   type AgentKeySecret, type DecryptedRelayEnvelope, type RelayEnvelope, type RelayLane, type RemovedRosterEntry,
   type RosterBody, type RosterEntry, type SignedRoster,
 } from '../src/browser/relay-crypto';
-import { RelayClient, type RelayClientOptions } from '../src/browser/relay-client';
+import { RelayClient, type RelayClientOptions, type SendPacketOptions } from '../src/browser/relay-client';
 import { RelayReplayGuard, type RelayReplayRecord } from '../src/browser/relay-replay';
+import { VFS_PROTOCOL_VERSION, VfsError } from '../src/browser/vfs/constants';
+import { utf8Bytes } from '../src/browser/vfs/envelope';
+import {
+  VFS_RELAY_SEND_OPTS, assertVfsRelaySafeOptions, isVfsHavePacket, isVfsKeyEpochPacket,
+  isVfsKeyGrantPacket, isVfsKeyWrapPacket, isVfsOpsPacket, isVfsPacketKind, isVfsRecordPacket,
+  vfsPacketRelayLane,
+  type VfsHavePacket, type VfsOpsPacket, type VfsPacket,
+} from '../src/browser/vfs/wire';
+import { VfsRelayBudget, VfsSyncTracker, type VfsRelayBudgetLane } from '../src/browser/vfs/pacing';
+import { VfsUnauthorizedError, type VfsRoomEngine, type VfsSignerInfo, type VfsSignerLookup } from '../src/browser/vfs/engine';
+import {
+  VFS_RPC_DEFAULT_TIMEOUT_MS,
+  VFS_RPC_STALE_MAX_AGE_MS,
+  VfsRpcTimeoutError,
+  awaitVfsRpcReply,
+  isValidVfsRpcId,
+  isVfsRpcOutboxItem,
+  parseVfsOutboxItem,
+  sweepStaleVfsRpcReplies,
+  writeVfsRpcMutation,
+  writeVfsRpcQuery,
+  writeVfsRpcReply,
+  type VfsChangesReplyData,
+  type VfsMutationRpc,
+  type VfsMutationRpcInput,
+  type VfsQueryRpcInput,
+  type VfsRpcReply,
+} from './vfs-rpc';
+import { openBridgeVfsRuntime, type BridgeVfsRuntime, type OpenBridgeVfsRuntimeOptions } from './vfs-runtime';
 
 export type AgentIdentity = {
   id: string;
@@ -109,8 +138,8 @@ type Peer = {
   iceKey?: string; remoteUfrag?: string;
   sent: Map<string, number>; queue?: SendQueue; resync: Resync;
 };
-/** Message, board and decision cursors `listen` continues from; saved in the agent's room folder. */
-export type ListenCursor = { after?: string; boardAfter: number; decisionsAfter: number };
+/** Message, board, decision and optional passive VFS cursors `listen` continues from; saved in the agent's room folder. */
+export type ListenCursor = { after?: string; boardAfter: number; decisionsAfter: number; vfsAfter?: number };
 const LISTEN_CURSOR = 'listen-cursor.json';
 /** The room folder's subfolder for what the agent's own commands write (see BrowserAgent.live). */
 export const LIVE = 'live';
@@ -439,6 +468,11 @@ export class BrowserAgent {
     });
     return { enc: id.encPublicKey, encVersion: id.encVersion, encSig };
   }
+  /** This device's non-exportable P-256 ECDH private CryptoKey (for VFS epoch unwrap & at-rest key derivation). */
+  async encPrivateKey(): Promise<CryptoKey> {
+    await this.ensureIdentity();
+    return this.encKey!;
+  }
   /** Decrypts an incoming E2E `RelayEnvelope` using this device's persistent ECDH private key. */
   async decryptRelay<T = unknown>(
     envelope: unknown,
@@ -572,7 +606,11 @@ export class BrowserAgent {
   listenCursor(): ListenCursor | undefined {
     const c = this.mem ? this.mem.listenCursor : readJson<Partial<ListenCursor> | undefined>(this.live(LISTEN_CURSOR), undefined);
     const n = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
-    return c && n(c.boardAfter) && n(c.decisionsAfter) && (c.after === undefined || typeof c.after === 'string') ? c as ListenCursor : undefined;
+    return c && n(c.boardAfter) && n(c.decisionsAfter)
+      && (c.after === undefined || typeof c.after === 'string')
+      && (c.vfsAfter === undefined || n(c.vfsAfter))
+      ? c as ListenCursor
+      : undefined;
   }
   saveListenCursor(cursor: ListenCursor, expected?: string, options: { monotonic?: boolean } = {}) {
     if (this.mem) {
@@ -602,10 +640,35 @@ export class BrowserAgent {
             if (curIdx >= 0 && (nextIdx < 0 || curIdx > nextIdx)) after = current.after;
           }
         }
-        next = { ...(after !== undefined ? { after } : {}), boardAfter: Math.max(curBoard, cursor.boardAfter), decisionsAfter: Math.max(curDecisions, cursor.decisionsAfter) };
+        const vfsAfter = current.vfsAfter !== undefined || cursor.vfsAfter !== undefined
+          ? Math.max(current.vfsAfter ?? 0, cursor.vfsAfter ?? 0)
+          : undefined;
+        next = {
+          ...(after !== undefined ? { after } : {}),
+          boardAfter: Math.max(curBoard, cursor.boardAfter),
+          decisionsAfter: Math.max(curDecisions, cursor.decisionsAfter),
+          ...(vfsAfter !== undefined ? { vfsAfter } : {}),
+        };
       }
       writeJson(join(this.dir, LIVE, LISTEN_CURSOR), next); return true;
     } finally { try { unlinkSync(lock); } catch { /* Released already. */ } }
+  }
+  /** Content-free VFS mutation counter/timestamp in `live/` so live pickup leases stay active during doc edits. */
+  vfsActivity(): { count: number; lastAt: number } {
+    if (this.mem) return { count: 0, lastAt: 0 };
+    const raw = readJson<{ count?: unknown; lastAt?: unknown } | undefined>(join(this.dir, LIVE, 'vfs-activity.json'), undefined);
+    const count = typeof raw?.count === 'number' && Number.isSafeInteger(raw.count) && raw.count >= 0 ? raw.count : 0;
+    const lastAt = typeof raw?.lastAt === 'number' && Number.isSafeInteger(raw.lastAt) && raw.lastAt >= 0 ? raw.lastAt : 0;
+    return { count, lastAt };
+  }
+  recordVfsAction(now = Date.now()) {
+    this.touchActivity(now);
+    if (this.mem) return;
+    const prev = this.vfsActivity();
+    try {
+      mkdirSync(join(this.dir, LIVE), { recursive: true, mode: 0o700 });
+      writeJson(join(this.dir, LIVE, 'vfs-activity.json'), { count: prev.count + 1, lastAt: Math.max(prev.lastAt, now) });
+    } catch { /* Best effort; pickup lease heartbeat already refreshed by touchActivity. */ }
   }
   /** What the agent is doing, as its own commands last recorded it; undefined before its first `listen`. */
   activity(): Activity | undefined {
@@ -751,6 +814,12 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
     const target = resolveMessageById(view.messages, it.messageId);
     if (!target || !needsClaim(view, target)) return 'it is not a message that went to every agent';
     return it.release || wakes(view, target, memberId) ? undefined : 'the message does not wake the agent';
+  }
+  if (isVfsRpcOutboxItem(it)) {
+    const parsed = parseVfsOutboxItem(it);
+    if (!parsed.ok) return parsed.error;
+    if (parsed.request.type === 'vfs-query') return undefined;
+    return speaks(parsed.request.replyTo) ? undefined : 'nothing in this room addressed the agent';
   }
   if (it.type !== undefined) return 'it is not a known kind';
   if (typeof it.text !== 'string' || it.text.length > 4000 || (!it.text.trim() && !(Array.isArray(it.attachments) && it.attachments.length)))
@@ -938,6 +1007,21 @@ export const OUTBOX_NOTE_MS = 10 * 60_000;
 export type PassDeadlines = typeof PASS_DEADLINES;
 /** Thrown by runBridge when a step never finished: the process should exit, so whatever still hangs goes with it. */
 export class RunnerWedged extends Error { readonly wedged = true; }
+/**
+ * The runner stops on purpose and for good: its device was removed from the room (`code` 4), another runner took over its
+ * folder or device (8), or the process that started it is gone (6). The exit codes are `listen --until-addressed`'s.
+ */
+export class RunnerStopped extends Error { constructor(message: string, readonly code: 4 | 6 | 8) { super(message); } }
+/**
+ * How long the room service must keep answering that this device is no longer admitted before the runner gives up and
+ * exits. Longer than the daemon's grace for a removed room (removedGraceMs, 60 s), so a supervised runner is let go by its
+ * daemon first rather than restarted; the runner's own exit is the backstop for one nobody supervises.
+ */
+export const DENIED_EXIT_MS = 90_000;
+/** How long the runner leaves the relay alone after it refused this device. */
+export const RELAY_DENIED_BACKOFF_MS = 60_000;
+/** A room service answer that says this device is not (or no longer) admitted to the room. */
+export const deniedAnswer = (error: unknown) => (error as { status?: unknown } | undefined)?.status === 403;
 /** `work`'s value, or a rejection saying `what` didn't answer within `ms`. */
 async function answerWithin<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -991,6 +1075,14 @@ export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | un
   };
 }
 
+/** Handle exposing VFS P2P broadcast and sync controls from a running `runBridge` instance. */
+export type BridgeVfsTransport = {
+  broadcastPackets: (packets: readonly VfsPacket[], targetIds?: readonly string[]) => void;
+  syncNow: (peerId?: string) => Promise<void>;
+  relayBudget: VfsRelayBudget;
+  syncTracker: VfsSyncTracker;
+};
+
 /**
  * Long-running peer loop: presence, signaling, data channels, storage, and outbox delivery. `pause` is how it waits
  * between passes (tests shorten it; the deadlines are what bound a pass).
@@ -1021,8 +1113,24 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     relayOptions?: Partial<RelayClientOptions>;
     /** Expected host key pin prefix (`#h=...`); falls back to `agent.hostPin` or `room.json`'s `hostPin`. */
     hostPin?: string;
+    /** Optional Room VFS engine; when omitted and VFS is on (`vfsEnabled`), `runBridge` opens `BridgeVfsRuntime` automatically. */
+    vfs?: VfsRoomEngine;
+    /** Whether this runner opens the Room VFS. Default: opted in with MESHROOMS_VFS=1 (see vfsOptedIn); off otherwise. */
+    vfsEnabled?: boolean;
+    /** Extra options forwarded to `openBridgeVfsRuntime` when `runBridge` owns the VFS runtime. */
+    vfsOptions?: Partial<OpenBridgeVfsRuntimeOptions>;
+    vfsRelayBudget?: VfsRelayBudget;
+    vfsSyncTracker?: VfsSyncTracker;
+    onVfsTransportReady?: (transport: BridgeVfsTransport) => void;
     /** Optional abort signal for graceful shutdown. */
     signal?: AbortSignal;
+    /**
+     * Asked once per pass: a reason (and the exit code that goes with it) when this runner must stop because it no longer
+     * owns its folder or device, or its parent is gone. Undefined while it should go on.
+     */
+    shouldStop?: () => { reason: string; code: 4 | 6 | 8 } | undefined;
+    /** How long a continuous "not admitted" answer is tolerated before the runner exits (default DENIED_EXIT_MS). */
+    deniedExitMs?: number;
   } = {}) {
   const deadlines: PassDeadlines = { ...PASS_DEADLINES, ...options.deadlines }, pause = options.pause ?? ((ms: number) => Bun.sleep(ms));
   const now = options.now ?? (() => Date.now()), gatherMs = options.gatherMs ?? 1500;
@@ -1052,6 +1160,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   /** When this runner first tried to connect to each device session (`device:session`): see CONNECTING_POLL_MS. */
   const firstOffer = new Map<string, number>();
   const idlePollEvery = Math.max(1, options.idlePollEvery ?? IDLE_POLL_EVERY);
+  /** Whether this runner opens the Room VFS: opt-in for now (vfsOptedIn), or as the caller says. */
+  const vfsOn = options.vfsEnabled ?? (options.vfs !== undefined || vfsOptedIn());
   let iceServers: RTCIceServer[] = []; let iceKey = '[]';
   let verifiedRoster: SignedRoster | undefined;
   /** Highest version of a HOST-SIGNED roster this loop verified. Never raised from envelope metadata. */
@@ -1106,6 +1216,38 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const historyInFlight = new Map<string, { sentAt: number; expectReply: boolean; timeouts: number }>();
   const relayHistorySynced = new Map<string, number>();
   const relayResync = new Map<string, Resync>();
+  let vfsEngine: VfsRoomEngine | undefined = options.vfs;
+  let ownedVfsRuntime: BridgeVfsRuntime | undefined;
+  let openingVfsRuntime: Promise<void> | undefined;
+  const vfsGrantedDevices = new Set<string>();
+  const vfsRotatedRevokedIds = new Set<string>();
+  const vfsRelayBudget = options.vfsRelayBudget ?? new VfsRelayBudget({ now });
+  const vfsSyncTracker = options.vfsSyncTracker ?? new VfsSyncTracker({ now });
+  const vfsServeLimiter = new PeerRateLimiter(now, 60, 24);
+  const vfsRelayQueue: Array<{ packet: VfsPacket; targetIds?: readonly string[] }> = [];
+  const VFS_RELAY_QUEUE_MAX = 128;
+  const VFS_RELAY_RETRY_MS = 15_000;
+  let vfsRelayTimer: ReturnType<typeof setTimeout> | undefined;
+  let vfsOutboxWatcher: FSWatcher | undefined;
+  let vfsOutboxDebounce: ReturnType<typeof setTimeout> | undefined;
+  let vfsOutboxPollTimer: ReturnType<typeof setInterval> | undefined;
+  let lastVfsSweepAt = 0;
+  const relayVfsSynced = new Map<string, number>();
+  const pendingChatRelayIds = new Set<string>();
+  const pendingVfsRelayIds = new Set<string>();
+  let vfsPrimaryQueued = 0;
+  const hasChatRelayPriorityPending = (): boolean => {
+    if (!relayClient) return false;
+    const pendingPrimary = relayClient.pendingPrimaryCount;
+    if (pendingPrimary <= 0) {
+      vfsPrimaryQueued = 0;
+      return false;
+    }
+    if (vfsPrimaryQueued > pendingPrimary) vfsPrimaryQueued = pendingPrimary;
+    if (pendingChatRelayIds.size > 0) return true;
+    return pendingPrimary > vfsPrimaryQueued;
+  };
+  vfsRelayBudget.setChatPriorityPending(hasChatRelayPriorityPending);
   let referencedCache: Map<string, AttachmentRef> | undefined;
   const save = (messages: Stored[]) => {
     writeJson(messagesFile, messages);
@@ -1279,7 +1421,121 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       && (!filter || filter.has(entry.id))
       && !hasLiveWebRtc(entry.id));
   };
+  const scheduleVfsRelayDrain = (wireBytes: number, budgetLane: VfsRelayBudgetLane) => {
+    if (vfsRelayTimer || !vfsRelayQueue.length) return;
+    const wait = vfsRelayBudget.nextAvailableMs(wireBytes, now(), budgetLane);
+    if (!Number.isFinite(wait)) return;
+    const delay = Math.max(25, Math.min(30_000, Math.ceil(wait)));
+    vfsRelayTimer = setTimeout(() => {
+      vfsRelayTimer = undefined;
+      drainVfsRelayQueue();
+    }, delay);
+  };
+  const drainVfsRelayQueue = () => {
+    if (!relayClient || !verifiedRoster) return;
+    while (vfsRelayQueue.length > 0) {
+      const head = vfsRelayQueue[0]!;
+      const recipients = relayRecipients(head.targetIds);
+      if (!recipients.length) {
+        vfsRelayQueue.shift();
+        continue;
+      }
+      const lane = vfsPacketRelayLane(head.packet);
+      const budgetLane: VfsRelayBudgetLane = lane === 'file' ? 'block' : 'ops';
+      const wireBytes = utf8Bytes(JSON.stringify(head.packet)).byteLength;
+      if (!Number.isFinite(vfsRelayBudget.nextAvailableMs(wireBytes, now(), budgetLane))) {
+        vfsRelayQueue.shift();
+        continue;
+      }
+      if (sendVfsViaRelay(head.packet, head.targetIds, true)) {
+        vfsRelayQueue.shift();
+      } else {
+        scheduleVfsRelayDrain(wireBytes, budgetLane);
+        break;
+      }
+    }
+  };
+  /** Sends a VFS packet over the E2E relay with `VfsRelayBudget` pacing and ZERO `hold`/`wake` flags. */
+  const sendVfsViaRelay = (packet: VfsPacket, targetIds?: readonly string[], bypassQueue = false): boolean => {
+    if (!relayClient || !verifiedRoster) return false;
+    const recipients = relayRecipients(targetIds);
+    if (!recipients.length) return false;
+    const lane = vfsPacketRelayLane(packet);
+    const budgetLane: VfsRelayBudgetLane = lane === 'file' ? 'block' : 'ops';
+    const wireBytes = utf8Bytes(JSON.stringify(packet)).byteLength;
+    if (!bypassQueue && vfsRelayQueue.length > 0) {
+      if (vfsRelayQueue.length >= VFS_RELAY_QUEUE_MAX) vfsRelayQueue.shift();
+      vfsRelayQueue.push({ packet, targetIds });
+      scheduleVfsRelayDrain(wireBytes, budgetLane);
+      return false;
+    }
+    if (!vfsRelayBudget.consume(wireBytes, now(), budgetLane)) {
+      if (!bypassQueue) {
+        if (vfsRelayQueue.length >= VFS_RELAY_QUEUE_MAX) vfsRelayQueue.shift();
+        vfsRelayQueue.push({ packet, targetIds });
+        scheduleVfsRelayDrain(wireBytes, budgetLane);
+      }
+      return false;
+    }
+    assertVfsRelaySafeOptions(VFS_RELAY_SEND_OPTS);
+    const enqueueOpts: SendPacketOptions = {
+      rosterVersion: verifiedRoster.body.version,
+      lane,
+      recipients,
+    };
+    assertVfsRelaySafeOptions(enqueueOpts);
+    try {
+      const beforePrimary = relayClient.pendingPrimaryCount;
+      const id = relayClient.enqueuePacket(packet, enqueueOpts);
+      if (lane === 'primary') {
+        vfsPrimaryQueued += Math.max(0, relayClient.pendingPrimaryCount - beforePrimary);
+        pendingVfsRelayIds.add(id);
+        if (pendingVfsRelayIds.size > 1024) pendingVfsRelayIds.delete(pendingVfsRelayIds.values().next().value!);
+      }
+      return true;
+    } catch (error) {
+      log(`relay vfs enqueue (${lane}): ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  };
+  const sendVfsPacketsToPeer = (peerId: string, packets: readonly VfsPacket[], peer?: Peer): boolean => {
+    if (!packets.length) return false;
+    const active = peer ?? peers.get(peerId);
+    if (active?.queue && hasLiveWebRtc(peerId) && active.channel?.readyState === 'open') {
+      return active.queue.push(packets.map(p => JSON.stringify(p)));
+    }
+    if (relayClient?.isConnected() && verifiedRoster?.body.devices.some(d => d.id === peerId)) {
+      for (const packet of packets) sendVfsViaRelay(packet, [peerId]);
+      return true;
+    }
+    return false;
+  };
+  const sendVfsPackets = (packets: readonly VfsPacket[], targetIds?: readonly string[]) => {
+    if (!packets.length) return;
+    const filter = targetIds ? new Set(targetIds) : undefined;
+    const encoded = packets.map(p => JSON.stringify(p));
+    for (const [id, peer] of peers) {
+      if (filter && !filter.has(id)) continue;
+      if (hasLiveWebRtc(id) && peer.channel?.readyState === 'open') {
+        if (peer.queue) {
+          peer.queue.push(encoded);
+        } else {
+          for (const frame of encoded) {
+            try { peer.channel.send(frame); } catch { break; }
+          }
+        }
+      }
+    }
+    for (const packet of packets) sendVfsViaRelay(packet, targetIds);
+    if (vfsEngine && packets.some(p => p.kind === 'vfs-record')) {
+      void vfsEngine.getFrontierHash().then(h => vfsSyncTracker.notifyFrontierChanged(h)).catch(() => {});
+    }
+  };
   const sendViaRelay = (packet: unknown, lane: RelayLane, targetIds?: readonly string[]) => {
+    if (packet && typeof packet === 'object' && !Array.isArray(packet) && isVfsPacketKind((packet as { kind?: unknown }).kind)) {
+      sendVfsViaRelay(packet as VfsPacket, targetIds);
+      return;
+    }
     if (!relayClient || !verifiedRoster) return;
     const recipients = relayRecipients(targetIds);
     if (!recipients.length) return;
@@ -1287,12 +1543,16 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       ? computeRelayWakeMeta(packet, recipients, verifiedRoster, status, readMessages(), now)
       : {};
     try {
-      relayClient.enqueuePacket(packet, {
+      const id = relayClient.enqueuePacket(packet, {
         rosterVersion: verifiedRoster.body.version,
         lane,
         recipients,
         ...meta,
       });
+      if (lane === 'primary') {
+        pendingChatRelayIds.add(id);
+        if (pendingChatRelayIds.size > 1024) pendingChatRelayIds.delete(pendingChatRelayIds.values().next().value!);
+      }
     } catch (error) {
       log(`relay enqueue (${lane}): ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1393,6 +1653,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   let loopAt = startedAt, polledAt: number | undefined, failingSince: number | undefined, failure: string | undefined, failureStatus: number | undefined, upgradeRequired = false;
   /** Since when the room service has answered that this device is no longer in the room, after it was (see RUNNER_ALIVE). */
   let removedSince: number | undefined;
+  /** Since when every answer has been 403 (not admitted / removed), and the last such line logged, so it is said once, not every second. */
+  let deniedSince: number | undefined, deniedLogged = '';
+  const deniedExitMs = options.deniedExitMs ?? DENIED_EXIT_MS;
+  /** After the relay refuses this device, no new relay connection is tried before this time. */
+  let relayDeniedUntil = 0;
   /** True while intentionally sleeping between passes (e.g. 60 s HTTP 426 backoff) so `loopAt` does not look wedged. */
   let sleeping = false;
   /**
@@ -1405,7 +1670,11 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       writeJson(join(agent.dir, RUNNER_ALIVE), { pid: process.pid, at: Date.now(), startedAt, loopAt, ...(polledAt ? { polledAt } : {}),
         ...(failingSince ? { failingSince, failure, ...(failureStatus !== undefined ? { failureStatus } : {}) } : {}),
         ...(upgradeRequired ? { upgradeRequired: true } : {}), ...(syncedAt ? { syncedAt } : {}),
-        ...(removedSince ? { removedSince } : {}) });
+        ...(removedSince ? { removedSince } : {}),
+        // The Room VFS is on in this runner (opt-in): the vfs-* commands refuse at once when it isn't.
+        ...(vfsOn ? { vfs: true } : {}),
+        // What waits for the relay and what was given up, so `doctor` and soak tests can see the queue never fills.
+        ...(relayClient ? { relayQueue: { ...relayClient.queueStats(), abandoned: relayClient.abandonedCursors } } : {}) });
     } catch { /* Written again next second. */ }
   };
   prove();
@@ -1641,6 +1910,310 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const resyncDue = (peer: Peer) => { if (peer.queue && peer.resync.due(peer.queue)) sendState(peer); };
   /** Packets waiting for the serialized handler are bounded (SEC-6); peers that lost some are asked for their state again. */
   const gate = new IncomingGate();
+  const vfsSignerLookup = (fromRelay: boolean): VfsSignerLookup => {
+    const roleOf = (memberId: string, former?: { role?: 'human' | 'agent' }): 'human' | 'agent' => {
+      const m = status?.members?.find(member => member.id === memberId);
+      if (m?.role === 'agent' || m?.role === 'human') return m.role;
+      if (former?.role === 'agent' || former?.role === 'human') return former.role;
+      return 'human';
+    };
+    return (deviceId: string): VfsSignerInfo | undefined => {
+      if (verifiedRoster) {
+        const active = verifiedRoster.body.devices.find(d => d.id === deviceId);
+        if (active) {
+          return {
+            deviceId: active.id,
+            memberId: active.memberId,
+            signPublicKey: active.sign,
+            role: active.role,
+            revoked: false,
+          };
+        }
+        const removed = verifiedRoster.body.removed.find(r => r.id === deviceId);
+        if (removed?.revoked) {
+          return { deviceId: removed.id, memberId: '', signPublicKey: '', role: 'human', revoked: true };
+        }
+        const former = status?.formerDevices?.find(d => d.id === deviceId);
+        if (former) {
+          return {
+            deviceId: former.id,
+            memberId: former.memberId,
+            signPublicKey: former.publicKey,
+            role: roleOf(former.memberId, former as { role?: 'human' | 'agent' }),
+            revoked: !!former.revoked,
+          };
+        }
+        if (fromRelay) return undefined;
+      }
+      if (fromRelay) return undefined;
+      const dev = status?.devices?.find(d => d.id === deviceId);
+      if (dev) {
+        return {
+          deviceId: dev.id,
+          memberId: dev.memberId,
+          signPublicKey: dev.publicKey,
+          role: roleOf(dev.memberId),
+          revoked: false,
+        };
+      }
+      const former = status?.formerDevices?.find(d => d.id === deviceId);
+      if (former) {
+        return {
+          deviceId: former.id,
+          memberId: former.memberId,
+          signPublicKey: former.publicKey,
+          role: roleOf(former.memberId, former as { role?: 'human' | 'agent' }),
+          revoked: !!former.revoked,
+        };
+      }
+      return undefined;
+    };
+  };
+  const sendVfsHave = async (peerId: string, peer?: Peer, cursor?: string, force = false): Promise<boolean> => {
+    if (!vfsEngine) return false;
+    const frontierHash = await vfsEngine.getFrontierHash();
+    if (!force && cursor === undefined && !vfsSyncTracker.shouldSendHave(peerId, frontierHash, now())) return false;
+    const have = await vfsEngine.buildHave(cursor !== undefined ? { cursor } : undefined);
+    const active = peer ?? peers.get(peerId);
+    const isWebRtc = !!(active?.queue && hasLiveWebRtc(peerId) && active.channel?.readyState === 'open');
+    const sent = sendVfsPacketsToPeer(peerId, [have], active);
+    if (!sent) return false;
+    vfsSyncTracker.markHaveSent(peerId, have.frontierHash, now());
+    if (!isWebRtc) relayVfsSynced.set(peerId, now());
+    return true;
+  };
+  const syncVfsViaRelay = () => {
+    if (!vfsEngine || !relayClient?.isConnected() || !verifiedRoster) return;
+    const at = now();
+    for (const entry of verifiedRoster.body.devices) {
+      if (entry.id === identity.id || hasLiveWebRtc(entry.id)) continue;
+      if (!status?.devices?.some(d => d.id === entry.id && d.session)) {
+        relayVfsSynced.delete(entry.id);
+        vfsSyncTracker.removePeer(entry.id);
+        continue;
+      }
+      const lastSent = relayVfsSynced.get(entry.id);
+      if (lastSent !== undefined && at - lastSent < VFS_RELAY_RETRY_MS) continue;
+      void sendVfsHave(entry.id).catch(error => log(`vfs-have: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  };
+  const syncVfsNow = async (peerId?: string): Promise<void> => {
+    if (!vfsEngine) return;
+    if (peerId !== undefined) {
+      vfsSyncTracker.resetPeer(peerId);
+      await sendVfsHave(peerId, peers.get(peerId), undefined, true);
+      return;
+    }
+    const targets = new Set<string>();
+    for (const [id, peer] of peers) {
+      if (hasLiveWebRtc(id) && peer.channel?.readyState === 'open') targets.add(id);
+    }
+    if (relayClient?.isConnected() && verifiedRoster) {
+      for (const entry of verifiedRoster.body.devices) {
+        if (entry.id !== identity.id) targets.add(entry.id);
+      }
+    }
+    for (const id of targets) {
+      vfsSyncTracker.resetPeer(id);
+      await sendVfsHave(id, peers.get(id), undefined, true);
+    }
+  };
+  const flushVfsSync = () => {
+    drainVfsRelayQueue();
+    if (!vfsEngine) return;
+    const at = now();
+    vfsSyncTracker.collectTimeouts(at);
+    const reachable = new Set<string>();
+    for (const [id, peer] of peers) {
+      if (hasLiveWebRtc(id) && peer.channel?.readyState === 'open') reachable.add(id);
+    }
+    if (relayClient?.isConnected() && verifiedRoster) {
+      for (const entry of verifiedRoster.body.devices) {
+        if (entry.id !== identity.id) reachable.add(entry.id);
+      }
+    }
+    for (const peerId of reachable) {
+      const state = vfsSyncTracker.getPeerState(peerId);
+      if (state && !state.paused && !state.inFlight && state.nextRetryAt > 0 && at >= state.nextRetryAt) {
+        void sendVfsHave(peerId, peers.get(peerId), state.cursor, false).catch(() => {});
+      }
+    }
+  };
+  const serveVfsHave = async (peerId: string, have: VfsHavePacket, peer?: Peer) => {
+    if (!vfsEngine) return;
+    if (!vfsServeLimiter.take(peerId)) {
+      if (vfsServeLimiter.report(peerId)) log(`over vfs-have quota: dropping vfs requests from ${peerId.slice(0, 8)}`);
+      if (vfsServeLimiter.maySendRetryHint(peerId)) {
+        const retryOps: VfsOpsPacket = {
+          kind: 'vfs-ops',
+          v: VFS_PROTOCOL_VERSION,
+          roomId: agent.roomId,
+          deviceId: identity.id,
+          records: [],
+          more: false,
+          retryAfterMs: vfsServeLimiter.retryAfterMs(peerId),
+        };
+        sendVfsPacketsToPeer(peerId, [retryOps], peer);
+      }
+      return;
+    }
+    const selfFrontier = await vfsEngine.getFrontierHash();
+    const { matched } = vfsSyncTracker.recordRemoteHave(peerId, have.frontierHash, selfFrontier);
+    const { keyPackets, opsPages } = await vfsEngine.handleHave(have);
+    const outbound: VfsPacket[] = [];
+    // If an admitted human peer holds newer epochs whose original broadcast wrap excluded `peerId`
+    // (e.g. a newcomer admitted after Epoch 1 bootstrap), mint a delegated key grant on demand.
+    if (agent.person && verifiedRoster && have.latestEpoch < vfsEngine.keyring.activeEpoch) {
+      const activeEpoch = vfsEngine.keyring.activeEpoch;
+      const hasActiveWrap = keyPackets.some(
+        p => p.kind === 'vfs-key-wrap'
+          && p.chunk.body.epoch === activeEpoch
+          && Object.prototype.hasOwnProperty.call(p.chunk.body.wraps, peerId),
+      );
+      if (!hasActiveWrap) {
+        const target = verifiedRoster.body.devices.find(d => d.id === peerId);
+        if (target) {
+          try {
+            outbound.push(await vfsEngine.createKeyGrant(target, verifiedRoster));
+            vfsGrantedDevices.add(peerId);
+          } catch (error) {
+            log(`vfs key grant (${peerId.slice(0, 8)}): ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+    }
+    outbound.push(...keyPackets);
+    if (opsPages.length > 0) {
+      outbound.push(opsPages[0]!);
+    } else if (have.cursor !== undefined) {
+      outbound.push({
+        kind: 'vfs-ops',
+        v: VFS_PROTOCOL_VERSION,
+        roomId: agent.roomId,
+        deviceId: identity.id,
+        records: [],
+        more: false,
+      });
+    }
+    if (outbound.length > 0) sendVfsPacketsToPeer(peerId, outbound, peer);
+    if (!matched && opsPages.length === 0 && vfsSyncTracker.shouldSendHave(peerId, selfFrontier, now())) {
+      await sendVfsHave(peerId, peer);
+    }
+  };
+  const acceptVfsPacket = async (
+    id: string,
+    memberId: string,
+    packet: unknown,
+    fromRelay: boolean,
+    peer?: Peer,
+  ): Promise<boolean> => {
+    if (!vfsEngine) return true;
+    if (isVfsHavePacket(packet, agent.roomId)) {
+      if (packet.deviceId !== id) return false;
+      await serveVfsHave(id, packet, peer);
+      return true;
+    }
+    if (isVfsOpsPacket(packet, agent.roomId)) {
+      if (packet.deviceId !== id) return false;
+      if (packet.retryAfterMs !== undefined && packet.records.length === 0) {
+        const st = vfsSyncTracker.getPeerState(id);
+        if (!st?.inFlight) return true;
+        const frontierHash = await vfsEngine.getFrontierHash();
+        vfsSyncTracker.recordOpsReceived(id, {
+          more: packet.more,
+          nextCursor: packet.nextCursor,
+          retryAfterMs: packet.retryAfterMs,
+          currentFrontierHash: frontierHash,
+        }, now());
+        return true;
+      }
+      const cost = Math.max(1, packet.records.length);
+      if (!allowed(memberId, 'vfs-sync', id, cost)) return true;
+      const res = await vfsEngine.acceptOps(packet, vfsSignerLookup(fromRelay));
+      const frontierHash = await vfsEngine.getFrontierHash();
+      if (res.applied > 0 || res.buffered > 0) {
+        vfsSyncTracker.notifyFrontierChanged(frontierHash);
+      }
+      const decision = vfsSyncTracker.recordOpsReceived(id, {
+        more: packet.more,
+        nextCursor: packet.nextCursor,
+        currentFrontierHash: frontierHash,
+      }, now());
+      if (decision.action === 'continue') {
+        await sendVfsHave(id, peer, decision.cursor);
+      } else if (res.rejected.some(r => r.code === 'VFS_EPOCH_UNKNOWN') && vfsSyncTracker.shouldSendHave(id, frontierHash, now())) {
+        await sendVfsHave(id, peer);
+      }
+      return true;
+    }
+    if (isVfsRecordPacket(packet, agent.roomId)) {
+      if (!allowed(memberId, 'vfs', id)) return true;
+      try {
+        const res = await vfsEngine.acceptRecord(packet, vfsSignerLookup(fromRelay));
+        if (res.accepted) {
+          const frontierHash = await vfsEngine.getFrontierHash();
+          vfsSyncTracker.notifyFrontierChanged(frontierHash);
+        }
+      } catch (err) {
+        if (err instanceof VfsError && err.code === 'VFS_EPOCH_UNKNOWN') {
+          const frontierHash = await vfsEngine.getFrontierHash();
+          if (vfsSyncTracker.shouldSendHave(id, frontierHash, now())) {
+            await sendVfsHave(id, peer);
+          }
+          return true;
+        }
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    if (isVfsKeyEpochPacket(packet, agent.roomId)) {
+      if (!allowed(memberId, 'vfs', id)) return true;
+      if (!verifiedRoster) return true;
+      try {
+        const res = await vfsEngine.acceptKeyEpoch(packet, { roster: verifiedRoster });
+        if (res.installed) {
+          vfsSyncTracker.resetPeer(id);
+          await sendVfsHave(id, peer);
+        }
+      } catch (err) {
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    if (isVfsKeyWrapPacket(packet, agent.roomId)) {
+      if (!allowed(memberId, 'vfs', id)) return true;
+      if (!verifiedRoster) return true;
+      try {
+        const res = await vfsEngine.acceptKeyWrap(packet, { roster: verifiedRoster });
+        if (res.installed) {
+          vfsSyncTracker.resetPeer(id);
+          await sendVfsHave(id, peer);
+        }
+      } catch (err) {
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    if (isVfsKeyGrantPacket(packet, agent.roomId)) {
+      if (!allowed(memberId, 'vfs', id)) return true;
+      if (!verifiedRoster) return true;
+      try {
+        const installed = await vfsEngine.acceptKeyGrant(packet, { roster: verifiedRoster });
+        if (installed.length > 0) {
+          vfsSyncTracker.resetPeer(id);
+          await sendVfsHave(id, peer);
+        }
+      } catch (err) {
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    return true;
+  };
   const requestSync = (id: string) => {
     const peer = peers.get(id);
     const channel = peer?.channel;
@@ -1649,6 +2222,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       try { channel.send(JSON.stringify(request)); } catch { /* Asked again after the next drop, or exchanged on reconnect. */ }
     } else if (relayClient?.isConnected() && verifiedRoster?.body.devices.some(d => d.id === id)) {
       sendViaRelay(request, 'primary', [id]);
+    }
+    if (vfsEngine) {
+      vfsSyncTracker.resetPeer(id);
+      void sendVfsHave(id, peer, undefined, true).catch(() => {});
     }
     if (historyRetryAt.has(id)) return;
     historyRoundDropped.delete(id);
@@ -1660,8 +2237,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   /** Peers whose task, decision, reaction or history operations went over quota; asked for their state again after the burst. */
   const quotaDrops = new QuotaDrops(now);
   /** A dropped message is sent again by its sender; for other kinds the peer `from` is asked for its state later. */
-  const allowed = (memberId: string, kind: QuotaKind, from: string) => {
-    if (quota.take(memberId, kind)) return true;
+  const allowed = (memberId: string, kind: QuotaKind, from: string, cost = 1) => {
+    if (quota.take(memberId, kind, cost)) return true;
     if (quota.report(memberId, kind)) log(`over receive quota: dropping ${kind} packets from member ${memberId.slice(0, 8)}`);
     if (kind !== 'message') quotaDrops.drop(from);
     return false;
@@ -1726,18 +2303,20 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (authorized) {
         if ((packet as { kind?: unknown }).kind === 'file-want' && !fileWantLimiter.take(id)) {
           if (fileWantLimiter.report(id)) log(`over file-want quota: dropping file-want packets from ${id.slice(0, 8)}`);
+          if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
           return;
         }
         transfers.handle(id, packet);
-        if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
       }
+      // Handled, or from a device the roster doesn't hold: either way nothing waits on this inbox copy.
+      if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
       return;
     }
     // For people's rosters; agents learn nothing from each other's activity. A person device keeps it for its page.
     if (isActivityPacket(packet)) {
       const authorized = fromRelay ? !!verifiedRoster?.body.devices.some(d => d.id === id) : peers.get(id) === peer;
       if (agent.person && authorized && validActivityPacket(packet, agent.roomId)) heard.set(id, receiveActivity(packet));
-      if (authorized && relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
+      if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
       return;
     }
     // Cheap and never queued: answered from the loop, at most once per interval (WebRTC or verified-roster relay).
@@ -1760,8 +2339,18 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
       return;
     }
+    const packetKind = packet && typeof packet === 'object' && !Array.isArray(packet)
+      ? (packet as { kind?: unknown }).kind
+      : undefined;
+    if (isVfsPacketKind(packetKind) && !vfsEngine) {
+      if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
+      return;
+    }
     if (!gate.admit(id)) {
       if (Date.now() - droppedLogged > 60_000) { log(`incoming backlog full: dropping packets from ${id.slice(0, 8)}; will ask for its state again`); droppedLogged = Date.now(); }
+      // Dropped for good (the sender is asked for its state again), so the relay's copy is acknowledged: left unacknowledged
+      // it would hold back every later acknowledgement and the inbox would fill to its cap.
+      if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
       return;
     }
     return transaction(async () => {
@@ -1773,6 +2362,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           })()
         : status?.devices?.find(d => d.id === id);
       if (!device) return false;
+      if (isVfsPacketKind(packetKind)) return acceptVfsPacket(id, device.memberId, packet, fromRelay, peer);
       const sync = packet as unknown as BoardSync;
       if (sync?.kind === 'board') { if (sync.roomId === agent.roomId && Array.isArray(sync.ops) && sync.ops.length <= 500) await acceptOps(sync.ops); return true; }
       if ((packet?.body as { kind?: string })?.kind === 'task') {
@@ -1834,7 +2424,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
       return false;
     }).then(persisted => {
-      if (!persisted) return;
+      // Not stored (invalid, over quota, from an unknown device): the sender resends what it never got a receipt for, so the
+      // relay's copy is acknowledged all the same instead of pinning the inbox's acknowledged cursor behind it.
+      if (!persisted) { if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor); return; }
       // Persist the replay guard BEFORE acknowledging the inbox cursor so a crash cannot allow a replay.
       if (relayMeta?.replay && relaySeen.add(relayMeta.replay.from, relayMeta.replay.id)) writeJson(relaySeenFile, relaySeen.export());
       if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
@@ -1843,7 +2435,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const handleRelayEnvelope = async (envelope: RelayEnvelope, envCursor?: number) => {
     if (!verifiedRoster || envelope.from === identity.id) return;
     const sender = verifiedRoster.body.devices.find(d => d.id === envelope.from);
-    if (!sender) return;
+    // From a device that isn't in the roster, or sealed for another: it can never be read, so its inbox copy is acknowledged.
+    if (!sender) { if (envCursor !== undefined) relayClient?.ackCursor(envCursor); return; }
     const key = `${envelope.from}:${envelope.id}`;
     // A repeat of something already processed and persisted: drop it, and let the inbox copy be acknowledged.
     if (relaySeen.seen(envelope.from, envelope.id) || relaySeenVolatile.seen(envelope.from, envelope.id)) {
@@ -1857,16 +2450,30 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       // version is sender-chosen metadata and never moves `highestRosterVersion`; the sender signature is checked against the roster key.
       decrypted = await agent.decryptRelay(envelope, { senderSignKey: sender.sign });
     } catch {
+      if (envCursor !== undefined) relayClient?.ackCursor(envCursor);
       return;
     }
-    if (!decrypted.packet || typeof decrypted.packet !== 'object') return;
+    if (!decrypted.packet || typeof decrypted.packet !== 'object') { if (envCursor !== undefined) relayClient?.ackCursor(envCursor); return; }
     const packet = decrypted.packet as Packet;
-    if (isFilePacket(packet) || isActivityPacket(packet)) {
+    const packetKind = packet && typeof packet === 'object' && !Array.isArray(packet)
+      ? (packet as { kind?: unknown }).kind
+      : undefined;
+    const volatileVfs = isVfsPacketKind(packetKind) && (
+      !vfsEngine
+      || packetKind === 'vfs-have'
+      || packetKind === 'vfs-block-want'
+      || packetKind === 'vfs-block-chunk'
+      || packetKind === 'vfs-block-have'
+    );
+    if (isFilePacket(packet) || isActivityPacket(packet) || volatileVfs) {
       if (!relaySeenVolatile.add(envelope.from, envelope.id)) return;
       handlePacket(envelope.from, packet, true, undefined, undefined, { cursor: envCursor });
       return;
     }
     relayInflight.add(key);
+    // A burst from the relay's inbox (a reconnect after hours offline) waits its turn: the relay keeps its copy until it is
+    // acknowledged, so there is nothing to gain from overrunning the incoming gate and dropping what it just delivered.
+    for (let waited = 0; !gate.hasRoom() && waited < 30_000; waited += 10) await Bun.sleep(10);
     const done = handlePacket(envelope.from, packet, true, undefined, undefined, { cursor: envCursor, replay: { from: envelope.from, id: envelope.id } });
     void Promise.resolve(done).finally(() => relayInflight.delete(key));
   };
@@ -1894,6 +2501,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       log(`channel open to ${id.slice(0, 8)}`);
       sendState(peer);
       sendHistoryHave(id, peer);
+      if (vfsEngine) {
+        vfsSyncTracker.resetPeer(id);
+        void sendVfsHave(id, peer).catch(() => {});
+      }
       if (peer.fileChannel?.readyState !== 'open') transfers.opened(id);
       activity.opened(channel);
       flush();
@@ -1904,7 +2515,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     channel.stateChanged?.subscribe(state => {
       if (state === 'closed') {
         peer.unhealthySince ??= now();
-        if (peers.get(id) === peer) { transfers.closed(id); heard.delete(id); historyInFlight.delete(id); historyRetryAt.delete(id); }
+        if (peers.get(id) === peer) {
+          transfers.closed(id); heard.delete(id); historyInFlight.delete(id); historyRetryAt.delete(id);
+          if (stateSent) { vfsSyncTracker.removePeer(id); relayVfsSynced.delete(id); }
+        }
         return;
       }
       // A peer that was retired (replaced, or its close still pending) has nothing more to exchange.
@@ -1964,7 +2578,14 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   };
   const retire = (id: string, peer: Peer) => {
     retireUfrag(id, peer.session, peer.remoteUfrag);
-    if (peers.get(id) === peer) { peers.delete(id); transfers.closed(id); heard.delete(id); }
+    if (peers.get(id) === peer) {
+      const wasLiveWebRtc = hasLiveWebRtc(id);
+      peers.delete(id); transfers.closed(id); heard.delete(id);
+      if (wasLiveWebRtc || !relayClient?.isConnected()) {
+        vfsSyncTracker.removePeer(id);
+        relayVfsSynced.delete(id);
+      }
+    }
     return closeConnection(id, peer);
   };
   /** OPS-9: on coordinator epoch change, abort only half-open/connecting/unhealthy peers and keep open channels alive. */
@@ -1976,9 +2597,24 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     }
   };
   /** Every peer, as the room closes or runner stops; waits for the closes at most `deadlines.close`. */
-  const retireAll = () => {
+  const retireAll = async () => {
+    if (vfsOutboxWatcher) { try { vfsOutboxWatcher.close(); } catch { /* Already closed. */ } vfsOutboxWatcher = undefined; }
+    if (vfsOutboxDebounce) { clearTimeout(vfsOutboxDebounce); vfsOutboxDebounce = undefined; }
+    if (vfsOutboxPollTimer) { clearInterval(vfsOutboxPollTimer); vfsOutboxPollTimer = undefined; }
+    if (vfsRelayTimer) { clearTimeout(vfsRelayTimer); vfsRelayTimer = undefined; }
+    vfsRelayQueue.length = 0;
+    pendingChatRelayIds.clear();
+    pendingVfsRelayIds.clear();
+    vfsPrimaryQueued = 0;
+    relayVfsSynced.clear();
     if (relayClient) { relayClient.stop(); relayClient = undefined; }
-    return within(Promise.allSettled([...peers].map(([id, peer]) => retire(id, peer))), deadlines.close);
+    await within(Promise.allSettled([...peers].map(([id, peer]) => retire(id, peer))), deadlines.close);
+    if (ownedVfsRuntime) {
+      const rt = ownedVfsRuntime;
+      ownedVfsRuntime = undefined;
+      vfsEngine = undefined;
+      try { await rt.close(); } catch (error) { log(`vfs close: ${error instanceof Error ? error.message : String(error)}`); }
+    }
   };
   /**
    * One step of the pass, waited on for at most `ms`. A step still running from an earlier pass is neither started again
@@ -2069,14 +2705,190 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       void claimMessage(agent, messageId, { answered: true }, CLAIM_CALL_MS).catch(error => log(`marking ${messageId.slice(0, 8)} answered: ${error instanceof Error ? error.message : String(error)}`));
     }
   };
+  /** Opens the runner-owned persistent `BridgeVfsRuntime` once admission (`memberId`) is known. */
+  const ensureVfsRuntime = async (next: RoomStatus) => {
+    if (vfsEngine || !vfsOn || !next.memberId) return;
+    if (openingVfsRuntime) { await openingVfsRuntime; return; }
+    openingVfsRuntime = (async () => {
+      try {
+        const encPrivateKey = await agent.encPrivateKey();
+        const isHost = agent.person && next.ownerId === next.memberId;
+        const rt = await openBridgeVfsRuntime({
+          roomDir: agent.stateless ? undefined : agent.dir,
+          useMemoryOnly: agent.stateless,
+          roomId: agent.roomId,
+          selfMemberId: next.memberId!,
+          selfDeviceId: identity.id,
+          selfRole: agent.person ? 'human' : 'agent',
+          selfEncPrivateKey: encPrivateKey,
+          selfEncVersion: identity.encVersion,
+          sign: v => agent.sign(v),
+          isHost,
+          pinnedHost,
+          log,
+          now,
+          ...options.vfsOptions,
+        });
+        ownedVfsRuntime = rt;
+        vfsEngine = rt.engine;
+        // Initiate VFS anti-entropy immediately on any already-open channels and connected relay.
+        for (const [id, peer] of peers) {
+          if (hasLiveWebRtc(id) && peer.channel?.readyState === 'open') {
+            vfsSyncTracker.resetPeer(id);
+            void sendVfsHave(id, peer).catch(() => {});
+          }
+        }
+        syncVfsViaRelay();
+        scheduleVfsOutboxDrain();
+      } catch (error) {
+        log(`vfs open: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        openingVfsRuntime = undefined;
+      }
+    })();
+    await openingVfsRuntime;
+  };
+  /**
+   * Host-side automatic Epoch 1 bootstrap, revocation rotation, and admitted-human key grants:
+   * runs whenever the verified roster updates or the VFS runtime opens.
+   */
+  const ensureVfsEpochAndGrants = () => transaction(async () => {
+    if (!vfsEngine || !verifiedRoster || !status?.memberId) return;
+    const isRosterHost = vfsEngine.isHost && verifiedRoster.body.host === identity.id;
+    // 1. Bootstrap Epoch 1 automatically on host startup once the host-signed roster is ready.
+    if (vfsEngine.keyring.activeEpoch === 0 && isRosterHost) {
+      try {
+        const boot = await vfsEngine.bootstrapEpoch1(verifiedRoster);
+        vfsGrantedDevices.clear();
+        for (const d of verifiedRoster.body.devices) vfsGrantedDevices.add(d.id);
+        for (const r of verifiedRoster.body.removed) if (r.revoked) vfsRotatedRevokedIds.add(r.id);
+        sendVfsPackets(boot.packets);
+      } catch (error) {
+        log(`vfs bootstrap epoch 1: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    // 2. Host rotates to Epoch e+1 when a newly revoked device appears in the verified roster.
+    if (vfsEngine.keyring.activeEpoch >= 1 && isRosterHost) {
+      const newlyRevoked = verifiedRoster.body.removed.filter(r => r.revoked && !vfsRotatedRevokedIds.has(r.id));
+      if (newlyRevoked.length > 0) {
+        try {
+          const rot = await vfsEngine.rotateEpoch(verifiedRoster);
+          for (const r of newlyRevoked) vfsRotatedRevokedIds.add(r.id);
+          vfsGrantedDevices.clear();
+          for (const d of verifiedRoster.body.devices) vfsGrantedDevices.add(d.id);
+          sendVfsPackets(rot.packets);
+          return;
+        } catch (error) {
+          log(`vfs rotate epoch: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+    // 3. Admitted humans (including host) grant keys to newly admitted devices not yet wrapped.
+    if (vfsEngine.keyring.activeEpoch >= 1 && agent.person) {
+      for (const entry of verifiedRoster.body.devices) {
+        if (entry.id === identity.id || vfsGrantedDevices.has(entry.id)) continue;
+        try {
+          const grant = await vfsEngine.createKeyGrant(entry, verifiedRoster);
+          vfsGrantedDevices.add(entry.id);
+          sendVfsPackets([grant], [entry.id]);
+        } catch (error) {
+          log(`vfs grant (${entry.id.slice(0, 8)}): ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+  });
+  /**
+   * Processes ephemeral VFS RPC queries (`outbox/q-<id>.json`) and VFS mutations (`type: 'vfs-mutation'`)
+   * inside the serialized room transaction, enforcing `mayAgentSpeak` floor gating and writing atomic
+   * `0o600` replies to `live/vfs-reply/<id>.json`.
+   */
+  const deliverVfsOutbox = () => transaction(async () => {
+    if (agent.stateless || !ownedVfsRuntime || !status?.memberId) return;
+    const outbox = join(agent.dir, 'outbox');
+    let outboxStat;
+    try { outboxStat = lstatSync(outbox); } catch { return; }
+    if (!outboxStat.isDirectory()) return;
+    let files: string[];
+    try { files = readdirSync(outbox).filter(f => f.endsWith('.json')).sort(); } catch { return; }
+    for (const file of files) {
+      const filePath = join(outbox, file);
+      try {
+        let st;
+        try { st = lstatSync(filePath); } catch { continue; }
+        if (!st.isFile()) {
+          if (file.startsWith('q-')) {
+            log(`vfs outbox ${file}: not a regular file, removed`);
+            try { unlinkSync(filePath); } catch { /* Gone. */ }
+          }
+          continue;
+        }
+        const raw = readJson<unknown>(filePath, null);
+        if (!isVfsRpcOutboxItem(raw)) {
+          if (file.startsWith('q-')) {
+            log(`vfs outbox ${file}: invalid VFS query payload, removed`);
+            try { unlinkSync(filePath); } catch { /* Gone. */ }
+          }
+          continue;
+        }
+        const reqId = typeof raw.id === 'string' ? raw.id : '';
+        const reply: VfsRpcReply = await ownedVfsRuntime.handleRpcRequest(raw, {
+          canWrite: (req: VfsMutationRpc) => {
+            if (agent.person) return true;
+            const view = agent.view();
+            return mayAgentSpeak(view, status!.memberId!, req.replyTo, undefined, true)
+              ? { allowed: true }
+              : { allowed: false, reason: speakRefusal(view.floor) };
+          },
+          floorRefusal: speakRefusal(agent.view().floor),
+          actorMemberId: status.memberId,
+          actorRole: agent.person ? 'human' : 'agent',
+          broadcast: packets => sendVfsPackets(packets),
+          onVfsChange: () => agent.recordVfsAction(),
+        });
+        if (isValidVfsRpcId(reqId)) {
+          try { writeVfsRpcReply(agent.dir, reqId, reply); }
+          catch (error) { log(`vfs reply ${reqId.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`); }
+        }
+        try { unlinkSync(filePath); } catch { /* Already removed. */ }
+      } catch (error) {
+        log(`vfs outbox ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  });
+  const scheduleVfsOutboxDrain = () => {
+    if (agent.stateless || vfsOutboxDebounce) return;
+    vfsOutboxDebounce = setTimeout(() => {
+      vfsOutboxDebounce = undefined;
+      void deliverVfsOutbox().catch(error => log(`vfs outbox: ${error instanceof Error ? error.message : String(error)}`));
+    }, 10);
+  };
+  const startVfsOutboxWatcher = () => {
+    if (agent.stateless || !vfsOn) return;
+    const outbox = join(agent.dir, 'outbox');
+    try {
+      if (lstatSync(outbox).isDirectory()) {
+        vfsOutboxWatcher = watch(outbox, () => scheduleVfsOutboxDrain());
+        vfsOutboxWatcher.on('error', () => { /* Fallback interval continues safely. */ });
+      }
+    } catch { /* Fallback interval handles sandboxed platforms without fs.watch. */ }
+    vfsOutboxPollTimer = setInterval(() => {
+      if (ownedVfsRuntime && status?.memberId) {
+        void deliverVfsOutbox().catch(() => {});
+      }
+    }, 250);
+  };
   const deliverOutbox = () => transaction(async () => {
     const outbox = join(agent.dir, 'outbox');
     for (const file of readdirSync(outbox).filter(f => f.endsWith('.json')).sort()) {
       try {
+        if (file.startsWith('q-')) continue; // VFS queries are handled by `deliverVfsOutbox`.
         // A harness sandbox can write the outbox: only regular files are read, and a planted link is removed, not followed.
         if (!lstatSync(join(outbox, file)).isFile()) { log(`outbox ${file}: not a regular file, removed`); unlinkSync(join(outbox, file)); continue; }
         const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | RetractIntent | ClaimIntent | null>(join(outbox, file), null);
         if (!item || !status?.memberId) continue;
+        // VFS RPC mutations are handled by `deliverVfsOutbox` (with 10ms fs.watch latency & live/vfs-reply replies).
+        if (isVfsRpcOutboxItem(item)) continue;
         // Claims are settled before this, outside the lock (settleOutboxClaims).
         if ((item as { type?: string }).type === 'claim') continue;
         const problem = outboxProblem(agent, status.memberId, item);
@@ -2290,8 +3102,10 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
     }
     // 4. Start optional WSS+HTTPS relay client when advertised.
-    if (options.relay !== false && next.relayUrl && next.memberId && !relayClient) {
+    if (options.relay !== false && next.relayUrl && next.memberId && !relayClient && now() >= relayDeniedUntil) {
+      const userRelayOpts = options.relayOptions;
       relayClient = await agent.createRelayClient({
+        ...userRelayOpts,
         relayUrl: next.relayUrl,
         session,
         rosterVersion: () => verifiedRoster?.body.version ?? 1,
@@ -2301,30 +3115,70 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           if (state === 'wss' || state === 'https') {
             syncedAt ??= Date.now();
             relayHistorySynced.clear();
+            relayVfsSynced.clear();
             syncHistoryViaRelay();
+            syncVfsViaRelay();
+            drainVfsRelayQueue();
             flush();
           }
+          userRelayOpts?.onStateChange?.(state);
         },
-        onError: err => log(`relay: ${err.message}`),
+        onAccepted: id => {
+          const hadChat = pendingChatRelayIds.delete(id);
+          if (pendingVfsRelayIds.delete(id)) vfsPrimaryQueued = Math.max(0, vfsPrimaryQueued - 1);
+          if (hadChat && vfsRelayQueue.length > 0) drainVfsRelayQueue();
+          userRelayOpts?.onAccepted?.(id);
+        },
+        onRejected: (id, reason, statusCode) => {
+          const hadChat = pendingChatRelayIds.delete(id);
+          if (pendingVfsRelayIds.delete(id)) vfsPrimaryQueued = Math.max(0, vfsPrimaryQueued - 1);
+          if (statusCode === 429 || /rate.?limit/i.test(reason)) vfsRelayBudget.noteRateLimited(now());
+          if (hadChat && vfsRelayQueue.length > 0) drainVfsRelayQueue();
+          userRelayOpts?.onRejected?.(id, reason, statusCode);
+        },
+        onError: err => {
+          log(`relay: ${err.message}`);
+          userRelayOpts?.onError?.(err);
+        },
         onAuthError: (code, msg) => {
-          log(`relay auth (${code}): ${msg}`);
+          // Said once per kind of refusal, and the relay is not asked again for a minute: a device the relay has removed
+          // would otherwise reconnect, be refused and log the same line on every pass.
+          if (relayDeniedUntil === 0 || now() >= relayDeniedUntil) log(`relay auth (${code}): ${msg}`);
+          relayDeniedUntil = now() + RELAY_DENIED_BACKOFF_MS;
           relayClient?.stop();
           relayClient = undefined;
           // Removed, or the room closed: the next pass polls, so it hears so, instead of opening the relay again.
           polledAt = undefined;
+          pendingChatRelayIds.clear();
+          pendingVfsRelayIds.clear();
+          vfsPrimaryQueued = 0;
+          userRelayOpts?.onAuthError?.(code, msg);
         },
-        ...options.relayOptions,
       });
       // The service pushes this room's status over the socket, as this runner's lobby session: no polling while it does.
       relayClient.watchStatus({ session, epoch, cursor });
       relayClient.start();
     }
   };
+  options.onVfsTransportReady?.({
+    broadcastPackets: sendVfsPackets,
+    syncNow: syncVfsNow,
+    relayBudget: vfsRelayBudget,
+    syncTracker: vfsSyncTracker,
+  });
+  startVfsOutboxWatcher();
   log(`bridge running as device ${identity.id.slice(0, 12)} in ${agent.roomId}`);
   while (!options.signal?.aborted) {
     loopAt = Date.now();
     // A step that never finishes holds the serialized work (incoming packets, the outbox) behind it: the runner would
     // stay present but deaf. It stops instead, so whoever owns the runner starts a fresh one.
+    const stop = options.shouldStop?.();
+    if (stop) {
+      clearInterval(ticking);
+      log(`stopping: ${stop.reason}`);
+      await retireAll();
+      throw new RunnerStopped(stop.reason, stop.code);
+    }
     const stuck = wedged();
     if (stuck) {
       clearInterval(ticking);
@@ -2347,6 +3201,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (live && pushed) {
         next = pushed; pushed = undefined; passesSincePoll = 0;
         polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined; upgradeRequired = false; pollBackoff = 0;
+        deniedSince = undefined;
       } else if (status && (live || !due)) {
         // Nothing new: the pass does its own work (outbox, peers, decisions) on what the room last said. Its signals were
         // handled already, as an idle poll would leave them out.
@@ -2369,6 +3224,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           throw error;
         } finally { loopAt = Date.now(); }
         polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined; upgradeRequired = false; pollBackoff = 0;
+        // A pass that only reused the last status proves nothing about admission: only a real answer clears a refusal.
+        deniedSince = undefined;
       }
       // Everything after the poll shares one budget, so the next poll comes inside the service's presence window.
       const passEnds = Date.now() + deadlines.budget, left = (cap: number) => Math.max(0, Math.min(cap, passEnds - Date.now()));
@@ -2384,8 +3241,18 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         }
         // Kept as the last status, so the next pass polls again instead of working on an admission this device lost.
         status = next;
-        log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await pause(3000); continue;
+        const waiting = next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room';
+        if (waiting !== deniedLogged) { log(waiting); deniedLogged = waiting; }
+        // Removed after having been a member, and still not back: nothing will change, so the runner exits instead of polling for good.
+        if (removedSince !== undefined && Date.now() - removedSince >= deniedExitMs) {
+          clearInterval(ticking); prove();
+          log(`this device was removed from the room ${Math.round((Date.now() - removedSince) / 1000)} s ago and is not back: exiting`);
+          await retireAll();
+          throw new RunnerStopped('This device was removed from the room.', 4);
+        }
+        await pause(3000); continue;
       }
+      deniedLogged = '';
       // The room's rules first, and on their own: listen, status and the watch peek read the floor from this file, so
       // nothing else in the pass (closing peers, a members.json busy on Windows) may leave it behind the room.
       // Every admitted status from the room service carries them; one that doesn't (a service from before room settings)
@@ -2421,7 +3288,9 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
       epoch = next.epoch; status = next;
       await step('relay', () => syncRosterAndRelay(next), left(deadlines.profile));
+      await step('vfs', async () => { await ensureVfsRuntime(next); await ensureVfsEpochAndGrants(); }, left(deadlines.profile));
       syncHistoryViaRelay();
+      syncVfsViaRelay();
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
@@ -2511,15 +3380,23 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       });
       await step('claims', settleOutboxClaims, left(deadlines.claims));
       await step('outbox', deliverOutbox, left(deadlines.outbox));
+      if (ownedVfsRuntime && !inFlight.has('outbox')) await step('vfs-rpc', deliverVfsOutbox, left(deadlines.outbox));
       markAnswered();
       await step('decisions', closeDueDecisions, left(deadlines.decisions));
       for (const peer of peers.values()) { peer.queue?.pump(); resyncDue(peer); }
       for (const id of quotaDrops.due()) requestSync(id);
       flushHistoryRetries();
+      flushVfsSync();
       transfers.tick(); fetchWanted();
       if (agent.person) keepStatus(next);
+      if (!agent.stateless && Date.now() - lastVfsSweepAt > 30_000) {
+        sweepStaleVfsRpcReplies(agent.dir, VFS_RPC_STALE_MAX_AGE_MS, now);
+        lastVfsSweepAt = Date.now();
+      }
       if (Date.now() - pruned > 60_000) { prune(); pruned = Date.now(); }
     } catch (error) {
+      // Stopping on purpose (removed): not a failed pass to retry.
+      if (error instanceof RunnerStopped) throw error;
       // 410: the host closed the room or the service removed it. Nothing will change, so stop instead of retrying.
       // A waiting listen reads the marker and returns at once instead of waiting out its timer.
       const statusCode = (error as { status?: number }).status;
@@ -2530,7 +3407,20 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         await retireAll();
         throw error;
       }
-      if (statusCode === 426 || errorCode === 'upgrade-required') {
+      if (deniedAnswer(error)) {
+        // 403: this device is not (or no longer) admitted. Said once; if it persists, the runner exits and the daemon lets the room go.
+        deniedSince ??= Date.now(); removedSince ??= Date.now();
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== deniedLogged) { log(`room service refused this device (403): ${message}`); deniedLogged = message; }
+        if (Date.now() - deniedSince >= deniedExitMs) {
+          clearInterval(ticking); prove();
+          log(`the room service has refused this device for ${Math.round((Date.now() - deniedSince) / 1000)} s: exiting without retrying`);
+          await retireAll();
+          throw new RunnerStopped(message, 4);
+        }
+        pollBackoff = 3000;
+        prove();
+      } else if (statusCode === 426 || errorCode === 'upgrade-required') {
         const message = error instanceof Error ? error.message : String(error);
         const retryAfterMs = (error as { retryAfterMs?: number }).retryAfterMs;
         pollBackoff = Math.max(UPGRADE_BACKOFF_MS, retryAfterMs ?? 0);
@@ -2695,18 +3585,154 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
  * wake it once, then the cursors move past them). Outcomes of decisions the agent opened wake it only from now on, so an
  * agent that starts over is not flooded with results it already had.
  */
+/** Whether a fresh proof of life from a running bridge exists right now (used for fast fail-closed RPC checks). */
+/**
+ * The Room VFS is opt-in for now: a runner opens it only with MESHROOMS_VFS=1 in its environment (the daemon's, for the
+ * runners it starts). Its proof of life says so (`vfs: true`), and the vfs-* commands refuse at once when it doesn't.
+ */
+export const vfsOptedIn = (env: Record<string, string | undefined> = process.env) => env.MESHROOMS_VFS === '1';
+/** Whether the room's live runner has the Room VFS on, by its proof of life. */
+function runnerVfsOn(agent: BrowserAgent): boolean {
+  const proof = readJson<{ vfs?: unknown } | undefined>(join(agent.dir, RUNNER_ALIVE), undefined);
+  return proof?.vfs === true;
+}
+const vfsDisabled = () => Object.assign(
+  new Error('The Room VFS is off for this agent: it is opt-in for now (MESHROOMS_VFS=1 where its bridge runs). Do not retry; tell the person if they need it.'),
+  { code: 'VFS_DISABLED', status: 403 },
+);
+
+function runnerProofAlive(agent: BrowserAgent, now = Date.now()): boolean {
+  if (agent.stateless) return false;
+  const proof = readJson<{ pid?: unknown; at?: unknown; loopAt?: unknown } | undefined>(join(agent.dir, RUNNER_ALIVE), undefined);
+  if (!proof || typeof proof.at !== 'number') return false;
+  if (now - proof.at > RUNNER_STALE_MS) return false;
+  if (processGone(proof.pid)) return false;
+  if (runnerStuck(proof, now, 0)) return false;
+  return true;
+}
+
+/**
+ * Executes a single VFS RPC request (read query or mutation) against the running bridge via the
+ * symlink-hardened ephemeral file mailbox (`outbox/` -> `live/vfs-reply/`).
+ *
+ * Inside a confined wake (`inWake: true`), fails closed with `code: 'runner-stopped'` when the
+ * runner is not alive — NEVER touching `identity.json` or `<roomDir>/vfs` directly.
+ */
+export async function vfsRpcCall<T = unknown>(
+  agent: BrowserAgent,
+  request: VfsQueryRpcInput | VfsMutationRpcInput,
+  options: { timeoutMs?: number; inWake?: boolean } = {},
+): Promise<T> {
+  if (agent.stateless) {
+    throw Object.assign(
+      new Error('Room VFS commands require a connected bridge runner and are not available in stateless MESHROOMS_AGENT_KEY mode.'),
+      { code: 'VFS_UNSUPPORTED_STATELESS', status: 400 },
+    );
+  }
+  const closed = roomClosed(agent);
+  if (closed) {
+    throw Object.assign(new Error(`${closed.reason} This room is closed.`), { code: 'ROOM_CLOSED', status: 410 });
+  }
+  const inWake = options.inWake ?? (process.env.MESHROOMS_WAKE_ROOM === agent.roomId);
+  // A live runner without the VFS answers nothing: say so now instead of after the timeout.
+  if (runnerProofAlive(agent) && !runnerVfsOn(agent)) throw vfsDisabled();
+  if (inWake && !runnerProofAlive(agent)) {
+    throw Object.assign(
+      new Error('This agent has no live connection to the room right now, so VFS cannot be accessed from here. Do not retry: nothing you do in this wake restarts it. Report this and end your turn.'),
+      { code: 'runner-stopped', status: 503 },
+    );
+  }
+  const started = Date.now();
+  const isMutation = request.op === 'vfs-write' || request.op === 'vfs-patch' || request.op === 'vfs-revert' || request.op === 'vfs-delete';
+  const handle = isMutation
+    ? writeVfsRpcMutation(agent.dir, request as VfsMutationRpcInput)
+    : writeVfsRpcQuery(agent.dir, request as VfsQueryRpcInput);
+  const timeoutMs = options.timeoutMs ?? VFS_RPC_DEFAULT_TIMEOUT_MS;
+  let reply: VfsRpcReply<T>;
+  try {
+    reply = await awaitVfsRpcReply<T>(agent.dir, handle.id, { timeoutMs });
+  } catch (err) {
+    if (!isMutation) {
+      try { rmSync(handle.filePath, { force: true }); } catch { /* Best effort. */ }
+    }
+    if (err instanceof VfsRpcTimeoutError && (!runnerProofAlive(agent) || runnerStopped(agent, started))) {
+      throw Object.assign(
+        new Error(inWake
+          ? 'This agent has no live connection to the room right now, so VFS cannot be accessed from here. Do not retry: nothing you do in this wake restarts it. Report this and end your turn.'
+          : 'The background process stopped before answering the VFS request. Run the command again to restart it.'),
+        { code: 'runner-stopped', status: 503 },
+      );
+    }
+    throw err;
+  }
+  if (!reply.ok) {
+    throw Object.assign(
+      new Error(reply.error),
+      {
+        code: reply.code,
+        status: reply.status,
+        ...(reply.details !== undefined ? { details: reply.details } : {}),
+      },
+    );
+  }
+  if (isMutation) agent.touchActivity();
+  return reply.data;
+}
+
+/**
+ * Opportunistically fetches passive non-waking VFS change summaries via ephemeral RPC ONLY after
+ * `listen` has already decided to return (`state: 'addressed' | 'history'`).
+ * Never writes plaintext VFS metadata to disk and returns `undefined` in 0ms if no runner is alive.
+ */
+export async function fetchPassiveVfsChanges(
+  agent: BrowserAgent,
+  afterCursor = 0,
+  timeoutMs = 1_000,
+): Promise<VfsChangesReplyData | undefined> {
+  if (agent.stateless || !runnerProofAlive(agent) || !runnerVfsOn(agent)) return undefined;
+  let handle: ReturnType<typeof writeVfsRpcQuery> | undefined;
+  try {
+    handle = writeVfsRpcQuery(agent.dir, { op: 'vfs-changes', afterCursor });
+    const reply = await awaitVfsRpcReply<VfsChangesReplyData>(agent.dir, handle.id, { timeoutMs });
+    return reply.ok ? reply.data : undefined;
+  } catch {
+    if (handle) {
+      try { rmSync(handle.filePath, { force: true }); } catch { /* Best effort. */ }
+    }
+    return undefined;
+  }
+}
+
 export async function listenRemembering(agent: BrowserAgent, seconds: number,
   flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean; restartRunner?: () => Promise<void> } = {}) {
   const { plan, saved } = listenPlan(agent, flags);
   const result = await listenBrowser(agent, plan.after, seconds, plan.boardAfter, plan.decisionsAfter, plan.outcomesAfter, plan.history, flags.restartRunner);
-  const next: ListenCursor = { ...(result.cursor ? { after: result.cursor } : {}), boardAfter: result.boardCursor ?? 0, decisionsAfter: result.decisionCursor };
-  const unchanged = !!saved && saved.after === next.after && saved.boardAfter === next.boardAfter && saved.decisionsAfter === next.decisionsAfter;
+  // HARD NON-WAKING INVARIANT: VFS changes NEVER wake `listen`; they are only piggybacked via
+  // ephemeral RPC once `listen` is already returning (`addressed` or `history`).
+  const prevVfsCursor = flags.fromStart ? 0 : (saved?.vfsAfter ?? 0);
+  let vfsFeed: VfsChangesReplyData | undefined;
+  if (result.state === 'addressed' || result.state === 'history') {
+    vfsFeed = await fetchPassiveVfsChanges(agent, prevVfsCursor);
+  }
+  const nextVfsAfter = vfsFeed && vfsFeed.cursor > prevVfsCursor
+    ? vfsFeed.cursor
+    : (!flags.fromStart && saved?.vfsAfter !== undefined ? saved.vfsAfter : undefined);
+  const next: ListenCursor = {
+    ...(result.cursor ? { after: result.cursor } : {}),
+    boardAfter: result.boardCursor ?? 0,
+    decisionsAfter: result.decisionCursor,
+    ...(nextVfsAfter !== undefined ? { vfsAfter: nextVfsAfter } : {}),
+  };
+  const unchanged = !!saved && saved.after === next.after && saved.boardAfter === next.boardAfter && saved.decisionsAfter === next.decisionsAfter && saved.vfsAfter === next.vfsAfter;
   const explicit = !!flags.fromStart || flags.after !== undefined || flags.boardAfter !== undefined || flags.decisionsAfter !== undefined;
   if (result.state !== 'runner-stopped' && result.state !== 'closed' && !(result.state === 'timeout' && unchanged)) {
     agent.saveListenCursor(next, undefined, { monotonic: !explicit });
   }
   const resumed = !!saved && (flags.after === undefined || flags.boardAfter === undefined || flags.decisionsAfter === undefined);
-  return resumed ? { ...result, resumed } : result;
+  const vfsExtra = vfsFeed && vfsFeed.events.length > 0
+    ? { vfsCursor: vfsFeed.cursor, vfsChanges: vfsFeed.events.slice(-20) }
+    : {};
+  return { ...result, ...vfsExtra, ...(resumed ? { resumed } : {}) };
 }
 
 /**
@@ -2818,7 +3844,7 @@ export async function sendBrowser(agent: BrowserAgent, text: string, replyTo: st
     // already knows that.
     const target = replyTo ? resolveMessageById(view.messages, replyTo) : undefined;
     if (!agent.person && target && heldByAnother(view, target, view.memberId)) return notSent(id, answeredElsewhere(memberName(view, takenBy(view, target)!)));
-    if (!mayAgentSpeak(view, view.memberId, replyTo, text, true)) throw new Error(speakRefusal(view.floor));
+    if (!agent.person && !mayAgentSpeak(view, view.memberId, replyTo, text, true)) throw new Error(speakRefusal(view.floor));
   }
   if (agent.activity()?.state === 'working') agent.touchActivity();
   let attachments = sent?.packet.body.attachments;
@@ -3250,9 +4276,11 @@ export async function buildNextHostRoster(
   }
   for (const former of status.formerDevices || []) {
     if (!activeIds.has(former.id)) {
+      // A device retired before the service recorded when keeps the time the last roster gave it: `now` here would
+      // change the roster on every build, and the host would publish a new version every time it looked.
       removedMap.set(former.id, {
         id: former.id,
-        at: former.retiredAt ?? now,
+        at: former.retiredAt ?? removedMap.get(former.id)?.at ?? now,
         revoked: !!former.revoked,
       });
     }

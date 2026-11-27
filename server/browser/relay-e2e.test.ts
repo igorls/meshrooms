@@ -284,6 +284,19 @@ describe('E2E WSS + HTTPS Relay & Cloud Agent Acceptance Tests (Issue #139 Secti
     expect(seen.members!.find(m => m.id === agentMember.id)!.name).toBe('Finch');
   });
 
+  test('a device retired before the service recorded when keeps its removal time, so the host builds no new roster each time it looks', async () => {
+    const stack = startTestStack();
+    const { host, hostId, roster } = await setupRoomWithAgents(stack, 'Quiet');
+    const status = await host.command('status', { session: crypto.randomUUID() }) as RoomStatus;
+    // A former device from before the service kept `retiredAt`.
+    const legacy = { ...status, formerDevices: [{ id: 'ab'.repeat(32), memberId: crypto.randomUUID(), publicKey: 'legacy', revoked: false }] } as unknown as RoomStatus;
+    const first = await buildNextHostRoster(legacy, hostId.id, roster, v => host.sign(v), roster.body.at + 1_000);
+    expect(first!.body.removed).toEqual([{ id: 'ab'.repeat(32), at: roster.body.at + 1_000, revoked: false }]);
+    // Later builds find nothing changed: the removal keeps the time the last roster gave it.
+    expect(await buildNextHostRoster(legacy, hostId.id, first, v => host.sign(v), first!.body.at + 5_000)).toBeUndefined();
+    expect(await buildNextHostRoster(legacy, hostId.id, first, v => host.sign(v), first!.body.at + 60_000)).toBeUndefined();
+  });
+
   test('Tests #1 & #2: Authenticated WSS 101 + synthetic message & reply with peer-level signed receipts (no relay-only fake receipt)', async () => {
     const stack = startTestStack();
     const { roomId, host, agent, hostId, agentId, roster } = await setupRoomWithAgents(stack, 'CloudAgent');
@@ -708,12 +721,14 @@ describe('E2E WSS + HTTPS Relay & Cloud Agent Acceptance Tests (Issue #139 Secti
     // Coalescing: 5 mentions while offline -> exactly 1 wake fired!
     expect(webhooks).toHaveLength(1);
     expect(webhooks[0].auth).toBe(`Bearer ${webhookSecret}`);
-    expect(Object.keys(webhooks[0].body).sort()).toEqual(['count', 'event', 'inbox', 'source']);
+    expect(Object.keys(webhooks[0].body).sort()).toEqual(['count', 'event', 'inbox', 'room', 'source']);
+    expect(webhooks[0].body.room).toBe(roomId);
+    // Five addressed mentions are waiting, so the count says five, however many frames the inbox holds.
+    expect(webhooks[0].body.count).toBeGreaterThanOrEqual(1);
     expect(webhooks[0].body.source).toBe('meshrooms');
     expect(webhooks[0].body.event).toBe('room-has-work');
     expect(webhooks[0].body.inbox).toBe(reg.inboxId);
-    // Zero roomId, zero plaintext, zero ciphertext in webhook body!
-    expect(webhooks[0].raw).not.toContain(roomId);
+    // The room is named; zero plaintext and zero ciphertext in the webhook body.
     expect(webhooks[0].raw).not.toContain('confidential-payload');
 
     // Woken ephemeral cloud agent runs `relayListenOnce` using persistent MESHROOMS_AGENT_KEY (stateless).

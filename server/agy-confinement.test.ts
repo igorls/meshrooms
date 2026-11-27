@@ -151,3 +151,66 @@ test('a Windows path in double quotes passes on Windows, and is still refused wh
   // A wake-folder path in the platform's own spelling, quoted, is accepted for --out wherever the tests run.
   expect(checkAgyCommand(`bun "${policy.launcher}" attachment --room ${ROOM} --id 11111111-2222-4333-8444-555555555555 --out "${join(wake, 'downloads')}"`, policy).ok).toBe(true);
 });
+
+test('Room VFS confinement: allows all 8 vfs-* commands for this room and strictly denies direct <roomDir>/vfs reads and --patch-file/--text-file escapes', () => {
+  const roomDir = folder();
+  const wake = join(roomDir, 'wake');
+  const vfsDir = join(roomDir, 'vfs');
+  mkdirSync(wake, { recursive: true });
+  mkdirSync(vfsDir, { recursive: true });
+  const vfsWal = join(vfsDir, 'wormdb.wal');
+  writeFileSync(vfsWal, 'sealed-room-keys-and-ops');
+  const wakeDraft = join(wake, 'draft.md');
+  const wakePatch = join(wake, 'hunks.json');
+  writeFileSync(wakeDraft, '# draft');
+  writeFileSync(wakePatch, '[]');
+
+  const policy = { roomId: ROOM, launcher: LAUNCHER, wakeDir: wake, delimiter: DELIM };
+  const reqId = '11111111-2222-4333-8444-555555555555';
+  const commitId = '22222222-3333-4444-8555-666666666666';
+
+  const allowedVfsCommands = [
+    `bun "${LAUNCHER}" vfs-list --room ${ROOM}`,
+    `bun "${LAUNCHER}" vfs-read --room ${ROOM} --path notes.md`,
+    `bun "${LAUNCHER}" vfs-write --room ${ROOM} --request-id ${reqId} --path notes.md --text-file "${wakeDraft}"`,
+    `bun "${LAUNCHER}" vfs-write --room ${ROOM} --request-id ${reqId} --path notes.md --text - <<'${DELIM}'\n# Hello\n${DELIM}`,
+    `bun "${LAUNCHER}" vfs-patch --room ${ROOM} --request-id ${reqId} --path notes.md --base-rev f:0123456789abcdef --patch-file "${wakePatch}"`,
+    `bun "${LAUNCHER}" vfs-patch --room ${ROOM} --request-id ${reqId} --path notes.md --base-rev f:0123456789abcdef --patch - <<'${DELIM}'\n[{"op":"append","text":"ok"}]\n${DELIM}`,
+    `bun "${LAUNCHER}" vfs-history --room ${ROOM} --path notes.md --limit 10`,
+    `bun "${LAUNCHER}" vfs-diff --room ${ROOM} --path notes.md --from ${commitId} --to head`,
+    `bun "${LAUNCHER}" vfs-revert --room ${ROOM} --request-id ${reqId} --path notes.md --commit ${commitId}`,
+    `bun "${LAUNCHER}" vfs-delete --room ${ROOM} --request-id ${reqId} --path notes.md`,
+  ];
+  for (const cmd of allowedVfsCommands) {
+    expect(evaluateAgyHook({ toolCall: { name: 'run_command', args: { CommandLine: cmd } } }, policy), `expected auto_approve for: ${cmd}`)
+      .toEqual({ decision: 'auto_approve' });
+  }
+
+  // Wrong room, missing --room, and file-flag escapes (both space and = forms) pointing at <roomDir>/vfs are denied.
+  const deniedVfsCommands = [
+    `bun "${LAUNCHER}" vfs-list --room ${OTHER_ROOM}`,
+    `bun "${LAUNCHER}" vfs-read --path notes.md`,
+    `bun "${LAUNCHER}" vfs-write --room ${ROOM} --request-id ${reqId} --path notes.md --text-file "${vfsWal}"`,
+    `bun "${LAUNCHER}" vfs-write --room ${ROOM} --request-id ${reqId} --path notes.md --text-file="${vfsWal}"`,
+    `bun "${LAUNCHER}" vfs-patch --room ${ROOM} --request-id ${reqId} --path notes.md --base-rev f:0123456789abcdef --patch-file "${vfsWal}"`,
+    `bun "${LAUNCHER}" vfs-patch --room ${ROOM} --request-id ${reqId} --path notes.md --base-rev f:0123456789abcdef --patch-file="${vfsWal}"`,
+  ];
+  for (const cmd of deniedVfsCommands) {
+    expect(evaluateAgyHook({ toolCall: { name: 'run_command', args: { CommandLine: cmd } } }, policy).decision, `expected deny for: ${cmd}`)
+      .toBe('deny');
+  }
+
+  // Direct view_file of <roomDir>/vfs or any file inside it is denied.
+  expect(evaluateAgyHook({ toolCall: { name: 'view_file', args: { AbsolutePath: vfsDir } } }, policy).decision).toBe('deny');
+  expect(evaluateAgyHook({ toolCall: { name: 'view_file', args: { AbsolutePath: vfsWal } } }, policy).decision).toBe('deny');
+
+  // Symlink inside wakeDir pointing into <roomDir>/vfs is denied for both view_file and --patch-file.
+  if (process.platform !== 'win32') {
+    const link = join(wake, 'vfs-escape.wal');
+    symlinkSync(vfsWal, link);
+    expect(evaluateAgyHook({ toolCall: { name: 'view_file', args: { AbsolutePath: link } } }, policy).decision).toBe('deny');
+    expect(evaluateAgyHook({
+      toolCall: { name: 'run_command', args: { CommandLine: `bun "${LAUNCHER}" vfs-patch --room ${ROOM} --request-id ${reqId} --path notes.md --base-rev f:0123456789abcdef --patch-file "${link}"` } },
+    }, policy).decision).toBe('deny');
+  }
+});

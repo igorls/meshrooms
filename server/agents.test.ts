@@ -42,7 +42,7 @@ afterAll(() => {
 function coordinator() {
   let handle: ReturnType<typeof browserHandler> | undefined;
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (request, s) => handle!(request, s.requestIP(request)?.address ?? 'unknown') });
-  const origin = `http://127.0.0.1:${server.port}`, lobby = new BrowserLobby(':memory:', { origin });
+  const origin = `http://127.0.0.1:${server.port}`, lobby = new BrowserLobby(':memory:', { origin, agentsPerOperator: 4 });
   handle = browserHandler(lobby, origin, '.');
   cleanups.push(() => { server.stop(true); lobby.close(); });
   return { origin, lobby };
@@ -272,11 +272,11 @@ test('the page creates an identity and puts it into a room: a member the person 
   expect(listed).toMatchObject({ approvalsWaiting: 0, agents: [{ id, name: 'Wren', rooms: [{ roomId: room.roomId, memberId: member.id, title: 'Design review', state: 'connected', binding: { wakes: 'unbound' } }] }] });
   expect(JSON.stringify(listed)).not.toContain(room.home);
 
-  // The room's own rule: four agents per operator per room, as the room service says it.
+  // The room's own rule: agents per operator per room (4 in this test's service), as the room service says it.
   for (const name of ['Ash', 'Fern', 'Oak', 'Elm']) {
     const other = (await api.call('page', 'POST', '/api/local/agents', { name, harness: 'codex' })).body.agent.id;
     const answer = await api.call('page', 'POST', `/api/local/rooms/${room.roomId}/agents`, { identity: other });
-    if (name === 'Elm') expect(answer).toMatchObject({ status: 429, body: { error: expect.stringContaining('four agents') } });
+    if (name === 'Elm') expect(answer).toMatchObject({ status: 429, body: { error: expect.stringContaining('4 agents') } });
     else expect(answer.status).toBe(201);
     await admitAgents(room);
   }

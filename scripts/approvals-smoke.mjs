@@ -32,6 +32,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { openRoomDetails } from './room-details.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MESHROOMS_PLAYWRIGHT_MODULE || 'playwright');
 const origin = process.env.MESHROOMS_BROWSER_TEST_ORIGIN || 'http://127.0.0.1:14337';
@@ -238,7 +239,7 @@ try {
   await local.waitForURL(u => !u.hash && u.pathname === '/rooms');
   await local.getByRole('link', { name: /Approvals check/ }).first().click();
   await local.waitForURL(new RegExp(`/r/${roomId}$`));
-  await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(local);
   const section = local.locator('#browser-room-details .browser-local-agents');
   const row = section.locator('li.browser-local-agent', { has: local.locator('strong', { hasText: 'Elm' }) });
   await row.getByRole('button', { name: 'Add to this room' }).click();

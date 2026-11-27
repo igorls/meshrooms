@@ -1,19 +1,23 @@
 /** Harnesses the connect prompt can name for the agent; `other` leaves the placeholder for the agent to fill in. */
-export const PROMPT_HARNESSES = { claude: 'Claude Code', codex: 'Codex CLI', codexApp: 'Codex app', agy: 'Antigravity', hermes: 'Hermes Agent', dsh: 'DeepSeek Harness', grok: 'Grok Bot', other: '' } as const;
+export const PROMPT_HARNESSES = { claude: 'Claude Code', codex: 'Codex CLI', codexApp: 'Codex app', agy: 'Antigravity', bentokit: 'BentoKit', hermes: 'Hermes Agent', dsh: 'DeepSeek Harness', grok: 'Grok Bot', other: '' } as const;
 export type PromptHarness = keyof typeof PROMPT_HARNESSES;
 
 /** What the invite dialog shows for each harness: its chip label and the short badge in the chip. Same keys and labels as `PROMPT_HARNESSES`. */
-export const PROMPT_HARNESS_META: { id: PromptHarness; label: string; badge: string }[] = [
+export const PROMPT_HARNESS_META: { id: PromptHarness; label: string; badge: string; linkOnly?: boolean }[] = [
   { id: 'claude', label: PROMPT_HARNESSES.claude, badge: 'C' },
   { id: 'codex', label: PROMPT_HARNESSES.codex, badge: 'Cx' },
   { id: 'codexApp', label: PROMPT_HARNESSES.codexApp, badge: 'Ca' },
   { id: 'agy', label: PROMPT_HARNESSES.agy, badge: 'A' },
+  { id: 'bentokit', label: PROMPT_HARNESSES.bentokit, badge: 'B', linkOnly: true },
   { id: 'grok', label: PROMPT_HARNESSES.grok, badge: 'G' },
   { id: 'hermes', label: PROMPT_HARNESSES.hermes, badge: 'H' },
   { id: 'dsh', label: PROMPT_HARNESSES.dsh, badge: 'D' },
   { id: 'other', label: 'Something else', badge: '·' },
 ];
 export const isPromptHarness = (value: unknown): value is PromptHarness => typeof value === 'string' && Object.prototype.hasOwnProperty.call(PROMPT_HARNESSES, value);
+
+/** Harnesses that connect natively with the one-time agent link (no CLI prompt or Bun install needed). */
+export const isLinkOnlyHarness = (harness: PromptHarness): boolean => PROMPT_HARNESS_META.some(h => h.id === harness && !!h.linkOnly);
 
 /** The name an agent gets in the room when the person hasn't typed one: the harness's own name; "Something else" has none. */
 export const defaultAgentName = (harness: PromptHarness): string => PROMPT_HARNESSES[harness];
@@ -23,6 +27,7 @@ export function harnessFromName(name: string): PromptHarness | undefined {
   if (/codex/i.test(name)) return 'codex';
   if (/claude/i.test(name)) return 'claude';
   if (/antigravity|\bagy\b/i.test(name)) return 'agy';
+  if (/bentokit|\bbento\b/i.test(name)) return 'bentokit';
   if (/hermes/i.test(name)) return 'hermes';
   if (/dsh|deepseek/i.test(name)) return 'dsh';
   if (/grok/i.test(name)) return 'grok';
@@ -49,6 +54,7 @@ const grokFolder = (name: string) => `agents-${name.toLowerCase().replace(/[^a-z
  * follows. `name` is the agent name this person just typed.
  */
 export function agentPrompt(input: { origin: string; roomId: string; link: string; name: string; version?: string; harness: PromptHarness }) {
+  if (input.harness === 'bentokit') return bentokitPrompt(input);
   const pkg = input.version && VERSION.test(input.version) ? `@wormdb/meshrooms@${input.version}` : '@wormdb/meshrooms@latest';
   const harness = PROMPT_HARNESSES[input.harness] || '<your harness>';
   if (input.harness === 'grok') return grokPrompt(input, pkg);
@@ -85,5 +91,19 @@ function grokPrompt(input: { origin: string; roomId: string; link: string; name:
     '4. Connect once with this one-time link, in your own agent folder. Keep the link private (not in chat, memory or a routine); it expires in 15 minutes:',
     `   export MESHROOMS_AGENT_HOME="$HOME/.meshrooms/${grokFolder(input.name)}"; bun x ${pkg} connect '${input.link}' --harness 'Grok Bot'`,
     "5. Then, as the Grok Bot guide says: start the daemon with a keepalive routine, and set up the webhook routine that wakes you when someone addresses you. Ask me for the routine's webhook only through a secure form, never in chat. Don't poll the room on a schedule.",
+  ].join('\n');
+}
+
+/**
+ * BentoKit connects natively to Meshrooms with the one-time agent link inside its channel settings, without running
+ * `bunx @wormdb/meshrooms connect` or installing Bun.
+ */
+function bentokitPrompt(input: { link: string; name: string }) {
+  return [
+    `Connect "${input.name}" in BentoKit:`,
+    '1. Open BentoKit -> Settings -> Channels -> Add Channel -> Meshrooms.',
+    '2. Paste the full one-time link (including the part after #) into "Agent connect link" and save (keep it private; it expires in 15 minutes):',
+    `   ${input.link}`,
+    '3. If Access Control shows Pairing, set it to Public or Admin approval so room members can reach the agent.',
   ].join('\n');
 }

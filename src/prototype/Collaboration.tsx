@@ -4,7 +4,7 @@ import { parseMarkdown, repoRef, safeHref, type Block, type Inline, type RepoRef
 import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
 import { issueFromTitle, issueLabel, issueLinkFrom, newIssueUrl, soleRepository } from '../browser/board';
 
-const statusLabels: Record<TaskStatus, string> = { todo: 'To do', doing: 'In progress', done: 'Done' };
+export const statusLabels: Record<TaskStatus, string> = { todo: 'To do', doing: 'In progress', done: 'Done' };
 
 const refGlyphs: Record<RepoRef['kind'], ReactNode> = {
   pull: <><circle cx="4" cy="3.5" r="1.5" /><circle cx="4" cy="12.5" r="1.5" /><circle cx="12" cy="12.5" r="1.5" /><path d="M4 5v6M12 11V7a2 2 0 0 0-2-2H7.5M9 3.5 7.5 5 9 6.5" /></>,
@@ -360,7 +360,7 @@ function TaskCard({ task, room, viewerId, disabled, actions, highlighted, workin
   </li>;
 }
 
-function IssueChip({ link }: { link: string }) {
+export function IssueChip({ link }: { link: string }) {
   const pull = link.includes('/pull/');
   return <a className="task-issue-chip" href={link} target="_blank" rel="noopener noreferrer" title={`Open ${pull ? 'the pull request' : 'the issue'} on GitHub`}>
     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">{pull

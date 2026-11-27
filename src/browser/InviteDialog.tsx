@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react';
-import { PROMPT_HARNESS_META, agentPrompt, defaultAgentName, isPromptHarness, type PromptHarness } from './agent-prompt';
+import { PROMPT_HARNESS_META, agentPrompt, defaultAgentName, isLinkOnlyHarness, isPromptHarness, type PromptHarness } from './agent-prompt';
 import { AGENT_LINK_TTL, agentLinkState, formatCountdown, inviteSteps, type AgentLinkState, type StepStatus } from './invite-state';
 import type { RoomStatus } from './protocol';
 import { PhonePairing, type PhoneAsking } from './PhonePairing';
@@ -30,11 +30,11 @@ function Icon({ kind }: { kind: 'person' | 'agent' | 'close' | 'check' | 'clock'
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[kind]}</svg>;
 }
 
-function Steps({ state, copied, name, host }: { state: AgentLinkState; copied: boolean; name: string; host: boolean }) {
+function Steps({ state, copied, name, host, linkOnly, harnessLabel }: { state: AgentLinkState; copied: boolean; name: string; host: boolean; linkOnly?: boolean; harnessLabel?: string }) {
   const [a, b, c] = inviteSteps(state, copied);
   const rows: [StepStatus, string, string][] = [
-    [a, `Copy the prompt and paste it to ${name}`, a === 'done' ? 'Copied' : 'Not copied yet'],
-    [b, state === 'expired' ? `The link expired before ${name} used it` : `${name} opens the link`, b === 'bad' ? 'Expired' : b === 'now' ? 'Listening…' : b === 'done' ? 'Link used' : ''],
+    [a, linkOnly ? `Copy the link and paste it in ${harnessLabel ?? 'your agent'}` : `Copy the prompt and paste it to ${name}`, a === 'done' ? 'Copied' : 'Not copied yet'],
+    [b, state === 'expired' ? `The link expired before ${name} used it` : linkOnly ? `${name} connects with the link` : `${name} opens the link`, b === 'bad' ? 'Expired' : b === 'now' ? 'Listening…' : b === 'done' ? 'Link used' : ''],
     [c, state === 'used' ? (host ? `${name} is connecting` : `Waiting for the host to let ${name} in`) : `${name} joins the room`, c === 'done' ? 'Just now' : state === 'used' && !host ? 'Needs host' : ''],
   ];
   return <ol className="invite-steps" role="status" aria-live="polite">{rows.map(([status, label, note], index) =>
@@ -137,9 +137,10 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
     try {
       const token = await createAgentLink(trimmed);
       const url = `${roomOrigin}/agent/${roomId}#${token}`;
-      const prompt = agentPrompt({ origin: roomOrigin, roomId, link: url, name: trimmed, version: agentVersion, harness: chosenHarness });
+      const linkOnly = isLinkOnlyHarness(chosenHarness);
+      const prompt = linkOnly ? undefined : agentPrompt({ origin: roomOrigin, roomId, link: url, name: trimmed, version: agentVersion, harness: chosenHarness });
       wasUsed.current = false; announced.current = '';
-      setLink({ name: trimmed, harness: chosenHarness, createdAt: Date.now(), prompt, url, preview: prompt.split(url).join(MASK) });
+      setLink({ name: trimmed, harness: chosenHarness, createdAt: Date.now(), prompt, url, preview: prompt ? prompt.split(url).join(MASK) : MASK });
       setCopied(undefined); setShowFull(false); setNow(Date.now());
     } catch (error) { setProblem((error as Error).message || 'Couldn’t make the link. Try again.'); }
     finally { setBusy(false); }
@@ -151,7 +152,7 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
   async function copyAgent(what: 'prompt' | 'link') {
     const text = what === 'prompt' ? link?.prompt : link?.url; if (!text) return;
     try { await navigator.clipboard.writeText(text); setCopied(what); setProblem(''); }
-    catch { setShowFull(true); setProblem('Couldn’t copy automatically. Select the prompt and copy it.'); }
+    catch { setShowFull(true); setProblem(`Couldn’t copy automatically. Select the ${what === 'link' ? 'link' : 'prompt'} and copy it.`); }
   }
   function again() { setLink(undefined); setCopied(undefined); setShowFull(false); setProblem(''); nameTouched.current = false; setName(defaultAgentName(harness)); }
   function moveTab(event: KeyboardEvent) {
@@ -191,9 +192,12 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
   }
 
   function chooseStep(): ReactNode {
+    const linkOnly = isLinkOnlyHarness(harness);
     return <form className="invite-panel" role="tabpanel" id="invite-panel-agent" aria-labelledby="invite-tab-agent" onSubmit={event => { event.preventDefault(); void make(name, harness); }}>
       <div className="invite-body">
-        <p className="invite-lead">Connect an <b>AI agent</b> that you run (Claude Code, Codex, Grok Bot…). You’ll copy one prompt and paste it into the agent. It handles the rest. Use your own browser here, not one an agent is driving.</p>
+        <p className="invite-lead">{linkOnly
+          ? <>Connect an <b>AI agent</b> in <b>BentoKit</b>. You’ll copy a one-time link and paste it into BentoKit’s Meshrooms channel settings. Use your own browser here, not one an agent is driving.</>
+          : <>Connect an <b>AI agent</b> that you run (Claude Code, Codex, Grok Bot…). You’ll copy one prompt and paste it into the agent. It handles the rest. Use your own browser here, not one an agent is driving.</>}</p>
         <div><span className="invite-label" id="invite-harness-label">1 · Your agent runs on</span>
           <div className="invite-chips" role="radiogroup" aria-labelledby="invite-harness-label">{PROMPT_HARNESS_META.map(h =>
             <button key={h.id} type="button" role="radio" aria-checked={h.id === harness} className={`invite-chip${h.id === harness ? ' is-on' : ''}`} onClick={() => pickHarness(h.id)}><span className="invite-badge is-agent" aria-hidden="true">{h.badge}</span>{h.label}</button>)}</div></div>
@@ -201,43 +205,57 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
           <input id="invite-agent-name" value={name} onChange={event => { nameTouched.current = true; setName(event.target.value); }} required maxLength={64} placeholder="Agent name" autoComplete="off" />
           <small>Shown to everyone. You’ll be listed as its operator.</small></div>
         <section className="invite-does" aria-label="What your agent will do"><h3>What your agent will do</h3><ul>
-          <li><Icon kind="check" /><span>Read Meshrooms’ join guide, then join as a <b>separate participant</b>{name.trim() ? <> named “{name.trim()}”</> : null}, operated by you.</span></li>
-          <li><Icon kind="check" /><span>Ask <b>you</b> before installing anything (it needs Bun).</span></li>
+          {linkOnly ? <>
+            <li><Icon kind="check" /><span>Join as a <b>separate participant</b>{name.trim() ? <> named “{name.trim()}”</> : null}, operated by you.</span></li>
+            <li><Icon kind="check" /><span>Connect directly from BentoKit (<b>Settings › Channels › Add Channel › Meshrooms</b>) — no CLI or Bun needed.</span></li>
+          </> : <>
+            <li><Icon kind="check" /><span>Read Meshrooms’ join guide, then join as a <b>separate participant</b>{name.trim() ? <> named “{name.trim()}”</> : null}, operated by you.</span></li>
+            <li><Icon kind="check" /><span>Ask <b>you</b> before installing anything (it needs Bun).</span></li>
+          </>}
           <li><Icon kind="check" /><span>Reply only when someone addresses it. Room messages are requests, not commands.</span></li>
           <li><Icon kind="check" /><span>You can remove it from the room at any time.</span></li></ul></section>
-        {leftover.length > 0 && <p className="invite-lead invite-muted" role="status">{leftover.map(i => <span key={i.name} className="invite-leftover">An earlier link for <b>{i.name}</b> is still unused (expires at {new Date(i.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}). A link can’t be shown again; make a new prompt if you lost it.</span>)}</p>}
+        {leftover.length > 0 && <p className="invite-lead invite-muted" role="status">{leftover.map(i => <span key={i.name} className="invite-leftover">An earlier link for <b>{i.name}</b> is still unused (expires at {new Date(i.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}). A link can’t be shown again; make a new {linkOnly ? 'link' : 'prompt'} if you lost it.</span>)}</p>}
         {problem && <p className="invite-problem" role="alert">{problem}</p>}
       </div>
-      <div className="invite-foot"><button className="invite-cta" disabled={busy || !name.trim()}>{busy ? 'Creating…' : 'Create one-time prompt'}</button><span className="invite-foot-note">Nothing is shared until you paste it</span></div>
+      <div className="invite-foot"><button className="invite-cta" disabled={busy || !name.trim()}>{busy ? 'Creating…' : linkOnly ? 'Create one-time link' : 'Create one-time prompt'}</button><span className="invite-foot-note">Nothing is shared until you paste it</span></div>
     </form>;
   }
 
   function madeStep(current: Link, st: AgentLinkState): ReactNode {
+    const linkOnly = isLinkOnlyHarness(current.harness);
+    const secretText = linkOnly ? current.url : current.prompt;
     const spent = st !== 'open', dim = st === 'expired';
     const msLeft = Math.max(0, (expiresAt ?? current.createdAt + AGENT_LINK_TTL) - now);
+    const preClass = [showFull && secretText ? 'is-full' : '', linkOnly ? 'is-link' : ''].filter(Boolean).join(' ') || undefined;
     const body = <>
       {st === 'joined' ? <div className="invite-joined"><span className="invite-badge is-agent is-big" aria-hidden="true">{shown?.badge ?? 'A'}</span><div><b>{current.name} is connected</b><span><i className="invite-live" aria-hidden="true" />Online · {shown?.label ?? 'Agent'} · operated by you</span></div></div>
         : <>
-          {st === 'expired' && <p className="invite-error" role="alert"><b>This link expired before {current.name} used it.</b><br />Links work once and last 15 minutes. Nothing was shared and nobody joined. Make a new prompt to try again.</p>}
-          {st === 'open' && <p className="invite-warn"><Icon kind="lock" /><span><b>Contains a one-time secret.</b> Paste it only to your own agent, never in chat, a room, or a ticket.</span></p>}
-          <section className={`invite-card${dim ? ' is-dim' : ''}`} aria-label={`Prompt for ${current.name}`}>
-            <header><span className="invite-badge is-agent" aria-hidden="true"><Icon kind="agent" /></span><div><b>Prompt for {current.name}</b><small>Paste into your agent, not into the room</small></div>
+          {st === 'expired' && <p className="invite-error" role="alert"><b>This link expired before {current.name} used it.</b><br />Links work once and last 15 minutes. Nothing was shared and nobody joined. Make a new {linkOnly ? 'link' : 'prompt'} to try again.</p>}
+          {st === 'open' && <p className="invite-warn"><Icon kind="lock" /><span><b>Contains a one-time secret.</b> {linkOnly ? 'Paste it only into BentoKit’s Meshrooms channel settings, never in chat, a room, or a ticket.' : 'Paste it only to your own agent, never in chat, a room, or a ticket.'}</span></p>}
+          <section className={`invite-card${dim ? ' is-dim' : ''}`} aria-label={`${linkOnly ? 'Link' : 'Prompt'} for ${current.name}`}>
+            <header><span className="invite-badge is-agent" aria-hidden="true"><Icon kind={linkOnly ? 'link' : 'agent'} /></span><div><b>{linkOnly ? 'Link' : 'Prompt'} for {current.name}</b><small>{linkOnly ? 'Paste into “Agent connect link” under Settings › Channels › Add Channel › Meshrooms' : 'Paste into your agent, not into the room'}</small></div>
               <span className={`invite-pill ${dim ? 'is-bad' : spent ? 'is-ok' : 'is-secret'}`}>{dim ? <><Icon kind="clock" />Expired</> : spent ? <><Icon kind="check" />Link used</> : <><Icon kind="lock" />One-time secret</>}</span></header>
-            <pre className={showFull && current.prompt ? 'is-full' : undefined} tabIndex={showFull ? 0 : -1} onFocus={event => { if (showFull) { const range = document.createRange(); range.selectNodeContents(event.currentTarget); const selection = getSelection(); selection?.removeAllRanges(); selection?.addRange(range); } }}>{showFull && current.prompt ? current.prompt : current.preview}</pre>
+            <pre className={preClass} tabIndex={showFull ? 0 : -1} onFocus={event => { if (showFull) { const range = document.createRange(); range.selectNodeContents(event.currentTarget); const selection = getSelection(); selection?.removeAllRanges(); selection?.addRange(range); } }}>{showFull && secretText ? secretText : current.preview}</pre>
             <footer><span><Icon kind="clock" />{dim ? 'Expired' : spent ? 'Link used' : <>Works once · expires in <b>{formatCountdown(msLeft)}</b></>}</span>
-              {current.prompt && <button type="button" className="browser-text-link" aria-expanded={showFull} onClick={() => setShowFull(!showFull)}>{showFull ? 'Hide full prompt' : 'Show full prompt'}</button>}</footer>
+              {secretText && <button type="button" className="browser-text-link" aria-expanded={showFull} onClick={() => setShowFull(!showFull)}>{showFull ? (linkOnly ? 'Hide full link' : 'Hide full prompt') : (linkOnly ? 'Show full link' : 'Show full prompt')}</button>}</footer>
           </section></>}
-      <Steps state={st} copied={!!copied} name={current.name} host={host} />
+      <Steps state={st} copied={!!copied} name={current.name} host={host} linkOnly={linkOnly} harnessLabel={shown?.label} />
       {st === 'used' && !host && <p className="invite-lead invite-muted">{current.name} used the link. The host has to let it in because it’s a guest’s agent. This updates when they do.</p>}
       {st === 'joined' && <p className="invite-lead invite-muted">It joined as a separate participant. Mention it in the room (<b>@{current.name}</b>) to ask it something. The one-time link is now spent.</p>}
-      {st === 'open' && <ul className="invite-facts"><li><Icon kind="shield" /><span>{copied ? 'This updates by itself. You can close this and keep chatting; the agent will appear in the room.' : 'Your agent reads the join guide first. It asks you before installing anything.'}</span></li></ul>}
+      {st === 'open' && <ul className="invite-facts">
+        <li><Icon kind="shield" /><span>{copied ? 'This updates by itself. You can close this and keep chatting; the agent will appear in the room.' : linkOnly ? <>In BentoKit, open <b>Settings › Channels › Add Channel › Meshrooms</b>, paste the full link (including the part after #) into <b>Agent connect link</b>, and save.</> : 'Your agent reads the join guide first. It asks you before installing anything.'}</span></li>
+        {linkOnly && <li><Icon kind="lock" /><span>If BentoKit’s <b>Access Control</b> shows <b>Pairing</b>, set it to <b>Public</b> or <b>Admin approval</b> so room members can reach the agent.</span></li>}
+      </ul>}
       {problem && <p className="invite-problem" role="alert">{problem}</p>}
     </>;
-    const foot = st === 'open' ? <>
+    const foot = st === 'open' ? (linkOnly ? <>
+        <button type="button" className={`invite-cta${copied ? ' is-done' : ''}`} onClick={() => void copyAgent('link')}>{copied ? <><Icon kind="check" />Link copied · paste it in {shown?.label ?? 'BentoKit'}</> : `Copy link for ${current.name}`}</button>
+        {copied && <button type="button" className="invite-text" onClick={() => void copyAgent('link')}>Copy again</button>}</>
+      : <>
         <button type="button" className={`invite-cta${copied ? ' is-done' : ''}`} onClick={() => void copyAgent('prompt')}>{copied ? <><Icon kind="check" />{copied === 'link' ? 'Link copied' : 'Copied'} · paste it to {current.name}</> : `Copy prompt for ${current.name}`}</button>
-        {copied ? <button type="button" className="invite-text" onClick={() => void copyAgent('prompt')}>Copy again</button> : <button type="button" className="invite-text" onClick={() => void copyAgent('link')}>Copy link only (advanced)</button>}</>
+        {copied ? <button type="button" className="invite-text" onClick={() => void copyAgent('prompt')}>Copy again</button> : <button type="button" className="invite-text" onClick={() => void copyAgent('link')}>Copy link only (advanced)</button>}</>)
       : st === 'joined' ? <><button type="button" className="primary invite-primary" onClick={onClose}>Back to room</button><button type="button" className="invite-text" onClick={again}>Invite another agent</button></>
-      : st === 'expired' ? <button type="button" className="invite-cta" disabled={busy} onClick={() => void make(current.name, current.harness)}>{busy ? 'Creating…' : 'Make a new prompt'}</button>
+      : st === 'expired' ? <button type="button" className="invite-cta" disabled={busy} onClick={() => void make(current.name, current.harness)}>{busy ? 'Creating…' : linkOnly ? 'Make a new link' : 'Make a new prompt'}</button>
       : <><button type="button" className="secondary invite-primary" onClick={onClose}>Done</button><button type="button" className="invite-text" onClick={again}>Invite another agent</button></>;
     return <div className="invite-panel" role="tabpanel" id="invite-panel-agent" aria-labelledby="invite-tab-agent"><div className="invite-body">{body}</div><div className="invite-foot">{foot}</div></div>;
   }
@@ -275,6 +293,6 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
       {slide('agent', localAgents ? localPanel() : link && state ? madeStep(link, state) : chooseStep())}
       {phone && slide('phone', <PhonePairing active={open && tab === 'phone'} rooms={phone.rooms} name={phone.name} device={phone.device} link={phone.link} command={phone.command} asking={phone.asking} onActiveChange={phone.onActiveChange} onUseCode={phone.onUseCode} onNotice={onNotice} onClose={onClose} />)}
     </div>
-    <span className="sr-only" role="status">{personCopied && tab === 'person' ? 'Room link copied' : copied && tab === 'agent' && state === 'open' ? 'Prompt copied. Paste it to your agent' : ''}</span>
+    <span className="sr-only" role="status">{personCopied && tab === 'person' ? 'Room link copied' : copied && tab === 'agent' && state === 'open' ? (copied === 'link' ? 'Link copied. Paste it into your agent' : 'Prompt copied. Paste it to your agent') : ''}</span>
   </dialog>;
 }

@@ -35,8 +35,18 @@ import {
   canonicalJson, hashRosterBody, parseHostPin, signRoster, verifyEncBinding, verifyRoster,
   type DecryptedRelayEnvelope, type RelayEnvelope, type RelayLane, type RemovedRosterEntry, type RosterBody, type RosterEntry, type SignedRoster,
 } from './relay-crypto';
-import { RelayClient, type RelayClientOptions } from './relay-client';
+import { RelayClient, type RelayClientOptions, type SendPacketOptions } from './relay-client';
 import { RelayReplayGuard } from './relay-replay';
+import { VFS_PROTOCOL_VERSION, VfsError } from './vfs/constants';
+import { utf8Bytes } from './vfs/envelope';
+import {
+  VFS_RELAY_SEND_OPTS, assertVfsRelaySafeOptions, isVfsHavePacket, isVfsKeyEpochPacket,
+  isVfsKeyGrantPacket, isVfsKeyWrapPacket, isVfsOpsPacket, isVfsPacketKind, isVfsRecordPacket,
+  vfsPacketRelayLane,
+  type VfsHavePacket, type VfsOpsPacket, type VfsPacket,
+} from './vfs/wire';
+import { VfsRelayBudget, VfsSyncTracker, type VfsRelayBudgetLane } from './vfs/pacing';
+import { VfsUnauthorizedError, type VfsRoomEngine, type VfsSignerInfo, type VfsSignerLookup } from './vfs/engine';
 
 /** `replyTo`, `attachments`, `visibility`, `seq` and `audienceUntil` are optional so browsers from before them keep verifying and storing these packets. */
 type MessageBody = {
@@ -96,6 +106,13 @@ export type FileView = { url?: string; type?: string; transfer?: TransferState }
 type FileIndex = Record<string, { size: number; type: string }>;
 /** Out-of-order reactions whose message hasn't arrived within this window are evicted as stale. */
 export const PENDING_REACTION_TTL_MS = 5 * 60_000;
+/** Per-peer serve budget for inbound `vfs-have` anti-entropy probes. */
+const VFS_SERVE_PER_MINUTE = 60;
+const VFS_SERVE_BURST = 24;
+/** Bounded outbound relay backlog for VFS frames paused by `VfsRelayBudget` or chat priority. */
+const VFS_RELAY_QUEUE_MAX = 128;
+/** Minimum interval between periodic relay `vfs-have` probes to the same peer. */
+const VFS_RELAY_RETRY_MS = 15_000;
 
 const isStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(v => typeof v === 'string');
 const isAttachmentRefShape = (value: unknown): value is AttachmentRef =>
@@ -228,6 +245,24 @@ export class BrowserPeers {
   private createRelayClient?: (options: RelayClientOptions) => RelayClient;
   /** Optional listener for verified retraction operations (used by UI gap analysis). */
   private retractionsChanged: (ops: RetractBody[]) => void = () => {};
+  /** Optional Room VFS engine; when unset, inbound `vfs-*` frames are silently ignored for legacy compatibility. */
+  private vfsEngine?: VfsRoomEngine;
+  /** Sliding-window relay frame/byte pacer that yields immediately whenever chat frames are pending. */
+  private vfsRelayBudget: VfsRelayBudget;
+  /** Per-peer VFS anti-entropy state machine (frontier matching, pagination cursors, round timeouts). */
+  private vfsSyncTracker: VfsSyncTracker;
+  /** Per-peer token bucket protecting `vfs-have` serving against probe floods. */
+  private vfsServeLimiter: PeerRateLimiter;
+  /** Bounded FIFO queue for VFS relay frames waiting on `VfsRelayBudget` or chat priority drain. */
+  private vfsRelayQueue: Array<{ packet: VfsPacket; targetIds?: readonly string[] }> = [];
+  private vfsRelayTimer?: ReturnType<typeof setTimeout>;
+  /** Online verified-roster peers recently probed with a relay `vfs-have`. */
+  private relayVfsSynced = new Map<string, number>();
+  /** Primary-lane relay envelope IDs belonging to non-VFS chat/collab frames (for VFS chat-priority yield). */
+  private pendingChatRelayIds = new Set<string>();
+  /** Primary-lane relay envelope IDs belonging to VFS frames so VFS bursts never self-yield. */
+  private pendingVfsRelayIds = new Set<string>();
+  private vfsPrimaryQueued = 0;
   constructor(private api: BrowserApi, private roomId: string, private deviceId: string, private session: string,
     private changed: (messages: SavedMessage[], connected: string[], added?: SavedMessage) => void, private error: (message: string) => void,
     private boardChanged: (tasks: Task[], ops: TaskBody[]) => void = () => {}, private filesChanged: (files: Record<string, FileView>) => void = () => {},
@@ -240,6 +275,9 @@ export class BrowserPeers {
       createRelayClient?: (options: RelayClientOptions) => RelayClient;
       decryptRelay?: (envelope: unknown, options: { room: string; senderSignKey: string; minRosterVersion?: number; expectedFrom?: string }) => Promise<DecryptedRelayEnvelope<unknown>>;
       retractionsChanged?: (ops: RetractBody[]) => void;
+      vfs?: VfsRoomEngine;
+      vfsRelayBudget?: VfsRelayBudget;
+      vfsSyncTracker?: VfsSyncTracker;
     }) {
     this.key = `messages:${deviceId}:${roomId}`;
     this.boardKey = `board:${deviceId}:${roomId}`;
@@ -253,6 +291,11 @@ export class BrowserPeers {
     this.quotaDrops = new QuotaDrops(() => this.now());
     this.historyServeLimiter = new PeerRateLimiter(() => this.now(), HISTORY_SERVE_PER_MINUTE, HISTORY_SERVE_BURST);
     this.historyAcceptLimiter = new PeerRateLimiter(() => this.now(), HISTORY_ACCEPT_ENTRIES_PER_MINUTE, HISTORY_ACCEPT_ENTRIES_BURST);
+    this.vfsEngine = relayOptions?.vfs;
+    this.vfsRelayBudget = relayOptions?.vfsRelayBudget ?? new VfsRelayBudget({ now: () => this.now() });
+    this.vfsRelayBudget.setChatPriorityPending(() => this.hasChatRelayPriorityPending());
+    this.vfsSyncTracker = relayOptions?.vfsSyncTracker ?? new VfsSyncTracker({ now: () => this.now() });
+    this.vfsServeLimiter = new PeerRateLimiter(() => this.now(), VFS_SERVE_PER_MINUTE, VFS_SERVE_BURST);
     this.pinnedHost = relayOptions?.hostPin ?? (typeof location !== 'undefined' ? parseHostPin(location.hash) : undefined);
     this.createRelayClient = relayOptions?.createRelayClient;
     if (relayOptions?.decryptRelay) this.decryptRelay = relayOptions.decryptRelay;
@@ -329,6 +372,12 @@ export class BrowserPeers {
       if (peer.pc.signalingState === 'have-local-offer' && at - (this.firstOffer.get(`${id}:${peer.session}`) ?? peer.started) < 10_000) return true;
     return false;
   }
+  /** Attached Room VFS engine, if configured. */
+  vfs(): VfsRoomEngine | undefined { return this.vfsEngine; }
+  /** Active Room VFS relay pacer budget. */
+  vfsBudget(): VfsRelayBudget { return this.vfsRelayBudget; }
+  /** Active Room VFS anti-entropy peer sync tracker. */
+  vfsTracker(): VfsSyncTracker { return this.vfsSyncTracker; }
   /** Explicitly pin the expected host key prefix (e.g. from `#h=` fragment). */
   setHostPin(pin: string | undefined) { if (pin) this.pinnedHost = pin; }
   /** Whether a peer currently has a live open WebRTC DataChannel (Section 5.4 WebRTC-first rule). */
@@ -441,19 +490,157 @@ export class BrowserPeers {
     }
     return { ...(wake.size ? { wake: [...wake] } : {}), ...(hold ? { hold } : {}) };
   }
+  /** Returns `true` when non-VFS chat/collab frames are queued on the relay primary lane so VFS yields immediately. */
+  private hasChatRelayPriorityPending(): boolean {
+    if (!this.relayClient) return false;
+    const pendingPrimary = this.relayClient.pendingPrimaryCount;
+    if (pendingPrimary <= 0) {
+      this.vfsPrimaryQueued = 0;
+      return false;
+    }
+    if (this.vfsPrimaryQueued > pendingPrimary) this.vfsPrimaryQueued = pendingPrimary;
+    if (this.pendingChatRelayIds.size > 0) return true;
+    return pendingPrimary > this.vfsPrimaryQueued;
+  }
+  /** Schedules a bounded timer to drain queued VFS relay frames once budget or chat priority clears. */
+  private scheduleVfsRelayDrain(wireBytes: number, budgetLane: VfsRelayBudgetLane) {
+    if (this.stopped || this.vfsRelayTimer || !this.vfsRelayQueue.length) return;
+    const wait = this.vfsRelayBudget.nextAvailableMs(wireBytes, this.now(), budgetLane);
+    if (!Number.isFinite(wait)) return;
+    const delay = Math.max(25, Math.min(30_000, Math.ceil(wait)));
+    this.vfsRelayTimer = setTimeout(() => {
+      this.vfsRelayTimer = undefined;
+      this.drainVfsRelayQueue();
+    }, delay);
+  }
+  /** Drains queued VFS relay frames in FIFO order whenever `VfsRelayBudget` admits them and chat is clear. */
+  private drainVfsRelayQueue() {
+    if (this.stopped || !this.relayClient || !this.verifiedRoster) return;
+    while (this.vfsRelayQueue.length > 0) {
+      const head = this.vfsRelayQueue[0]!;
+      const recipients = this.relayRecipients(head.targetIds);
+      if (!recipients.length) {
+        this.vfsRelayQueue.shift();
+        continue;
+      }
+      const lane = vfsPacketRelayLane(head.packet);
+      const budgetLane: VfsRelayBudgetLane = lane === 'file' ? 'block' : 'ops';
+      const wireBytes = utf8Bytes(JSON.stringify(head.packet)).byteLength;
+      if (!Number.isFinite(this.vfsRelayBudget.nextAvailableMs(wireBytes, this.now(), budgetLane))) {
+        this.vfsRelayQueue.shift();
+        continue;
+      }
+      if (this.sendVfsViaRelay(head.packet, head.targetIds, true)) {
+        this.vfsRelayQueue.shift();
+      } else {
+        this.scheduleVfsRelayDrain(wireBytes, budgetLane);
+        break;
+      }
+    }
+  }
+  /**
+   * Sends a single VFS packet over the E2E relay with strict pacing (`VfsRelayBudget`) and hard
+   * Decision 1 + loop-safety guards: NEVER sets `hold: true` and NEVER sets `wake`.
+   */
+  private sendVfsViaRelay(packet: VfsPacket, targetIds?: readonly string[], bypassQueue = false): boolean {
+    if (!this.relayClient || !this.verifiedRoster || this.stopped) return false;
+    const recipients = this.relayRecipients(targetIds);
+    if (!recipients.length) return false;
+    const lane = vfsPacketRelayLane(packet);
+    const budgetLane: VfsRelayBudgetLane = lane === 'file' ? 'block' : 'ops';
+    const wireBytes = utf8Bytes(JSON.stringify(packet)).byteLength;
+    if (!bypassQueue && this.vfsRelayQueue.length > 0) {
+      if (this.vfsRelayQueue.length >= VFS_RELAY_QUEUE_MAX) this.vfsRelayQueue.shift();
+      this.vfsRelayQueue.push({ packet, targetIds });
+      this.scheduleVfsRelayDrain(wireBytes, budgetLane);
+      return false;
+    }
+    if (!this.vfsRelayBudget.consume(wireBytes, this.now(), budgetLane)) {
+      if (!bypassQueue) {
+        if (this.vfsRelayQueue.length >= VFS_RELAY_QUEUE_MAX) this.vfsRelayQueue.shift();
+        this.vfsRelayQueue.push({ packet, targetIds });
+        this.scheduleVfsRelayDrain(wireBytes, budgetLane);
+      }
+      return false;
+    }
+    assertVfsRelaySafeOptions(VFS_RELAY_SEND_OPTS);
+    const enqueueOpts: SendPacketOptions = {
+      rosterVersion: this.verifiedRoster.body.version,
+      lane,
+      recipients,
+    };
+    assertVfsRelaySafeOptions(enqueueOpts);
+    try {
+      const beforePrimary = this.relayClient.pendingPrimaryCount;
+      const id = this.relayClient.enqueuePacket(packet, enqueueOpts);
+      if (lane === 'primary') {
+        this.vfsPrimaryQueued += Math.max(0, this.relayClient.pendingPrimaryCount - beforePrimary);
+        this.pendingVfsRelayIds.add(id);
+        if (this.pendingVfsRelayIds.size > 1024) this.pendingVfsRelayIds.delete(this.pendingVfsRelayIds.values().next().value!);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  /** Sends VFS packets to one peer (WebRTC-first, paced relay fallback without `hold` or `wake`). */
+  private sendVfsPacketsToPeer(peerId: string, packets: readonly VfsPacket[], peer?: Peer): boolean {
+    if (this.stopped || !packets.length) return false;
+    const active = peer ?? this.peers.get(peerId);
+    if (active?.queue && this.hasLiveWebRtc(peerId) && active.channel?.readyState === 'open') {
+      return active.queue.push(packets.map(p => JSON.stringify(p)));
+    }
+    if (this.relayClient?.isConnected() && this.verifiedRoster?.body.devices.some(d => d.id === peerId)) {
+      for (const packet of packets) this.sendVfsViaRelay(packet, [peerId]);
+      return true;
+    }
+    return false;
+  }
+  /** Broadcasts outbound VFS packets (e.g. from `VfsRoomEngine` writes/key broadcasts) WebRTC-first + paced relay. */
+  sendVfsPackets(packets: readonly VfsPacket[], targetIds?: readonly string[]): void {
+    if (this.stopped || !packets.length) return;
+    const filter = targetIds ? new Set(targetIds) : undefined;
+    const encoded = packets.map(p => JSON.stringify(p));
+    for (const [id, peer] of this.peers) {
+      if (filter && !filter.has(id)) continue;
+      if (this.hasLiveWebRtc(id) && peer.channel?.readyState === 'open') {
+        if (peer.queue) {
+          peer.queue.push(encoded);
+        } else {
+          for (const frame of encoded) {
+            try { peer.channel.send(frame); } catch { break; }
+          }
+        }
+      }
+    }
+    for (const packet of packets) this.sendVfsViaRelay(packet, targetIds);
+    if (this.vfsEngine && packets.some(p => p.kind === 'vfs-record')) {
+      void this.vfsEngine.getFrontierHash().then(h => {
+        if (!this.stopped) this.vfsSyncTracker.notifyFrontierChanged(h);
+      }).catch(() => {});
+    }
+  }
   /** Encrypts and queues `packet` onto the relay for non-WebRTC verified-roster peers. */
   private sendViaRelay(packet: unknown, lane: RelayLane, targetIds?: readonly string[]) {
+    if (isPlainObject(packet) && isVfsPacketKind(packet.kind)) {
+      this.sendVfsViaRelay(packet as VfsPacket, targetIds);
+      return;
+    }
     if (!this.relayClient || !this.verifiedRoster || this.stopped) return;
     const recipients = this.relayRecipients(targetIds);
     if (!recipients.length) return;
     const meta = lane === 'primary' ? this.computeRelayMeta(packet, recipients) : {};
     try {
-      this.relayClient.enqueuePacket(packet, {
+      const id = this.relayClient.enqueuePacket(packet, {
         rosterVersion: this.verifiedRoster.body.version,
         lane,
         recipients,
         ...meta,
       });
+      if (lane === 'primary') {
+        this.pendingChatRelayIds.add(id);
+        if (this.pendingChatRelayIds.size > 1024) this.pendingChatRelayIds.delete(this.pendingChatRelayIds.values().next().value!);
+      }
     } catch { /* Outbox or resync retries later. */ }
   }
   /** Broadcasts a primary packet to open WebRTC channels AND via relay to verified-roster peers without live WebRTC. */
@@ -1007,6 +1194,301 @@ export class BrowserPeers {
       this.armHistoryRoundTimeout(fromPeerId, 0);
     }
   }
+  /** Resolves a VFS record signer against verified roster + status, explicitly marking revoked devices. */
+  private vfsSignerLookup(fromRelay: boolean): VfsSignerLookup {
+    const roleOf = (memberId: string, former?: { role?: 'human' | 'agent' }): 'human' | 'agent' => {
+      const m = this.status?.members?.find(member => member.id === memberId);
+      if (m?.role === 'agent' || m?.role === 'human') return m.role;
+      if (former?.role === 'agent' || former?.role === 'human') return former.role;
+      return 'human';
+    };
+    return (deviceId: string): VfsSignerInfo | undefined => {
+      if (this.verifiedRoster) {
+        const active = this.verifiedRoster.body.devices.find(d => d.id === deviceId);
+        if (active) {
+          return {
+            deviceId: active.id,
+            memberId: active.memberId,
+            signPublicKey: active.sign,
+            role: active.role,
+            revoked: false,
+          };
+        }
+        const removed = this.verifiedRoster.body.removed.find(r => r.id === deviceId);
+        if (removed?.revoked) {
+          return { deviceId: removed.id, memberId: '', signPublicKey: '', role: 'human', revoked: true };
+        }
+        const former = this.status?.formerDevices?.find(d => d.id === deviceId);
+        if (former) {
+          const formerRole = roleOf(former.memberId, former as { role?: 'human' | 'agent' });
+          return {
+            deviceId: former.id,
+            memberId: former.memberId,
+            signPublicKey: former.publicKey,
+            role: formerRole,
+            revoked: !!former.revoked,
+          };
+        }
+        if (fromRelay) return undefined;
+      }
+      if (fromRelay) return undefined;
+      const dev = this.status?.devices?.find(d => d.id === deviceId);
+      if (dev) {
+        return {
+          deviceId: dev.id,
+          memberId: dev.memberId,
+          signPublicKey: dev.publicKey,
+          role: roleOf(dev.memberId),
+          revoked: false,
+        };
+      }
+      const former = this.status?.formerDevices?.find(d => d.id === deviceId);
+      if (former) {
+        const formerRole = roleOf(former.memberId, former as { role?: 'human' | 'agent' });
+        return {
+          deviceId: former.id,
+          memberId: former.memberId,
+          signPublicKey: former.publicKey,
+          role: formerRole,
+          revoked: !!former.revoked,
+        };
+      }
+      return undefined;
+    };
+  }
+  /** Sends a `vfs-have` anti-entropy probe to `peerId` when allowed by `VfsSyncTracker` (or forced). */
+  private async sendVfsHave(peerId: string, peer?: Peer, cursor?: string, force = false): Promise<boolean> {
+    if (this.stopped || !this.vfsEngine) return false;
+    const frontierHash = await this.vfsEngine.getFrontierHash();
+    if (this.stopped) return false;
+    if (!force && cursor === undefined && !this.vfsSyncTracker.shouldSendHave(peerId, frontierHash, this.now())) {
+      return false;
+    }
+    const have = await this.vfsEngine.buildHave(cursor !== undefined ? { cursor } : undefined);
+    if (this.stopped) return false;
+    const active = peer ?? this.peers.get(peerId);
+    const isWebRtc = !!(active?.queue && this.hasLiveWebRtc(peerId) && active.channel?.readyState === 'open');
+    const sent = this.sendVfsPacketsToPeer(peerId, [have], active);
+    if (!sent) return false;
+    this.vfsSyncTracker.markHaveSent(peerId, have.frontierHash, this.now());
+    if (!isWebRtc) this.relayVfsSynced.set(peerId, this.now());
+    return true;
+  }
+  /** Initiates peer-to-peer VFS sync over the E2E relay for online verified-roster peers without live WebRTC. */
+  private syncVfsViaRelay() {
+    if (this.stopped || !this.vfsEngine || !this.relayClient?.isConnected() || !this.verifiedRoster) return;
+    const at = this.now();
+    for (const entry of this.verifiedRoster.body.devices) {
+      if (entry.id === this.deviceId || this.hasLiveWebRtc(entry.id)) continue;
+      if (!this.status?.devices?.some(d => d.id === entry.id && d.session)) {
+        this.relayVfsSynced.delete(entry.id);
+        continue;
+      }
+      const lastSent = this.relayVfsSynced.get(entry.id);
+      if (lastSent !== undefined && at - lastSent < VFS_RELAY_RETRY_MS) continue;
+      void this.sendVfsHave(entry.id).catch(() => {});
+    }
+  }
+  /** Explicitly triggers a fresh `vfs-have` anti-entropy exchange with `peerId` or all reachable peers. */
+  async syncVfsNow(peerId?: string): Promise<void> {
+    if (this.stopped || !this.vfsEngine) return;
+    if (peerId !== undefined) {
+      this.vfsSyncTracker.resetPeer(peerId);
+      await this.sendVfsHave(peerId, this.peers.get(peerId), undefined, true);
+      return;
+    }
+    const targets = new Set<string>();
+    for (const [id, peer] of this.peers) {
+      if (this.hasLiveWebRtc(id) && peer.channel?.readyState === 'open') targets.add(id);
+    }
+    if (this.relayClient?.isConnected() && this.verifiedRoster) {
+      for (const entry of this.verifiedRoster.body.devices) {
+        if (entry.id !== this.deviceId) targets.add(entry.id);
+      }
+    }
+    for (const id of targets) {
+      this.vfsSyncTracker.resetPeer(id);
+      await this.sendVfsHave(id, this.peers.get(id), undefined, true);
+    }
+  }
+  /** Drives VFS relay queue draining, round timeout collection, and backoff retries on each tick. */
+  private flushVfsSync() {
+    this.drainVfsRelayQueue();
+    if (this.stopped || !this.vfsEngine) return;
+    const at = this.now();
+    this.vfsSyncTracker.collectTimeouts(at);
+    const reachable = new Set<string>();
+    for (const [id, peer] of this.peers) {
+      if (this.hasLiveWebRtc(id) && peer.channel?.readyState === 'open') reachable.add(id);
+    }
+    if (this.relayClient?.isConnected() && this.verifiedRoster) {
+      for (const entry of this.verifiedRoster.body.devices) {
+        if (entry.id !== this.deviceId) reachable.add(entry.id);
+      }
+    }
+    for (const peerId of reachable) {
+      const state = this.vfsSyncTracker.getPeerState(peerId);
+      if (state && !state.paused && !state.inFlight && state.nextRetryAt > 0 && at >= state.nextRetryAt) {
+        void this.sendVfsHave(peerId, this.peers.get(peerId), state.cursor, false).catch(() => {});
+      }
+    }
+  }
+  /** Answers an inbound `vfs-have` probe with missing epoch keys and at most one bounded `vfs-ops` page. */
+  private async serveVfsHave(peerId: string, have: VfsHavePacket, peer?: Peer) {
+    if (!this.vfsEngine || this.stopped) return;
+    if (!this.vfsServeLimiter.take(peerId)) {
+      if (this.vfsServeLimiter.report(peerId)) console.debug(`Meshrooms: rate-limited vfs-have requests from ${peerId.slice(0, 8)}`);
+      if (this.vfsServeLimiter.maySendRetryHint(peerId)) {
+        const retryOps: VfsOpsPacket = {
+          kind: 'vfs-ops',
+          v: VFS_PROTOCOL_VERSION,
+          roomId: this.roomId,
+          deviceId: this.deviceId,
+          records: [],
+          more: false,
+          retryAfterMs: this.vfsServeLimiter.retryAfterMs(peerId),
+        };
+        this.sendVfsPacketsToPeer(peerId, [retryOps], peer);
+      }
+      return;
+    }
+    const selfFrontier = await this.vfsEngine.getFrontierHash();
+    const { matched } = this.vfsSyncTracker.recordRemoteHave(peerId, have.frontierHash, selfFrontier);
+    const { keyPackets, opsPages } = await this.vfsEngine.handleHave(have);
+    const outbound: VfsPacket[] = [...keyPackets];
+    if (opsPages.length > 0) {
+      outbound.push(opsPages[0]!);
+    } else if (have.cursor !== undefined) {
+      outbound.push({
+        kind: 'vfs-ops',
+        v: VFS_PROTOCOL_VERSION,
+        roomId: this.roomId,
+        deviceId: this.deviceId,
+        records: [],
+        more: false,
+      });
+    }
+    if (outbound.length > 0) this.sendVfsPacketsToPeer(peerId, outbound, peer);
+    if (!matched && opsPages.length === 0 && this.vfsSyncTracker.shouldSendHave(peerId, selfFrontier, this.now())) {
+      await this.sendVfsHave(peerId, peer);
+    }
+  }
+  /** Dispatches an authenticated inbound `vfs-*` packet into `VfsRoomEngine`, quotas, and sync state. */
+  private async acceptVfsPacket(
+    id: string,
+    memberId: string,
+    packet: unknown,
+    fromRelay: boolean,
+    peer?: Peer,
+  ): Promise<boolean> {
+    if (!this.vfsEngine) return true;
+    if (isVfsHavePacket(packet, this.roomId)) {
+      if (packet.deviceId !== id) return false;
+      await this.serveVfsHave(id, packet, peer);
+      return true;
+    }
+    if (isVfsOpsPacket(packet, this.roomId)) {
+      if (packet.deviceId !== id) return false;
+      if (packet.retryAfterMs !== undefined && packet.records.length === 0) {
+        const st = this.vfsSyncTracker.getPeerState(id);
+        if (!st?.inFlight) return true;
+        const frontierHash = await this.vfsEngine.getFrontierHash();
+        this.vfsSyncTracker.recordOpsReceived(id, {
+          more: packet.more,
+          nextCursor: packet.nextCursor,
+          retryAfterMs: packet.retryAfterMs,
+          currentFrontierHash: frontierHash,
+        }, this.now());
+        return true;
+      }
+      const cost = Math.max(1, packet.records.length);
+      if (!this.allowed(memberId, 'vfs-sync', id, cost)) return true;
+      const res = await this.vfsEngine.acceptOps(packet, this.vfsSignerLookup(fromRelay));
+      const frontierHash = await this.vfsEngine.getFrontierHash();
+      if (res.applied > 0 || res.buffered > 0) {
+        this.vfsSyncTracker.notifyFrontierChanged(frontierHash);
+      }
+      const decision = this.vfsSyncTracker.recordOpsReceived(id, {
+        more: packet.more,
+        nextCursor: packet.nextCursor,
+        currentFrontierHash: frontierHash,
+      }, this.now());
+      if (decision.action === 'continue') {
+        await this.sendVfsHave(id, peer, decision.cursor);
+      } else if (res.rejected.some(r => r.code === 'VFS_EPOCH_UNKNOWN') && this.vfsSyncTracker.shouldSendHave(id, frontierHash, this.now())) {
+        await this.sendVfsHave(id, peer);
+      }
+      return true;
+    }
+    if (isVfsRecordPacket(packet, this.roomId)) {
+      if (!this.allowed(memberId, 'vfs', id)) return true;
+      try {
+        const res = await this.vfsEngine.acceptRecord(packet, this.vfsSignerLookup(fromRelay));
+        if (res.accepted) {
+          const frontierHash = await this.vfsEngine.getFrontierHash();
+          this.vfsSyncTracker.notifyFrontierChanged(frontierHash);
+        }
+      } catch (err) {
+        if (err instanceof VfsError && err.code === 'VFS_EPOCH_UNKNOWN') {
+          const frontierHash = await this.vfsEngine.getFrontierHash();
+          if (this.vfsSyncTracker.shouldSendHave(id, frontierHash, this.now())) {
+            await this.sendVfsHave(id, peer);
+          }
+          return true;
+        }
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    if (isVfsKeyEpochPacket(packet, this.roomId)) {
+      if (!this.allowed(memberId, 'vfs', id)) return true;
+      if (!this.verifiedRoster) return true;
+      try {
+        const res = await this.vfsEngine.acceptKeyEpoch(packet, { roster: this.verifiedRoster });
+        if (res.installed) {
+          this.vfsSyncTracker.resetPeer(id);
+          await this.sendVfsHave(id, peer);
+        }
+      } catch (err) {
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    if (isVfsKeyWrapPacket(packet, this.roomId)) {
+      if (!this.allowed(memberId, 'vfs', id)) return true;
+      if (!this.verifiedRoster) return true;
+      try {
+        const res = await this.vfsEngine.acceptKeyWrap(packet, { roster: this.verifiedRoster });
+        if (res.installed) {
+          this.vfsSyncTracker.resetPeer(id);
+          await this.sendVfsHave(id, peer);
+        }
+      } catch (err) {
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    if (isVfsKeyGrantPacket(packet, this.roomId)) {
+      if (!this.allowed(memberId, 'vfs', id)) return true;
+      if (!this.verifiedRoster) return true;
+      try {
+        const installed = await this.vfsEngine.acceptKeyGrant(packet, { roster: this.verifiedRoster });
+        if (installed.length > 0) {
+          this.vfsSyncTracker.resetPeer(id);
+          await this.sendVfsHave(id, peer);
+        }
+      } catch (err) {
+        if (err instanceof VfsError || err instanceof VfsUnauthorizedError) return true;
+        throw err;
+      }
+      return true;
+    }
+    // Phase 2 `vfs-block-*` frames or unrecognized future `vfs-*` frames are safely ignored in MVP.
+    return true;
+  }
   /** Ask a peer for its state and history again after packets were dropped under load (works over WebRTC and relay). */
   private requestSync(id: string) {
     const peer = this.peers.get(id);
@@ -1016,6 +1498,10 @@ export class BrowserPeers {
       try { channel.send(JSON.stringify(request)); } catch { /* Asked again after the next drop, or the state is exchanged on reconnect. */ }
     } else if (this.relayClient?.isConnected() && this.verifiedRoster?.body.devices.some(d => d.id === id)) {
       this.sendViaRelay(request, 'primary', [id]);
+    }
+    if (this.vfsEngine) {
+      this.vfsSyncTracker.resetPeer(id);
+      void this.sendVfsHave(id, peer, undefined, true).catch(() => {});
     }
     // Never cancel an active server `retryAfterMs` backoff — firing early hits `maySendRetryHint`'s 1s quiet window.
     if (this.historyRetryAt.has(id)) return;
@@ -1084,14 +1570,19 @@ export class BrowserPeers {
    * Spend one live packet of `kind` from a member, sent by peer `from`; false (with a debug line, at most once a minute)
    * when over quota. A dropped message is sent again by its sender; for other kinds the peer is asked for its state.
    */
-  private allowed(memberId: string, kind: QuotaKind, from: string) {
-    if (this.quota.take(memberId, kind)) return true;
+  private allowed(memberId: string, kind: QuotaKind, from: string, cost = 1) {
+    if (this.quota.take(memberId, kind, cost)) return true;
     if (this.quota.report(memberId, kind)) console.debug(`Meshrooms: dropped ${kind} packets from member ${memberId.slice(0, 8)} over the receive quota`);
     if (kind !== 'message') this.quotaDrops.drop(from);
     return false;
   }
   private notifyActivity() { if (!this.stopped) this.activityChanged(Object.fromEntries(this.activity)); }
-  private forget(id: string) { this.clearPeerHistoryState(id); if (this.activity.delete(id)) this.notifyActivity(); }
+  private forget(id: string) {
+    this.clearPeerHistoryState(id);
+    this.vfsSyncTracker.removePeer(id);
+    this.relayVfsSynced.delete(id);
+    if (this.activity.delete(id)) this.notifyActivity();
+  }
   /** Only an agent's own device speaks for it, on its own channel. */
   private acceptActivity(id: string, packet: unknown) {
     const device = this.status?.devices?.find(d => d.id === id);
@@ -1263,6 +1754,12 @@ export class BrowserPeers {
       }
       return;
     }
+    // Legacy peers without VFS attached silently ignore `vfs-*` frames without consuming queue slots or stalling relay acks.
+    const packetKind = isPlainObject(packet) ? (packet as Record<string, unknown>).kind : undefined;
+    if (isVfsPacketKind(packetKind) && !this.vfsEngine) {
+      if (relayMeta?.cursor !== undefined) this.relayClient?.ackCursor(relayMeta.cursor);
+      return;
+    }
     if (!this.incoming.admit(id)) return;
     return this.transaction(async () => {
       if (this.stopped || !this.status?.memberId) return false;
@@ -1274,6 +1771,7 @@ export class BrowserPeers {
           })()
         : this.status.devices?.find(d => d.id === id);
       if (!device) return false;
+      if (isVfsPacketKind(packetKind)) return this.acceptVfsPacket(id, device.memberId, packet, fromRelay, peer);
       if ((packet as unknown as { kind?: unknown })?.kind === 'board') { await this.acceptBoard(packet as never, fromRelay); return true; }
       if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never, fromRelay); return true; }
       if ((packet as unknown as { kind?: unknown })?.kind === 'reactions') { await this.acceptReactions(packet as never, fromRelay); return true; }
@@ -1367,7 +1865,15 @@ export class BrowserPeers {
     }
     if (!decrypted.packet || typeof decrypted.packet !== 'object') return;
     const packet = decrypted.packet as Packet;
-    if (isFilePacket(packet) || isActivityPacket(packet)) {
+    const packetKind = isPlainObject(packet) ? (packet as Record<string, unknown>).kind : undefined;
+    const volatileVfs = isVfsPacketKind(packetKind) && (
+      !this.vfsEngine
+      || packetKind === 'vfs-have'
+      || packetKind === 'vfs-block-want'
+      || packetKind === 'vfs-block-chunk'
+      || packetKind === 'vfs-block-have'
+    );
+    if (isFilePacket(packet) || isActivityPacket(packet) || volatileVfs) {
       if (!this.relaySeenVolatile.add(envelope.from, envelope.id)) return;
       this.handleIncomingPacket(envelope.from, packet, true, undefined, undefined, { cursor });
       return;
@@ -1390,6 +1896,10 @@ export class BrowserPeers {
       this.clearPeerHistoryState(id);
       this.healthOf(peer);
       this.flush(); this.sendState(peer); this.sendHistoryHave(id, peer);
+      if (this.vfsEngine) {
+        this.vfsSyncTracker.resetPeer(id);
+        void this.sendVfsHave(id, peer).catch(() => {});
+      }
       if (peer.fileChannel?.readyState !== 'open') this.files.opened(id);
       this.notify();
     };
@@ -1430,6 +1940,7 @@ export class BrowserPeers {
     for (const peer of this.peers.values()) { peer.queue?.pump(); this.resyncDue(peer); }
     for (const id of this.quotaDrops.due()) this.requestSync(id);
     this.flushHistoryRetries();
+    this.flushVfsSync();
   }
   private retireUfrag(id: string, session: string, ufrag: string | undefined) {
     if (!ufrag) return;
@@ -1594,6 +2105,7 @@ export class BrowserPeers {
     for (const result of results) if (result.status === 'rejected' && !this.stopped) this.error('Peer connection interrupted. Reconnecting automatically.');
     this.tick();
     this.syncHistoryViaRelay();
+    this.syncVfsViaRelay();
     this.flush(); this.notify();
   }
   /** Verifies `status.roster` against the pinned host key (or TOFU at first sight) and rejects rollbacks/tampering. */
@@ -1619,6 +2131,7 @@ export class BrowserPeers {
     this.highestRosterVersion = Math.max(this.highestRosterVersion, incoming.body.version);
     this.pinnedHost = result.hostDeviceId;
     this.syncHistoryViaRelay();
+    this.syncVfsViaRelay();
   }
   /** Publishes this browser device's ECDH public key (`enc`, `encVersion`, `encSig`) to a relay-capable lobby when missing or rotated. */
   private async maybePublishEncKey(status: RoomStatus) {
@@ -1686,9 +2199,11 @@ export class BrowserPeers {
       }
       for (const former of status.formerDevices || []) {
         if (!activeIds.has(former.id)) {
+          // A device retired before the service recorded when keeps the time the last roster gave it: `now` here would
+          // change the roster on every build, and the host would publish a new version every time it looked.
           removedMap.set(former.id, {
             id: former.id,
-            at: former.retiredAt ?? now,
+            at: former.retiredAt ?? removedMap.get(former.id)?.at ?? now,
             revoked: !!former.revoked,
           });
         }
@@ -1771,10 +2286,30 @@ export class BrowserPeers {
         onStateChange: state => {
           if (state === 'wss' || state === 'https') {
             this.relayHistorySynced.clear();
+            this.relayVfsSynced.clear();
             this.flush();
             this.syncHistoryViaRelay();
+            this.syncVfsViaRelay();
+            this.drainVfsRelayQueue();
             this.notify();
           }
+        },
+        onAccepted: id => {
+          const hadChat = this.pendingChatRelayIds.delete(id);
+          if (this.pendingVfsRelayIds.delete(id)) {
+            this.vfsPrimaryQueued = Math.max(0, this.vfsPrimaryQueued - 1);
+          }
+          if (hadChat && this.vfsRelayQueue.length > 0) this.drainVfsRelayQueue();
+        },
+        onRejected: (id, reason, statusCode) => {
+          const hadChat = this.pendingChatRelayIds.delete(id);
+          if (this.pendingVfsRelayIds.delete(id)) {
+            this.vfsPrimaryQueued = Math.max(0, this.vfsPrimaryQueued - 1);
+          }
+          if (statusCode === 429 || /rate.?limit/i.test(reason)) {
+            this.vfsRelayBudget.noteRateLimited(this.now());
+          }
+          if (hadChat && this.vfsRelayQueue.length > 0) this.drainVfsRelayQueue();
         },
         onAuthError: () => {
           this.relayClient?.stop();
@@ -1794,12 +2329,18 @@ export class BrowserPeers {
       this.relayClient.stop();
       this.relayClient = undefined;
     }
+    this.pendingChatRelayIds.clear();
+    this.pendingVfsRelayIds.clear();
+    this.vfsPrimaryQueued = 0;
+    this.relayVfsSynced.clear();
   }
   stop() {
     this.stopped = true; this.disconnect();
     // No file is fetched for a stopped engine: another owner, if any, fetches what the room needs.
     this.files.keep(() => false);
     if (this.receiptTimer) { clearTimeout(this.receiptTimer); this.receiptTimer = undefined; void this.transaction(() => this.writeReceipts()).catch(() => {}); }
+    if (this.vfsRelayTimer) { clearTimeout(this.vfsRelayTimer); this.vfsRelayTimer = undefined; }
+    this.vfsRelayQueue.length = 0;
     for (const timer of this.historyRetryTimers.values()) clearTimeout(timer);
     this.historyRetryTimers.clear();
     this.historyRetryAt.clear();

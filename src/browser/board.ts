@@ -131,6 +131,12 @@ function assignmentIndex(steps: TaskBody[]) {
   while (index > 0 && steps[index - 1].assigneeId === final) index--;
   return index;
 }
+/** Where a done task became done: the first of the operations at its end that all say done. */
+function finishIndex(steps: TaskBody[]) {
+  let index = steps.length - 1;
+  while (index > 0 && steps[index - 1].status === 'done') index--;
+  return index;
+}
 function group(ops: TaskBody[]) {
   const byTask = new Map<string, TaskBody[]>();
   for (const op of ops) byTask.set(op.taskId, [...(byTask.get(op.taskId) || []), op]);
@@ -146,8 +152,10 @@ export function foldBoard(ops: TaskBody[]): Task[] {
   for (const [taskId, list] of group(ops)) {
     if (list.some(op => op.removed)) continue;
     const steps = chain(list), last = steps.at(-1)!, assigned = steps[assignmentIndex(steps)];
+    const finished = last.status === 'done' ? steps[finishIndex(steps)] : undefined;
     tasks.push({ id: taskId, title: last.title, notes: last.notes, status: last.status, ...(last.issue ? { issue: last.issue } : {}),
       ...(last.assigneeId ? { assigneeId: last.assigneeId, assignedBy: assigned.memberId, assignedRevision: assigned.revision } : {}),
+      ...(finished ? { finished: { by: finished.memberId, at: new Date(Math.min(finished.at, MAX_TIME)).toISOString(), revision: finished.revision } } : {}),
       createdBy: steps[0].memberId, updatedBy: last.memberId, updatedAt: new Date(Math.min(last.at, MAX_TIME)).toISOString(), revision: last.revision, createdAt: steps[0].at });
   }
   return tasks.sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1)).map(({ createdAt: _, ...task }) => task);

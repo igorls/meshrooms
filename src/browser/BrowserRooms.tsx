@@ -6,6 +6,10 @@ import type { Attachment, Participant, RoomSnapshot, TaskDraft } from '../room';
 import { deriveActivity, duration, type ActivityRecord, type AgentActivity } from './activity';
 import { MAX_TIME, issueLabel, mentionedRepositories, repositoryFrom, taskTimeline, type TaskBody, type TaskEvent } from './board';
 import type { ApiError } from './client';
+import { AttentionStrip } from './AttentionStrip';
+import { attentionAt, decisionMark, loadSeen, markSeen, messageMark, messagesForYou, taskMark } from './attention';
+import { WorkPane } from './WorkPane';
+import { resolveWork, taskFromDecision, workList, type WorkRef } from './work-pane';
 import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
 import { roomDrafts } from './drafts';
 import { DesktopPairing } from './DesktopPairing';
@@ -230,13 +234,16 @@ function dayLabel(at: number) {
   return sameDay(at, Date.now()) ? 'Today' : new Date(at).toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' });
 }
 const statusMoves: Record<TaskStatus, string> = { todo: 'back to to-do', doing: 'to in progress', done: 'to done' };
-/** "Igor assigned “Fix header” to Wren and moved it to in progress". The title leads; later phrases say "it". */
-function describeTask(event: TaskEvent, name: (memberId: string, subject?: boolean) => string) {
-  const title = `“${event.title}”`, phrases: string[] = [], it = () => phrases.length ? 'it' : title;
+/**
+ * "Igor assigned “Fix header” to Wren and moved it to in progress". The title leads; later phrases say "it". `here`
+ * describes the change from the task's own page, where the title is already shown: "Igor created this task".
+ */
+function describeTask(event: TaskEvent, name: (memberId: string, subject?: boolean) => string, here = false) {
+  const title = here ? 'this task' : `“${event.title}”`, phrases: string[] = [], it = () => phrases.length ? 'it' : title;
   if (event.removed) return `${name(event.memberId, true)} removed ${title}`;
   if (event.created) phrases.push(`created ${title}`);
   if (event.updated) phrases.push(`updated ${title}`);
-  if (event.renamedFrom !== undefined) phrases.push(`renamed “${event.renamedFrom}” to ${title}`);
+  if (event.renamedFrom !== undefined) phrases.push(here ? `renamed ${it()} to “${event.title}”` : `renamed “${event.renamedFrom}” to ${title}`);
   if (event.assigneeId !== undefined) phrases.push(event.assigneeId === null ? `unassigned ${it()}` : event.assigneeId === event.memberId ? `took ${it()}` : `assigned ${it()} to ${name(event.assigneeId)}`);
   if (event.status) phrases.push(`moved ${it()} ${statusMoves[event.status]}`);
   if (event.notes) phrases.push(`edited the notes on ${it()}`);
@@ -261,6 +268,25 @@ function mergeTranscriptItems(
     merged.push({ message });
   }
   return [...merged, ...inserts.slice(next)];
+}
+/** A stable empty list, so memos keyed on a room's pinned repositories don't rerun while it has none. */
+const NO_REPOSITORIES: string[] = [];
+/** Where the side pane sits beside the conversation; below it (max-width:1150px in browser.css) it covers it. */
+const PANE_BESIDE = '(min-width: 1151px)';
+/** Which side panel was open when the person left a room: `details:<tab>`, `work`, `tasks`, `decisions`, or empty. */
+const SIDE_PANEL_KEY = 'meshrooms:side-panel';
+/**
+ * The side panel to reopen in this room. Opening a room loads a new page, so without this every room started with its
+ * panels closed. Only on screens wide enough to keep the conversation beside the panel: below that the panel replaces it.
+ */
+function savedSidePanel(): { panel?: 'details' | 'work' | 'tasks' | 'decisions'; tab?: DetailsTab } {
+  try {
+    if (!matchMedia(PANE_BESIDE).matches) return {};
+    const [panel, tab] = (localStorage.getItem(SIDE_PANEL_KEY) || '').split(':');
+    if (panel === 'tasks' || panel === 'decisions' || panel === 'work') return { panel };
+    if (panel === 'details') return { panel, ...(DETAILS_TABS.some(t => t.id === tab) ? { tab: tab as DetailsTab } : {}) };
+  } catch { /* storage or matchMedia unavailable */ }
+  return {};
 }
 const DETAILS_TABS: { id: DetailsTab; label: string }[] = [
   { id: 'members', label: 'Members' },
@@ -303,8 +329,14 @@ function Rooms({ source }: { source: RoomSource }) {
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [retry, setRetry] = useState(0);
-  const [detailsOpen, setDetailsOpen] = useState(false);
-  const [detailsTab, setDetailsTab] = useState<DetailsTab>('members');
+  const [restoredPanel] = useState(savedSidePanel);
+  const [detailsOpen, setDetailsOpen] = useState(restoredPanel.panel === 'details' || restoredPanel.panel === 'work');
+  const [detailsTab, setDetailsTab] = useState<DetailsTab>(restoredPanel.tab ?? 'members');
+  /** The side pane shows this room's work ("This work") or the room itself (Room details). */
+  const [paneTab, setPaneTab] = useState<'work' | 'room'>(restoredPanel.panel === 'work' ? 'work' : 'room');
+  const [selectedWork, setSelectedWork] = useState<WorkRef>();
+  /** What opened the pane onto a piece of work, so closing it returns focus there. */
+  const workOpener = useRef<HTMLElement | null>(null);
   const [pendingDetailsTarget, setPendingDetailsTarget] = useState<'desktop-pairing' | 'link-device'>();
   const [memberMenu, setMemberMenu] = useState<string>();
   const memberMenuFocus = useRef<'first' | 'last'>('first');
@@ -352,7 +384,7 @@ function Rooms({ source }: { source: RoomSource }) {
   const announced = useRef<Set<string> | null>(null);
   const [confirming, setConfirming] = useState<string>();
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [boardOpen, setBoardOpen] = useState(false);
+  const [boardOpen, setBoardOpen] = useState(restoredPanel.panel === 'tasks');
   const [boardWidth, setBoardWidth] = useState(savedBoardWidth);
   const workspace = useRef<HTMLDivElement>(null);
   const [railCollapsed, setRailCollapsed] = useState(() => { try { return localStorage.getItem('meshrooms:rail') === 'collapsed'; } catch { return false; } });
@@ -379,7 +411,16 @@ function Rooms({ source }: { source: RoomSource }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const [taskOps, setTaskOps] = useState<TaskBody[]>([]);
   const [decisionOps, setDecisionOps] = useState<(DecisionBody | VoteBody)[]>([]);
-  const [decisionsOpen, setDecisionsOpen] = useState(false);
+  const [decisionsOpen, setDecisionsOpen] = useState(restoredPanel.panel === 'decisions');
+  // Remember the side panel the person leaves open, for the next room they open. Only their changes are saved: the
+  // first render is what was restored (or nothing, on a narrow screen), and saving it would forget the choice.
+  const shownPanel = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const panel = detailsOpen ? paneTab === 'work' ? 'work' : `details:${detailsTab}` : boardOpen ? 'tasks' : decisionsOpen ? 'decisions' : '';
+    if (shownPanel.current === undefined || shownPanel.current === panel) { shownPanel.current = panel; return; }
+    shownPanel.current = panel;
+    try { localStorage.setItem(SIDE_PANEL_KEY, panel); } catch { /* Not remembered. */ }
+  }, [detailsOpen, paneTab, detailsTab, boardOpen, decisionsOpen]);
   const [deciding, setDeciding] = useState(false);
   const [reactions, setReactions] = useState<ReactionChip[]>([]);
   const [reactPicker, setReactPicker] = useState<string>();
@@ -491,8 +532,8 @@ function Rooms({ source }: { source: RoomSource }) {
   /** The "Bring your agent" banner: until they have an agent here, an unused link, or chose "Not now". */
   const agentCtaShown = !!(admitted && self && !isAgent(self) && !agentCtaDismissed && !status?.agentInvites?.length && !status?.members?.some(m => isAgent(m) && m.operatorId === self.id));
   const people = (status?.members?.length || 0) - agents.length;
-  /** The local page: the person's agents on this computer, read while the details are open or one of them is in the room. */
-  const localAgents = useLocalAgents(source.agents, admitted && (detailsOpen || agents.some(a => a.operatorId === status?.memberId)));
+  /** The local page: the person's agents on this computer, read while Room details shows or one of them is in the room. */
+  const localAgents = useLocalAgents(source.agents, admitted && ((detailsOpen && paneTab === 'room') || agents.some(a => a.operatorId === status?.memberId)));
   /** The agent whose sessions the people list asked to show (`at`: each ask scrolls to it again). */
   const [agentFocus, setAgentFocus] = useState<{ id: string; at: number }>();
   /** How an agent of the person's wakes here, from its identity on this computer (the local page only). */
@@ -529,6 +570,18 @@ function Rooms({ source }: { source: RoomSource }) {
   const former = useMemo(() => [...new Map((status?.formerDevices ?? []).map(d => [d.memberId, { id: d.memberId, ...(d.role ? { role: d.role } : {}) }])).values()], [status?.formerDevices]);
   const decisions = useMemo(() => foldDecisions(decisionOps, { ownerId: status?.ownerId, members: status?.members ?? [], former }), [decisionOps, status?.ownerId, status?.members, former]);
   const openDecisions = decisions.filter(d => d.state === 'open').length;
+  const roomWork = useMemo(() => workList(tasks, decisions, now), [tasks, decisions, now]);
+  /** What waits on this person here ("Needs you"), and what they've already opened from it on this device. */
+  const [attentionSeen, setAttentionSeen] = useState(() => loadSeen(urlRoom));
+  // Reading the conversation for messages to this person happens when it changes, not on every tick of the clock: the
+  // clock only moves the windows, which attentionAt applies to what was found.
+  const forYou = useMemo(() => messagesForYou({
+    memberId: status?.memberId ?? '', participants, reactions,
+    messages: [...canonicalById.values()].map(({ packet: { body }, retracted }) => ({ id: body.id, memberId: body.memberId, text: body.text, at: body.at, ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(retracted ? { retracted } : {}) })),
+  }), [status?.memberId, participants, reactions, canonicalById]);
+  const attention = useMemo(() => attentionAt(forYou, { memberId: status?.memberId ?? '', participants, decisions, tasks, seen: attentionSeen, now }),
+    [forYou, status?.memberId, participants, decisions, tasks, attentionSeen, now]);
+  const seeAttention = (marks: string[]) => setAttentionSeen(current => markSeen(urlRoom, current, marks));
   const items = useMemo(() => mergeTranscriptItems(messages, timeline, decisions, status?.renames ?? []), [messages, timeline, decisions, status?.renames]);
   const hasAgentMessages = useMemo(() => {
     const agentIds = new Set(agents.map(a => a.id));
@@ -790,13 +843,22 @@ function Rooms({ source }: { source: RoomSource }) {
   const alertShown = joinAlerts.find(a => counts[a.roomId]?.waiting?.some(w => w.id === a.request.id) && recent.some(r => r.id === a.roomId));
   const alertRoom = alertShown && recent.find(r => r.id === alertShown.roomId)?.title;
   const alertsMore = alertShown ? joinAlerts.filter(a => a !== alertShown && counts[a.roomId]?.waiting?.some(w => w.id === a.request.id)).length : 0;
-  useEffect(() => { if (detailsOpen) detailsHeading.current?.focus(); }, [detailsOpen]);
+  // Opening onto a piece of work focuses its title instead (the work view does that as it mounts).
+  useEffect(() => { if (detailsOpen && !(paneTab === 'work' && selectedWork)) detailsHeading.current?.focus(); }, [detailsOpen]);
   // Activity durations and staleness move with the clock, not only with packets.
   useEffect(() => {
     if (!agents.length) return;
     const timer = setInterval(() => setNow(Date.now()), 15_000);
     return () => clearInterval(timer);
   }, [agents.length]);
+  // So do This work's "5 min ago", in a room without agents to keep the clock going.
+  const workShown = detailsOpen && paneTab === 'work';
+  useEffect(() => {
+    if (!workShown || agents.length) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [workShown, agents.length]);
   useEffect(() => {
     if (!admitted || !notice) return;
     const timeout = setTimeout(() => setNotice(''), 6000);
@@ -808,7 +870,13 @@ function Rooms({ source }: { source: RoomSource }) {
     const timeout = setTimeout(() => setHighlight(undefined), 2400);
     return () => clearTimeout(timeout);
   }, [highlight]);
-  function showTask(taskId: string) { setBoardOpen(true); setDetailsOpen(false); setDecisionsOpen(false); setHighlight(taskId); }
+  function showOnBoard(taskId: string) { setBoardOpen(true); setDetailsOpen(false); setDecisionsOpen(false); setHighlight(taskId); }
+  /** Opens a task or decision in the side pane's "This work", remembering what opened it for when the pane closes. */
+  function showWork(ref: WorkRef) {
+    if (!detailsOpen) workOpener.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+    setSelectedWork(ref); setPaneTab('work'); setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false);
+  }
+  function showTask(taskId: string) { showWork({ kind: 'task', id: taskId }); }
   function showDecision(key: string) { setHighlight(key); document.getElementById(`decision-${key}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
   /** A decided option becomes a task on the board, noting where it was decided. */
   async function decisionTask(d: Decision) {
@@ -838,8 +906,13 @@ function Rooms({ source }: { source: RoomSource }) {
     setHighlight(messageId);
     requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`message-${messageId}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })));
   }
+  /** Below the wide layout the side pane covers the conversation: step out of it before showing something there. */
+  function uncoverConversation() {
+    if (matchMedia(PANE_BESIDE).matches) return;
+    setDetailsOpen(false); workOpener.current = null;
+  }
   function showMessage(id: string) {
-    setDetailsOpen(false);
+    uncoverConversation();
     const parentStack = streamEntries.find(e => e.kind === 'stack' && e.messages.some(m => m.packet.body.id === id));
     if (parentStack && parentStack.kind === 'stack') {
       setExpandedStacks(current => current.has(parentStack.id) ? current : new Set([...current, parentStack.id]));
@@ -874,7 +947,7 @@ function Rooms({ source }: { source: RoomSource }) {
       : <span className="agent-activity is-idle is-quiet">Not listening<span className="agent-activity-quiet"> · no check-in for {duration(a.quiet)}</span></span>;
     if (a.quiet !== undefined) return <span className="agent-activity is-working is-quiet">Busy<span className="agent-activity-quiet"> · no check-in for {duration(a.quiet)}</span></span>;
     const task = a.on.tasks?.map(id => tasks.find(t => t.id === id)).find(Boolean);
-    if (task) return <span className="agent-activity is-working">Working on <button className="agent-activity-link" title="Show on the task board" onClick={() => showTask(task.id)}>“{task.title}”</button>{age}</span>;
+    if (task) return <span className="agent-activity is-working">Working on <button className="agent-activity-link" title="Open this task" onClick={() => showTask(task.id)}>“{task.title}”</button>{age}</span>;
     const woke = (a.on.messages || []).map(id => messages.find(m => m.packet.body.id === id)?.packet.body).filter(b => !!b);
     if (!woke.length) return <span className="agent-activity is-working">Working{age}</span>;
     const authors = [...new Set(woke.map(b => b.memberId === status?.memberId ? 'you' : nameOf(b.memberId)))];
@@ -892,7 +965,7 @@ function Rooms({ source }: { source: RoomSource }) {
   function rosterDetail(a: AgentActivity) {
     if (a.state !== 'working' || a.quiet !== undefined) return null;
     const task = a.on.tasks?.map(id => tasks.find(t => t.id === id)).find(Boolean);
-    if (task) return <span className="browser-person-detail">On <button className="agent-activity-link" title={`Show “${task.title}” on the task board`} onClick={() => showTask(task.id)}>“{task.title}”</button></span>;
+    if (task) return <span className="browser-person-detail">On <button className="agent-activity-link" title={`Open “${task.title}”`} onClick={() => showTask(task.id)}>“{task.title}”</button></span>;
     const woke = (a.on.messages || []).map(id => messages.find(m => m.packet.body.id === id)?.packet.body).filter(b => !!b);
     if (!woke.length) return null;
     const authors = [...new Set(woke.map(b => b.memberId === status?.memberId ? 'you' : nameOf(b.memberId)))];
@@ -902,8 +975,10 @@ function Rooms({ source }: { source: RoomSource }) {
   function closeDetails() {
     setDetailsOpen(false);
     setMemberMenu(undefined);
+    const opener = workOpener.current; workOpener.current = null;
     requestAnimationFrame(() => {
-      if (headerMore.current && headerMore.current.getClientRects().length) headerMore.current.focus();
+      if (opener?.isConnected && opener.getClientRects().length) opener.focus();
+      else if (headerMore.current && headerMore.current.getClientRects().length) headerMore.current.focus();
       else detailsButton.current?.focus();
     });
   }
@@ -927,7 +1002,8 @@ function Rooms({ source }: { source: RoomSource }) {
   }
   function openDetails(tab?: DetailsTab) {
     if (tab) setDetailsTab(tab);
-    setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false);
+    if (!detailsOpen) workOpener.current = null;
+    setPaneTab('room'); setDetailsOpen(true); setBoardOpen(false); setDecisionsOpen(false);
   }
   useEffect(() => {
     if (!detailsOpen || detailsTab !== 'you' || !pendingDetailsTarget) return;
@@ -1153,10 +1229,15 @@ function Rooms({ source }: { source: RoomSource }) {
       setNotice(done);
     });
   }
-  const pinned = status?.repositories ?? [];
-  // Only while the details are open: scanning the conversation on every render would slow typing. Messages are
-  // stored as they arrived from peers, so order them by when they were sent for newest-first suggestions.
-  const mentioned = detailsOpen ? mentionedRepositories([...messages].sort((a, b) => a.packet.body.at - b.packet.body.at).map(m => m.packet.body.text)).filter(r => !pinned.some(p => p.toLowerCase() === r.toLowerCase())) : [];
+  const pinned = status?.repositories ?? NO_REPOSITORIES;
+  // Only while the Shared tab shows them, and once per change to the conversation: scanning it on every render would
+  // slow typing. Messages are stored as they arrived from peers, so order them by when they were sent for newest-first
+  // suggestions.
+  const showsMentioned = detailsOpen && paneTab === 'room' && detailsTab === 'shared';
+  const mentioned = useMemo(() => showsMentioned
+    ? mentionedRepositories([...messages].sort((a, b) => a.packet.body.at - b.packet.body.at).map(m => m.packet.body.text))
+      .filter(r => !pinned.some(p => p.toLowerCase() === r.toLowerCase()))
+    : [], [showsMentioned, messages, pinned]);
   function pinRepository(change: { pin: string } | { unpin: string }) {
     void act(async () => {
       await source.command('repositories', urlRoom, change);
@@ -1302,7 +1383,7 @@ function Rooms({ source }: { source: RoomSource }) {
           <header className="browser-room-header">
             <a className="browser-header-rooms" href="/rooms" aria-label="Your rooms"><RoomIcon kind="back" /><RoomBadges count={{ unread: otherUnread, mentions: others.reduce((sum, r) => sum + (counts[r.id]?.mentions || 0), 0), waiting: otherWaiting }} /></a>
             <div className="browser-room-heading"><h1 title={title || undefined}>{title}</h1><p><span className="browser-room-sub-full">{people} {people === 1 ? 'person' : 'people'}{agents.length ? ` and ${agents.length} agent${agents.length === 1 ? '' : 's'}` : ''} in this room{working ? ` · ${working} working` : ''}{settings.historyForNewcomers ? ' · History for newcomers on' : ''}</span><span className="browser-room-sub-short">{people} {people === 1 ? 'person' : 'people'}{agents.length ? ` · ${agents.length} agent${agents.length === 1 ? '' : 's'}` : ''}{working ? ` · ${working} working` : ''}{settings.historyForNewcomers ? ' · History on' : ''}</span></p></div>
-            <div className="browser-room-actions" ref={headerActions}><button type="button" className="secondary browser-header-wide" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" /><span className="browser-action-label">Decisions</span>{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button type="button" className="secondary browser-header-wide" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" /><span className="browser-action-label">Tasks</span>{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button type="button" className="secondary browser-header-wide" ref={detailsButton} aria-expanded={detailsOpen} aria-controls="browser-room-details" onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); }}><RoomIcon kind="people" /><span className="browser-action-label">Room details</span></button>{!source.isLocal && (appPaired && !desktopPairingActive
+            <div className="browser-room-actions" ref={headerActions}><button type="button" className="secondary browser-header-wide" aria-expanded={decisionsOpen} aria-controls="browser-decisions" onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); }}><RoomIcon kind="vote" /><span className="browser-action-label">Decisions</span>{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button><button type="button" className="secondary browser-header-wide" aria-expanded={boardOpen} aria-controls="task-board" onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); }}><RoomIcon kind="tasks" /><span className="browser-action-label">Tasks</span>{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button><button type="button" className="secondary browser-header-wide" ref={detailsButton} aria-expanded={detailsOpen && paneTab === 'room'} aria-controls="browser-room-details" onClick={() => { if (detailsOpen && paneTab === 'room') closeDetails(); else openDetails(); }}><RoomIcon kind="people" /><span className="browser-action-label">Room details</span></button>{!source.isLocal && (appPaired && !desktopPairingActive
               ? <a className="secondary browser-open-app browser-header-wide" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
               : <button type="button" className={`${desktopPairingActive ? "primary browser-app-hint" : "browser-text-link browser-app-hint"} browser-header-wide`} onClick={() => { setPendingDetailsTarget('desktop-pairing'); openDetails('you'); }}>{desktopPairingActive ? 'Finish desktop pairing' : 'Have the desktop app?'}</button>)}<button type="button" className="primary browser-header-invite" aria-haspopup="dialog" onClick={() => openInvite('person')} title="Invite a person or an agent"><RoomIcon kind="invite" /><span className="browser-action-label">Invite</span></button>
               <button type="button" className="secondary browser-header-more" ref={headerMore} aria-label="Room actions" aria-haspopup="menu" aria-expanded={headerMenuOpen} aria-controls="browser-header-menu" title="Room actions" onClick={() => setHeaderMenuOpen(open => !open)}><RoomIcon kind="more" />{(openDecisions || openTasks) ? <span className="browser-count">{(openDecisions || 0) + (openTasks || 0)}</span> : null}</button>
@@ -1311,7 +1392,7 @@ function Rooms({ source }: { source: RoomSource }) {
                 {!source.isLocal && <button type="button" role="menuitem" aria-haspopup="dialog" onClick={() => openInvite('phone')}><RoomIcon kind="phone" />Connect your phone</button>}
                 <button type="button" role="menuitem" aria-expanded={decisionsOpen} onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); setHeaderMenuOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button>
                 <button type="button" role="menuitem" aria-expanded={boardOpen} onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); setHeaderMenuOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button>
-                <button type="button" role="menuitem" aria-expanded={detailsOpen} onClick={() => { if (detailsOpen) closeDetails(); else openDetails(); setHeaderMenuOpen(false); }}><RoomIcon kind="people" />Room details</button>
+                <button type="button" role="menuitem" aria-expanded={detailsOpen && paneTab === 'room'} onClick={() => { if (detailsOpen && paneTab === 'room') closeDetails(); else openDetails(); setHeaderMenuOpen(false); }}><RoomIcon kind="people" />Room details</button>
                 {!source.isLocal && (appPaired && !desktopPairingActive
                   ? <a role="menuitem" className="browser-open-app" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
                   : <button type="button" role="menuitem" onClick={() => { setPendingDetailsTarget('desktop-pairing'); openDetails('you'); setHeaderMenuOpen(false); }}>{desktopPairingActive ? 'Finish desktop pairing' : 'Have the desktop app?'}</button>)}
@@ -1350,6 +1431,11 @@ function Rooms({ source }: { source: RoomSource }) {
               onDragOver={e => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } }}
               onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false); }}
               onDrop={e => { if (!e.dataTransfer.files.length) return; e.preventDefault(); setDragging(false); addFiles(e.dataTransfer.files); }}>
+              {admitted && <AttentionStrip attention={attention} nameOf={nameOf}
+                onMessage={id => { seeAttention([messageMark(id)]); showMessage(id); }}
+                onDecision={d => showWork({ kind: 'decision', key: d.key })}
+                onTask={task => { seeAttention([taskMark(task)]); showTask(task.id); }}
+                onClear={() => seeAttention([...attention.messages.map(m => messageMark(m.id)), ...attention.decisions.map(decisionMark), ...attention.tasks.map(taskMark)])} />}
               {dragging && <div className="drop-overlay" aria-hidden="true"><RoomIcon kind="clip" /><strong>Drop to attach</strong><span>Screenshots and files up to {formatBytes(MAX_UPLOAD_BYTES)}</span></div>}
               <section ref={stick.ref} className="browser-transcript" role="log" aria-live="off" aria-label="Conversation" tabIndex={0} onScroll={() => {
                 stick.onScroll();
@@ -1438,7 +1524,7 @@ function Rooms({ source }: { source: RoomSource }) {
                       const line = describeTask(event, (id, subject) => id === status.memberId ? subject ? 'You' : 'you' : nameOf(id));
                       const time = <time dateTime={new Date(Math.min(event.at, MAX_TIME)).toISOString()}>{new Date(Math.min(event.at, MAX_TIME)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>;
                       return <p key={event.id} className="browser-task-line">
-                        {tasks.some(t => t.id === event.taskId) ? <button title="Show on the task board" onClick={() => showTask(event.taskId)}>{line}</button> : <span>{line}</span>}{time}</p>;
+                        {tasks.some(t => t.id === event.taskId) ? <button title="Open this task" onClick={() => showTask(event.taskId)}>{line}</button> : <span>{line}</span>}{time}</p>;
                     };
 
                     return streamEntries.map((entry, index) => {
@@ -1524,7 +1610,7 @@ function Rooms({ source }: { source: RoomSource }) {
                           avatar={id => <MemberAvatar member={status.members!.find(m => m.id === id)} roomId={urlRoom} fallback={nameOf(id)} />}
                           onVote={(optionId, comment) => peers.current!.vote(d, optionId, comment)} onAddOption={label => peers.current!.reviseDecision(d, { addOption: label })}
                           onClose={() => peers.current!.reviseDecision(d, { close: true })} onWithdraw={() => peers.current!.reviseDecision(d, { withdraw: true })}
-                          onTasks={() => void decisionTask(d)} /></Fragment>;
+                          onTasks={taskFromDecision(d, tasks, decisions) ? undefined : () => void decisionTask(d)} /></Fragment>;
                       }
                       if (item.rename) {
                         const rename = item.rename, time = <time dateTime={new Date(Math.min(at, MAX_TIME)).toISOString()}>{new Date(Math.min(at, MAX_TIME)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>;
@@ -1575,7 +1661,7 @@ function Rooms({ source }: { source: RoomSource }) {
             {boardOpen && <BoardHandle workspace={workspace} width={boardWidth} onCommit={width => { setBoardWidth(width ?? BOARD_DEFAULT); saveBoardWidth(width); }} />}
             {decisionsOpen && <DecisionList decisions={decisions} onShow={showDecision} onClose={() => setDecisionsOpen(false)} />}
             {boardOpen && <TaskBoard room={boardRoom} viewerId={status.memberId} disabled={!admitted} onClose={() => setBoardOpen(false)} actions={boardActions} highlight={highlight} working={workingOn} repositories={pinned} />}
-            <aside id="browser-room-details" className="browser-details browser-details-tabbed" aria-label="Room details" hidden={!detailsOpen} onKeyDown={e => {
+            <aside id="browser-room-details" className={`browser-details browser-details-tabbed is-${paneTab}`} aria-label={paneTab === 'work' ? 'This work' : 'Room details'} hidden={!detailsOpen} onKeyDown={e => {
               if (e.key !== 'Escape') return;
               if (memberMenu) { const openId = memberMenu; e.stopPropagation(); setMemberMenu(undefined); focusMemberMenuButton(openId); }
               else closeDetails();
@@ -1583,13 +1669,25 @@ function Rooms({ source }: { source: RoomSource }) {
               <input ref={avatarInput} type="file" accept="image/png,image/jpeg,image/webp,image/*" hidden onChange={e => { uploadAvatar(e.target.files?.[0]); e.target.value = ''; }} />
               <div className="browser-details-sticky">
                 <header className="browser-details-heading">
-                  <h2 tabIndex={-1} ref={detailsHeading}>Room details</h2>
+                  <h2 tabIndex={-1} ref={detailsHeading} className="sr-only">{paneTab === 'work' ? 'This work' : 'Room details'}</h2>
+                  <div className="browser-pane-switch" role="tablist" aria-label="Side panel" data-tab={paneTab} onKeyDown={e => {
+                    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+                    e.preventDefault();
+                    const next = e.key === 'Home' ? 'work' : e.key === 'End' ? 'room' : paneTab === 'work' ? 'room' : 'work';
+                    setPaneTab(next); setMemberMenu(undefined);
+                    requestAnimationFrame(() => document.getElementById(`pane-tab-${next}`)?.focus());
+                  }}>
+                    <span className="browser-pane-glider" aria-hidden="true" />
+                    {(['work', 'room'] as const).map(tab => <button key={tab} type="button" role="tab" id={`pane-tab-${tab}`} aria-selected={paneTab === tab}
+                      aria-controls={tab === 'work' ? 'pane-panel-work' : `details-panel-${detailsTab}`} tabIndex={paneTab === tab ? 0 : -1}
+                      onClick={() => { setPaneTab(tab); setMemberMenu(undefined); }}>{tab === 'work' ? 'This work' : 'Room details'}</button>)}
+                  </div>
                   <div className="browser-details-head-actions">
-                    <button type="button" className="primary browser-details-invite-btn" aria-haspopup="dialog" onClick={() => openInvite('person')}>+ Invite</button>
-                    <button type="button" className="browser-close" aria-label="Close room details" onClick={closeDetails}><RoomIcon kind="close" /></button>
+                    {paneTab === 'room' && <button type="button" className="primary browser-details-invite-btn" aria-haspopup="dialog" onClick={() => openInvite('person')}>+ Invite</button>}
+                    <button type="button" className="browser-close" aria-label={paneTab === 'work' ? 'Close this work' : 'Close room details'} onClick={closeDetails}><RoomIcon kind="close" /></button>
                   </div>
                 </header>
-                <div className="browser-details-tabs" role="tablist" aria-label="Room details sections" onKeyDown={e => {
+                {paneTab === 'room' && <div className="browser-details-tabs" role="tablist" aria-label="Room details sections" onKeyDown={e => {
                   const idx = DETAILS_TABS.findIndex(t => t.id === detailsTab);
                   let next: DetailsTab | undefined;
                   if (e.key === 'ArrowRight') next = DETAILS_TABS[(idx + 1) % DETAILS_TABS.length].id;
@@ -1609,11 +1707,29 @@ function Rooms({ source }: { source: RoomSource }) {
                       {tab.label}
                     </button>;
                   })}
-                </div>
+                </div>}
               </div>
 
               <div className="browser-details-body">
-                <div role="tabpanel" id="details-panel-members" aria-labelledby="details-tab-members" hidden={detailsTab !== 'members'}>
+                <div role="tabpanel" id="pane-panel-work" aria-labelledby="pane-tab-work" hidden={paneTab !== 'work'}>
+                  {workShown && <WorkPane work={resolveWork(selectedWork, tasks, decisions)} list={roomWork} tasks={tasks} decisions={decisions} events={timeline}
+                    viewerId={status.memberId} viewerIsPerson={participants.find(p => p.id === status.memberId)?.role === 'human'} now={now} disabled={!admitted}
+                    nameOf={id => id === status.memberId ? 'You' : nameOf(id)}
+                    avatar={id => <MemberAvatar member={status.members!.find(m => m.id === id)} roomId={urlRoom} fallback={nameOf(id)} />}
+                    describe={event => describeTask(event, (id, subject) => id === status.memberId ? subject ? 'You' : 'you' : nameOf(id), true)}
+                    renderDecision={(d, made) => <DecisionCard decision={d} idBase="work-decision" viewerId={status.memberId} ownerId={status.ownerId} members={status.members!} participants={participants} now={now}
+                      nameOf={id => id === status.memberId ? 'You' : nameOf(id)}
+                      avatar={id => <MemberAvatar member={status.members!.find(m => m.id === id)} roomId={urlRoom} fallback={nameOf(id)} />}
+                      onVote={(optionId, comment) => peers.current!.vote(d, optionId, comment)} onAddOption={label => peers.current!.reviseDecision(d, { addOption: label })}
+                      onClose={() => peers.current!.reviseDecision(d, { close: true })} onWithdraw={() => peers.current!.reviseDecision(d, { withdraw: true })}
+                      onTasks={made ? undefined : () => void decisionTask(d)} />}
+                    onSelect={setSelectedWork}
+                    onStatus={(task, next) => boardActions.update(task, { status: next })}
+                    onShowOnBoard={showOnBoard}
+                    onShowInConversation={key => { uncoverConversation(); requestAnimationFrame(() => showDecision(key)); }}
+                    onOpenBoard={() => { setBoardOpen(true); setDetailsOpen(false); setDecisionsOpen(false); }} />}
+                </div>
+                <div role="tabpanel" id="details-panel-members" aria-labelledby="details-tab-members" hidden={paneTab !== 'room' || detailsTab !== 'members'}>
                   <div className="browser-people">
                     <section aria-label="People in this room" className="browser-roster-group">
                       <h3>People <span>{sortedPeople.length}</span></h3>
@@ -1711,7 +1827,7 @@ function Rooms({ source }: { source: RoomSource }) {
                   {!isAgent(self) && source.agents && <LocalAgentsSection api={source.agents} state={localAgents} roomId={urlRoom} selfName={self?.name} focus={agentFocus} />}
                 </div>
 
-                <div role="tabpanel" id="details-panel-shared" aria-labelledby="details-tab-shared" hidden={detailsTab !== 'shared'}>
+                <div role="tabpanel" id="details-panel-shared" aria-labelledby="details-tab-shared" hidden={paneTab !== 'room' || detailsTab !== 'shared'}>
                   <section className="browser-shared-files" aria-label="Shared files">
                     <h3>Shared files {sharedFiles.length > 0 && <span>{sharedFiles.length}</span>}</h3>
                     {sharedFiles.length === 0 ? <p>Files and screenshots shared in this room appear here.</p> : (
@@ -1749,7 +1865,7 @@ function Rooms({ source }: { source: RoomSource }) {
                   </section>
                 </div>
 
-                <div role="tabpanel" id="details-panel-rules" aria-labelledby="details-tab-rules" hidden={detailsTab !== 'rules'}>
+                <div role="tabpanel" id="details-panel-rules" aria-labelledby="details-tab-rules" hidden={paneTab !== 'room' || detailsTab !== 'rules'}>
                   <section className="browser-settings" aria-label="Room settings">
                     <h3>Room settings</h3>
                     {host ? <>
@@ -1781,7 +1897,7 @@ function Rooms({ source }: { source: RoomSource }) {
                     : 'Messages and files stay in participating browsers and devices; each keeps the newest 256 MB of files per room. Messages deliver directly while devices are online together, and newcomers don’t receive earlier chat history. Device receipts confirm storage, not that someone has read a message.'}</p>
                 </div>
 
-                <div role="tabpanel" id="details-panel-you" aria-labelledby="details-tab-you" hidden={detailsTab !== 'you'}>
+                <div role="tabpanel" id="details-panel-you" aria-labelledby="details-tab-you" hidden={paneTab !== 'room' || detailsTab !== 'you'}>
                   <section className="browser-picture" aria-label="Your picture">
                     <h3>Your picture</h3>
                     <div>
@@ -1792,7 +1908,7 @@ function Rooms({ source }: { source: RoomSource }) {
                     <p>Cropped to a square and kept under 16 KB. Everyone in this room sees it.</p>
                   </section>
 
-                  {detailsOpen && detailsTab === 'you' && source.notifications && <RoomNotificationControls key={urlRoom} api={source.notifications} roomId={urlRoom} />}
+                  {detailsOpen && paneTab === 'room' && detailsTab === 'you' && source.notifications && <RoomNotificationControls key={urlRoom} api={source.notifications} roomId={urlRoom} />}
                   {detailsOpen && notifySupported && host && <section className="browser-notifications" aria-label="Browser notifications">
                     <h3>Browser notifications</h3>
                     <p>Get notified when someone asks to join while this tab is in the background.</p>

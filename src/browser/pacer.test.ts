@@ -57,6 +57,17 @@ describe('paced sync', () => {
     expect(gate.done()).toEqual([]); // Never negative.
   });
 
+  test('a source that can wait asks the gate for room first, so a relay inbox burst is handled in turn and never dropped', () => {
+    const gate = new IncomingGate(3);
+    expect(gate.hasRoom()).toBe(true);
+    for (let i = 0; i < 3; i++) gate.admit('relay');
+    expect(gate.hasRoom()).toBe(false);
+    expect(gate.done()).toEqual([]);
+    expect(gate.hasRoom()).toBe(true);
+    // Nothing was refused, so nobody is asked to resend.
+    gate.admit('relay'); for (let i = 0; i < 3; i++) expect(gate.done()).toEqual([]);
+  });
+
   test('sync requests are recognised only for this room', () => {
     const room = crypto.randomUUID();
     expect(isSyncRequest({ kind: SYNC_REQUEST, roomId: room }, room)).toBe(true);

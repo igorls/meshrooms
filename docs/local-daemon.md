@@ -197,3 +197,13 @@ and browser subscription lifetime. Current run evidence is recorded in
 
 The ownership implementation follows the Windows
 [named mutex contract](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexw).
+
+## Stray runners: `doctor`
+
+The daemon keeps one runner per agent folder and room, and `run` itself refuses to start beside a live runner for the same
+folder or the same room device (exit code 7), so a copied agent folder or a test session cannot share the relay session
+with the real runner. A runner started before this guard, or one whose folder was deleted, can still be left running.
+`meshrooms doctor [--room ROOM]` lists every runner process and marks the ones no agent folder the machine knows
+(`agent-homes.json`) names as its runner as orphans; `meshrooms doctor --reap` stops those orphans, each only while its
+command line still says it is that room's runner. A runner you start by hand for a test can pass `--parent PID` so it exits
+when that process does. A runner that is told its device was removed from the room (403) for 90 seconds exits with 4, after the daemon's own 60 s grace for a removed room.

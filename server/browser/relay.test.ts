@@ -786,6 +786,65 @@ test('Bounded ciphertext inbox: non-wakeable gets no inbox, wakeable 500-frame /
   }
 });
 
+test('Wake noise: unaddressed chatter never wakes and is evicted first, addressed frames survive a full inbox, and the wake counts only addressed frames and names the room', async () => {
+  const origin = 'http://127.0.0.1:4321';
+  const now = Date.now();
+  const lobby = new BrowserLobby(':memory:', { origin, now: () => now });
+  const hooks: { body: { room: string; count: number } }[] = [];
+  const wakeConnector = new WakeConnector({
+    allowLoopbackHttp: true, now: () => now,
+    fetch: async (_url, init) => { hooks.push({ body: JSON.parse(String(init?.body)) }); return new Response('ok', { status: 200 }); },
+  });
+  const relay = new RelayService({ lobby, wakeConnector, now: () => now, rateFramesPerMin: 5000, rateBytesPerMin: 64 * 1024 * 1024, inboxMaxFrames: 20 });
+  try {
+    const { room, host, agent, agentEntry } = await setupRoom(lobby, origin, () => now);
+    const hostSess = crypto.randomUUID();
+    await relay.handleHttp('/api/relay/v1/open', await host.signed('relay-open', room, { session: hostSess }));
+    await relay.handleHttp('/api/relay/v1/wake-register', await agent.signed('relay-wake-register', room, { url: 'http://127.0.0.1:9999/wake', key: 'tok' }));
+    let seq = 1;
+    const send = async (addressed: boolean) => {
+      const e = await encryptRelayEnvelope({ n: seq }, {
+        room, from: host.id, id: crypto.randomUUID(), seq: seq++, rosterVersion: 1, lane: 'primary', recipients: [agentEntry], hold: true,
+        ...(addressed ? { wake: [agent.id] } : {}), sign: host.sign,
+      });
+      await relay.handleHttp('/api/relay/v1/send', await host.signed('relay-send', room, { session: hostSess, envelopes: [e] }));
+      return e.id;
+    };
+    // Room chatter that addresses nobody is held for the agent but wakes nothing.
+    for (let i = 0; i < 12; i++) await send(false);
+    await new Promise(r => setTimeout(r, 15));
+    expect(hooks).toHaveLength(0);
+    expect(relay.inboxStats(room, agent.id).count).toBe(12);
+
+    // The first addressed frame wakes once; the count is the addressed frames waiting (1), not the inbox size (13).
+    const firstAddressed = await send(true);
+    await new Promise(r => setTimeout(r, 15));
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].body).toMatchObject({ source: 'meshrooms', event: 'room-has-work', room, count: 1 });
+
+    // More addressed frames inside the coalescing window do not wake again.
+    const addressed = [firstAddressed, await send(true), await send(true)];
+    await new Promise(r => setTimeout(r, 15));
+    expect(hooks).toHaveLength(1);
+
+    // A flood of chatter fills the 20-frame inbox many times over: it never crowds the addressed frames out.
+    for (let i = 0; i < 60; i++) await send(false);
+    expect(relay.inboxStats(room, agent.id).count).toBe(20);
+    const polled = (await relay.handleHttp('/api/relay/v1/poll', await agent.signed('relay-poll', room, { session: agent.session }))) as { frames: { envelope: RelayEnvelope }[]; cursor: number };
+    const kept = polled.frames.map(f => f.envelope.id);
+    for (const id of addressed) expect(kept).toContain(id);
+    expect(polled.frames).toHaveLength(20);
+
+    // Acknowledging the read drains the inbox: the next frame starts again from one, not from a stuck full inbox.
+    await relay.handleHttp('/api/relay/v1/poll', await agent.signed('relay-poll', room, { session: agent.session, ackCursor: polled.cursor }));
+    expect(relay.inboxStats(room, agent.id).count).toBe(0);
+  } finally {
+    relay.close();
+    wakeConnector.close();
+    lobby.close();
+  }
+});
+
 test('WakeConnector: AES-GCM encryption at rest, SSRF guard, content-free body, coalescing, retries, and room/agent/sender hourly caps', async () => {
   const dir = testDirectory('wake-connector');
   const dbPath = join(dir.path, 'wake.sqlite');
@@ -875,9 +934,8 @@ test('WakeConnector: AES-GCM encryption at rest, SSRF guard, content-free body, 
     expect(results.slice(1)).toEqual(['coalesced', 'coalesced', 'coalesced', 'coalesced']);
     expect(calls).toHaveLength(1);
     expect(calls[0].auth).toBe(`Bearer ${secretKey}`);
-    expect(calls[0].body).toEqual({ source: 'meshrooms', event: 'room-has-work', inbox: inboxId, count: 1 });
-    expect(Object.keys(calls[0].body).sort()).toEqual(['count', 'event', 'inbox', 'source']);
-    expect(JSON.stringify(calls[0].body)).not.toContain(roomId);
+    expect(calls[0].body).toEqual({ source: 'meshrooms', event: 'room-has-work', inbox: inboxId, room: roomId, count: 1 });
+    expect(Object.keys(calls[0].body).sort()).toEqual(['count', 'event', 'inbox', 'room', 'source']);
     expect(JSON.stringify(calls[0].body)).not.toContain(deviceId);
 
     // Sequential follow-up before agent connects is also coalesced; once cleared, next wake fires.
@@ -1199,7 +1257,7 @@ test('WakeConnector P1: fail-closed default allowlist, pinned-IP socket egress, 
       family: 4,
       hostname: 'pinned.invalid',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer pin-key' },
-      body: '{"source":"meshrooms","event":"room-has-work","inbox":"abc","count":1}',
+      body: '{"source":"meshrooms","event":"room-has-work","inbox":"abc","room":"r","count":1}',
       timeoutMs: 3000,
     });
     expect(directRes.status).toBe(200);
@@ -1208,7 +1266,7 @@ test('WakeConnector P1: fail-closed default allowlist, pinned-IP socket egress, 
     // 4b. WakeConnector real HTTP path dispatches cleanly over pinnedHttpRequest.
     const { inboxId } = realConnector.register(roomId, deviceId, `http://127.0.0.1:${webhookServer.port}/wake`, 'real-key');
     expect(await realConnector.notify(roomId, deviceId, 'sender1', 3)).toBe('dispatched');
-    expect(JSON.parse(received[1].body)).toEqual({ source: 'meshrooms', event: 'room-has-work', inbox: inboxId, count: 3 });
+    expect(JSON.parse(received[1].body)).toEqual({ source: 'meshrooms', event: 'room-has-work', inbox: inboxId, room: roomId, count: 3 });
 
     // 4c. 3xx redirect is refused immediately without following or retrying.
     realConnector.clearPending(roomId, deviceId);
@@ -1276,7 +1334,7 @@ test('WakeConnector P2: Claude Code routine wake adapter and Retry-After header 
     expect(Object.keys(parsedBody)).toEqual(['text']);
     expect(parsedBody.text).toContain(reg.inboxId);
     expect(parsedBody.text).toContain('4');
-    expect(dispatched[0].body).not.toContain(room);
+    expect(parsedBody.text).toContain(room);
     expect(dispatched[0].body).not.toContain(agent.id);
 
     // Explicit provider: 'claude-code' also works on a custom allowlisted host.

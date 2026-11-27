@@ -33,8 +33,9 @@ export type AgyHookDecision =
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const DELIMITER_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const WAKE_SUBCOMMANDS = new Set<string>(WAKE_COMMANDS);
-const STDIN_FLAGS = new Set(['--text', '--notes', '--comment', '--question', '--context']);
-const PATH_FLAGS = new Set(['--attach', '--out', '--text-file', '--notes-file', '--comment-file', '--question-file', '--context-file', '--plan-file']);
+const STDIN_FLAGS = new Set(['--text', '--notes', '--comment', '--question', '--context', '--patch']);
+const PATH_FLAGS = new Set(['--attach', '--out', '--text-file', '--notes-file', '--comment-file', '--question-file', '--context-file', '--plan-file', '--patch-file']);
+const isPathFlag = (flag: string) => PATH_FLAGS.has(flag) || (flag.startsWith('--') && flag.endsWith('-file'));
 
 const deny = (reason: string): AgyHookDecision => ({ decision: 'deny', reason });
 
@@ -190,12 +191,27 @@ export function checkAgyCommand(commandLine: string, policy: AgyHookPolicy, cwd?
       i++;
       continue;
     }
-    if (PATH_FLAGS.has(arg)) {
+    if (isPathFlag(arg)) {
       const value = rest[++i];
       if (!value || !insideAgyWakeDir(value, policy.wakeDir, false)) {
         return { ok: false, reason: `Paths passed to ${arg} must stay inside the room wake folder.` };
       }
       continue;
+    }
+    const eqIdx = arg.indexOf('=');
+    if (eqIdx > 2 && arg.startsWith('--')) {
+      const flag = arg.slice(0, eqIdx);
+      const value = arg.slice(eqIdx + 1);
+      if (STDIN_FLAGS.has(flag) && value === '-') {
+        readsStdin = true;
+        continue;
+      }
+      if (isPathFlag(flag)) {
+        if (!value || !insideAgyWakeDir(value, policy.wakeDir, false)) {
+          return { ok: false, reason: `Paths passed to ${flag} must stay inside the room wake folder.` };
+        }
+        continue;
+      }
     }
   }
 

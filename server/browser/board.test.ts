@@ -21,6 +21,19 @@ test('the last revision of each task wins, and every device folds concurrent edi
   expect(foldBoard([create, a, b, next])[0].assigneeId).toBeUndefined();
 });
 
+test('a done task keeps who finished it and when; later edits leave it, reopening clears it', () => {
+  const create = op(alex, { title: 'Fix header', assigneeId: codex }, undefined, { at: 1000 });
+  const done = op(codex, { status: 'done' }, foldBoard([create])[0], { at: 2000 });
+  const finished = foldBoard([create, done])[0];
+  expect(finished.finished).toEqual({ by: codex, at: new Date(2000).toISOString(), revision: 2 });
+  const noted = op(sam, { notes: 'shipped in #12' }, finished, { at: 3000 });
+  expect(foldBoard([create, done, noted])[0]).toMatchObject({ revision: 3, updatedBy: sam, finished: { by: codex, revision: 2 } });
+  const reopened = op(alex, { status: 'doing' }, foldBoard([create, done, noted])[0], { at: 4000 });
+  expect(foldBoard([create, done, noted, reopened])[0].finished).toBeUndefined();
+  const again = op(codex, { status: 'done' }, foldBoard([create, done, noted, reopened])[0], { at: 5000 });
+  expect(foldBoard([create, done, noted, reopened, again])[0].finished).toEqual({ by: codex, at: new Date(5000).toISOString(), revision: 5 });
+});
+
 test('a removed task disappears for everyone, and boards keep creation order', () => {
   const first = op(alex, { title: 'First' }, undefined, { at: 1000 }), second = op(sam, { title: 'Second' }, undefined, { at: 2000 });
   expect(foldBoard([second, first]).map(t => t.title)).toEqual(['First', 'Second']);

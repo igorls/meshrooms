@@ -66,6 +66,8 @@ export class IncomingGate {
   private dropped = new Set<string>();
   constructor(private limit = MAX_PENDING_INCOMING) {}
   get size() { return this.pending; }
+  /** Whether `admit` would accept one more now: a source that can wait (the relay inbox keeps its copy) checks this first instead of being dropped. */
+  hasRoom() { return this.pending < this.limit; }
   /** Room for one more packet from `from`; false means drop it. */
   admit(from: string) {
     if (this.pending >= this.limit) { this.dropped.add(from); return false; }

@@ -6,7 +6,7 @@
  *   <person home>/agents/<identity id>, holding one room folder (and one device key) per room it is in, like any agent
  *   folder; it is recorded in agent-homes.json when first put into a room, so the daemon looks after its runners.
  * - Putting an identity into a room: the person device signs `agent-invite {name}` and the daemon redeems the token
- *   itself through connect (connectAgent), so no link is ever copied. The room's rules still apply (four agents per
+ *   itself through connect (connectAgent), so no link is ever copied. The room's rules still apply (eight agents per
  *   operator per room, names unique in the room); the room service's refusals come back as they are.
  * - Binding it to a NEW session needs no approval (the session starts empty), but it is logged (agents.log). Binding it
  *   to an EXISTING session carries that session's context into the room, so it is only filed as a pending approval

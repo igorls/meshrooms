@@ -122,6 +122,17 @@ function sameBindingPath(a: string, b: string, platform: NodeJS.Platform): boole
   return normalizeBindingPath(a, platform) === normalizeBindingPath(b, platform);
 }
 
+/** Whether `target` equals or lies inside `outer` under the platform's normalized path semantics. */
+function sameOrInsideBindingPath(target: string, outer: string, platform: NodeJS.Platform): boolean {
+  if (!target || !outer) return false;
+  if (bindingPathKind(target, platform) !== bindingPathKind(outer, platform)) return false;
+  const a = normalizeBindingPath(target, platform);
+  const b = normalizeBindingPath(outer, platform);
+  const separator = platform === 'win32' ? '\\' : '/';
+  const prefix = b.endsWith(separator) ? b : b + separator;
+  return a === b || a.startsWith(prefix);
+}
+
 /**
  * Why this server entry cannot serve a wake for `roomId`, or undefined when it is correct.
  *
@@ -150,10 +161,19 @@ export function hermesBindingProblem(
   const home = values.get('--agent-home');
   if (home === undefined) return 'its args do not pass --agent-home, so the server would read the shared agents folder instead of this agent\'s';
   if (!sameBindingPath(home, agentHome, platform)) return `its args pass --agent-home ${home}, but this agent\'s home is ${agentHome}`;
+  // Never allow --wake-dir to point at the room's restricted VFS storage folder (raw WormDB/BunFile + sealed keys).
+  const dir = values.get('--wake-dir');
+  if (dir !== undefined) {
+    const vfsDir = platform === 'win32'
+      ? win32.join(agentHome, 'browser-agents', roomId, 'vfs')
+      : posix.join(agentHome, 'browser-agents', roomId, 'vfs');
+    if (sameOrInsideBindingPath(dir, vfsDir, platform)) {
+      return `its args pass --wake-dir ${dir}, which points into the room's restricted vfs storage folder`;
+    }
+  }
   // The wake folder is part of the binding too: a server pointed at another wake folder refuses every
   // file this wake's harness was told to write there.
   if (wakeDir !== undefined) {
-    const dir = values.get('--wake-dir');
     if (dir !== undefined && !sameBindingPath(dir, wakeDir, platform)) return `its args pass --wake-dir ${dir}, but this watcher's wake folder is ${wakeDir}`;
   }
   return undefined;

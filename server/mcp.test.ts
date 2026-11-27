@@ -20,7 +20,10 @@ describe('MCP server — the tool list', () => {
   test('exposes exactly the wake subcommands, and nothing else', async () => {
     const out: any = await handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { room: ROOM, call: recorder().call });
     const names = out.result.tools.map((t: { name: string }) => t.name);
-    expect(names).toEqual(['listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status']);
+    expect(names).toEqual([
+      'listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status',
+      'vfs-list', 'vfs-read', 'vfs-write', 'vfs-patch', 'vfs-history', 'vfs-diff', 'vfs-revert', 'vfs-delete',
+    ]);
     // The commands that must never be reachable from a room: they are operator-only, and exposing
     // them would let room text reconfigure or stop the agent.
     for (const forbidden of ['connect', 'watch', 'watch-stop', 'stop', 'profile', 'avatar', 'rooms', 'run', 'mcp', 'listen-loop']) {
@@ -218,6 +221,129 @@ describe('MCP server — vote and task-update parameters, and unsafe/extra input
       params: { name: 'status', arguments: ['--room', 'other'] },
     }, { room: ROOM, call: recorder().call });
     expect(badArgs.error.code).toBe(-32602);
+  });
+});
+
+describe('MCP server — Room VFS tools (pinning, inline payloads, validation, confinement)', () => {
+  const REQ = '3f2a9c1e-0000-4000-8000-000000000050';
+  const NODE = '3f2a9c1e-0000-4000-8000-000000000060';
+  const COMMIT = '3f2a9c1e-0000-4000-8000-000000000070';
+  const MSG = '3f2a9c1e-0000-4000-8000-000000000080';
+  const VFS_TOOLS = ['vfs-list', 'vfs-read', 'vfs-write', 'vfs-patch', 'vfs-history', 'vfs-diff', 'vfs-revert', 'vfs-delete'] as const;
+  const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+
+  test('all 8 VFS tools have closed schemas with no room or host file path inputs', () => {
+    for (const name of VFS_TOOLS) {
+      const schema = TOOL_SCHEMAS[name].schema;
+      const props = Object.keys(schema.properties ?? {});
+      expect(schema.additionalProperties).toBe(false);
+      expect(props).not.toContain('room');
+      expect(props).not.toContain('text_file');
+      expect(props).not.toContain('patch_file');
+      expect(props).not.toContain('out');
+    }
+  });
+
+  test('all 8 VFS tools build exact pinned CLI argv and auto-generate request_id UUID on mutations when omitted', async () => {
+    expect(toolArgv('vfs-list', { include_deleted: true }, ROOM)).toEqual(['vfs-list', '--room', ROOM, '--include-deleted']);
+    expect(toolArgv('vfs-list', {}, ROOM)).toEqual(['vfs-list', '--room', ROOM]);
+
+    expect(toolArgv('vfs-read', { path: 'specs/api.md', rev: 'f:0123456789abcdef', offset: 0, limit: 4096 }, ROOM))
+      .toEqual(['vfs-read', '--room', ROOM, '--path', 'specs/api.md', '--rev', 'f:0123456789abcdef', '--offset', '0', '--limit', '4096']);
+    expect(toolArgv('vfs-read', { node_id: NODE }, ROOM))
+      .toEqual(['vfs-read', '--room', ROOM, '--node-id', NODE]);
+
+    // Explicit request_id is preserved; omitted request_id auto-generates a valid UUID.
+    expect(toolArgv('vfs-write', { request_id: REQ, path: 'notes.md', text: '# Hello\nworld', base_rev: 'f:aaaa1111bbbb2222', message: 'update notes', reply_to: MSG }, ROOM))
+      .toEqual(['vfs-write', '--room', ROOM, '--request-id', REQ, '--path', 'notes.md', '--text', '# Hello\nworld', '--base-rev', 'f:aaaa1111bbbb2222', '--message', 'update notes', '--reply-to', MSG]);
+
+    for (const mut of ['vfs-write', 'vfs-patch', 'vfs-revert', 'vfs-delete'] as const) {
+      const autoArgv = toolArgv(mut, {}, ROOM);
+      const reqIdx = autoArgv.indexOf('--request-id');
+      expect(reqIdx).toBeGreaterThanOrEqual(3);
+      expect(autoArgv[reqIdx + 1]).toMatch(UUID_RE);
+    }
+
+    const hunks = [{ op: 'replace', old: 'draft', new: 'final', before: 'Status: ' }];
+    expect(toolArgv('vfs-patch', { request_id: REQ, node_id: NODE, base_rev: 'f:1111222233334444', hunks, message: 'finalize', reply_to: MSG }, ROOM))
+      .toEqual(['vfs-patch', '--room', ROOM, '--request-id', REQ, '--node-id', NODE, '--base-rev', 'f:1111222233334444', '--patch', JSON.stringify(hunks), '--message', 'finalize', '--reply-to', MSG]);
+
+    expect(toolArgv('vfs-history', { path: 'notes.md', limit: 20 }, ROOM))
+      .toEqual(['vfs-history', '--room', ROOM, '--path', 'notes.md', '--limit', '20']);
+
+    expect(toolArgv('vfs-diff', { path: 'notes.md', from: COMMIT, to: 'head' }, ROOM))
+      .toEqual(['vfs-diff', '--room', ROOM, '--path', 'notes.md', '--from', COMMIT, '--to', 'head']);
+
+    expect(toolArgv('vfs-revert', { request_id: REQ, path: 'notes.md', commit: COMMIT, message: 'rollback', reply_to: MSG }, ROOM))
+      .toEqual(['vfs-revert', '--room', ROOM, '--request-id', REQ, '--path', 'notes.md', '--commit', COMMIT, '--message', 'rollback', '--reply-to', MSG]);
+
+    expect(toolArgv('vfs-delete', { request_id: REQ, node_id: NODE, restore: true, message: 'restore', reply_to: MSG }, ROOM))
+      .toEqual(['vfs-delete', '--room', ROOM, '--request-id', REQ, '--node-id', NODE, '--restore', '--message', 'restore', '--reply-to', MSG]);
+
+    // Dispatch via handleMessage routes cleanly to injected call.
+    const rec = recorder();
+    const out: any = await handleMessage({
+      jsonrpc: '2.0', id: 10, method: 'tools/call',
+      params: { name: 'vfs-patch', arguments: { request_id: REQ, path: 'notes.md', base_rev: 'f:0123456789abcdef', hunks } },
+    }, { room: ROOM, call: rec.call });
+    expect(out.error).toBeUndefined();
+    expect(out.result.isError).toBeUndefined();
+    expect(rec.calls).toEqual([['vfs-patch', '--room', ROOM, '--request-id', REQ, '--path', 'notes.md', '--base-rev', 'f:0123456789abcdef', '--patch', JSON.stringify(hunks)]]);
+  });
+
+  test('rejects path traversal, host file smuggling, stdin "-", invalid UUIDs/integers, and ambiguous patch inputs', async () => {
+    const rec = recorder();
+    const badCalls: [typeof VFS_TOOLS[number], Record<string, unknown>, string][] = [
+      ['vfs-read', { path: '../identity.json' }, 'Invalid VFS path'],
+      ['vfs-read', { path: '/etc/passwd' }, 'Invalid VFS path'],
+      ['vfs-read', { path: '.meshrooms/vfs/wormdb.wal' }, 'Invalid VFS path'],
+      ['vfs-read', { path: 'bad\0path.md' }, 'Invalid VFS path'],
+      ['vfs-read', { node_id: '../vfs' }, '--node-id'],
+      ['vfs-read', { path: 'notes.md', offset: -1 }, '--offset'],
+      ['vfs-read', { path: 'notes.md', limit: 0 }, '--limit'],
+      ['vfs-history', { path: 'notes.md', limit: -5 }, '--limit'],
+      ['vfs-write', { path: 'notes.md', text: '-' }, 'stdin'],
+      ['vfs-write', { path: 'notes.md', text: ' - ' }, 'stdin'],
+      ['vfs-write', { request_id: 'not-a-uuid', path: 'notes.md', text: 'ok' }, '--request-id'],
+      ['vfs-patch', { path: 'notes.md', base_rev: 'f:0123456789abcdef', patch: '-' }, 'stdin'],
+      ['vfs-patch', { path: 'notes.md', base_rev: 'f:0123456789abcdef', hunks: 'not-array' }, 'hunks'],
+      ['vfs-patch', { path: 'notes.md', base_rev: 'f:0123456789abcdef', hunks: [], patch: '[]' }, 'not both'],
+    ];
+
+    for (const [name, args, expectedErr] of badCalls) {
+      const out: any = await handleMessage({
+        jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name, arguments: args },
+      }, { room: ROOM, call: rec.call });
+      expect(out.error).toBeUndefined();
+      expect(out.result.isError).toBe(true);
+      expect(out.result.content[0].text).toContain(expectedErr);
+    }
+    expect(rec.calls).toEqual([]);
+
+    // Smuggled host file path options and room overrides are never forwarded to argv.
+    const writeArgv = toolArgv('vfs-write', {
+      request_id: REQ, path: 'notes.md', text: 'safe',
+      room: 'ffffffff-ffff-4fff-8fff-ffffffffffff', text_file: '/etc/passwd',
+    }, ROOM);
+    expect(writeArgv).not.toContain('--text-file');
+    expect(writeArgv).not.toContain('/etc/passwd');
+    expect(writeArgv).not.toContain('ffffffff-ffff-4fff-8fff-ffffffffffff');
+
+    const patchArgv = toolArgv('vfs-patch', {
+      request_id: REQ, path: 'notes.md', base_rev: 'f:0123456789abcdef', hunks: [],
+      patch_file: '/etc/passwd', room: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+    }, ROOM);
+    expect(patchArgv).not.toContain('--patch-file');
+    expect(patchArgv).not.toContain('/etc/passwd');
+  });
+
+  test('Hermes nonRoomTools allows all 8 room-bound VFS MCP tools and flags other servers', () => {
+    const roomServer = 'meshrooms-0a1b2c3d';
+    const qualified = VFS_TOOLS.map(t => `mcp__meshrooms_0a1b2c3d__${t.replace(/-/g, '_')}`);
+    expect(nonRoomTools(qualified, roomServer)).toEqual([]);
+    expect(nonRoomTools(['mcp__meshrooms_deadbeef__vfs_read'], roomServer)).toEqual(['mcp__meshrooms_deadbeef__vfs_read']);
+    expect(nonRoomTools(['vfs-read'], roomServer)).toEqual(['vfs-read']);
   });
 });
 

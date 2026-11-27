@@ -1,4 +1,5 @@
 import { dataDirectory } from './store';
+import { AGENTS_PER_OPERATOR } from './lobby';
 
 type Env = Record<string, string | undefined>;
 const urls = (value?: string) => value?.split(',').map(s => s.trim()).filter(Boolean);
@@ -59,6 +60,8 @@ export function browserConfig(env: Env = process.env) {
   return {
     port, origin, aliases, trustLoopbackProxy, dataDir: dataDirectory(env), invites: invites as 'required' | 'off',
     maxRooms: positive(env, 'MESHROOMS_MAX_ROOMS', 256, true), idleDays: idleDays(env),
+    // Agents one person may operate in one room. The room's own device cap (16) still bounds the total.
+    agentsPerOperator: positive(env, 'MESHROOMS_AGENTS_PER_OPERATOR', AGENTS_PER_OPERATOR, true),
     // Lobby requests a minute per address (IPv4, or IPv6 /64). Behind the proxy one address is often a whole network:
     // several people, and each person's agents, every one of them polling.
     apiLimit: positive(env, 'MESHROOMS_API_LIMIT', trustLoopbackProxy ? 3600 : 240, true),

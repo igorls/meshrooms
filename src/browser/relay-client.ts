@@ -76,6 +76,8 @@ export type RelayClientOptions = {
   maxQueuedPrimary?: number;
   /** Maximum queued file frames (default 1024). */
   maxQueuedFile?: number;
+  /** A delivered inbox frame never committed or acknowledged after this long is given up on so it can't pin the inbox (default 10 min). */
+  pendingAckMaxAgeMs?: number;
   /** Injectable fetch implementation for tests. */
   fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   /** Injectable WebSocket constructor for tests. */
@@ -100,6 +102,8 @@ type QueuedItem =
       kind: 'packet';
       id: string;
       lane: RelayLane;
+      /** Whether the sender named a recipient to wake (it addresses someone): such a packet is never dropped for room chatter. */
+      addressed: boolean;
       build: (seq: number) => Promise<RelayEnvelope>;
       envelope?: RelayEnvelope;
       wireBytes?: number;
@@ -122,6 +126,7 @@ export const DEFAULT_POLL_WAIT_SECONDS = 25;
  */
 export const STATUS_LIVE_MS = 22_000;
 export const DEFAULT_FILE_IN_FLIGHT_CAP_BYTES = 1024 * 1024;
+export const DEFAULT_PENDING_ACK_MAX_AGE_MS = 600_000;
 /** Target batch byte ceiling for `POST /api/relay/v1/send` so JSON + SignedCommand stays <= 64 KB. */
 const HTTPS_SEND_BATCH_MAX_BYTES = 56 * 1024;
 const WSS_BUFFERED_HIGH_WATER = 256 * 1024;
@@ -207,6 +212,7 @@ export class RelayClient {
   private readonly fileInFlightCapBytes: number;
   private readonly maxQueuedPrimary: number;
   private readonly maxQueuedFile: number;
+  private readonly pendingAckMaxAgeMs: number;
 
   private session: string;
   private seq = 0;
@@ -269,6 +275,7 @@ export class RelayClient {
     this.reconnectBaseMs = options.reconnectBaseMs ?? 1_000;
     this.reconnectMaxMs = options.reconnectMaxMs ?? 30_000;
     this.fileInFlightCapBytes = options.fileInFlightCapBytes ?? DEFAULT_FILE_IN_FLIGHT_CAP_BYTES;
+    this.pendingAckMaxAgeMs = options.pendingAckMaxAgeMs ?? DEFAULT_PENDING_ACK_MAX_AGE_MS;
     this.maxQueuedPrimary = options.maxQueuedPrimary ?? 512;
     this.maxQueuedFile = options.maxQueuedFile ?? 1024;
   }
@@ -505,6 +512,30 @@ export class RelayClient {
     if (fileBack.length) this.fileQueue.unshift(...fileBack);
   }
 
+  /** Frames dropped from a full queue to make room (always unaddressed ones), and what waits now. */
+  queueStats(): { primaryQueued: number; fileQueued: number; droppedUnaddressed: number } {
+    return { primaryQueued: this.primaryQueue.length, fileQueued: this.fileQueue.length, droppedUnaddressed: this.droppedUnaddressed };
+  }
+  private droppedUnaddressed = 0;
+  /** Inbox cursors given up on after `pendingAckMaxAgeMs` without a commit (see ackCursor). */
+  abandonedCursors = 0;
+  private pendingSince = new Map<number, number>();
+  private static addressed(item: QueuedItem): boolean {
+    return item.kind === 'packet' ? item.addressed : (item.envelope.wake?.length ?? 0) > 0;
+  }
+  /**
+   * Makes room in a full lane without ever blocking it: the oldest frame that addresses nobody goes first (the room
+   * resends its state on request). Returns false when every queued frame is addressed to someone, so the caller decides.
+   */
+  private makeRoom(queue: QueuedItem[], limit: number): boolean {
+    if (queue.length < limit) return true;
+    const victim = queue.findIndex(item => !RelayClient.addressed(item));
+    if (victim < 0) return false;
+    queue.splice(victim, 1);
+    this.droppedUnaddressed++;
+    return true;
+  }
+
   /** Enqueues a pre-encrypted `RelayEnvelope` onto its lane (`primary` or `file`). */
   enqueue(envelope: RelayEnvelope): boolean {
     const serialized = JSON.stringify(envelope);
@@ -514,7 +545,7 @@ export class RelayClient {
     }
     const queue = envelope.lane === 'primary' ? this.primaryQueue : this.fileQueue;
     const limit = envelope.lane === 'primary' ? this.maxQueuedPrimary : this.maxQueuedFile;
-    if (queue.length >= limit) return false;
+    if (!this.makeRoom(queue, limit)) return false;
     queue.push({ kind: 'envelope', id: envelope.id, lane: envelope.lane, envelope, wireBytes });
     this.scheduleDrain();
     return true;
@@ -529,7 +560,10 @@ export class RelayClient {
     const id = options.id ?? crypto.randomUUID();
     const queue = options.lane === 'primary' ? this.primaryQueue : this.fileQueue;
     const limit = options.lane === 'primary' ? this.maxQueuedPrimary : this.maxQueuedFile;
-    if (queue.length >= limit) {
+    const addressed = (options.wake?.length ?? 0) > 0;
+    if (!this.makeRoom(queue, limit)) {
+      // Full of frames that each address someone: room chatter is dropped instead, and only a frame that addresses someone is refused.
+      if (!addressed) { this.droppedUnaddressed++; return id; }
       throw new Error(`Relay ${options.lane} queue is full`);
     }
     const build = (seq: number) => encryptRelayEnvelope(plaintextPacket, {
@@ -540,7 +574,7 @@ export class RelayClient {
       seq,
       sign: this.signFn,
     });
-    queue.push({ kind: 'packet', id, lane: options.lane, build });
+    queue.push({ kind: 'packet', id, lane: options.lane, addressed, build });
     this.scheduleDrain();
     return id;
   }
@@ -551,6 +585,7 @@ export class RelayClient {
     if (cursor > this.cursor) this.cursor = cursor;
     if (cursor <= this.ackedCursor || this.pendingCursorSet.has(cursor) || this.committedCursors.has(cursor)) return;
     this.pendingCursorSet.add(cursor);
+    this.pendingSince.set(cursor, this.now());
     if (this.pendingCursors.length === 0 || cursor > this.pendingCursors[this.pendingCursors.length - 1]) {
       this.pendingCursors.push(cursor);
     } else {
@@ -565,6 +600,7 @@ export class RelayClient {
     this.cursor = this.ackedCursor;
     this.pendingCursors = [];
     this.pendingCursorSet.clear();
+    this.pendingSince.clear();
     this.committedCursors.clear();
   }
 
@@ -580,11 +616,24 @@ export class RelayClient {
       this.ackedCursor = cursor;
     } else {
       this.committedCursors.add(cursor);
-      while (this.pendingCursors.length > 0 && this.committedCursors.has(this.pendingCursors[0])) {
+      const advance = () => {
         const next = this.pendingCursors.shift()!;
         this.pendingCursorSet.delete(next);
+        this.pendingSince.delete(next);
         this.committedCursors.delete(next);
         if (next > this.ackedCursor) this.ackedCursor = next;
+      };
+      while (this.pendingCursors.length > 0 && this.committedCursors.has(this.pendingCursors[0])) advance();
+      // A frame that never got committed (a handler that failed for good) must not hold every later acknowledgement back
+      // and let the relay's inbox fill to its cap: once it is older than the limit and later frames are committed, it is
+      // given up on, and the relay may delete it. The sender resends anything it never got a receipt for.
+      const limit = this.pendingAckMaxAgeMs, at = this.now();
+      while (this.pendingCursors.length > 0 && !this.committedCursors.has(this.pendingCursors[0])
+        && at - (this.pendingSince.get(this.pendingCursors[0]) ?? at) > limit
+        && this.pendingCursors.some(c => this.committedCursors.has(c))) {
+        this.abandonedCursors++;
+        advance();
+        while (this.pendingCursors.length > 0 && this.committedCursors.has(this.pendingCursors[0])) advance();
       }
     }
     if (this.ackedCursor > prevAcked && this.state === 'wss' && this.ws && this.wsAuthed && this.ws.readyState === 1) {

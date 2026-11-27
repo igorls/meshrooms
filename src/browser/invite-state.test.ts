@@ -1,14 +1,19 @@
 import { expect, test } from 'bun:test';
-import { PROMPT_HARNESSES, PROMPT_HARNESS_META, defaultAgentName, harnessFromName, isPromptHarness } from './agent-prompt';
+import { PROMPT_HARNESSES, PROMPT_HARNESS_META, defaultAgentName, harnessFromName, isLinkOnlyHarness, isPromptHarness } from './agent-prompt';
 import { AGENT_LINK_TTL, agentLinkState, formatCountdown, inviteSteps } from './invite-state';
 
 test('the dialog lists every prompt harness once, with the prompt\'s own label, and a placeholder for "something else"', () => {
   expect((PROMPT_HARNESS_META.map(h => h.id) as string[]).sort()).toEqual((Object.keys(PROMPT_HARNESSES) as string[]).sort());
   for (const h of PROMPT_HARNESS_META) { expect(h.badge.length).toBeGreaterThan(0); if (h.id !== 'other') expect(h.label).toBe(PROMPT_HARNESSES[h.id]); }
   expect(PROMPT_HARNESS_META.find(h => h.id === 'other')!.label).toBe('Something else');
+  expect(defaultAgentName('bentokit')).toBe('BentoKit');
   expect(defaultAgentName('grok')).toBe('Grok Bot');
   expect(defaultAgentName('other')).toBe('');
+  expect(isLinkOnlyHarness('bentokit')).toBe(true);
+  expect(isLinkOnlyHarness('claude')).toBe(false);
+  expect(isLinkOnlyHarness('grok')).toBe(false);
   expect(isPromptHarness('claude')).toBe(true);
+  expect(isPromptHarness('bentokit')).toBe(true);
   expect(isPromptHarness('toString')).toBe(false);
   expect(isPromptHarness(undefined)).toBe(false);
 });
@@ -16,6 +21,9 @@ test('the dialog lists every prompt harness once, with the prompt\'s own label, 
 test('a name that says which harness it is picks it, as before', () => {
   expect(harnessFromName('My Codex')).toBe('codex');
   expect(harnessFromName('claude-2')).toBe('claude');
+  expect(harnessFromName('Antigravity')).toBe('agy');
+  expect(harnessFromName('BentoKit Integrator')).toBe('bentokit');
+  expect(harnessFromName('Bento desktop')).toBe('bentokit');
   expect(harnessFromName('Hermes')).toBe('hermes');
   expect(harnessFromName('DeepSeek helper')).toBe('dsh');
   expect(harnessFromName('Grok Bot')).toBe('grok');

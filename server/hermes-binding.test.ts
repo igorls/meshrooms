@@ -411,3 +411,41 @@ describe('Windows paths, YAML quoting and CRLF robustness', () => {
     expect(duplicateMcpServerKey(escapedQuoteDup, 'a"b')).toBe(true);
   });
 });
+
+describe('Room VFS confinement in Hermes bindings', () => {
+  test('refuses --wake-dir pointing at or inside the room vfs storage folder on POSIX and Windows', () => {
+    const posixHome = '/x/agents';
+    const posixVfs = `/x/agents/browser-agents/${ROOM_A}/vfs`;
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', posixHome, '--wake-dir', posixVfs],
+      ROOM_A, posixHome, undefined, 'linux',
+    )).toContain('vfs');
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', posixHome, '--wake-dir', `${posixVfs}/wormdb`],
+      ROOM_A, posixHome, undefined, 'linux',
+    )).toContain('vfs');
+    // Also refused via dot-segment traversal into vfs/
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', posixHome, '--wake-dir', `/x/agents/browser-agents/${ROOM_A}/wake/../vfs`],
+      ROOM_A, posixHome, undefined, 'linux',
+    )).toContain('vfs');
+
+    const winHome = 'C:\\Users\\Jane\\.meshrooms\\agents';
+    const winVfs = `${winHome}\\browser-agents\\${ROOM_A}\\vfs`;
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', winHome, '--wake-dir', winVfs],
+      ROOM_A, winHome, undefined, 'win32',
+    )).toContain('vfs');
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', winHome, '--wake-dir', `${winVfs}\\cas`],
+      ROOM_A, winHome, undefined, 'win32',
+    )).toContain('vfs');
+
+    // Legitimate wake folder alongside vfs/ still passes cleanly.
+    const validWake = `/x/agents/browser-agents/${ROOM_A}/wake`;
+    expect(hermesBindingProblem(
+      ['mcp', '--room', ROOM_A, '--agent-home', posixHome, '--wake-dir', validWake],
+      ROOM_A, posixHome, validWake, 'linux',
+    )).toBeUndefined();
+  });
+});

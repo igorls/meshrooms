@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { checkRoomDraft } from './check-room-draft.mjs';
 import { checkLocalRecovery } from './check-local-recovery.mjs';
 import { checkLocalHistory } from './check-local-history.mjs';
+import { openRoomDetails } from './room-details.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MESHROOMS_PLAYWRIGHT_MODULE || 'playwright');
 const origin = process.env.MESHROOMS_BROWSER_TEST_ORIGIN || 'http://127.0.0.1:14332';
@@ -144,7 +145,7 @@ try {
 
   // Desktop message preferences are this computer's, available to every person in the local room, never on the host's
   // hosted page. Read failures must not pretend the default was loaded; failed writes keep the last saved selection.
-  await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(host);
   await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   assert.equal(await host.getByRole('region', { name: 'Desktop notifications', exact: true }).count(), 0);
   await host.getByRole('button', { name: 'Close room details', exact: true }).click();
@@ -157,7 +158,7 @@ try {
     }
     return route.continue();
   });
-  await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(local);
   await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   const notifications = local.getByRole('region', { name: 'Desktop notifications', exact: true });
   const notificationChoice = notifications.getByLabel('Message notifications', { exact: true });
@@ -183,8 +184,9 @@ try {
   assert.equal(notificationSettings()[roomId], 'off');
   await snapshot(local, 'local-ui-notifications-desktop.png');
   await local.reload();
-  await local.getByRole('button', { name: 'Room details', exact: true }).click();
-  await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
+  // A wide page reopens the side panel it was left with: Room details, on You.
+  assert.equal(await local.getByRole('button', { name: 'Room details', exact: true }).getAttribute('aria-expanded'), 'true');
+  assert.equal(await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).getAttribute('aria-selected'), 'true');
   await until(async () => await notificationChoice.inputValue() === 'off' && await notificationChoice.isEnabled(), 'the notification preference after reload');
   await notificationChoice.selectOption('mentions');
   await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
@@ -253,7 +255,7 @@ try {
   await host.waitForURL(/\/r\//); const hostedUrl = host.url(), hostedId = hostedUrl.split('/r/')[1];
   cli('person', 'companion', hostedUrl);
   const code = await until(() => cli('person', 'rooms').find(r => r.roomId === hostedId && r.code)?.code, 'the companion code');
-  await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(host);
   await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await host.locator('details.browser-link-device > summary').click();
   await host.getByLabel('Device code', { exact: true }).fill(code);
@@ -269,7 +271,7 @@ try {
   await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor({ timeout: 45_000 });
   await local.locator('.browser-requests').waitFor({ state: 'detached', timeout: 20_000 });
   await visible(local, '2 people in this room');
-  await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(local);
   await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await until(async () => await notificationChoice.inputValue() === 'mentions' && await notificationChoice.isEnabled(), 'a second room to keep its own notification preference');
   await notificationChoice.selectOption('all');
@@ -279,7 +281,9 @@ try {
   const handOff = local.locator('label.browser-setting', { hasText: 'Agents can hand tasks to each other' }).locator('input');
   await handOff.click();
   await visible(local, 'Agents can now hand tasks to each other.');
-  await until(async () => { await host.reload(); await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  // Closed again, so the checks below start from the conversation: a wide page would reopen it after each reload.
+  await local.getByRole('button', { name: 'Close room details', exact: true }).click();
+  await until(async () => { await host.reload(); await openRoomDetails(host);
     await host.locator('#browser-room-details').getByRole('tab', { name: /^Rules/ }).click();
     return host.locator('label.browser-setting', { hasText: 'Agents can hand tasks to each other' }).locator('input').isChecked(); }, 'the setting to reach the host', 45_000);
   await snapshot(local, 'local-ui-host-actions.png');

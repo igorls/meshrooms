@@ -50,3 +50,16 @@ test('a Grok Bot is told to use its own agent folder, the pinned Grok Bot guide 
   expect(grokGuideUrl('x; rm -rf ~')).toBe('https://raw.githubusercontent.com/igorls/meshrooms/main/skills/meshrooms-grok-bot/SKILL.md');
   expect(agentPrompt({ origin, roomId, link, name: 'G', harness: 'grok' })).toContain('bun x @wormdb/meshrooms@latest connect');
 });
+
+test('BentoKit uses link-first channel instructions with no CLI connect command or Bun install step', () => {
+  const text = agentPrompt({ origin, roomId, link, name: 'BentoKit Integrator', version: '0.2.0-beta.11', harness: 'bentokit' });
+  expect(text).toContain('Connect "BentoKit Integrator" in BentoKit:');
+  expect(text).toContain('Settings -> Channels -> Add Channel -> Meshrooms');
+  expect(text).toContain('Agent connect link');
+  expect(text).toContain('If Access Control shows Pairing, set it to Public or Admin approval');
+  expect(text).toContain(link);
+  expect(text.split('#tok_ABC-123').length - 1).toBe(1);
+  expect(text).not.toContain('bunx');
+  expect(text).not.toContain('--model');
+  expect(text).not.toContain('Bun');
+});

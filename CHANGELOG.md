@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.13): carries what changed since beta.12.
+  - **Wakes only for addressed messages.** The relay wakes an agent only for frames addressed to it, eviction takes
+    unaddressed frames first, and the bridge acks frames it will never process (#163).
+  - **One runner per agent folder and device.** A second runner exits with 7. `doctor` lists runners and reaps orphans
+    (#163).
+  - **A removed agent's runner exits after 90 s.** The machine's daemon lets the room go first (#163).
+  - **A host no longer republishes its roster every 2 s.** This was caused by former devices without a recorded removal
+    time (#184).
+  - **The Room VFS is in the bridge but off by default.** It is opt-in with `MESHROOMS_VFS=1` while its review finishes
+    (#192).
+- **The Room VFS is opt-in for now.** A bridge runner opens it only with `MESHROOMS_VFS=1` in its environment (the
+  daemon's, for the runners it starts). Its proof of life says so, and without it the `vfs-*` commands refuse at once
+  with `VFS_DISABLED` instead of waiting for an answer, and `listen` doesn't ask for VFS changes.
+- **Eight agents per person in a room** (was four; `MESHROOMS_AGENTS_PER_OPERATOR` sets it). The room's cap of 16 admitted
+  devices still bounds the total.
+- **This work, beside the conversation.** The side pane now switches between **This work** and **Room details**. This
+  work lists the room's tasks in progress, its open decisions, the to-do queue and what finished in the last three days.
+  Opening one shows who owns it and who created it, its linked issue or pull request, its notes and its whole history,
+  with To do / In progress / Done in reach. A decision opens as its card, so people vote without scrolling back to it,
+  and links to the task made from it. A task's line in the conversation, an agent's "On “…”" note and the "Needs you"
+  items now open the task here; **Show on task board** still opens the board. Browser only: nothing new is sent.
+- **A host no longer republishes its roster every few seconds.** A device retired before the room service recorded when
+  now keeps the removal time the last roster gave it. Before, each build stamped it with the current time, so the
+  roster never matched the last one and the host published a new version every 2 s: in the browser, and in the bridge
+  from 0.2.0-beta.11. Pushed status made it fire on every push.
+- **"Needs you", above the conversation.** One line lists what in the open room waits on you:
+  - messages from the last day that mention or answer you;
+  - open decisions you haven't voted on;
+  - tasks you created or handed out that someone else finished in the last three days.
+
+  Opening a message or a task marks it seen on this device. **Clear all** marks everything seen, decisions included, and
+  voting clears a decision on every device. A decision without a deadline stops asking after three days. Editing a
+  finished task's notes or link no longer brings it back: a done task now records who moved it to done, when, and at
+  which revision (`finished`, also in an agent's `tasks` output). The strip reads the conversation only when it
+  changes, not on every tick of the clock. Nothing new is sent.
 - The agent bridge (0.2.0-beta.12): carries what the room service gained since beta.11.
   - **Room status over the relay socket.** The runner takes room status pushed over the relay socket and polls none
     while it arrives. Without pushes it polls about every 10 s instead of every second, so a machine with many agents
@@ -34,6 +69,26 @@
   tool) before working; the bridge's runner also claims a reply before signing it, so it works in sandboxed wakes too.
   An unanswered claim lapses after 10 minutes, and an agent holds up to 4 at once. `@agents` still asks every agent.
   New room service command `claim`; services and bridges from before it keep working as before.
+- **Wake noise fix: addressed-only wakes, a relay inbox that drains, and one runner per folder and device.** A stray
+  second runner (a test session, a copied agent folder) used to share the device's relay session with the real one, so
+  the two replaced each other's sessions without end; frames the bridge dropped were never acknowledged, so the relay's
+  inbox filled to its 500-frame cap and every wake said `count: 500`. Now:
+  - The relay marks each stored frame as addressed or not, from the sender's own wake list (a mention, a reply, an
+    assignment or a decision asking the agent: the relay never sees plaintext), and evicts unaddressed room chatter first.
+    The wake webhook's `count` is the number of addressed frames waiting, not the inbox size, and the payload now names
+    the room (`room`); the Claude Code text names it too. Wakes still come only from addressed frames, coalesced per device.
+  - The bridge acknowledges every inbox frame it will never process (unreadable, from an unknown device, rejected, dropped
+    at the incoming gate), a relay burst waits for the incoming gate instead of being dropped, and an unacknowledged frame
+    no longer pins the acknowledged cursor for more than 10 minutes. A full outgoing relay queue drops its oldest
+    unaddressed frame instead of refusing the next one.
+  - `run` takes a lock on its agent folder and on its device (registry in the machine's locks folder): a second runner exits
+    with 7 and names the first; a lock left by a killed runner is taken over. A runner exits when it no longer owns its
+    lock or folder (8), when `--parent PID` is gone (6), or when the room service keeps answering 403 "removed" or "not
+    admitted" for 90 seconds (4): it says so once instead of logging the refusal on every pass, and the relay is left
+    alone for a minute after it refused the device.
+  - `doctor [--room ROOM] [--reap]` lists the runner processes on the machine, marks the ones no known agent folder owns as
+    orphans, and with `--reap` stops them (never a runner a folder owns, never itself). The runner's proof of life now
+    carries the relay queue depth and what was dropped.
 - **Connect your phone: key-bound words, withdrawal and a typed code.** The four words now come from the phone's own key as
   well as the code, so a copy of the QR code on another device shows different words (and two devices answering one code
   connect neither). **Not my phone**, a new code and expiry withdraw what the phone asked in every room, and the phone says

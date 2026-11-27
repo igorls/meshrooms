@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
+import { openRoomDetails } from './room-details.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MESHROOMS_PLAYWRIGHT_MODULE || 'playwright');
 const origin = process.env.MESHROOMS_BROWSER_TEST_ORIGIN || 'http://127.0.0.1:14332';
@@ -134,7 +135,7 @@ try {
   // Once signed in (the room is listed), as a person opens it.
   await local.getByRole('link', { name: /Agents check/ }).first().click();
   await local.waitForURL(new RegExp(`/r/${roomId}$`));
-  await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(local);
   const panel = local.locator('#browser-room-details'), section = panel.locator('.browser-local-agents');
 
   // No agents yet: the new agent form is open, with the harnesses found here (the fakes) and the custom command shown

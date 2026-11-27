@@ -54,7 +54,10 @@ FIRST VIEWPORT: the navy rail holds recent rooms and the current identity. The
 room header establishes context; conversation and the anchored composer lead.
 People, invitations, and both device operations belong in Room details, opened
 beside chat on wide screens. Below 1150px it occupies the conversation area until
-closed, preserving the draft, scroll position, and keyboard return target. Mobile
+closed, preserving the draft, scroll position, and keyboard return target. The
+same pane switches to This work: the room's tasks and open decisions, and one of
+them in full when opened from the conversation, an agent's activity or Needs you;
+closing it returns focus to what opened it. Mobile
 compresses navigation into a small brand/rooms bar; no roster precedes the chat.
 Admission requests alone interrupt the conversation path. Spacing is tight within
 message groups and generous between authors; long histories and detail lists

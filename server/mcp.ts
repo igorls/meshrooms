@@ -22,13 +22,18 @@
  *    in-process, so validation, argument parsing and every refusal are the same code the CLI runs,
  *    not a reimplementation that could drift.
  */
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { validateVfsPath } from '../src/browser/vfs/path';
 import { agentCli, TEXT_OPTIONS } from './agent-cli';
 
 /** The wake subcommands this server exposes. Deliberately not connect/watch/profile/stop. */
-export const MCP_TOOLS = ['listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status'] as const;
+export const MCP_TOOLS = [
+  'listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status',
+  'vfs-list', 'vfs-read', 'vfs-write', 'vfs-patch', 'vfs-history', 'vfs-diff', 'vfs-revert', 'vfs-delete',
+] as const;
 export type McpTool = (typeof MCP_TOOLS)[number];
 
 export const SERVER_NAME = 'meshrooms';
@@ -40,13 +45,34 @@ type Schema = { type: 'object'; properties: Record<string, unknown>; required?: 
 
 const str = (description: string) => ({ type: 'string', description });
 const num = (description: string) => ({ type: 'integer', description });
+const bool = (description: string) => ({ type: 'boolean', description });
 const arr = (description: string, items: unknown) => ({ type: 'array', description, items });
+
+const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+/** Text/patch flags that mean "read stdin" on the CLI and must never accept "-" over stdio MCP. (Lazy to avoid TDZ on circular agent-cli <-> mcp import.) */
+const isMcpStdinFlag = (flag: string) =>
+  flag === '--patch' || TEXT_OPTIONS.includes(flag as (typeof TEXT_OPTIONS)[number]);
+
+const VFS_HUNK_SCHEMA = {
+  type: 'object',
+  properties: {
+    op: { type: 'string', enum: ['replace', 'insert_after', 'insert_before', 'append', 'prepend'], description: 'Hunk operation kind.' },
+    old: str('Exact text to replace (for op="replace").'),
+    new: str('Replacement text (for op="replace").'),
+    anchor: str('Exact anchor text (for op="insert_after" or op="insert_before").'),
+    text: str('Text to insert, append, or prepend.'),
+    before: str('Optional preceding context to disambiguate a repeated anchor.'),
+    after: str('Optional following context to disambiguate a repeated anchor.'),
+  },
+  required: ['op'],
+  additionalProperties: false,
+};
 
 /**
  * Tool schemas. Note what is ABSENT and why:
  * - no `room` anywhere (the launch argument owns it);
- * - no `--out` on attachment and no `--note` on status: the wake guard refuses both, so offering
- *   them would only produce a refusal the model could have been spared.
+ * - no `--out` on attachment, no `--note` on status, and no host `*-file` paths on VFS tools:
+ *   the wake guard refuses them (or host paths cannot be reached from a file-less MCP harness).
  */
 export const TOOL_SCHEMAS: Record<McpTool, { title: string; description: string; schema: Schema }> = {
   listen: { title: 'Read the room once', description: 'Read the room once and return what needs you: messages addressed to you, tasks assigned to you, decisions asking you. Pass wait_seconds to wait for something to arrive. If nothing is listed, there is nothing to do.',
@@ -75,6 +101,22 @@ export const TOOL_SCHEMAS: Record<McpTool, { title: string; description: string;
     schema: { type: 'object', properties: { id: str('The attachment id from listen.'), wait_seconds: num('How long to wait for a device that has it (1-300).') }, required: ['id'], additionalProperties: false } },
   status: { title: 'Read room status', description: 'Show members and whether this agent is admitted. Setting a note is not available during a wake.',
     schema: { type: 'object', properties: {}, additionalProperties: false } },
+  'vfs-list': { title: 'List shared room documents', description: 'List encrypted shared documents in the room VFS (paths, node IDs, revisions, sizes, timestamps).',
+    schema: { type: 'object', properties: { include_deleted: bool('Include soft-deleted documents.') }, additionalProperties: false } },
+  'vfs-read': { title: 'Read a shared room document', description: 'Read a shared room document by relative path or node_id, optionally at a historical revision or byte offset/limit.',
+    schema: { type: 'object', properties: { path: str('Relative room document path (e.g. "notes.md" or "specs/api.md").'), node_id: str('Stable document UUID from vfs-list.'), rev: str('Optional frontier revision or commit ID to inspect historically.'), offset: num('Optional byte offset (>= 0) for paginated reads.'), limit: num('Optional byte limit (>= 1, default 65536).') }, additionalProperties: false } },
+  'vfs-write': { title: 'Create or write a shared room document', description: 'Create or overwrite a shared document with inline UTF-8 text. A fresh request_id UUID is generated if omitted; pass reply_to in humans-first rooms.',
+    schema: { type: 'object', properties: { request_id: str('Optional fresh UUID for retry idempotency; generated if omitted.'), path: str('Relative room document path.'), node_id: str('Stable document UUID when updating by ID.'), text: str('Full UTF-8 document text (inline; no host file paths).'), base_rev: str('Optional expected revision from vfs-read.'), message: str('Optional short commit summary.'), reply_to: str('The message id you are answering (for room floor rules).') }, required: ['text'], additionalProperties: false } },
+  'vfs-patch': { title: 'Patch a shared room document', description: 'Apply anchor-based edit hunks to a shared document at base_rev. Disjoint concurrent edits auto-rebase; conflicting edits fail closed with VFS_CONFLICT.',
+    schema: { type: 'object', properties: { request_id: str('Optional fresh UUID for retry idempotency; generated if omitted.'), path: str('Relative room document path.'), node_id: str('Stable document UUID.'), base_rev: str('Revision from vfs-read that your patch anchors target.'), hunks: arr('Ordered edit hunks to apply.', VFS_HUNK_SCHEMA), patch: str('Alternative JSON string encoding of the hunks array.'), message: str('Optional short commit summary.'), reply_to: str('The message id you are answering (for room floor rules).') }, required: ['base_rev'], additionalProperties: false } },
+  'vfs-history': { title: 'Inspect shared document history', description: 'List commit history, authors, timestamps, and any concurrent-edit-during-revert warnings for a shared document.',
+    schema: { type: 'object', properties: { path: str('Relative room document path.'), node_id: str('Stable document UUID.'), limit: num('Maximum number of commits to return (>= 1).') }, additionalProperties: false } },
+  'vfs-diff': { title: 'Diff two revisions of a shared document', description: 'Compute a unified line diff between two revisions or commit IDs of a shared document (to defaults to head).',
+    schema: { type: 'object', properties: { path: str('Relative room document path.'), node_id: str('Stable document UUID.'), from: str('Base revision or commit ID.'), to: str('Target revision or commit ID (defaults to current head).') }, required: ['from'], additionalProperties: false } },
+  'vfs-revert': { title: 'Revert a shared document', description: 'Revert a shared document to a prior commit using a forward CRDT-safe compensating op so offline peers converge cleanly.',
+    schema: { type: 'object', properties: { request_id: str('Optional fresh UUID for retry idempotency; generated if omitted.'), path: str('Relative room document path.'), node_id: str('Stable document UUID.'), commit: str('Target commit ID from vfs-history.'), message: str('Optional short revert summary.'), reply_to: str('The message id you are answering (for room floor rules).') }, required: ['commit'], additionalProperties: false } },
+  'vfs-delete': { title: 'Soft-delete or restore a shared document', description: 'Soft-delete a shared document (agents may only soft-delete documents they created; humans may soft-delete or restore any document).',
+    schema: { type: 'object', properties: { request_id: str('Optional fresh UUID for retry idempotency; generated if omitted.'), path: str('Relative room document path.'), node_id: str('Stable document UUID.'), restore: bool('Restore a soft-deleted document (humans only).'), message: str('Optional short commit summary.'), reply_to: str('The message id you are answering (for room floor rules).') }, additionalProperties: false } },
 };
 
 /**
@@ -90,7 +132,7 @@ export function toolArgv(tool: McpTool, args: Record<string, unknown>, room: str
   const push = (flag: string, value: unknown) => {
     if (value === undefined || value === null) return;
     const text = String(value);
-    if (TEXT_OPTIONS.includes(flag as (typeof TEXT_OPTIONS)[number]) && text.trim() === '-') {
+    if (isMcpStdinFlag(flag) && text.trim() === '-') {
       throw new Error(`${flag} cannot be "-" here: that would read the server's own stdin. Write the text out, or use the matching -file option with a path in the wake folder.`);
     }
     argv.push(flag, text);
@@ -99,6 +141,55 @@ export function toolArgv(tool: McpTool, args: Record<string, unknown>, room: str
     if (value === undefined || value === null) return;
     if (!Array.isArray(value)) throw new Error(`${flag} expects a list of values.`);
     for (const item of value) argv.push(flag, String(item));
+  };
+  const pushVfsPath = (value: unknown) => {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'string') throw new Error('--path must be a relative room document path string.');
+    const checked = validateVfsPath(value);
+    if (!checked.ok) throw new Error(`Invalid VFS path: ${checked.message}`);
+    argv.push('--path', checked.normalized);
+  };
+  const pushUuid = (flag: string, value: unknown) => {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'string' || !UUID_RE.test(value.trim())) {
+      throw new Error(`${flag} must be a valid UUID.`);
+    }
+    argv.push(flag, value.trim().toLowerCase());
+  };
+  const pushVfsRequestId = (value: unknown) => {
+    if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) {
+      argv.push('--request-id', randomUUID());
+      return;
+    }
+    pushUuid('--request-id', value);
+  };
+  const pushInt = (flag: string, value: unknown, min: number) => {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min) {
+      throw new Error(`${flag} must be an integer >= ${min}.`);
+    }
+    argv.push(flag, String(value));
+  };
+  const pushVfsPatch = (hunks: unknown, patch: unknown) => {
+    if (hunks !== undefined && hunks !== null && patch !== undefined && patch !== null) {
+      throw new Error('Pass either hunks or patch, not both.');
+    }
+    if (hunks !== undefined && hunks !== null) {
+      if (!Array.isArray(hunks)) throw new Error('hunks must be an array of edit hunk objects.');
+      argv.push('--patch', JSON.stringify(hunks));
+      return;
+    }
+    if (patch !== undefined && patch !== null) {
+      if (typeof patch === 'string') {
+        push('--patch', patch);
+        return;
+      }
+      if (Array.isArray(patch) || typeof patch === 'object') {
+        argv.push('--patch', JSON.stringify(patch));
+        return;
+      }
+      throw new Error('patch must be a JSON string or array of edit hunks.');
+    }
   };
   switch (tool) {
     case 'listen': push('--wait-seconds', args.wait_seconds); if (args.peek === true) argv.push('--peek'); break;
@@ -113,6 +204,61 @@ export function toolArgv(tool: McpTool, args: Record<string, unknown>, room: str
     case 'ask': push('--request-id', args.request_id); push('--question', args.question); pushList('--option', args.options); push('--context', args.context); push('--ask-agents', args.ask_agents); push('--closes', args.closes); push('--reply-to', args.reply_to); break;
     case 'decision-wait': push('--decision', args.decision); push('--wait-seconds', args.wait_seconds); break;
     case 'attachment': push('--id', args.id); push('--wait-seconds', args.wait_seconds); break;
+    case 'vfs-list':
+      if (args.include_deleted === true) argv.push('--include-deleted');
+      break;
+    case 'vfs-read':
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      push('--rev', args.rev);
+      pushInt('--offset', args.offset, 0);
+      pushInt('--limit', args.limit, 1);
+      break;
+    case 'vfs-write':
+      pushVfsRequestId(args.request_id);
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      push('--text', args.text);
+      push('--base-rev', args.base_rev);
+      push('--message', args.message);
+      push('--reply-to', args.reply_to);
+      break;
+    case 'vfs-patch':
+      pushVfsRequestId(args.request_id);
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      push('--base-rev', args.base_rev);
+      pushVfsPatch(args.hunks, args.patch);
+      push('--message', args.message);
+      push('--reply-to', args.reply_to);
+      break;
+    case 'vfs-history':
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      pushInt('--limit', args.limit, 1);
+      break;
+    case 'vfs-diff':
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      push('--from', args.from);
+      push('--to', args.to);
+      break;
+    case 'vfs-revert':
+      pushVfsRequestId(args.request_id);
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      push('--commit', args.commit);
+      push('--message', args.message);
+      push('--reply-to', args.reply_to);
+      break;
+    case 'vfs-delete':
+      pushVfsRequestId(args.request_id);
+      pushVfsPath(args.path);
+      pushUuid('--node-id', args.node_id);
+      if (args.restore === true) argv.push('--restore');
+      push('--message', args.message);
+      push('--reply-to', args.reply_to);
+      break;
   }
   return argv;
 }

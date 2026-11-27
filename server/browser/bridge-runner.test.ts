@@ -7,7 +7,7 @@ import {
   watcherRunnerCheck, withRunnerLock, type FoundRunner, type RepairDeps,
 } from '../agent-cli';
 import {
-  BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerWedged, UPGRADE_BACKOFF_MS, runBridge, withGatheredCandidates, runnerStopped, runnerStuck, runnerTrouble, serviceSilence, settleWithin, stuckFor, within,
+  BrowserAgent, PENDING_PROFILE, RUNNER_ALIVE, RUNNER_STUCK_MS, RunnerStopped, RunnerWedged, UPGRADE_BACKOFF_MS, runBridge, withGatheredCandidates, runnerStopped, runnerStuck, runnerTrouble, serviceSilence, settleWithin, stuckFor, within,
 } from '../browser-agent';
 import { CONNECT_TIMEOUT_MS, FILE_CHANNEL_LABEL, PRIMARY_CHANNEL_LABEL, UNHEALTHY_GRACE_MS } from '../../src/browser/pacer';
 import { fakeRunner } from './fake-runner';
@@ -506,6 +506,84 @@ test('run exits when the runner wedges, so nothing of it lingers beside the next
   expect(logs).toEqual(["The runner's outbox step never finished; start the runner again."]);
   await expect(runRunner(r.agent, deps(async () => { throw Object.assign(new Error('This room was closed by its host.'), { status: 410 }); }))).rejects.toThrow('closed by its host');
   expect(exits).toEqual([1]);
+});
+
+test('a second runner exits with 7 and names the first instead of starting, and a runner that is stopped on purpose exits with its code and gives its lock back', async () => {
+  const r = room(), exits: number[] = [], logs: string[] = [];
+  let bridged = 0, released = 0;
+  const base = { check: async () => {}, exit: (code: number) => { exits.push(code); }, log: (line: string) => logs.push(line) };
+  await runRunner(r.agent, { ...base, claim: () => ({ ok: false as const, holder: 4242, scope: 'folder' as const }), bridge: async () => { bridged++; } });
+  expect(exits).toEqual([7]);
+  expect(bridged).toBe(0);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain('pid 4242');
+  expect(logs[0]).toContain('agent folder');
+  // The same for another folder with this device's identity.
+  await runRunner(r.agent, { ...base, claim: () => ({ ok: false as const, holder: undefined, scope: 'device' as const }), bridge: async () => { bridged++; } });
+  expect(exits).toEqual([7, 7]);
+  expect(logs[1]).toContain('device');
+  // Holding the lock: the bridge runs, is handed the stop check, and the lock is released however it ends.
+  const claim = { ok: true as const, held: () => true, release: () => { released++; } };
+  let asked: (() => unknown) | undefined;
+  await runRunner(r.agent, { ...base, claim: () => claim, parentAlive: () => true, bridge: async (_agent, extra) => { asked = extra.shouldStop; } }, { parent: 99 });
+  expect(released).toBe(1);
+  expect(asked?.()).toBeUndefined();
+  await runRunner(r.agent, { ...base, claim: () => claim, parentAlive: () => false, bridge: async (_agent, extra) => { throw new RunnerStopped(extra.shouldStop()!.reason, extra.shouldStop()!.code); } }, { parent: 99 });
+  expect(exits.at(-1)).toBe(6);
+  expect(released).toBe(2);
+  await expect(runRunner(r.agent, { ...base, claim: () => claim, bridge: async () => { throw new Error('boom'); } })).rejects.toThrow('boom');
+  expect(released).toBe(3);
+});
+
+test('a runner whose device was removed (403) says so once, stops retrying and exits with 4, leaving the proof that it was removed', async () => {
+  let polls = 0;
+  const r = room({ status: () => { polls++; return Promise.reject(Object.assign(new Error('This device was removed from the room.'), { status: 403 })); } });
+  const logs: string[] = [];
+  const outcome = await runBridge(r.agent, line => logs.push(line), { pause: r.pause, deniedExitMs: 300 }).then(() => undefined, error => error);
+  expect(outcome).toBeInstanceOf(RunnerStopped);
+  expect((outcome as RunnerStopped).code).toBe(4);
+  // Many polls, one line: the refusal is not logged on every pass.
+  expect(polls).toBeGreaterThan(3);
+  expect(logs.filter(line => line.includes('refused this device (403)'))).toHaveLength(1);
+  expect(logs.some(line => line.includes('exiting without retrying'))).toBe(true);
+  expect(r.proof().removedSince).toBeGreaterThan(0);
+  // It no longer polls once it has gone.
+  const settled = polls;
+  await Bun.sleep(100);
+  expect(polls).toBe(settled);
+});
+
+test('a runner answered "not admitted" after it was a member exits once the removal has lasted, and one that is admitted again before then goes on', async () => {
+  const r = room({ status: () => Promise.resolve({ roomId, epoch: 'one', members, devices: [], settings: { floor: 'open', agentAssignmentsWake: false, guestAgentApproval: true } }) });
+  const logs: string[] = [];
+  const outcome = await runBridge(r.agent, line => logs.push(line), { pause: r.pause, deniedExitMs: 300 }).then(() => undefined, error => error);
+  expect(outcome).toBeInstanceOf(RunnerStopped);
+  expect((outcome as RunnerStopped).code).toBe(4);
+  expect(logs.filter(line => line === 'not admitted to this room')).toHaveLength(1);
+  // A brief refusal that ends before the limit never stops the runner.
+  let refuse = true;
+  const brief = room({ status: () => refuse ? Promise.reject(Object.assign(new Error('not admitted to this room'), { status: 403 })) : undefined });
+  const controller = new AbortController();
+  const running = runBridge(brief.agent, () => {}, { pause: brief.pause, deniedExitMs: 5_000, signal: controller.signal }).then(() => 'ended', error => error);
+  await Bun.sleep(150);
+  refuse = false;
+  await brief.until(() => brief.proof().polledAt > 0);
+  expect(brief.proof().removedSince).toBeUndefined();
+  controller.abort();
+  expect(await running).toBe('ended');
+});
+
+test('a runner asked to stop (its parent is gone, or another runner took its place) retires its peers and exits with that code', async () => {
+  const r = room();
+  const logs: string[] = [];
+  let stop: { reason: string; code: 6 | 8 } | undefined;
+  const bridge = runBridge(r.agent, line => logs.push(line), { pause: r.pause, shouldStop: () => stop }).then(() => undefined, error => error);
+  await r.until(() => r.state.polls >= 3);
+  stop = { reason: 'its parent process (pid 1) is gone', code: 6 };
+  const outcome = await bridge;
+  expect(outcome).toBeInstanceOf(RunnerStopped);
+  expect((outcome as RunnerStopped).code).toBe(6);
+  expect(logs).toContain('stopping: its parent process (pid 1) is gone');
 });
 
 /** Runs `work` with MESHROOMS_AGENT_HOME set to `home`. */
