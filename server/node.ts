@@ -4,7 +4,7 @@ import type { Attachment, Draft, NodeSnapshot, Participant, RoomSnapshot } from 
 import { memoryBlobs, type BlobStore } from './blobs';
 import { MAX_ATTACHMENT_BYTES, MAX_MESSAGE_ATTACHMENTS, MAX_PENDING_ATTACHMENTS, MAX_ROOM_ATTACHMENTS, MAX_ROOM_ATTACHMENT_BYTES, PENDING_ATTACHMENT_MS,
   cleanName, defaultName, normalizeAttachment, sniff } from './attachments';
-import { DEFAULT_FLOOR, FLOORS, TASK_STATUSES, mayAgentSpeak, mentionedIds, reservedName, type Floor, type Task } from '../src/collab';
+import { DEFAULT_FLOOR, TASK_STATUSES, mayAgentSpeak, mentionedIds, reservedName, speakRefusal, type Floor, type Task } from '../src/collab';
 import type { SetupCommand, PendingRoom } from '../src/setup';
 import type { DurableStore } from './persistence/store';
 import { CATALOG, CATALOG_V1, MAX_BOARD_RECEIPTS, MAX_ROOMS, MAX_MESSAGES, MAX_HISTORY_BYTES, MAX_TASKS, attachmentsKey, boardKey, fingerprint, historyKey, isHash, isUuid,
@@ -233,8 +233,8 @@ export class LocalNode {
     if (history.messages.length >= MAX_MESSAGES) throw new NodeError(409, `This local beta supports ${MAX_MESSAGES} messages per room.`);
     const actor = this.person(principal.participantId);
     const attachments = attachmentIds && this.bindable(room, principal, attachmentIds);
-    if (actor.role === 'agent' && !mayAgentSpeak(this.floorView(room), actor.id, replyTo)) {
-      throw new NodeError(409, 'This room is humans-first: agents speak only when a person addresses them. Reply to a message that mentions you or replies to you, or work on a task a person assigned to you.');
+    if (actor.role === 'agent' && !mayAgentSpeak(this.floorView(room), actor.id, replyTo, body)) {
+      throw new NodeError(409, speakRefusal(room.floor));
     }
     const message: StoredMessage = { id: randomUUID(), authorId: actor.id, author: actor.name, role: actor.role, text: body,
       time: new Date().toISOString(), share, replyTo, ...(attachments ? { attachments } : {}), requestId: id, fingerprint: hash };
@@ -293,7 +293,8 @@ export class LocalNode {
   setFloor(input: { roomId?: unknown; requestId?: unknown; floor?: unknown }, principal: Principal = this.owner): { roomId: string } {
     this.assertReady(); this.requireOwner(principal); requestId(input.requestId);
     const room = this.requireRoom(input.roomId, principal);
-    if (!FLOORS.includes(input.floor as Floor)) throw new NodeError(400, 'Choose humans-first or open for agent replies.');
+    // The frozen local node's interface offers only the first two: people-and-agents is for hosted rooms.
+    if (input.floor !== 'humans-first' && input.floor !== 'open') throw new NodeError(400, 'Choose humans-first or open for who wakes agents.');
     if ((room.floor ?? DEFAULT_FLOOR) === input.floor) return { roomId: room.id };
     const next = structuredClone(this.catalog); next.rooms.find(r => r.id === room.id)!.floor = input.floor as Floor;
     this.saveCatalog(next); return { roomId: room.id };

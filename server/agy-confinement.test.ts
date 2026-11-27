@@ -131,3 +131,23 @@ test('writeAgyWakeHooks writes .agents/hooks.json and runAgyHookCli fails closed
     async () => JSON.stringify({ toolCall: { name: 'run_command', args: { CommandLine: `bun "${LAUNCHER}" listen --room ${ROOM}` } } }),
   )).toEqual({ decision: 'auto_approve' });
 });
+
+test('a Windows path in double quotes passes on Windows, and is still refused where a backslash escapes', () => {
+  const wake = folder();
+  const policy = { roomId: ROOM, launcher: 'C:/Users/someone/.meshrooms/bin/meshrooms.js', wakeDir: wake, delimiter: DELIM };
+  // The prompt spells the launcher with forward slashes, but an agent may type the wake folder in its native spelling.
+  const native = 'bun "C:\\Users\\someone\\.meshrooms\\bin\\meshrooms.js" help';
+  expect(checkAgyCommand(native, policy, undefined, 'win32')).toEqual({ ok: true });
+  expect(checkAgyCommand(native, policy, undefined, 'linux')).toMatchObject({ ok: false, reason: expect.stringContaining('escape') });
+  // Even on Windows, a backslash may not act on the quote or the backslash after it (a Bourne-style shell would read it
+  // as an escape), and `$`, backticks and operators stay refused inside the quotes.
+  for (const bad of [
+    'bun "C:\\Users\\someone\\.meshrooms\\bin\\meshrooms.js\\" help',
+    'bun "C:\\Users\\\\someone\\.meshrooms\\bin\\meshrooms.js" help',
+    'bun "C:\\Users\\$HOME\\.meshrooms\\bin\\meshrooms.js" help',
+    'bun "C:\\Users\\someone\\.meshrooms\\bin\\meshrooms.js" help ; calc',
+    'bun C:\\Users\\someone\\.meshrooms\\bin\\meshrooms.js help',
+  ]) expect(checkAgyCommand(bad, policy, undefined, 'win32').ok).toBe(false);
+  // A wake-folder path in the platform's own spelling, quoted, is accepted for --out wherever the tests run.
+  expect(checkAgyCommand(`bun "${policy.launcher}" attachment --room ${ROOM} --id 11111111-2222-4333-8444-555555555555 --out "${join(wake, 'downloads')}"`, policy).ok).toBe(true);
+});

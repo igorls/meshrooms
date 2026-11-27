@@ -12,7 +12,8 @@ import type { ActivityRecord } from './activity';
 import { autoFetchFiles, retainedFiles } from './files';
 import type { FileView, SavedMessage } from './peers';
 import type { ReactionChip } from './reactions';
-import { retractedStub } from './retractions';
+import { retractedStub, type RetractBody } from './retractions';
+import { messageKey } from './history-sync';
 import type { RecentRoom } from './background';
 import type { UnreadCount, Waiting } from './unread';
 import type { BrowserDevice, RoomStatus } from './protocol';
@@ -26,7 +27,7 @@ type PersonStatus = Omit<RoomStatus, 'devices' | 'signals' | 'iceServers'> & { d
 type View = {
   roomId: string; origin: string; title: string | null; state: 'joined' | 'waiting' | 'declined' | 'expired' | 'closed' | 'removed' | 'starting'; code?: string; reason?: string;
   memberId: string | null; status: PersonStatus | null; messages: SavedMessage[]; deleted: string[]; more: boolean; taskOps: TaskBody[]; decisionOps: (DecisionBody | VoteBody)[];
-  reactions: ReactionChip[]; files: Record<string, { held: boolean; transfer?: FileView['transfer'] }>; read: { id?: string; at: number };
+  reactions: ReactionChip[]; retractOps?: RetractBody[]; files: Record<string, { held: boolean; transfer?: FileView['transfer'] }>; read: { id?: string; at: number };
 };
 type LocalEvent = { type: 'message' | 'members' | 'room'; roomId: string } | { type: 'rooms'; roomIds: string[] };
 export type ApiFailure = Error & { status?: number };
@@ -332,12 +333,12 @@ export class LocalSource implements RoomSource {
         events.network('');
         // When the sliding window advances past the end of `older`, merge any displaced messages from `current` into
         // `older` so the conversation stays contiguous; if the window jumped completely past `current`, reset to avoid a gap.
-        const viewIds = new Set(view.messages.map(v => v.packet.body.id));
+        const viewKeys = new Set(view.messages.map(v => messageKey(v.packet.body.deviceId, v.packet.body.id)));
         if (!first && current.length && view.messages.length) {
-          const overlap = current.findIndex(m => viewIds.has(m.packet.body.id));
+          const overlap = current.findIndex(m => viewKeys.has(messageKey(m.packet.body.deviceId, m.packet.body.id)));
           if (overlap > 0) {
-            const olderIds = new Set(older.map(m => m.packet.body.id));
-            const displaced = current.slice(0, overlap).filter(m => !olderIds.has(m.packet.body.id));
+            const olderKeys = new Set(older.map(m => messageKey(m.packet.body.deviceId, m.packet.body.id)));
+            const displaced = current.slice(0, overlap).filter(m => !olderKeys.has(messageKey(m.packet.body.deviceId, m.packet.body.id)));
             if (displaced.length) older = [...older, ...displaced];
           } else if (overlap < 0) {
             older = [];
@@ -345,16 +346,17 @@ export class LocalSource implements RoomSource {
           }
         }
         const deleted = new Set(view.deleted);
-        older = older.filter(m => !viewIds.has(m.packet.body.id)).map(m => deleted.has(m.packet.body.id) ? retractedStub(m) : m);
+        older = older.filter(m => !viewKeys.has(messageKey(m.packet.body.deviceId, m.packet.body.id))).map(m => deleted.has(m.packet.body.id) ? retractedStub(m) : m);
         const messages = [...older, ...view.messages];
         if (first || (!older.length && view.more)) more = view.more;
         // Only the newest window brings arrivals: an older page loaded on request is history, never announced as new.
-        const added = first ? undefined : view.messages.filter(m => !shown.has(m.packet.body.id)).at(-1);
-        shown = new Set(messages.map(m => m.packet.body.id)); current = messages;
+        const added = first ? undefined : view.messages.filter(m => !shown.has(messageKey(m.packet.body.deviceId, m.packet.body.id))).at(-1);
+        shown = new Set(messages.map(m => messageKey(m.packet.body.deviceId, m.packet.body.id))); current = messages;
         events.messages(messages, view.status?.connected ?? [], added);
         events.board(foldBoard(view.taskOps), view.taskOps);
         events.decisions(view.decisionOps);
         events.reactions(view.reactions);
+        if (view.retractOps) events.retractions?.(view.retractOps);
         pruneFiles(referencedShas());
         events.files(mergeFiles(view.files));
         events.activity(view.status?.activity ?? {});

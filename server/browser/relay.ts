@@ -15,6 +15,18 @@ import { WakeConnector, WakeValidationError, type WakeProvider } from './wake-co
 export const RELAY_AUTH_TIMEOUT_MS = 15_000;
 /** WSS heartbeat ping interval (25s) to keep reverse proxies and NATs alive. */
 export const RELAY_HEARTBEAT_MS = 25_000;
+/**
+ * How often a socket that watches its room's status gets it even when nothing changed: inside the room service's
+ * 25 s presence window, so a watching device stays present, and fresh TURN credentials and peers that went away reach it.
+ */
+export const RELAY_STATUS_REFRESH_MS = 10_000;
+/**
+ * A refresh goes only to a client heard from this recently (its heartbeat pings every 25 s): a frozen tab or a stuck
+ * runner whose socket stays open must not stay present for the others.
+ */
+const STATUS_CLIENT_QUIET_MS = 60_000;
+/** Changes that arrive together (a burst of signals, a decision and its votes) make one push per socket. */
+const STATUS_PUSH_DEBOUNCE_MS = 50;
 /** Frame id deduplication window (10 minutes). */
 export const RELAY_DEDUP_WINDOW_MS = 10 * 60_000;
 /** Per-device outer rate limits (120 frames/min and 2 MB/min). */
@@ -60,6 +72,17 @@ export type RelaySocketData = {
   primaryQueue: QueuedOutbound[];
   fileQueue: QueuedOutbound[];
   fileQueuedBytes: number;
+  /**
+   * The room status this socket watches (`status-watch`): the lobby session it polls as, and the epoch and signal
+   * cursor it last confirmed (`status-ack`). Pushed on every change and every RELAY_STATUS_REFRESH_MS.
+   */
+  watch?: { session: string; epoch?: string; cursor: number };
+  /** When the client last sent anything (a ping, an ack, a frame). */
+  heardAt?: number;
+  /** The service address the socket authenticated through: pushed status names the relay there. */
+  origin?: string;
+  statusTimer?: ReturnType<typeof setInterval>;
+  statusPending?: ReturnType<typeof setTimeout>;
 };
 
 type PollWaiter = {
@@ -100,6 +123,8 @@ export type RelayServiceOptions = {
   inboxMaxRoomBytes?: number;
   inboxTtlMs?: number;
   httpsSessionTtlMs?: number;
+  /** How often a watched status is pushed when nothing changed (default RELAY_STATUS_REFRESH_MS). */
+  statusRefreshMs?: number;
   log?: (line: string) => void;
 };
 
@@ -128,6 +153,7 @@ export class RelayService {
   private now: () => number;
   private authTimeoutMs: number;
   private heartbeatMs: number;
+  private statusRefreshMs: number;
   private dedupWindowMs: number;
   private rateFramesPerMin: number;
   private rateBytesPerMin: number;
@@ -154,6 +180,7 @@ export class RelayService {
 
   private unsubRemoved: () => void;
   private unsubClosed: () => void;
+  private unsubChanged: () => void;
 
   constructor(options: RelayServiceOptions) {
     this.lobby = options.lobby;
@@ -161,6 +188,7 @@ export class RelayService {
     this.now = options.now ?? Date.now;
     this.authTimeoutMs = options.authTimeoutMs ?? RELAY_AUTH_TIMEOUT_MS;
     this.heartbeatMs = options.heartbeatMs ?? RELAY_HEARTBEAT_MS;
+    this.statusRefreshMs = options.statusRefreshMs ?? RELAY_STATUS_REFRESH_MS;
     this.dedupWindowMs = options.dedupWindowMs ?? RELAY_DEDUP_WINDOW_MS;
     this.rateFramesPerMin = options.rateFramesPerMin ?? RELAY_RATE_FRAMES_PER_MIN;
     this.rateBytesPerMin = options.rateBytesPerMin ?? RELAY_RATE_BYTES_PER_MIN;
@@ -203,6 +231,7 @@ export class RelayService {
 
     this.unsubRemoved = this.lobby.onDeviceRemoved((roomId, deviceId) => this.handleDeviceRemoved(roomId, deviceId));
     this.unsubClosed = this.lobby.onRoomClosed(roomId => this.handleRoomClosed(roomId));
+    this.unsubChanged = this.lobby.onRoomChanged((roomId, deviceId) => this.handleRoomChanged(roomId, deviceId));
   }
 
   /** Creates initial per-connection state passed to `server.upgrade(request, { data })`. */
@@ -253,6 +282,7 @@ export class RelayService {
     this.openSockets.delete(ws);
     if (ws.data.authTimer) { clearTimeout(ws.data.authTimer); ws.data.authTimer = undefined; }
     if (ws.data.heartbeatTimer) { clearInterval(ws.data.heartbeatTimer); ws.data.heartbeatTimer = undefined; }
+    this.unwatch(ws);
     if (ws.data.authenticated && ws.data.roomId && ws.data.deviceId) {
       const key = `${ws.data.roomId}:${ws.data.deviceId}`;
       if (this.sockets.get(key) === ws) this.sockets.delete(key);
@@ -335,6 +365,7 @@ export class RelayService {
 
     const roomId = ws.data.roomId!;
     const deviceId = ws.data.deviceId!;
+    ws.data.heardAt = this.now();
 
     switch (msg.t) {
       case 'ping': {
@@ -347,6 +378,37 @@ export class RelayService {
         if (typeof msg.cursor === 'number' && Number.isInteger(msg.cursor) && msg.cursor > 0) {
           this.ackInbox(roomId, deviceId, msg.cursor);
         }
+        return;
+      }
+      case 'status-watch': {
+        // The lobby session this device polls as: the push stands in for its status polls (presence, signals).
+        const session = msg.session, epoch = msg.epoch, cursor = msg.cursor ?? 0;
+        if (typeof session !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session)
+          || (epoch !== undefined && typeof epoch !== 'string') || typeof cursor !== 'number' || !Number.isSafeInteger(cursor) || cursor < 0) {
+          this.enqueueSocket(ws, 'primary', { t: 'error', code: 'invalid-watch', message: 'Invalid status watch.' });
+          return;
+        }
+        // One watch per socket (a client re-sends it on each new socket): a repeat would only cost the service pushes.
+        if (ws.data.watch) {
+          this.enqueueSocket(ws, 'primary', { t: 'error', code: 'already-watching', message: 'This socket already watches its room.' });
+          return;
+        }
+        ws.data.watch = { session, ...(typeof epoch === 'string' ? { epoch } : {}), cursor };
+        ws.data.statusTimer = setInterval(() => this.pushStatus(ws), this.statusRefreshMs);
+        this.pushStatus(ws);
+        return;
+      }
+      case 'status-ack': {
+        // Signals up to `cursor` were handled: the next push leaves them out. Nothing is pushed for an ack itself.
+        const watch = ws.data.watch;
+        if (watch && typeof msg.cursor === 'number' && Number.isSafeInteger(msg.cursor) && msg.cursor >= 0) {
+          watch.cursor = msg.cursor;
+          if (typeof msg.epoch === 'string') watch.epoch = msg.epoch;
+        }
+        return;
+      }
+      case 'status-unwatch': {
+        this.unwatch(ws);
         return;
       }
       case 'frame': {
@@ -406,6 +468,7 @@ export class RelayService {
       ws.data.roomId = roomId;
       ws.data.deviceId = deviceId;
       ws.data.session = session;
+      ws.data.origin = command.origin;
       ws.data.lastSeq = 0;
       this.sockets.set(key, ws);
       this.wakeConnector?.clearPending(roomId, deviceId);
@@ -428,6 +491,8 @@ export class RelayService {
         session,
         cursor: maxCursor,
         rosterVersion,
+        // This service pushes room status to a socket that watches it (status-watch): no status polling needed.
+        status: true,
       });
 
       for (const item of pending) {
@@ -945,6 +1010,7 @@ export class RelayService {
     const ws = this.sockets.get(key);
     if (ws) {
       this.sockets.delete(key);
+      this.unwatch(ws);
       this.sendImmediate(ws, { t: 'error', code: 'removed', message: 'This device was removed from the room.' });
       try { ws.close(4003, 'Removed'); } catch { /* ignore */ }
     }
@@ -970,6 +1036,7 @@ export class RelayService {
     for (const [key, ws] of this.sockets) {
       if (!key.startsWith(prefix)) continue;
       this.sockets.delete(key);
+      this.unwatch(ws);
       this.sendImmediate(ws, { t: 'error', code: ROOM_CLOSED, message: 'This room was closed.' });
       try { ws.close(4010, ROOM_CLOSED); } catch { /* ignore */ }
     }
@@ -994,13 +1061,53 @@ export class RelayService {
     this.logOp('room-closed', 200);
   }
 
+  /** A socket that watches its room's status, pushed the status now (presence and signals as a status poll would). */
+  private pushStatus(ws: ServerWebSocket<RelaySocketData>) {
+    const watch = ws.data.watch;
+    if (!watch || !ws.data.authenticated || !this.openSockets.has(ws)) return;
+    // A push keeps the device present: none for a client gone quiet, whatever brought the push.
+    if (this.now() - (ws.data.heardAt ?? 0) > STATUS_CLIENT_QUIET_MS) return;
+    if (ws.data.statusPending) { clearTimeout(ws.data.statusPending); ws.data.statusPending = undefined; }
+    try {
+      const status = this.lobby.statusFor(ws.data.roomId!, ws.data.deviceId!, { session: watch.session, cursor: watch.cursor, ...(watch.epoch ? { epoch: watch.epoch } : {}) }, ws.data.origin);
+      this.enqueueSocket(ws, 'primary', { t: 'status', status });
+    } catch (error) {
+      // A closed room or a removed device also closes the socket (handleRoomClosed, handleDeviceRemoved).
+      const status = error instanceof LobbyError ? error.status : 500;
+      const code = error instanceof LobbyError && error.code ? error.code : undefined;
+      // Only the room service's own messages go out; anything else (a database error) stays on the server.
+      this.enqueueSocket(ws, 'primary', { t: 'status-error', status, ...(code ? { code } : {}), message: error instanceof LobbyError ? error.message : 'Status unavailable.' });
+    }
+  }
+  private schedulePush(ws: ServerWebSocket<RelaySocketData>) {
+    if (!ws.data.watch || ws.data.statusPending) return;
+    ws.data.statusPending = setTimeout(() => { ws.data.statusPending = undefined; this.pushStatus(ws); }, STATUS_PUSH_DEBOUNCE_MS);
+  }
+  private unwatch(ws: ServerWebSocket<RelaySocketData>) {
+    if (ws.data.statusTimer) { clearInterval(ws.data.statusTimer); ws.data.statusTimer = undefined; }
+    if (ws.data.statusPending) { clearTimeout(ws.data.statusPending); ws.data.statusPending = undefined; }
+    ws.data.watch = undefined;
+  }
+  /** A room's status changed: the sockets watching it (or, for a signal, its recipient's) get it pushed. */
+  private handleRoomChanged(roomId: string, deviceId?: string) {
+    if (deviceId) {
+      const ws = this.sockets.get(`${roomId}:${deviceId}`);
+      if (ws) this.schedulePush(ws);
+      return;
+    }
+    const prefix = `${roomId}:`;
+    for (const [key, ws] of this.sockets) if (key.startsWith(prefix)) this.schedulePush(ws);
+  }
+
   /** Cleanly stops all timers, closes open sockets, resolves waiting long-polls, and closes the relay SQLite DB. */
   close() {
     this.unsubRemoved();
     this.unsubClosed();
+    this.unsubChanged();
     for (const ws of this.openSockets) {
       if (ws.data.authTimer) clearTimeout(ws.data.authTimer);
       if (ws.data.heartbeatTimer) clearInterval(ws.data.heartbeatTimer);
+      this.unwatch(ws);
       try { ws.close(1001, 'Server shutting down'); } catch { /* ignore */ }
     }
     this.openSockets.clear();

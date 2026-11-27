@@ -14,6 +14,7 @@ mkdirSync(config.dataDir, { recursive: true });
 const release = acquireInstance(config.dataDir);
 const lobby = new BrowserLobby(admissionPath(config.dataDir), {
   origin: config.origin,
+  aliases: config.aliases,
   stunUrls: config.stunUrls,
   turnUrls: config.turnUrls,
   turnSecret: config.turnSecret,
@@ -43,9 +44,9 @@ if (config.relayEnabled) {
     log: line => console.log(line),
   });
 }
-const handle = browserHandler(lobby, config.origin, resolve('dist'), {
+const handle = browserHandler(lobby, [config.origin, ...config.aliases], resolve('dist'), {
   trustLoopbackProxy: config.trustLoopbackProxy,
-  apiLimit: config.trustLoopbackProxy ? 1200 : 240,
+  apiLimit: config.apiLimit,
   revision: config.revision,
   backupFresh: config.backupMaxAgeHours ? backupFreshness(config.dataDir, config.backupMaxAgeHours) : undefined,
   relay,

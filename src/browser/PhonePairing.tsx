@@ -219,7 +219,20 @@ export function PhonePairing({ active, rooms, name, device, link, command, askin
   const words = (run?.seen?.words || '').split(' ').filter(Boolean);
 
   function body(): ReactNode {
-    if (!run || !stage) return <p className="invite-lead" role="status">{device ? 'Making a code…' : 'This browser isn’t ready yet.'}</p>;
+    const qrSteps = <ol className="phone-steps">
+      <li><span>1</span><div>Open your phone’s <b>camera</b> and point it at this code.</div></li>
+      <li><span>2</span><div>Tap the link it shows, then <b>Connect this phone</b>.<small>It opens in your phone’s browser. Nothing to install.</small></div></li>
+      <li><span>3</span><div>Check that the four words match, and confirm here.</div></li></ol>;
+    if (!device && !run) return <p className="invite-lead" role="status">This browser isn’t ready yet.</p>;
+    // Before the tab is first shown no code exists yet: the same layout, empty, so the dialog is already sized for it.
+    if (!run || !stage) return <>
+      <div className="phone-layout">
+        <div className="phone-code"><div className="phone-qr-card"><span className="phone-qr-empty" role="status">Making a code…</span></div>
+          <p className="phone-ttl"><Glyph kind="clock" /><span>Works once · lasts <b>{formatCountdown(PHONE_TTL_MS)}</b></span></p></div>
+        {qrSteps}
+      </div>
+      <div><span className="invite-label">Rooms to connect · {Math.min(rooms.length, PHONE_MAX_ROOMS)}</span>
+        <div className="phone-chips">{rooms.slice(0, PHONE_MAX_ROOMS).map(r => <span key={r.id} className="phone-chip is-on"><Glyph kind="check" /><span>{r.title}</span></span>)}</div></div></>;
     if (stage === 'expired') return <div className="invite-error" role="alert"><b>{run.failure ? 'This code can’t be used.' : 'The code expired.'}</b><br />{run.failure ?? 'Codes work once and last five minutes. Nothing was shared and no phone was connected. Make a new one to try again.'}</div>;
     if (stage === 'done') return <>
       <div className="phone-done"><span className="phone-big-check" aria-hidden="true"><Glyph kind="check" /></span><b>Your phone is connected</b><span>It joined as you, not as a new person.</span></div>
@@ -257,10 +270,7 @@ export function PhonePairing({ active, rooms, name, device, link, command, askin
       <div className="phone-layout">
         <div className="phone-code"><div className={`phone-qr-card${left < 30_000 ? ' is-low' : ''}`}>{url ? <QrCode text={url} label="QR code that connects your phone. It is a one-time secret." /> : <span className="phone-qr-empty">Choose a room</span>}</div>
           <p className="phone-ttl"><Glyph kind="clock" /><span>Works once · expires in <b>{formatCountdown(left)}</b></span></p></div>
-        <ol className="phone-steps">
-          <li><span>1</span><div>Open your phone’s <b>camera</b> and point it at this code.</div></li>
-          <li><span>2</span><div>Tap the link it shows, then <b>Connect this phone</b>.<small>It opens in your phone’s browser. Nothing to install.</small></div></li>
-          <li><span>3</span><div>Check that the four words match, and confirm here.</div></li></ol>
+        {qrSteps}
       </div>
       {roomChips}
       <div className="phone-alt"><span>Can’t scan?</span>

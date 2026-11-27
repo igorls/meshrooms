@@ -266,7 +266,7 @@ test('LIFE-2: activity from a command that fails is not remembered, and short id
     await create(host, room);
     const created = now;
     now += 2 * 3_600_000;
-    await expect(host.send('settings', room, { floor: 'loud' })).rejects.toThrow('when agents reply');
+    await expect(host.send('settings', room, { floor: 'loud' })).rejects.toThrow('who wakes agents');
     expect(activity(room)).toBe(created); // rolled back with the command
     await host.status(room);
     expect(activity(room)).toBe(now); // and not suppressed by a cached value
@@ -306,7 +306,7 @@ test('read-only paths (status, creation-status, publicRoom, avatar, health, room
       expect((await sam.status(room)).memberId).toBeDefined();
       expect((await stranger.status(room)).memberId).toBeUndefined();
       expect(await host.send('creation-status', room)).toEqual({ roomId: room, admitted: true });
-      expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Read-only check' });
+      expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Read-only check', historyForNewcomers: false });
       expect(lobby.avatar(room, samStatus.memberId!, samAvatar)?.type).toBe('image/png');
       expect(lobby.healthy()).toBe(true);
       expect(listRooms(reader)).toHaveLength(1);
@@ -406,7 +406,7 @@ test('legacy DBs backfill room metadata once; create, status, link and warm rest
       const code = (await comp2.status(room2)).request!.code;
       await lobby.execute(await host.signed('link', room2, { code }));
       await lobby.execute(await host.signed('status', room2, { session: host.session }));
-      expect(lobby.publicRoom(room2)).toEqual({ roomId: room2, title: 'Legacy 2' });
+      expect(lobby.publicRoom(room2)).toEqual({ roomId: room2, title: 'Legacy 2', historyForNewcomers: false });
       expect(listRooms(db)).toHaveLength(8);
       expect(getRoomSummary(db, room2)?.title).toBe('Legacy 2');
       // Creating a 9th room (rejected by cap) or replacing a closed room still never scans rooms.body.

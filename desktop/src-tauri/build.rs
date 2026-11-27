@@ -5,7 +5,7 @@ fn main() {
     // to the Review window alone, and capabilities/approvals.json the approvals commands to the Approvals window alone, and capabilities/notice.json the
     // notice window its own close command and nothing else).
     let commands = &[
-        "home_view", "home_action",
+        "home_view", "home_action", "home_window",
         "pair_view", "pair_check", "pair_verify", "pair_confirm", "pair_reject", "pair_cancel", "pair_unpair", "pair_close", "pair_open",
         "join_view", "join_confirm", "join_cancel", "join_browse",
         "review_view", "review_pause", "review_resume", "review_close",

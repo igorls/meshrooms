@@ -150,6 +150,26 @@ jobs:
           trap 'kill "$coordinator" 2>/dev/null || true' EXIT
           for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14335/api/lobby/health && break; sleep 0.5; done
           MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14335 node scripts/pairing-smoke.mjs
+      # "Connect your phone": the invite dialog's QR and typed code, key-bound words, "Not my phone", and a phone that
+      # becomes a device of the same person in every room. Two browser profiles, one an iPhone.
+      - name: Phone pairing smoke (loopback coordinator on 14339)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14339 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-phone.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14339/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14339 node scripts/phone-pairing-smoke.mjs
+      # History after pairing: a newly paired person device shows the earlier messages of the rooms it joined, and a
+      # newcomer with history for newcomers off sees none of them.
+      - name: History after pairing smoke (loopback coordinator on 14340)
+        run: |
+          data=$(mktemp -d)
+          MESHROOMS_BROWSER_PORT=14340 MESHROOMS_BROWSER_DATA="$data" bun run server/browser/main.ts > .impeccable/review/coordinator-history.log 2>&1 &
+          coordinator=$!
+          trap 'kill "$coordinator" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do curl -fsS http://127.0.0.1:14340/api/lobby/health && break; sleep 0.5; done
+          MESHROOMS_BROWSER_TEST_ORIGIN=http://127.0.0.1:14340 node scripts/history-pairing-smoke.mjs
       - name: Upload smoke evidence
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -248,3 +268,57 @@ jobs:
           name: desktop-smoke-linux
           path: .impeccable/review
           retention-days: 7
+
+  # The desktop app on Windows: its Rust tests (the Run key round trip included, on a throwaway value in the runner's
+  # own HKCU), then the release NSIS installer with the bundled bridge, uploaded with its SHA-256 for the team to install.
+  # The installer is not code signed (docs/desktop-shell.md, "Code signing"). Skipped when the tag check calls this
+  # workflow, like the Linux desktop job.
+  desktop-windows:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop/src-tauri -> target
+      - name: Run desktop Rust tests
+        working-directory: desktop/src-tauri
+        run: cargo test --locked -- --include-ignored
+      - run: bun install --frozen-lockfile
+      - name: Bundle the bridge
+        run: bun run desktop:bridge
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # A cached target may hold an earlier version's installer; only this build's may be uploaded.
+          Remove-Item -LiteralPath desktop/src-tauri/target/release/bundle -Recurse -Force -ErrorAction SilentlyContinue
+          bun run desktop:build
+          if ($LASTEXITCODE -ne 0) { throw 'The installer build failed.' }
+      - name: The build leaves the tree clean
+        shell: pwsh
+        run: |
+          $changed = git status --porcelain --untracked-files=no
+          if ($changed) { $changed; throw 'Building the app changed tracked files.' }
+      - name: Hash the installer
+        shell: pwsh
+        run: |
+          $dir = 'desktop/src-tauri/target/release/bundle/nsis'
+          $setup = @(Get-ChildItem -LiteralPath $dir -Filter '*-setup.exe')
+          if ($setup.Count -ne 1) { throw "Expected one installer in $dir, found $($setup.Count)." }
+          $line = (Get-FileHash -LiteralPath $setup[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $setup[0].Name
+          [IO.File]::WriteAllText((Join-Path $dir 'SHA256SUMS.txt'), "$line`n", [Text.UTF8Encoding]::new($false))
+          "Windows installer: ``$line``" >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: meshrooms-desktop-windows-x64
+          path: |
+            desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            desktop/src-tauri/target/release/bundle/nsis/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14

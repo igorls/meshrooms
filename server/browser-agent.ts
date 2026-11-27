@@ -18,7 +18,7 @@ import { guardNetworkInterfaces, interfacesUnavailable, withoutMdnsCandidates } 
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
-import { browserProtocol, signerOf, type BrowserDevice, type Command, type RoomStatus } from '../src/browser/protocol';
+import { browserProtocol, signerOf, type AgentRuntimeProfile, type BrowserDevice, type BrowserMember, type Command, type MessageVisibility, type RoomStatus } from '../src/browser/protocol';
 import { COMPACT_AT, compactBoard, foldBoard, MAX_TASK_OPS, MAX_TIME, syncChunks, taskBody, validIssueLink, validTaskBody, capLiveTasks, mayAddTask, withinRevisionJump, type BoardSync, type TaskChange, type TaskPacket } from '../src/browser/board';
 import {
   FileTransfers, IMAGE_TYPES, LOW_WATER, MAX_ATTACHMENT_BYTES, displayKind, MAX_MESSAGE_ATTACHMENTS, attachmentRef, attachmentText, isFilePacket, isSha256, retainedFiles, shownText,
@@ -33,12 +33,21 @@ import {
   foldReactions, isReactionEmoji, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody,
   type ReactionBody, type ReactionEmoji, type ReactionPacket,
 } from '../src/browser/reactions';
-import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket, type RetractionSync } from '../src/browser/retractions';
-import { assignmentWakes, authorWakes, evaluateWake, mayAgentSpeak, mentionedIds, wakes, type Floor, type Task } from '../src/collab';
+import { addRetractions, applyRetractions, isRetracted, mayRetract, opKey, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket, type RetractionSync } from '../src/browser/retractions';
+import { assignmentWakes, authorWakes, claimHolder, claimRefusal, evaluateWake, heldByAnother, takenBy, mayAgentSpeak, mentionedIds, needsClaim, resolveMessageById, speakRefusal, wakes, type Claim, type Floor, type Task } from '../src/collab';
 import type { Message, Participant } from '../src/room';
 import { releaseIssueTask } from './github-issues';
 import { whileBusy } from './agent-install';
-import { awaitingDelivery, windowHistory } from '../src/browser/history';
+import { awaitingDelivery, MAX_STORED_MESSAGES, windowHistory } from '../src/browser/history';
+import {
+  buildHistoryHave, canonicalMessageKeys, currentAudienceUntil, HISTORY_ACCEPT_ENTRIES_BURST,
+  HISTORY_ACCEPT_ENTRIES_PER_MINUTE, HISTORY_ROUND_TIMEOUT_MS, HISTORY_SERVE_BURST, HISTORY_SERVE_PER_MINUTE,
+  historyChunks, isHistoryHavePacket, isHistoryPacket, MAX_HISTORY_ROUND_TIMEOUTS, MAX_HISTORY_ROUNDS,
+  maxSeqByDevice, maxSeqForDevice, mayServeMessage, mergeHistoryMessages, messageKey, nextAuthorSeq,
+  PeerRateLimiter, RELAY_HISTORY_RETRY_MS, selectHistoryEntries, storedCursorIndex, validAudienceUntil,
+  validMessageSeq, validMessageVisibility, withinSeqJump,
+  type HistoryCursor, type HistoryHavePacket, type HistoryPacket,
+} from '../src/browser/history-sync';
 import {
   FILE_CHANNEL_LABEL, IncomingGate, PACE_LOW_WATER, PRIMARY_CHANNEL_LABEL, Resync, SYNC_REQUEST, SendQueue,
   answerMatchesOffer, dedupeSignals, evaluatePeerHealth, isLiveOpenPeer, isSyncRequest, nextPollBackoff, parseRetryAfter, sdpIceUfrag,
@@ -65,18 +74,23 @@ export type AgentIdentity = {
   encSig: string;
 };
 type Identity = AgentIdentity;
-type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
+type MessageBody = {
+  kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number;
+  replyTo?: string; attachments?: AttachmentRef[]; visibility?: MessageVisibility; seq?: number; audienceUntil?: number;
+};
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody | ReactionBody | RetractBody; signature: string };
-export type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[]; retracted?: true };
+export type Stored = { packet: { body: MessageBody; signature: string }; targets: string[]; receipts: string[]; retracted?: true; receivedAt?: number; replicated?: true };
 /** `online` (a person device's folders only): the device polled the room service within its presence window. */
-type Members = { memberId?: string; ownerId?: string; title?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; harness?: string; model?: string }[]; devices: { id: string; memberId: string; online?: boolean }[] };
+type Members = { memberId?: string; ownerId?: string; title?: string; former?: { id: string; role?: 'human' | 'agent' }[]; members: BrowserMember[]; devices: { id: string; memberId: string; online?: boolean }[] };
 /** A queued task change; `run` applies it to the board as it stands when signing, so the revision is current. */
 type TaskIntent = { type: 'task'; id: string; taskId: string; change: TaskChange; removed?: boolean };
 /** A queued reaction toggle; `run` signs it against the current folded chips and revision. */
 type ReactionIntent = { type: 'reaction'; id: string; messageId: string; emoji: ReactionEmoji; blocked?: 'log-full' };
 /** A queued deletion of the member's own message; `run` signs it. */
 type RetractIntent = { type: 'retract'; id: string; messageId: string };
+/** A queued claim of a message that went to every agent (or its release); `run` settles it with the room service. */
+type ClaimIntent = { type: 'claim'; id: string; messageId: string; release?: true };
 /** A queued decision change; like tasks, `run` builds it against the decision as it stands when signing. */
 type DecisionIntent = { type: 'decision'; id: string; decisionId: string } & (
   | { action: 'open'; question: string; context: string; mode: DecisionMode; options: string[]; askAgents: boolean | string[]; closesAt: number | null; replyTo?: string }
@@ -177,7 +191,7 @@ export function parseConnectLink(link: string) {
 }
 
 /** settings.json. `checkedAt`: when the runner last had them from the room service (this machine's clock). */
-export type RoomRules = { floor: Floor; agentAssignmentsWake?: boolean; repositories?: string[]; checkedAt?: number };
+export type RoomRules = { floor: Floor; agentAssignmentsWake?: boolean; historyForNewcomers?: boolean; repositories?: string[]; claims?: Claim[]; checkedAt?: number };
 
 /** Written by a person device's runner while it waits for admission: the request's state, and a companion's code. */
 export const ADMISSION_FILE = 'admission.json';
@@ -487,11 +501,11 @@ export class BrowserAgent {
     } catch { return false; }
   }
   /** A signed coordinator command. Retries of one logical action reuse its id. */
-  async command(action: Command['action'] | 'agent-redeem', payload: Record<string, unknown> = {}, id: string = randomUUID()): Promise<any> {
+  async command(action: Command['action'] | 'agent-redeem', payload: Record<string, unknown> = {}, id: string = randomUUID(), timeoutMs = 10_000): Promise<any> {
     const identity = await this.ensureIdentity();
     // 'agent-redeem' joins the protocol with browser-room agents; older coordinators reject it with a clear error.
     const command = { protocol: browserProtocol, origin: this.origin, id, at: Date.now(), action, roomId: this.roomId, payload } as Command;
-    const response = await fetch(`${this.origin}/api/lobby`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
+    const response = await fetch(`${this.origin}/api/lobby`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
       headers: { 'Content-Type': 'application/json', Origin: this.origin, 'X-Meshrooms-Protocol': '1' },
       body: JSON.stringify({ command, publicKey: identity.publicKey, signature: await this.sign(command) }) });
     const result = await response.json().catch(() => ({}));
@@ -513,6 +527,16 @@ export class BrowserAgent {
   members(): Members { return this.mem ? this.mem.members : readJson(this.path('members.json'), { members: [], devices: [] }); }
   /** The room's rules as the host set them, copied from the room service by `run`. */
   settings(): RoomRules { return this.mem ? this.mem.settings : readJson(this.path('settings.json'), { floor: 'humans-first' as Floor }); }
+  /**
+   * Keeps a claim the room service just settled, until the runner's next poll brings the room's own list. Only over rules
+   * the runner already wrote: never a default floor in place of the host's. Best effort: a sandboxed wake may not write
+   * the room folder, and the runner's next poll brings the same claim.
+   */
+  noteClaim(messageId: string, claim: Claim | null) {
+    const rules = this.settings(), claims = [...(rules.claims ?? []).filter(c => c.messageId !== messageId), ...(claim ? [claim] : [])];
+    if (this.mem) { this.mem.settings = { ...rules, claims }; return; }
+    try { if (existsSync(this.path('settings.json'))) writeJson(this.path('settings.json'), { ...rules, claims }); } catch { /* the next poll writes it */ }
+  }
   /** Verified task operations in arrival order, each with the board cursor at which it arrived. */
   taskOps(): StoredOp[] {
     const raw = this.mem ? this.mem.taskOps : readJson<StoredOp[]>(this.path('tasks.json'), []);
@@ -571,11 +595,10 @@ export class BrowserAgent {
         let after = cursor.after;
         if (current.after !== undefined) {
           if (cursor.after === undefined) {
-            const ids = this.messages().map(m => m.packet.body.id);
-            if (ids.includes(current.after)) after = current.after;
+            if (storedCursorIndex(this.messages(), current.after) >= 0) after = current.after;
           } else if (cursor.after !== current.after) {
-            const ids = this.messages().map(m => m.packet.body.id);
-            const curIdx = ids.indexOf(current.after), nextIdx = ids.indexOf(cursor.after);
+            const held = this.messages();
+            const curIdx = storedCursorIndex(held, current.after), nextIdx = storedCursorIndex(held, cursor.after);
             if (curIdx >= 0 && (nextIdx < 0 || curIdx > nextIdx)) after = current.after;
           }
         }
@@ -622,17 +645,20 @@ export class BrowserAgent {
     const self = this.person ? 'human' as const : 'agent' as const;
     const participants: Participant[] = members.map(m => ({ id: m.id, name: m.name, role: m.id === memberId ? self : m.role ?? 'human',
       state: m.id === memberId ? 'local' : 'remote', detail: 'Browser room member', ...(m.operatorId ? { operatorId: m.operatorId } : {}) }));
-    const messages: Message[] = this.messages().map(({ packet: { body }, retracted }) => {
+    const stored = this.messages();
+    const canonicalKeys = canonicalMessageKeys(stored);
+    const messages: Message[] = stored.map(({ packet: { body }, retracted }) => {
       const author = participants.find(p => p.id === body.memberId);
       const text = retracted ? 'Message deleted' : shownText(body), mentions = mentionedIds(text, participants);
       // `kind` follows the declared type here; `attachment` re-checks it against the verified bytes.
       const attachments = body.attachments?.map(ref => ({ ...ref, kind: IMAGE_TYPES.includes(ref.type) ? 'image' as const : 'file' as const }));
+      const collidingCopy = canonicalKeys.get(body.id) !== messageKey(body.deviceId, body.id);
       return { id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human', text,
-        time: safeIso(body.at), ...(retracted ? { deleted: true } : {}), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(mentions.length ? { mentions } : {}), ...(attachments ? { attachments } : {}) };
+        time: safeIso(body.at), deviceId: body.deviceId, ...(collidingCopy ? { collidingCopy: true as const } : {}), ...(retracted ? { deleted: true } : {}), ...(body.replyTo ? { replyTo: body.replyTo } : {}), ...(mentions.length ? { mentions } : {}), ...(attachments ? { attachments } : {}) };
     });
     const ops = this.taskOps();
     const settings = this.settings();
-    return { memberId, participants, messages, floor: settings.floor, agentAssignmentsWake: !!settings.agentAssignmentsWake, tasks: boardTasks(ops), boardRevision: this.boardCursor(ops) };
+    return { memberId, participants, messages, floor: settings.floor, agentAssignmentsWake: !!settings.agentAssignmentsWake, historyForNewcomers: !!settings.historyForNewcomers, claims: settings.claims ?? [], tasks: boardTasks(ops), boardRevision: this.boardCursor(ops) };
   }
 }
 
@@ -672,8 +698,8 @@ export function activityAnnouncer(agent: BrowserAgent, channels: () => (Channel 
 }
 
 /** Whether the runner may sign a queued message: the room's floor rules, as `send` checks them, for its reply target. */
-export function queuedMaySpeak(agent: BrowserAgent, memberId: string, replyTo: string | undefined) {
-  return mayAgentSpeak(agent.view(), memberId, replyTo);
+export function queuedMaySpeak(agent: BrowserAgent, memberId: string, replyTo: string | undefined, text?: string) {
+  return mayAgentSpeak(agent.view(), memberId, replyTo, text);
 }
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 /**
@@ -689,11 +715,13 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
   if (!it || typeof it !== 'object' || !id(it.id)) return 'its id is not a UUID';
   if (it.replyTo !== undefined && !id(it.replyTo)) return 'its reply target is not a UUID';
   const view = agent.view();
-  // A person's own device: the floor is for agents, and a person's vote counts rather than advises.
-  const speaks = (replyTo: unknown) => agent.person || mayAgentSpeak(view, memberId, replyTo as string | undefined);
+  // A person's own device: the floor is for agents, and a person's vote counts rather than advises. Claims aside: the
+  // runner settles those with the room service before it signs a reply (see settleClaim), since the claims this device
+  // last heard may already be out of date.
+  const speaks = (replyTo: unknown, text?: string) => agent.person || mayAgentSpeak(view, memberId, replyTo as string | undefined, text, true);
   if (it.type === 'decision') {
     if (!id(it.decisionId)) return 'its decision id is not a UUID';
-    if (it.action === 'open') return speaks(it.replyTo) ? undefined : 'the room is humans-first and nothing addressed the agent';
+    if (it.action === 'open') return speaks(it.replyTo) ? undefined : 'nothing in this room addressed the agent';
     const current = pickDecision(agent.decisions(), it.decisionId, memberId);
     if (!current) return undefined; // Nothing to change: the runner makes no change for it.
     if (it.action === 'vote') {
@@ -716,10 +744,18 @@ export function outboxProblem(agent: BrowserAgent, memberId: string, item: unkno
     const target = agent.messages().find(m => m.packet.body.id === it.messageId);
     return target && target.packet.body.memberId !== memberId ? 'only its author can delete a message' : undefined;
   }
+  if (it.type === 'claim') {
+    if (agent.person) return 'only agents claim messages';
+    if (!id(it.messageId)) return 'its message id is not a UUID';
+    if (it.release !== undefined && it.release !== true) return 'it is neither a claim nor a release';
+    const target = resolveMessageById(view.messages, it.messageId);
+    if (!target || !needsClaim(view, target)) return 'it is not a message that went to every agent';
+    return it.release || wakes(view, target, memberId) ? undefined : 'the message does not wake the agent';
+  }
   if (it.type !== undefined) return 'it is not a known kind';
   if (typeof it.text !== 'string' || it.text.length > 4000 || (!it.text.trim() && !(Array.isArray(it.attachments) && it.attachments.length)))
     return 'its text is empty or longer than 4,000 characters';
-  return speaks(it.replyTo) ? undefined : 'nothing in this room addressed the agent';
+  return speaks(it.replyTo, it.text) ? undefined : 'nothing in this room addressed the agent';
 }
 
 /**
@@ -802,15 +838,19 @@ export function roomClosed(agent: BrowserAgent): { at: number; reason: string } 
   return closed && typeof closed.reason === 'string' && typeof closed.at === 'number' ? { at: closed.at, reason: closed.reason } : undefined;
 }
 
-/** Harness and model given to `connect` before the host admitted the agent; the runner reports them once admitted. */
+/** Runtime settings given to `connect` before host approval. The runner reports them once admitted. */
 export const PENDING_PROFILE = 'profile-pending.json';
 export async function applyPendingProfile(agent: BrowserAgent, log: (line: string) => void) {
   const path = join(agent.dir, PENDING_PROFILE);
   if (!existsSync(path)) return;
-  const pending = readJson<{ harness?: string; model?: string } | null>(path, null);
-  try { if (pending) { await agent.command('profile', pending); log('reported harness and model'); } }
-  catch (error) { log(`could not report harness and model (run profile again): ${(error as Error).message}`); }
-  finally { try { unlinkSync(path); } catch { /* Already gone. */ } }
+  const pending = readJson<AgentRuntimeProfile | null>(path, null);
+  try { if (pending) { await agent.command('profile', pending); log('reported runtime settings'); } }
+  catch (error) {
+    const { status, message } = error as Error & { status?: number };
+    if (status === undefined || status === 408 || status === 429 || status >= 500) return;
+    log(`could not report runtime settings (run profile again): ${message}`);
+  }
+  try { unlinkSync(path); } catch { /* Already gone. */ }
 }
 
 type OutboxPeer = { channel?: { readonly readyState: string; readonly bufferedAmount: number; send(data: string): void }; sent: Map<string, number> };
@@ -890,7 +930,11 @@ export function withGatheredCandidates(sdp: string, candidates: GatheredCandidat
  * left running, never started twice, and the pass moves on; one still unfinished after `wedged` means the runner can no
  * longer do its work, and it stops so a fresh one takes over (see runBridge).
  */
-export const PASS_DEADLINES = { poll: 11_000, budget: 12_000, profile: 5_000, signals: 10_000, outbox: 5_000, decisions: 3_000, close: 5_000, wedged: 60_000 };
+export const PASS_DEADLINES = { poll: 11_000, budget: 12_000, profile: 5_000, signals: 10_000, claims: 4_000, outbox: 5_000, decisions: 3_000, close: 5_000, wedged: 60_000 };
+/** How long the runner waits on the room service for one claim, so a slow one delays a reply rather than the pass. */
+export const CLAIM_CALL_MS = 3_000;
+/** Notes the runner leaves next to the outbox for a command (`.dropped`, `.claim`) that nobody read go after this long. */
+export const OUTBOX_NOTE_MS = 10 * 60_000;
 export type PassDeadlines = typeof PASS_DEADLINES;
 /** Thrown by runBridge when a step never finished: the process should exit, so whatever still hangs goes with it. */
 export class RunnerWedged extends Error { readonly wedged = true; }
@@ -914,7 +958,10 @@ export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | un
     const { messages, changed, released } = applyRetractions(readMessages(), log.map(op => op.body));
     if (!changed.length) return;
     save(messages);
-    onRetracted?.(changed);
+    // Only notify reaction cleanup for IDs that have NO remaining live copy (colliding-ID copy retraction never wipes victim reactions).
+    const stillLive = new Set(messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+    const fullyRetracted = changed.filter(id => !stillLive.has(id));
+    if (fullyRetracted.length) onRetracted?.(fullyRetracted);
     release(released);
   };
   const add = (incoming: RetractPacket[]) => {
@@ -926,13 +973,15 @@ export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | un
     apply, add,
     /** Keep those signed by a device of their author that may still sign (see signerOf), whichever device relayed them. */
     async accept(packets: unknown[]) {
-      const accepted: RetractPacket[] = [], known = new Set(readLog().map(p => p.body.id)), room = status();
+      const accepted: RetractPacket[] = [], known = new Set(readLog().map(p => opKey(p.body))), room = status();
       for (const packet of packets as RetractPacket[]) {
         const b = packet?.body;
-        if (!validRetractBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
+        if (!validRetractBody(b, agent.roomId) || typeof packet.signature !== 'string') continue;
+        const k = opKey(b);
+        if (known.has(k)) continue;
         const author = signerOf(room, b.deviceId, b.at);
         if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
-        known.add(b.id);
+        known.add(k);
         accepted.push({ body: b, signature: packet.signature });
       }
       add(accepted);
@@ -946,10 +995,21 @@ export function retractionLog(agent: BrowserAgent, status: () => RoomStatus | un
  * Long-running peer loop: presence, signaling, data channels, storage, and outbox delivery. `pause` is how it waits
  * between passes (tests shorten it; the deadlines are what bound a pass).
  */
+/**
+ * Without status pushed over the relay socket, an idle runner polls the room service one pass in this many: with a
+ * pass a second, about every 10 s, well inside the service's 25 s presence window.
+ */
+export const IDLE_POLL_EVERY = 10;
+/** And never longer than this without status, however long the passes take: inside the 25 s presence window. */
+export const IDLE_POLL_MS = 8_000;
+/** A new peer connection gets each pass's poll for this long, for the answer and candidates it waits on. */
+export const CONNECTING_POLL_MS = 10_000;
 export async function runBridge(agent: BrowserAgent, log: (line: string) => void = console.error,
   options: {
     deadlines?: Partial<PassDeadlines>;
     pause?: (ms: number) => Promise<unknown>;
+    /** Without pushed status, an idle runner polls one pass in this many (default IDLE_POLL_EVERY). */
+    idlePollEvery?: number;
     now?: () => number;
     gatherMs?: number;
     gatherDeadlineMs?: number;
@@ -983,6 +1043,15 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const identity = await agent.ensureIdentity();
   const session = randomUUID(); const peers = new Map<string, Peer>();
   let status: RoomStatus | undefined; let epoch = ''; let cursor = 0;
+  /**
+   * Room status the service pushed over the relay socket (watchStatus), not yet taken by a pass. While pushes arrive,
+   * the runner polls no status at all; without them it polls one pass in IDLE_POLL_EVERY (about every 10 s), and every
+   * pass only while it waits for admission, recovers from a failed poll, or sets up a peer connection.
+   */
+  let pushed: RoomStatus | undefined, passesSincePoll = 0;
+  /** When this runner first tried to connect to each device session (`device:session`): see CONNECTING_POLL_MS. */
+  const firstOffer = new Map<string, number>();
+  const idlePollEvery = Math.max(1, options.idlePollEvery ?? IDLE_POLL_EVERY);
   let iceServers: RTCIceServer[] = []; let iceKey = '[]';
   let verifiedRoster: SignedRoster | undefined;
   /** Highest version of a HOST-SIGNED roster this loop verified. Never raised from envelope metadata. */
@@ -1003,15 +1072,47 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   let pollBackoff = 0;
   let serial: Promise<unknown> = Promise.resolve();
   const transaction = <T>(work: () => Promise<T>) => { const next = serial.then(work); serial = next.catch(() => {}); return next; };
-  const readMessages = () => readJsonStrict<Stored[]>(join(agent.dir, 'messages.json'), []);
+  const messagesFile = join(agent.dir, 'messages.json');
+  let messagesCache: { mtimeMs: number; ctimeMs: number; size: number; ino: number; value: Stored[] } | undefined;
+  const readMessages = (): Stored[] => {
+    let st: { mtimeMs: number; ctimeMs: number; size: number; ino: number };
+    try { st = statSync(messagesFile); } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') { messagesCache = undefined; return []; }
+      throw error;
+    }
+    if (messagesCache && messagesCache.mtimeMs === st.mtimeMs && messagesCache.ctimeMs === st.ctimeMs
+      && messagesCache.size === st.size && messagesCache.ino === st.ino) {
+      return messagesCache.value;
+    }
+    const value = readJsonStrict<Stored[]>(messagesFile, []);
+    messagesCache = { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, ino: st.ino, value };
+    return value;
+  };
   const readTaskOps = () => readJsonStrict<StoredOp[]>(join(agent.dir, 'tasks.json'), []).map((p, i) => ({ ...p, seq: p.seq ?? i + 1 }));
   const readBoardCursor = (ops: StoredOp[]) => Math.max(readJsonStrict<{ seq: number }>(join(agent.dir, 'board.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0);
   const readDecisionOps = () => readJsonStrict<StoredDecisionOp[]>(join(agent.dir, 'decisions.json'), []);
   const readDecisionCursor = (ops: StoredDecisionOp[]) => Math.max(readJsonStrict<{ seq: number }>(join(agent.dir, 'decisions-cursor.json'), { seq: 0 }).seq, ops.at(-1)?.seq ?? 0);
   const readReactionOps = () => readJsonStrict<ReactionPacket[]>(join(agent.dir, 'reactions.json'), []);
   const readRetractOps = () => readJsonStrict<RetractPacket[]>(join(agent.dir, 'retractions.json'), []);
+  const authorSeqFile = join(agent.dir, 'author-seq.json');
+  const readAuthorSeq = () => readJson<{ seq?: number }>(authorSeqFile, {}).seq ?? 0;
+  const saveAuthorSeq = (seq: number) => { if (seq > readAuthorSeq()) writeJson(authorSeqFile, { seq }); };
+  const historyServeLimiter = new PeerRateLimiter(now, HISTORY_SERVE_PER_MINUTE, HISTORY_SERVE_BURST);
+  const historyAcceptLimiter = new PeerRateLimiter(now, HISTORY_ACCEPT_ENTRIES_PER_MINUTE, HISTORY_ACCEPT_ENTRIES_BURST);
+  const historyRounds = new Map<string, number>();
+  const historyCursors = new Map<string, HistoryCursor>();
+  const historyRoundDropped = new Set<string>();
+  const historyRetryAt = new Map<string, number>();
+  const historyInFlight = new Map<string, { sentAt: number; expectReply: boolean; timeouts: number }>();
+  const relayHistorySynced = new Map<string, number>();
+  const relayResync = new Map<string, Resync>();
   let referencedCache: Map<string, AttachmentRef> | undefined;
-  const save = (messages: Stored[]) => { writeJson(join(agent.dir, 'messages.json'), messages); referencedCache = undefined; };
+  const save = (messages: Stored[]) => {
+    writeJson(messagesFile, messages);
+    referencedCache = undefined;
+    try { const st = statSync(messagesFile); messagesCache = { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, ino: st.ino, value: messages }; }
+    catch { messagesCache = undefined; }
+  };
   /** Own messages a current device has not confirmed; the window never evicts them. */
   const awaiting = (m: Stored) => awaitingDelivery(m, identity.id, status?.devices && new Set(status.devices.map(d => d.id)));
   /** Append a message to the stored history, evicting the oldest past the rolling window (logged, never silent). */
@@ -1100,13 +1201,14 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   const addReactionOps = (incoming: ReactionPacket[]) => {
     const messages = readMessages();
     const held = new Set(messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
-    const retractedIds = new Set(messages.filter(isRetracted).map(m => m.packet.body.id));
+    const retractedIds = new Set(messages.filter(m => isRetracted(m) && !held.has(m.packet.body.id)).map(m => m.packet.body.id));
     const ops = readReactionOps();
-    const known = new Set([...ops.map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
+    const known = new Set([...ops.map(p => opKey(p.body)), ...pendingReactions.map(p => opKey(p.body))]);
     let ready: ReactionPacket[] = [];
     for (const op of incoming) {
-      if (known.has(op.body.id) || retractedIds.has(op.body.messageId)) continue;
-      known.add(op.body.id);
+      const k = opKey(op.body);
+      if (known.has(k) || retractedIds.has(op.body.messageId)) continue;
+      known.add(k);
       if (held.has(op.body.messageId)) ready.push(op);
       else if (mayHoldPending(pendingReactions, op)) pendingReactions.push(op);
     }
@@ -1122,13 +1224,15 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
   /** Keep reaction operations signed by a current or former device of their author; duplicates are ignored. */
   const acceptReactions = async (packets: unknown[]) => {
     const accepted: ReactionPacket[] = [];
-    const known = new Set([...readReactionOps().map(p => p.body.id), ...pendingReactions.map(p => p.body.id)]);
+    const known = new Set([...readReactionOps().map(p => opKey(p.body)), ...pendingReactions.map(p => opKey(p.body))]);
     for (const packet of packets as ReactionPacket[]) {
       const b = packet?.body;
-      if (!validReactionBody(b, agent.roomId) || known.has(b.id) || typeof packet.signature !== 'string') continue;
+      if (!validReactionBody(b, agent.roomId) || typeof packet.signature !== 'string') continue;
+      const k = opKey(b);
+      if (known.has(k)) continue;
       const author = signerOf(status, b.deviceId, b.at);
       if (!author || author.memberId !== b.memberId || !await agent.verify(author.publicKey, b, packet.signature)) continue;
-      known.add(b.id);
+      known.add(k);
       accepted.push({ body: b, signature: packet.signature });
     }
     if (accepted.length) addReactionOps(accepted);
@@ -1144,10 +1248,18 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     const p = peers.get(id);
     return !!p && isLiveOpenPeer(p.pc.connectionState, p.pc.iceConnectionState, p.channel?.readyState);
   };
-  const signerFor = (deviceId: unknown, at: unknown, fromRelay: boolean): { publicKey: string; memberId: string } | undefined => {
+  const signerFor = (deviceId: unknown, at: unknown, fromRelay: boolean, expectedMemberId?: unknown): { publicKey: string; memberId: string } | undefined => {
     if (verifiedRoster) {
       const active = verifiedRoster.body.devices.find(d => d.id === deviceId);
-      if (active) return { publicKey: active.sign, memberId: active.memberId };
+      if (active) {
+        if (expectedMemberId !== undefined && active.memberId !== expectedMemberId) {
+          const statusDev = status?.devices?.find(d => d.id === deviceId);
+          const prior = statusDev?.priorMembers?.find(p =>
+            p.memberId === expectedMemberId && (p.retiredAt === undefined || (typeof at === 'number' && at <= p.retiredAt)));
+          if (prior) return { publicKey: active.sign, memberId: prior.memberId };
+        }
+        return { publicKey: active.sign, memberId: active.memberId };
+      }
       const removed = verifiedRoster.body.removed.find(r => r.id === deviceId);
       if (removed?.revoked) return undefined;
       if (fromRelay) {
@@ -1157,7 +1269,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
     }
     if (fromRelay) return undefined;
-    return signerOf(status, deviceId, at);
+    return signerOf(status, deviceId, at, expectedMemberId);
   };
   const relayRecipients = (targetIds?: readonly string[]): RosterEntry[] => {
     if (!verifiedRoster) return [];
@@ -1192,7 +1304,20 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       try { sendViaRelay(JSON.parse(data), 'file', [targetId]); } catch { /* Ignore unparseable data. */ }
     },
   }) as unknown as RTCDataChannel;
-  const transfers = new FileTransfers({ roomId: agent.roomId, store: agent.files, referenced: sha => referenced().get(sha), now,
+  const transfers = new FileTransfers({
+    roomId: agent.roomId,
+    store: agent.files,
+    referenced: (sha, peer) => {
+      if (!peer) return referenced().get(sha);
+      // Attachments follow message visibility: serve only when referenced by a message `peer` is authorized to see.
+      for (const m of readMessages()) {
+        if (!mayServeMessage(m, peer, status, status?.memberId, verifiedRoster)) continue;
+        const match = m.packet.body.attachments?.find(a => a.sha256 === sha);
+        if (match) return match;
+      }
+      return undefined;
+    },
+    now,
     channel: id => {
       const p = peers.get(id);
       if (p?.fileChannel?.readyState === 'open') return p.fileChannel;
@@ -1318,29 +1443,222 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     }
     sendViaRelay(packet, 'primary');
   };
-  /** This agent's board, decisions and reactions, paced onto the peer's channel (on open, and when it asks again). */
+  /** This agent's board, decisions, reactions and retractions, paced onto the peer's channel. */
   const sendState = (peer: Peer) => {
     if (!peer.queue) return;
+    const chunks = [
+      ...syncChunks(agent.roomId, agent.taskOps().map(({ body, signature }) => ({ body, signature }))),
+      ...decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature }))),
+      ...reactionSyncChunks(agent.roomId, agent.reactionOps()),
+      ...retractionSyncChunks(agent.roomId, agent.retractOps()),
+    ];
+    if (!chunks.length) return;
     peer.resync.sent();
-    const chunks = [...syncChunks(agent.roomId, agent.taskOps().map(({ body, signature }) => ({ body, signature }))),
-      ...decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature }))), ...reactionSyncChunks(agent.roomId, agent.reactionOps()),
-      ...retractionSyncChunks(agent.roomId, agent.retractOps())];
     if (!peer.queue.push(chunks.map(chunk => JSON.stringify(chunk)))) log('sync queue full; state is exchanged again on the next request');
+  };
+  /** Advertises this agent's held message history so the peer can serve anything missing. */
+  const sendHistoryHave = (peerId: string, peer: Peer, cursor?: HistoryCursor, expectReply = false) => {
+    sendHistoryHaveTo(peerId, cursor, peer, expectReply, 0);
+  };
+  const sendHistoryPackets = (peerId: string, packets: (HistoryHavePacket | HistoryPacket)[], peer?: Peer): boolean => {
+    const active = peer ?? peers.get(peerId);
+    if (active?.queue && hasLiveWebRtc(peerId) && active.channel?.readyState === 'open') {
+      return active.queue.push(packets.map(p => JSON.stringify(p)));
+    }
+    if (relayClient?.isConnected() && verifiedRoster?.body.devices.some(d => d.id === peerId)) {
+      for (const packet of packets) sendViaRelay(packet, 'primary', [peerId]);
+      return true;
+    }
+    return false;
+  };
+  const scheduleHistoryRetry = (peerId: string, delayMs: number) => {
+    const clamped = Math.max(250, Math.min(30_000, delayMs));
+    const dueAt = now() + clamped;
+    const prev = historyRetryAt.get(peerId);
+    if (prev === undefined || dueAt < prev) historyRetryAt.set(peerId, dueAt);
+  };
+  const sendHistoryHaveTo = (peerId: string, cursor: HistoryCursor | undefined, peer: Peer | undefined, expectReply: boolean, timeouts = 0): boolean => {
+    const have = buildHistoryHave(agent.roomId, readMessages(), cursor ? { cursor } : undefined);
+    const active = peer ?? peers.get(peerId);
+    const isWebRtc = !!(active?.queue && hasLiveWebRtc(peerId) && active.channel?.readyState === 'open');
+    const sent = sendHistoryPackets(peerId, [have], active);
+    if (!sent) {
+      if (isWebRtc) scheduleHistoryRetry(peerId, 1_500);
+      return false;
+    }
+    if (!isWebRtc) relayHistorySynced.set(peerId, now());
+    historyInFlight.set(peerId, { sentAt: now(), expectReply, timeouts });
+    return true;
+  };
+  const flushHistoryRetries = () => {
+    const at = now();
+    for (const [peerId, dueAt] of [...historyRetryAt]) {
+      if (at < dueAt) continue;
+      historyRetryAt.delete(peerId);
+      historyRoundDropped.delete(peerId);
+      sendHistoryHaveTo(peerId, historyCursors.get(peerId), undefined, true, 0);
+    }
+    for (const [peerId, pending] of [...historyInFlight]) {
+      if (!pending.expectReply || historyRetryAt.has(peerId)) continue;
+      const waitMs = Math.min(30_000, HISTORY_ROUND_TIMEOUT_MS * (pending.timeouts + 1));
+      if (at - pending.sentAt < waitMs) continue;
+      if (pending.timeouts + 1 > MAX_HISTORY_ROUND_TIMEOUTS) {
+        historyInFlight.delete(peerId);
+        continue;
+      }
+      historyRoundDropped.delete(peerId);
+      if (!sendHistoryHaveTo(peerId, historyCursors.get(peerId), undefined, true, pending.timeouts + 1)) {
+        if (!historyRetryAt.has(peerId)) historyInFlight.delete(peerId);
+      }
+    }
+  };
+  const syncHistoryViaRelay = () => {
+    if (!relayClient?.isConnected() || !verifiedRoster) return;
+    const at = now();
+    for (const entry of verifiedRoster.body.devices) {
+      if (entry.id === identity.id || hasLiveWebRtc(entry.id)) continue;
+      if (!status?.devices?.some(d => d.id === entry.id && d.session)) {
+        relayHistorySynced.delete(entry.id);
+        continue;
+      }
+      if (historyRetryAt.has(entry.id)) continue;
+      const lastSent = relayHistorySynced.get(entry.id);
+      if (lastSent !== undefined && at - lastSent < RELAY_HISTORY_RETRY_MS) continue;
+      historyRounds.set(entry.id, 0);
+      historyRoundDropped.delete(entry.id);
+      sendHistoryHaveTo(entry.id, historyCursors.get(entry.id), undefined, historyCursors.has(entry.id), 0);
+    }
+  };
+  const serveHistory = (peerId: string, have: HistoryHavePacket, peer?: Peer) => {
+    if (!status?.memberId) return;
+    if (!historyServeLimiter.take(peerId)) {
+      if (historyServeLimiter.report(peerId)) log(`over history-have quota: dropping history requests from ${peerId.slice(0, 8)}`);
+      if (historyServeLimiter.maySendRetryHint(peerId)) {
+        sendHistoryPackets(peerId, [{ kind: 'history', roomId: agent.roomId, entries: [], retryAfterMs: historyServeLimiter.retryAfterMs(peerId) }], peer);
+      }
+      return;
+    }
+    const { entries, more, nextCursor } = selectHistoryEntries(readMessages(), have, peerId, status, status.memberId, undefined, verifiedRoster);
+    if (!entries.length) {
+      if (have.cursor) sendHistoryPackets(peerId, [{ kind: 'history', roomId: agent.roomId, entries: [], done: true }], peer);
+      return;
+    }
+    sendHistoryPackets(peerId, historyChunks(agent.roomId, entries, more, nextCursor), peer);
+  };
+  const acceptHistory = async (fromPeerId: string, packet: HistoryPacket, fromRelay: boolean, peer?: Peer) => {
+    if (packet.retryAfterMs !== undefined && packet.entries.length === 0) {
+      const pending = historyInFlight.get(fromPeerId);
+      if (!pending || now() - pending.sentAt > 60_000) return;
+      historyInFlight.delete(fromPeerId);
+      scheduleHistoryRetry(fromPeerId, packet.retryAfterMs);
+      return;
+    }
+    if (fromRelay) relayHistorySynced.set(fromPeerId, now());
+    const cost = Math.max(1, packet.entries.length);
+    if (!historyAcceptLimiter.take(fromPeerId, cost)) {
+      if (historyAcceptLimiter.report(fromPeerId)) log(`over history-accept quota: dropping history entries from ${fromPeerId.slice(0, 8)}`);
+      historyRoundDropped.add(fromPeerId);
+      historyInFlight.delete(fromPeerId);
+      quotaDrops.drop(fromPeerId);
+      return;
+    }
+    const messages = readMessages();
+    const held = new Set(messages.map(m => messageKey(m.packet.body.deviceId, m.packet.body.id)));
+    const baseMaxSeq = maxSeqByDevice(messages);
+    const batchAnchor = new Map<string, number>();
+    const accepted: Stored[] = [];
+    let droppedByQuota = false;
+    for (const entry of packet.entries) {
+      const b = entry?.body;
+      if (!b || b.kind !== 'message' || b.roomId !== agent.roomId || typeof b.id !== 'string' || !UUID.test(b.id) || typeof b.deviceId !== 'string') continue;
+      const key = messageKey(b.deviceId, b.id);
+      if (held.has(key)) continue;
+      if (typeof entry.signature !== 'string') continue;
+      if (typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > MAX_TIME) continue;
+      if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !UUID.test(b.replyTo))) continue;
+      if (b.attachments !== undefined && !validAttachments(b.attachments)) continue;
+      if (!validMessageVisibility(b.visibility) || !validMessageSeq(b.seq) || !validAudienceUntil(b.audienceUntil)) continue;
+      const maxHeld = baseMaxSeq.get(b.deviceId) ?? batchAnchor.get(b.deviceId) ?? 0;
+      if (!withinSeqJump(b.seq, maxHeld)) continue;
+      const author = signerFor(b.deviceId, b.at, fromRelay, b.memberId);
+      if (!author || b.memberId !== author.memberId) continue;
+      if (!await agent.verify(author.publicKey, b, entry.signature)) continue;
+      if (!allowed(b.memberId, 'history', fromPeerId)) {
+        droppedByQuota = true;
+        historyRoundDropped.add(fromPeerId);
+        continue;
+      }
+      held.add(key);
+      if (typeof b.seq === 'number' && !baseMaxSeq.has(b.deviceId) && !batchAnchor.has(b.deviceId)) batchAnchor.set(b.deviceId, b.seq);
+      const arrived = retractions.arriving({ packet: { body: b, signature: entry.signature }, targets: [], receipts: [], receivedAt: Date.now(), replicated: true });
+      accepted.push(arrived);
+    }
+    let windowUnchanged = false;
+    if (accepted.length) {
+      const { messages: merged, added } = mergeHistoryMessages(messages, accepted);
+      if (added.length) {
+        const { kept } = windowHistory(merged, awaiting);
+        const changed = kept.length !== messages.length || kept.some((m, i) => m !== messages[i]);
+        if (changed) {
+          save(kept);
+          const keptSet = new Set(kept);
+          const liveIds = new Set(kept.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+          for (const m of added) {
+            if (!keptSet.has(m)) continue;
+            if (isRetracted(m)) {
+              if (!liveIds.has(m.packet.body.id)) pendingReactions = pendingReactions.filter(op => op.body.messageId !== m.packet.body.id);
+            } else flushPendingReactions(m.packet.body.id);
+          }
+        } else {
+          windowUnchanged = true;
+        }
+      }
+    }
+    if (packet.more) {
+      if (droppedByQuota || historyRoundDropped.has(fromPeerId)) {
+        historyInFlight.delete(fromPeerId);
+        quotaDrops.drop(fromPeerId);
+      } else if (windowUnchanged && readMessages().length >= MAX_STORED_MESSAGES) {
+        historyCursors.delete(fromPeerId);
+        historyInFlight.delete(fromPeerId);
+      } else {
+        if (packet.nextCursor) historyCursors.set(fromPeerId, packet.nextCursor);
+        const rounds = (historyRounds.get(fromPeerId) ?? 0) + 1;
+        if (rounds <= MAX_HISTORY_ROUNDS) {
+          historyRounds.set(fromPeerId, rounds);
+          sendHistoryHaveTo(fromPeerId, historyCursors.get(fromPeerId), peer, true, 0);
+        } else {
+          historyInFlight.delete(fromPeerId);
+        }
+      }
+    } else if (packet.done && !droppedByQuota && !historyRoundDropped.has(fromPeerId)) {
+      historyCursors.delete(fromPeerId);
+      historyInFlight.delete(fromPeerId);
+    } else if (!droppedByQuota && !historyRoundDropped.has(fromPeerId) && packet.entries.length > 0 && historyInFlight.has(fromPeerId)) {
+      historyInFlight.set(fromPeerId, { sentAt: now(), expectReply: true, timeouts: 0 });
+    }
   };
   const resyncDue = (peer: Peer) => { if (peer.queue && peer.resync.due(peer.queue)) sendState(peer); };
   /** Packets waiting for the serialized handler are bounded (SEC-6); peers that lost some are asked for their state again. */
   const gate = new IncomingGate();
   const requestSync = (id: string) => {
-    const channel = peers.get(id)?.channel;
-    if (channel?.readyState !== 'open') return;
+    const peer = peers.get(id);
+    const channel = peer?.channel;
     const request: SyncRequest = { kind: SYNC_REQUEST, roomId: agent.roomId };
-    try { channel.send(JSON.stringify(request)); } catch { /* Asked again after the next drop, or exchanged on reconnect. */ }
+    if (channel?.readyState === 'open') {
+      try { channel.send(JSON.stringify(request)); } catch { /* Asked again after the next drop, or exchanged on reconnect. */ }
+    } else if (relayClient?.isConnected() && verifiedRoster?.body.devices.some(d => d.id === id)) {
+      sendViaRelay(request, 'primary', [id]);
+    }
+    if (historyRetryAt.has(id)) return;
+    historyRoundDropped.delete(id);
+    sendHistoryHaveTo(id, historyCursors.get(id), peer, true, 0);
   };
   let droppedLogged = 0;
   /** Live packets per member and kind (DEC-6); over-quota packets are dropped unstored, unrelayed and unconfirmed. */
-  const quota = new ReceiveQuota();
-  /** Peers whose task, decision or reaction operations went over quota; asked for their state again after the burst. */
-  const quotaDrops = new QuotaDrops();
+  const quota = new ReceiveQuota(now);
+  /** Peers whose task, decision, reaction or history operations went over quota; asked for their state again after the burst. */
+  const quotaDrops = new QuotaDrops(now);
   /** A dropped message is sent again by its sender; for other kinds the peer `from` is asked for its state later. */
   const allowed = (memberId: string, kind: QuotaKind, from: string) => {
     if (quota.take(memberId, kind)) return true;
@@ -1348,8 +1666,14 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     if (kind !== 'message') quotaDrops.drop(from);
     return false;
   };
-  /** A live operation this device does not hold yet, which counts against its sender's quota. */
-  const fresh = (held: { body: { id: string } }[], packet: Packet) => !held.some(p => p.body.id === (packet?.body as { id?: unknown })?.id);
+  /** A live operation this device does not hold yet, which counts against its sender's quota (keyed by deviceId:id when available). */
+  const fresh = (held: { body: { id: string; deviceId?: string } }[], packet: Packet) => {
+    const body = packet?.body as { id?: unknown; deviceId?: unknown } | undefined;
+    if (typeof body?.deviceId === 'string' && typeof body?.id === 'string') {
+      return !held.some(p => (p.body.deviceId ? p.body.deviceId === body.deviceId && p.body.id === body.id : p.body.id === body.id));
+    }
+    return !held.some(p => p.body.id === body?.id);
+  };
   const expandIceServers = (servers: RTCIceServer[]) => servers.flatMap(s => (Array.isArray(s.urls) ? s.urls : [s.urls])
     .map(urls => ({ urls, username: s.username, credential: s.credential as string | undefined })));
   const healthOf = (peer: Peer, at = now()) => {
@@ -1416,9 +1740,24 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (authorized && relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
       return;
     }
-    // Cheap and never queued: answered from the loop, at most once per interval.
+    // Cheap and never queued: answered from the loop, at most once per interval (WebRTC or verified-roster relay).
     if (isSyncRequest(packet, agent.roomId)) {
       if (!fromRelay && peer && peers.get(id) === peer && status?.devices?.some(d => d.id === id)) { peer.resync.request(); resyncDue(peer); }
+      else if (fromRelay && verifiedRoster?.body.devices.some(d => d.id === id)) {
+        let limiter = relayResync.get(id);
+        if (!limiter) { limiter = new Resync(); relayResync.set(id, limiter); if (relayResync.size > 512) relayResync.delete(relayResync.keys().next().value!); }
+        limiter.request();
+        if (limiter.due({ pending: 0 } as SendQueue)) {
+          limiter.sent();
+          for (const chunk of [
+            ...syncChunks(agent.roomId, agent.taskOps().map(({ body, signature }) => ({ body, signature }))),
+            ...decisionChunks(agent.roomId, agent.decisionOps().map(({ body, signature }) => ({ body, signature }))),
+            ...reactionSyncChunks(agent.roomId, agent.reactionOps()),
+            ...retractionSyncChunks(agent.roomId, agent.retractOps()),
+          ]) sendViaRelay(chunk, 'primary', [id]);
+        }
+        if (relayMeta?.cursor !== undefined) relayClient?.ackCursor(relayMeta.cursor);
+      }
       return;
     }
     if (!gate.admit(id)) {
@@ -1462,21 +1801,25 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         if (!fresh(readRetractOps(), packet) || allowed(device.memberId, 'retract', id)) await retractions.accept([packet]);
         return true;
       }
+      if (isHistoryHavePacket(packet, agent.roomId)) { serveHistory(id, packet, peer); return true; }
+      if (isHistoryPacket(packet, agent.roomId)) { await acceptHistory(id, packet, fromRelay, peer); return true; }
       const b = packet?.body;
-      if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !/^[a-f0-9-]{36}$/.test(b.id)
+      if (!b || b.roomId !== agent.roomId || b.deviceId !== id || typeof b.id !== 'string' || !UUID.test(b.id)
         || typeof packet.signature !== 'string' || !await agent.verify(device.publicKey, b, packet.signature)) return false;
       if (b.kind === 'message') {
         if (b.memberId !== device.memberId || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > MAX_TIME) return false;
-        if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !/^[a-f0-9-]{36}$/.test(b.replyTo))) return false;
+        if (b.replyTo !== undefined && (typeof b.replyTo !== 'string' || !UUID.test(b.replyTo))) return false;
         if (b.attachments !== undefined && !validAttachments(b.attachments)) return false;
-        const messages = readMessages(); const existing = messages.find(m => m.packet.body.id === b.id);
+        if (!validMessageVisibility(b.visibility) || !validMessageSeq(b.seq) || !validAudienceUntil(b.audienceUntil)) return false;
+        const messages = readMessages(); const existing = messages.find(m => m.packet.body.deviceId === b.deviceId && m.packet.body.id === b.id);
         // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
         if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return false;
+        if (!existing && !withinSeqJump(b.seq, maxSeqForDevice(messages, b.deviceId))) return false;
         // Over quota: not stored and not confirmed, so its sender retries later.
         if (!existing && !allowed(device.memberId, 'message', id)) return false;
         // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
         if (!existing) {
-          const arrived = retractions.arriving({ packet: packet as Stored['packet'], targets: [], receipts: [] });
+          const arrived = retractions.arriving({ packet: packet as Stored['packet'], targets: [], receipts: [], receivedAt: Date.now() });
           if (store(messages, arrived)) {
             if (isRetracted(arrived)) pendingReactions = pendingReactions.filter(op => op.body.messageId !== b.id);
             else flushPendingReactions(b.id);
@@ -1541,10 +1884,16 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     const opened = () => {
       if (stateSent || peers.get(id) !== peer) return;
       stateSent = true;
+      historyRounds.set(id, 0);
+      historyCursors.delete(id);
+      historyRoundDropped.delete(id);
+      historyRetryAt.delete(id);
+      historyInFlight.delete(id);
       healthOf(peer);
       syncedAt ??= Date.now();
       log(`channel open to ${id.slice(0, 8)}`);
       sendState(peer);
+      sendHistoryHave(id, peer);
       if (peer.fileChannel?.readyState !== 'open') transfers.opened(id);
       activity.opened(channel);
       flush();
@@ -1555,7 +1904,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     channel.stateChanged?.subscribe(state => {
       if (state === 'closed') {
         peer.unhealthySince ??= now();
-        if (peers.get(id) === peer) { transfers.closed(id); heard.delete(id); }
+        if (peers.get(id) === peer) { transfers.closed(id); heard.delete(id); historyInFlight.delete(id); historyRetryAt.delete(id); }
         return;
       }
       // A peer that was retired (replaced, or its close still pending) has nothing more to exchange.
@@ -1594,6 +1943,8 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     const pc = makePc({ iceServers: expandIceServers(iceServers), ...policy() });
     const peer: Peer = { pc, session: device.session!, started: now(), iceKey, sent: new Map(), resync: new Resync() };
     peers.set(device.id, peer);
+    const tried = `${device.id}:${device.session}`;
+    if (!firstOffer.has(tried)) { if (firstOffer.size >= 256) firstOffer.clear(); firstOffer.set(tried, peer.started); }
     pc.onDataChannel?.subscribe(channel => channel.label === FILE_CHANNEL_LABEL
       ? connectFileChannel(peer, device.id, channel)
       : connectChannel(peer, device.id, channel));
@@ -1670,18 +2021,70 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     await agent.command('signal', { to: id, session, targetSession: peer.session,
       description: { type: local.type, sdp: complete ? local.sdp : withGatheredCandidates(local.sdp, gathered) } });
   };
+  /** Per queued reply to a message that went to every agent: why it may not go (another agent has it), or undefined. */
+  const claimVerdicts = new Map<string, ClaimVerdict | undefined>();
+  /** Messages this runner answered, to mark answered with the room service once the outbox step lets go of the lock. */
+  const answeredMarks: string[] = [];
+  /**
+   * Claims, settled with the room service before the outbox step and outside its lock, so incoming packets never wait on
+   * the room service: claims the agent asked for (`claim`), answered in a note next to the outbox for the command waiting
+   * on it, and the claim each queued reply to a message that went to every agent needs before it is signed. Old notes
+   * nobody read are pruned here.
+   */
+  const settleOutboxClaims = async () => {
+    const outbox = join(agent.dir, 'outbox'), memberId = agent.members().memberId;
+    if (!memberId || agent.person) return;
+    const files = readdirSync(outbox);
+    for (const file of files.filter(f => f.endsWith('.dropped') || f.endsWith('.claim'))) {
+      try { if (Date.now() - lstatSync(join(outbox, file)).mtimeMs > OUTBOX_NOTE_MS) rmSync(join(outbox, file), { force: true }); } catch { /* gone */ }
+    }
+    // Within the step's budget: what is left waits for the next pass, so a slow room service never wedges the runner.
+    const ends = Date.now() + deadlines.claims;
+    for (const file of files.filter(f => f.endsWith('.json')).sort()) {
+      if (Date.now() >= ends) break;
+      try {
+        if (!lstatSync(join(outbox, file)).isFile()) continue; // deliverOutbox removes it.
+        const item = readJson<Record<string, any> | null>(join(outbox, file), null);
+        if (!item || typeof item !== 'object') continue;
+        if (item.type === 'claim') {
+          const problem = outboxProblem(agent, memberId, item);
+          let answer: { claim?: Claim | null; unsupported?: true; error?: string };
+          if (problem) { log(`dropped ${file}: ${problem}`); noteDropped(outbox, String(item.id), `This was not done: ${problem}.`); rmSync(join(outbox, file), { force: true }); continue; }
+          try { const claim = await claimMessage(agent, item.messageId, item.release ? { release: true } : {}, CLAIM_CALL_MS); answer = claim === undefined ? { unsupported: true } : { claim }; }
+          catch (error: any) { answer = error?.status === 429 ? { error: error.message } : { error: `The room service could not settle the claim: ${error instanceof Error ? error.message : String(error)}` }; }
+          noteDropped(outbox, item.id, JSON.stringify(answer), 'claim');
+          rmSync(join(outbox, file), { force: true }); continue;
+        }
+        if (item.type !== undefined || typeof item.replyTo !== 'string' || claimVerdicts.has(item.id)) continue;
+        if (agent.messages().some(m => m.packet.body.memberId === memberId && m.packet.body.id === item.id)) continue;
+        // A reply the outbox step will drop anyway takes no claim; it drops it.
+        if (outboxProblem(agent, memberId, item)) continue;
+        const view = agent.view(), target = resolveMessageById(view.messages, item.replyTo);
+        if (target && needsClaim(view, target)) claimVerdicts.set(item.id, await settleClaim(agent, view, target.id, CLAIM_CALL_MS));
+      } catch (error) { log(`claims: ${file}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+  };
+  const markAnswered = () => {
+    for (const messageId of answeredMarks.splice(0)) {
+      void claimMessage(agent, messageId, { answered: true }, CLAIM_CALL_MS).catch(error => log(`marking ${messageId.slice(0, 8)} answered: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  };
   const deliverOutbox = () => transaction(async () => {
     const outbox = join(agent.dir, 'outbox');
     for (const file of readdirSync(outbox).filter(f => f.endsWith('.json')).sort()) {
       try {
         // A harness sandbox can write the outbox: only regular files are read, and a planted link is removed, not followed.
         if (!lstatSync(join(outbox, file)).isFile()) { log(`outbox ${file}: not a regular file, removed`); unlinkSync(join(outbox, file)); continue; }
-        const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | RetractIntent | null>(join(outbox, file), null);
+        const item = readJson<{ id: string; text: string; replyTo?: string; attachments?: AttachmentRef[] } | TaskIntent | DecisionIntent | ReactionIntent | RetractIntent | ClaimIntent | null>(join(outbox, file), null);
         if (!item || !status?.memberId) continue;
+        // Claims are settled before this, outside the lock (settleOutboxClaims).
+        if ((item as { type?: string }).type === 'claim') continue;
         const problem = outboxProblem(agent, status.memberId, item);
         if (problem) {
           log(`dropped ${file}: ${problem}`);
-          if ((item as DecisionIntent).type === 'decision' && UUID.test(String(item.id))) noteDropped(outbox, item.id, `This change was not made: ${problem}.`);
+          // Told to the command waiting on it: a decision change, a claim, or a message.
+          const kind = (item as { type?: string }).type;
+          if ((kind === 'decision' || kind === 'claim' || 'text' in item) && UUID.test(String(item.id))) noteDropped(outbox, item.id, `This was not done: ${problem}.`);
           unlinkSync(join(outbox, file)); continue;
         }
         if ('type' in item && item.type === 'decision') {
@@ -1755,9 +2158,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           // Already in the log: a pass signed it and failed before finishing, and this one finishes it.
           let packet = readRetractOps().find(p => p.body.id === item.id);
           if (!packet) {
-            const target = readMessages().find(m => m.packet.body.id === item.messageId);
+            const target = readMessages().find(m => m.packet.body.id === item.messageId && m.packet.body.memberId === status!.memberId);
             if (!target || isRetracted(target)) { unlinkSync(join(outbox, file)); continue; }
-            const body: RetractBody = { kind: 'retract', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId, at: Date.now(), target: item.messageId };
+            const body: RetractBody = {
+              kind: 'retract', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId,
+              at: Date.now(), target: item.messageId, targetDeviceId: target.packet.body.deviceId,
+              ...(target.packet.body.seq !== undefined ? { seq: target.packet.body.seq } : {}),
+            };
             packet = { body, signature: await agent.sign(body) };
           }
           retractions.add([packet]);
@@ -1768,12 +2175,37 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         const messages = readMessages();
         const files = item.attachments;
         if (files && (!validAttachments(files) || !files.every(ref => agent.files.has(ref.sha256)))) { log(`dropped message ${item.id}: its files are missing`); unlinkSync(join(outbox, file)); continue; }
-        if (!messages.some(m => m.packet.body.id === item.id)) {
+        let answering: string | undefined;
+        if (!messages.some(m => m.packet.body.deviceId === identity.id && m.packet.body.id === item.id) && item.replyTo) {
+          // A reply to a message that went to every agent waits for its claim (settleOutboxClaims), and is dropped when
+          // another agent got there first.
+          const view = agent.view(), target = resolveMessageById(view.messages, item.replyTo);
+          if (!agent.person && target && needsClaim(view, target)) {
+            if (!claimVerdicts.has(item.id)) continue;
+            const refused = claimVerdicts.get(item.id);
+            claimVerdicts.delete(item.id);
+            if (refused) {
+              log(`dropped message ${item.id}: ${refused.reason}`);
+              // Answered by another agent: noted as such, so send can tell it from a failure.
+              noteDropped(outbox, item.id, refused.answeredBy !== undefined ? JSON.stringify(refused) : refused.reason);
+              unlinkSync(join(outbox, file)); continue;
+            }
+            answering = target.id;
+          }
+        }
+        if (!messages.some(m => m.packet.body.deviceId === identity.id && m.packet.body.id === item.id)) {
+          const visibility: MessageVisibility = status.settings?.historyForNewcomers ? 'room' : 'members';
+          const audienceUntil = visibility === 'members' ? currentAudienceUntil(status) : undefined;
+          const seq = nextAuthorSeq(messages, identity.id, readAuthorSeq());
           const body: MessageBody = { kind: 'message', roomId: agent.roomId, id: item.id, deviceId: identity.id, memberId: status.memberId,
-            text: item.text.trim() || (files ? attachmentText(files) : ''), at: Date.now(), ...(item.replyTo ? { replyTo: item.replyTo } : {}), ...(files ? { attachments: files } : {}) };
-          if (store(messages, { packet: { body, signature: await agent.sign(body) }, targets: (status.devices || []).filter(d => d.id !== identity.id).map(d => d.id), receipts: [] })) flushPendingReactions(item.id);
+            text: item.text.trim() || (files ? attachmentText(files) : ''), at: Date.now(), visibility, seq,
+            ...(audienceUntil !== undefined ? { audienceUntil } : {}), ...(item.replyTo ? { replyTo: item.replyTo } : {}), ...(files ? { attachments: files } : {}) };
+          saveAuthorSeq(seq);
+          if (store(messages, { packet: { body, signature: await agent.sign(body) }, targets: (status.devices || []).filter(d => d.id !== identity.id).map(d => d.id), receipts: [], receivedAt: Date.now() })) flushPendingReactions(item.id);
         }
         unlinkSync(join(outbox, file));
+        // The answer is signed: its claim is marked answered once this pass lets go of the lock (markAnswered).
+        if (answering) answeredMarks.push(answering);
       } catch (error) {
         // One item that can't be delivered now (a failed signature or write) stays queued and doesn't block the rest.
         log(`outbox ${file}: ${error instanceof Error ? error.message : String(error)}`);
@@ -1864,9 +2296,12 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         session,
         rosterVersion: () => verifiedRoster?.body.version ?? 1,
         onEnvelope: (envelope, meta) => handleRelayEnvelope(envelope, meta.cursor),
+        onStatus: pushedStatus => { pushed = pushedStatus; },
         onStateChange: state => {
           if (state === 'wss' || state === 'https') {
             syncedAt ??= Date.now();
+            relayHistorySynced.clear();
+            syncHistoryViaRelay();
             flush();
           }
         },
@@ -1875,9 +2310,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
           log(`relay auth (${code}): ${msg}`);
           relayClient?.stop();
           relayClient = undefined;
+          // Removed, or the room closed: the next pass polls, so it hears so, instead of opening the relay again.
+          polledAt = undefined;
         },
         ...options.relayOptions,
       });
+      // The service pushes this room's status over the socket, as this runner's lobby session: no polling while it does.
+      relayClient.watchStatus({ session, epoch, cursor });
       relayClient.start();
     }
   };
@@ -1895,22 +2334,42 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
     }
     try {
       let next: RoomStatus;
-      try { next = await answerWithin(agent.command('status', { session, epoch, cursor }), deadlines.poll, 'the room service'); }
-      catch (error) {
-        // An outage, a machine that woke before its network, a rejection: reported through the proof, never a reason to
-        // replace this runner, which carries on and polls again (a 410 is handled below).
-        const status = (error as { status?: unknown }).status;
-        const code = (error as { code?: unknown }).code;
-        if (status !== 410) {
-          failingSince ??= Date.now(); failure = error instanceof Error ? error.message : String(error);
-          // An HTTP answer (a rejection, a rate limit, a server error) means the service was reached: only a failure without
-          // one (the request failed or timed out) can mean this runner's own networking broke. See repairRunner.
-          failureStatus = typeof status === 'number' ? status : undefined;
-          upgradeRequired = status === 426 || code === 'upgrade-required';
-        }
-        throw error;
-      } finally { loopAt = Date.now(); }
-      polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined; upgradeRequired = false; pollBackoff = 0;
+      const live = relayClient?.statusLive === true;
+      // An offer waiting for its answer: poll each pass for it while no push brings it, for the offer's first seconds
+      // only. A device that never answers (online, but unable to connect) mustn't keep the runner polling.
+      // Counted from the first attempt at that device's session, so retries don't keep it going.
+      const setupAt = now();
+      const connecting = [...peers.entries()].some(([id, p]) => p.pc.signalingState === 'have-local-offer'
+        && setupAt - (firstOffer.get(`${id}:${p.session}`) ?? p.started) < CONNECTING_POLL_MS);
+      // A service without the relay has no socket to push over: polling is all there is, at the rate it always had.
+      const due = !status?.memberId || !status.relayUrl || failingSince !== undefined || connecting || passesSincePoll + 1 >= idlePollEvery
+        || Date.now() - (polledAt ?? 0) >= IDLE_POLL_MS;
+      if (live && pushed) {
+        next = pushed; pushed = undefined; passesSincePoll = 0;
+        polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined; upgradeRequired = false; pollBackoff = 0;
+      } else if (status && (live || !due)) {
+        // Nothing new: the pass does its own work (outbox, peers, decisions) on what the room last said. Its signals were
+        // handled already, as an idle poll would leave them out.
+        next = { ...status, signals: [] }; passesSincePoll++;
+      } else {
+        passesSincePoll = 0;
+        try { next = await answerWithin(agent.command('status', { session, epoch, cursor }), deadlines.poll, 'the room service'); }
+        catch (error) {
+          // An outage, a machine that woke before its network, a rejection: reported through the proof, never a reason to
+          // replace this runner, which carries on and polls again (a 410 is handled below).
+          const status = (error as { status?: unknown }).status;
+          const code = (error as { code?: unknown }).code;
+          if (status !== 410) {
+            failingSince ??= Date.now(); failure = error instanceof Error ? error.message : String(error);
+            // An HTTP answer (a rejection, a rate limit, a server error) means the service was reached: only a failure without
+            // one (the request failed or timed out) can mean this runner's own networking broke. See repairRunner.
+            failureStatus = typeof status === 'number' ? status : undefined;
+            upgradeRequired = status === 426 || code === 'upgrade-required';
+          }
+          throw error;
+        } finally { loopAt = Date.now(); }
+        polledAt = Date.now(); failingSince = undefined; failure = undefined; failureStatus = undefined; upgradeRequired = false; pollBackoff = 0;
+      }
       // Everything after the poll shares one budget, so the next poll comes inside the service's presence window.
       const passEnds = Date.now() + deadlines.budget, left = (cap: number) => Math.max(0, Math.min(cap, passEnds - Date.now()));
       // A device the room no longer has, with no request of its own, after it was a member: someone removed this agent.
@@ -1923,16 +2382,20 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
             expiresAt: next.request.expiresAt, at: Date.now() } : { state: 'none', at: Date.now() });
           keepStatus(next);
         }
+        // Kept as the last status, so the next pass polls again instead of working on an admission this device lost.
+        status = next;
         log(next.request ? `waiting for admission (${next.request.state})` : 'not admitted to this room'); await pause(3000); continue;
       }
       // The room's rules first, and on their own: listen, status and the watch peek read the floor from this file, so
       // nothing else in the pass (closing peers, a members.json busy on Windows) may leave it behind the room.
       // Every admitted status from the room service carries them; one that doesn't (a service from before room settings)
       // keeps the last ones heard, which are still written, so a lost or damaged copy never falls back to the default.
-      if (next.settings) rules = { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, repositories: next.repositories ?? [], checkedAt: Date.now() };
+      if (next.settings) rules = { floor: next.settings.floor, agentAssignmentsWake: next.settings.agentAssignmentsWake, historyForNewcomers: !!next.settings.historyForNewcomers, repositories: next.repositories ?? [], claims: next.claims ?? [], checkedAt: Date.now() };
       rules ??= agent.settings();
       keep('settings.json', rules);
       // OPS-9: on coordinator restart (epoch change), keep healthy open DataChannels alive and drop only half-open peers.
+      // A push may still carry signals handled before its ack reached the service: each is applied once.
+      if (next.epoch === epoch && next.signals?.length) next = { ...next, signals: next.signals.filter(s => s.seq > cursor) };
       if (epoch && next.epoch !== epoch) { retireHalfOpen(); cursor = 0; }
       // OPS-11: store refreshed TURN credentials immediately and update existing connections where supported.
       if (next.iceServers) {
@@ -1958,6 +2421,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       }
       epoch = next.epoch; status = next;
       await step('relay', () => syncRosterAndRelay(next), left(deadlines.profile));
+      syncHistoryViaRelay();
       // Departed members' roles, one per member, so an agent that left is never counted as a person in a decision.
       const former = [...new Map((next.formerDevices || []).map(d => [d.memberId, { id: d.memberId, ...((d as { role?: 'human' | 'agent' }).role ? { role: (d as { role?: 'human' | 'agent' }).role } : {}) }])).values()];
       // A roster that can't be saved keeps the last good one for the commands; peers and the outbox carry on regardless.
@@ -1966,6 +2430,7 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
       if (agent.person && existsSync(join(agent.dir, ADMISSION_FILE))) rmSync(join(agent.dir, ADMISSION_FILE), { force: true });
       await step('profile', () => applyPendingProfile(agent, log), left(deadlines.profile));
       for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
+      relayClient?.ackStatus(cursor, epoch);
       const devices = (next.devices || []).filter(d => d.id !== identity.id);
       const available = devices.filter(d => d.session);
       // Alone in the room: no device can send history, so there is nothing to wait for before a watcher starts from now.
@@ -2044,10 +2509,13 @@ export async function runBridge(agent: BrowserAgent, log: (line: string) => void
         log(`pass: connecting to ${id.slice(0, 8)} did not finish within ${Math.round(signalMs / 100) / 10} s; dropping that connection to try again`);
         if (peers.get(id) === peer) void retire(id, peer);
       });
+      await step('claims', settleOutboxClaims, left(deadlines.claims));
       await step('outbox', deliverOutbox, left(deadlines.outbox));
+      markAnswered();
       await step('decisions', closeDueDecisions, left(deadlines.decisions));
       for (const peer of peers.values()) { peer.queue?.pump(); resyncDue(peer); }
       for (const id of quotaDrops.due()) requestSync(id);
+      flushHistoryRetries();
       transfers.tick(); fetchWanted();
       if (agent.person) keepStatus(next);
       if (Date.now() - pruned > 60_000) { prune(); pruned = Date.now(); }
@@ -2125,7 +2593,7 @@ export function listenSnapshot(agent: BrowserAgent, plan: ListenPlan, historyDue
 export function listenPlan(agent: BrowserAgent, flags: { after?: string; boardAfter?: number; decisionsAfter?: number; fromStart?: boolean } = {}) {
   const saved = flags.fromStart ? undefined : agent.listenCursor();
   // A cursor for a message this folder no longer holds (its messages were reset) starts over rather than failing every listen.
-  const known = saved?.after !== undefined && agent.messages().some(m => m.packet.body.id === saved.after);
+  const known = saved?.after !== undefined && storedCursorIndex(agent.messages(), saved.after) >= 0;
   const after = flags.after ?? (known ? saved!.after : undefined);
   // Saved cursors ahead of what this folder holds (its tasks or decisions were reset) are stale: start those from 0.
   const board = saved?.boardAfter !== undefined && saved.boardAfter <= agent.boardCursor() ? saved.boardAfter : undefined;
@@ -2185,7 +2653,10 @@ export async function listenBrowser(agent: BrowserAgent, after: string | undefin
       // History without anything for this agent is catching up, not work.
       if (result.addressed.length || result.tasks.length || decided) agent.recordActivity('working', { messages: result.addressed.slice(-8), tasks: result.tasks.map(t => t.id).slice(-8) });
       else agent.recordActivity('idle');
-      return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, ...result, decisionCursor,
+      // Messages that went to every agent: one of them answers, the first to claim it.
+      const toClaim = result.addressed.filter(id => { const m = resolveMessageById(view.messages, id); return !!m && needsClaim(view, m); });
+      return { roomId: agent.roomId, participantId: view.memberId, floor: view.floor, historyForNewcomers: view.historyForNewcomers, ...result, decisionCursor,
+        ...(toClaim.length ? { claim: { messages: toClaim, note: CLAIM_NOTE } } : {}),
         ...(decided ? { decisions: { asked: wakes.asked.map(d => describeDecision(agent, d)), resolved: wakes.resolved.map(d => describeDecision(agent, d)),
           ...(wakes.withdrawn.length ? { withdrawn: wakes.withdrawn.map(d => describeDecision(agent, d)) } : {}) } } : {}) };
     }
@@ -2238,16 +2709,118 @@ export async function listenRemembering(agent: BrowserAgent, seconds: number,
   return resumed ? { ...result, resumed } : result;
 }
 
+/**
+ * Claims a message that went to every agent (`needsClaim` in src/collab.ts) with the room service, which settles who got
+ * there first, and keeps the answer in the agent's rules so `send`, `listen` and the runner see it before the next poll.
+ * Returns who holds it now, or null once released. A room service from before claims answers undefined: nobody can hold
+ * one there, and agents answer as before.
+ */
+export async function claimMessage(agent: BrowserAgent, messageId: string, change: { answered?: true; release?: true } = {}, timeoutMs = 10_000): Promise<Claim | null | undefined> {
+  let claim: Claim | null | undefined;
+  try { claim = (await agent.command('claim', { messageId, ...change }, randomUUID(), timeoutMs)).claim; }
+  catch (error: any) { if (error?.status === 400 && /Unknown room action/.test(error.message)) return undefined; throw error; }
+  if (claim === undefined) return undefined;
+  agent.noteClaim(messageId, claim);
+  return claim;
+}
+
+const memberName = (view: { participants: { id: string; name?: string }[] }, id: string) => view.participants.find(p => p.id === id)?.name;
+
+/** Why a reply may not go: `answeredBy` when another agent has the message (named, or '' when unknown), else a refusal. */
+export type ClaimVerdict = { reason: string; answeredBy?: string };
+/** A message another agent answers: an expected outcome for the agent, not a failed delivery. */
+const answeredElsewhere = (by: string | undefined): ClaimVerdict => ({ reason: claimRefusal(by), answeredBy: by ?? '' });
+
+/**
+ * What `send` returns when the reply did not go because another agent has the message: exit 0, `status: not-sent`,
+ * `reason: answered-by-another`, so a channel records it as handled elsewhere rather than as a failed delivery.
+ */
+export const notSent = (messageId: string, verdict: ClaimVerdict) =>
+  ({ messageId, status: 'not-sent' as const, reason: 'answered-by-another' as const, answeredBy: verdict.answeredBy || 'another agent', note: verdict.reason });
+
+/**
+ * Before an agent's reply to a message that went to every agent is signed: claim it, and say why not when another agent
+ * got there first. The room service decides; one from before claims lets every agent answer, as before; one out of reach
+ * leaves it to the claims this device last heard. Undefined: the reply may go.
+ */
+export async function settleClaim(agent: BrowserAgent, view: { memberId?: string; participants: { id: string; name?: string }[]; claims?: Claim[]; messages: Message[] }, messageId: string, timeoutMs = 10_000): Promise<ClaimVerdict | undefined> {
+  let claim: Claim | null | undefined;
+  try { claim = await claimMessage(agent, messageId, {}, timeoutMs); }
+  catch (error: any) {
+    // The agent holds as many unanswered messages as it may: answer or release one first.
+    if (error?.status === 429) return { reason: error.message };
+    const holder = claimHolder(view, messageId);
+    return holder && holder !== view.memberId ? answeredElsewhere(memberName(view, holder)) : undefined;
+  }
+  // Another agent's answered claim counts past its time only once this device holds the answer, as everywhere.
+  const holder = claim ? claimHolder({ claims: [claim], messages: view.messages }, messageId) : undefined;
+  return holder && holder !== view.memberId ? answeredElsewhere(memberName(view, holder)) : undefined;
+}
+
+/**
+ * `claim`: take (or with `release`, give back) a message that went to every agent, before working on it, so the others
+ * know to stay quiet. `send` claims too when it replies to one, so this matters for work that takes a while.
+ */
+export async function claimBrowser(agent: BrowserAgent, messageId: string, release = false, seconds = 15) {
+  const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
+  if (agent.person) throw new Error('Only agents claim messages.');
+  const target = resolveMessageById(view.messages, messageId);
+  if (!target) throw new Error('No message in this room has that id. Use a message id from listen.');
+  if (!needsClaim(view, target)) throw new Error('This message is not one that goes to every agent (a person’s message on an open floor that names nobody and replies to nothing), so it needs no claim. Answer it if it addresses you.');
+  if (!release && !wakes({ ...view, claims: [] }, target, view.memberId)) throw new Error('This message does not wake this agent (it answers only its operator), so it is not one for it to answer.');
+  let claim: Claim | null | undefined;
+  if (agent.stateless) claim = await claimMessage(agent, messageId, release ? { release: true } : {});
+  else {
+    // The runner settles it: it can reach the room service, which a sandboxed wake may not.
+    const id = randomUUID(), outbox = join(agent.dir, 'outbox');
+    writeJson(join(outbox, `${Date.now()}-${id}.json`), { type: 'claim', id, messageId, ...(release ? { release: true } : {}) });
+    const deadline = Date.now() + seconds * 1000;
+    let answer: { claim?: Claim | null; unsupported?: true; error?: string } | undefined;
+    while (!answer && Date.now() < deadline) {
+      const dropped = takeDropped(outbox, id);
+      if (dropped) throw new Error(dropped);
+      const note = takeDropped(outbox, id, 'claim');
+      if (note) answer = JSON.parse(note); else await Bun.sleep(200);
+    }
+    if (!answer) {
+      // Withdrawn, so a runner that comes back later doesn't take a claim the agent stopped waiting for.
+      for (const f of readdirSync(outbox)) if (f.endsWith(`-${id}.json`)) rmSync(join(outbox, f), { force: true });
+      if (takeDropped(outbox, id, 'claim') === undefined) return { messageId, claimed: false, status: 'not-settled', note: 'The bridge could not settle the claim in time; nothing was claimed. send claims the message when you reply.' };
+      answer = { error: 'The bridge settled the claim just as the wait ended. Run claim again to see who holds it.' };
+    }
+    if (answer.error) throw new Error(answer.error);
+    claim = answer.unsupported ? undefined : answer.claim ?? null;
+  }
+  if (claim === undefined) return { messageId, claimed: false, note: 'This room service does not settle claims yet. Answer as agents did before.' };
+  if (claim === null) return { messageId, released: true };
+  const answered = claim.answered ? { answered: true } : {};
+  if (claim.memberId === view.memberId) return release ? { messageId, released: false, ...answered, note: 'You already answered it.' } : { messageId, claimed: true, until: new Date(claim.until).toISOString(), ...answered };
+  const holder = memberName(view, claim.memberId);
+  return { messageId, claimed: false, claimedBy: holder ?? 'Another agent', ...answered, note: claimRefusal(holder) };
+}
+
+/** What `listen` tells an agent about messages that went to every agent. */
+export const CLAIM_NOTE = 'These went to every agent, and one of them answers. Decide whether you are the one to answer; if so, claim it (claim --message ID) before you work on it, and claim it again every few minutes while the work takes longer. If another agent has it, stay quiet. Answer with a reply to the message (--reply-to): the bridge claims it then too, and if another agent got there first send answers status not-sent, reason answered-by-another: stay quiet then.';
+
 /** Queue a message for `run` to sign and deliver; waits until peers store it or the timeout passes. */
 export async function sendBrowser(agent: BrowserAgent, text: string, replyTo: string | undefined, requestId: string, attach: string[] = []) {
   const view = agent.view(); if (!view.memberId) throw new Error('This agent is not admitted to the browser room yet.');
   if ((!text.trim() && !attach.length) || text.length > 4000) throw new Error('Write a message of up to 4,000 characters.');
   if (attach.length > MAX_MESSAGE_ATTACHMENTS) throw new Error(`Attach up to ${MAX_MESSAGE_ATTACHMENTS} files per message.`);
   if (replyTo && !view.messages.some(m => m.id === replyTo)) throw new Error('The reply target is not in this browser room.');
-  if (!mayAgentSpeak(view, view.memberId, replyTo)) throw new Error('This room is humans-first: agents speak only when a person addresses them. Reply to a message that mentions you or replies to you.');
   const id = requestId; // Stable per logical send, so a retry never duplicates.
+  const sent = agent.messages().find(m => m.packet.body.id === id), outbox = join(agent.dir, 'outbox');
+  const queued = !sent && existsSync(outbox) && readdirSync(outbox).some(f => f.endsWith(`-${id}.json`));
+  // A retry of a message already on its way isn't checked again: the claim it took may have lapsed since.
+  if (!sent && !queued) {
+    // A message that went to every agent is answered by the one that claims it first. The runner claims it before it
+    // signs the reply, and drops the reply when another agent got there first; refuse here at once when this device
+    // already knows that.
+    const target = replyTo ? resolveMessageById(view.messages, replyTo) : undefined;
+    if (!agent.person && target && heldByAnother(view, target, view.memberId)) return notSent(id, answeredElsewhere(memberName(view, takenBy(view, target)!)));
+    if (!mayAgentSpeak(view, view.memberId, replyTo, text, true)) throw new Error(speakRefusal(view.floor));
+  }
   if (agent.activity()?.state === 'working') agent.touchActivity();
-  const sent = agent.messages().find(m => m.packet.body.id === id);
   let attachments = sent?.packet.body.attachments;
   if (!sent) {
     const files = attach.map(path => {
@@ -2257,11 +2830,20 @@ export async function sendBrowser(agent: BrowserAgent, text: string, replyTo: st
     });
     // Stored before the message is queued, so `run` can serve each file as soon as a peer asks.
     attachments = await Promise.all(files.map(async ({ path, bytes }) => { const ref = await attachmentRef(bytes, basename(path)); agent.files.add(bytes); return ref; }));
-    writeJson(join(agent.dir, 'outbox', `${Date.now()}-${id}.json`), { id, text: text.trim(), ...(replyTo ? { replyTo } : {}), ...(attachments.length ? { attachments } : {}) });
+    if (!queued) writeJson(join(outbox, `${Date.now()}-${id}.json`), { id, text: text.trim(), ...(replyTo ? { replyTo } : {}), ...(attachments.length ? { attachments } : {}) });
   }
   const files = attachments?.length ? { attachments } : {};
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
+    // The runner dropped it (another agent claimed what it replies to): say why, rather than that it is still queued.
+    const dropped = takeDropped(outbox, id);
+    if (dropped) {
+      // Another agent answers it: not a failure. Anything else the runner noted is.
+      let verdict: ClaimVerdict | undefined;
+      try { const parsed = JSON.parse(dropped); if (typeof parsed?.reason === 'string' && typeof parsed.answeredBy === 'string') verdict = parsed; } catch { /* a plain reason */ }
+      if (verdict) return notSent(id, verdict);
+      throw new Error(dropped);
+    }
     const stored = agent.messages().find(m => m.packet.body.id === id);
     if (stored && stored.receipts.length) return { messageId: id, status: 'stored-remotely', devices: stored.receipts.length, ...files };
     await Bun.sleep(300);
@@ -2389,14 +2971,14 @@ export function describeDecision(agent: BrowserAgent, d: Decision) {
 }
 
 /** Why `run` could not sign a queued decision change, kept next to the outbox for the command waiting on it. */
-export function noteDropped(outbox: string, id: string, reason: string) {
+export function noteDropped(outbox: string, id: string, reason: string, kind: 'dropped' | 'claim' = 'dropped') {
   // The id names the file, so it must be a UUID; written by rename, so a link planted at the name is replaced, not followed.
   if (!UUID.test(id)) return;
-  replaceFile(join(outbox, `${id}.dropped`), reason);
+  replaceFile(join(outbox, `${id}.${kind}`), reason);
 }
-/** The reason `run` noted for dropping a change, read once. */
-export function takeDropped(outbox: string, id: string) {
-  const note = join(outbox, `${id}.dropped`);
+/** The reason `run` noted for dropping a change (or, `claim`, how it settled a claim), read once. */
+export function takeDropped(outbox: string, id: string, kind: 'dropped' | 'claim' = 'dropped') {
+  const note = join(outbox, `${id}.${kind}`);
   // The outbox is writable by a sandboxed wake: only a small regular file is read, never a link to something else.
   let found; try { found = lstatSync(note); } catch { return undefined; }
   if (!found.isFile() || found.size > 4096) { rmSync(note, { force: true }); return undefined; }
@@ -2547,13 +3129,16 @@ export function computeRelayWakeMeta(
   }));
   const floor = status.settings?.floor ?? 'humans-first';
   const agentAssignmentsWake = !!status.settings?.agentAssignmentsWake;
+  const canonicalKeys = canonicalMessageKeys(messages);
   const history: Message[] = messages.map(({ packet: { body }, retracted }) => {
     const author = participants.find(p => p.id === body.memberId);
     const text = retracted ? 'Message deleted' : shownText(body);
     const mentions = mentionedIds(text, participants);
+    const collidingCopy = canonicalKeys.get(body.id) !== messageKey(body.deviceId, body.id);
     return {
       id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human',
-      text, time: safeIso(body.at),
+      text, time: safeIso(body.at), deviceId: body.deviceId,
+      ...(collidingCopy ? { collidingCopy: true as const } : {}),
       ...(retracted ? { deleted: true } : {}),
       ...(body.replyTo ? { replyTo: body.replyTo } : {}),
       ...(mentions.length ? { mentions } : {}),
@@ -2711,6 +3296,8 @@ export type SealedAgentState = {
   decisionOps: StoredDecisionOp[];
   reactionOps: ReactionPacket[];
   retractOps: RetractPacket[];
+  /** Highest per-author-device sequence number this agent signed in this room. */
+  lastAuthorSeq?: number;
   /** Relay envelopes (sender + id) already processed, so a replayed envelope is dropped. */
   relaySeen?: RelayReplayRecord;
 };
@@ -2769,7 +3356,9 @@ function hydrateAgentFromStatusAndSealed(agent: BrowserAgent, status: RoomStatus
   const settings: RoomRules = {
     floor: status.settings?.floor ?? 'humans-first',
     agentAssignmentsWake: !!status.settings?.agentAssignmentsWake,
+    historyForNewcomers: !!status.settings?.historyForNewcomers,
     repositories: status.repositories ?? [],
+    claims: status.claims ?? [],
     checkedAt: Date.now(),
   };
   if (agent.stateless) {
@@ -2845,6 +3434,7 @@ async function fetchStatusAndVerifyRoster(
           decisionOps: Array.isArray(unsealed.decisionOps) ? unsealed.decisionOps : [],
           reactionOps: Array.isArray(unsealed.reactionOps) ? unsealed.reactionOps : [],
           retractOps: Array.isArray(unsealed.retractOps) ? unsealed.retractOps : [],
+          ...(typeof unsealed.lastAuthorSeq === 'number' && Number.isSafeInteger(unsealed.lastAuthorSeq) && unsealed.lastAuthorSeq > 0 ? { lastAuthorSeq: unsealed.lastAuthorSeq } : {}),
         };
       }
     } catch {
@@ -2906,6 +3496,7 @@ export async function relayListenOnce(
     preferHttps?: boolean;
     minRosterVersion?: number;
     relayOptions?: Partial<RelayClientOptions>;
+    now?: () => number;
   } = {},
 ) {
   const identity = await agent.ensureIdentity();
@@ -2936,6 +3527,9 @@ export async function relayListenOnce(
     const findRosterDevice = (deviceId: string) => rosterDevices.find(d => d.id === deviceId);
     const awaiting = (m: Stored) => awaitingDelivery(m, identity.id, new Set(rosterDevices.map(d => d.id)));
     const seen = RelayReplayGuard.from(sealed.relaySeen);
+    const clock = options.now ?? Date.now;
+    const coldHistoryAcceptLimiter = new PeerRateLimiter(clock, HISTORY_ACCEPT_ENTRIES_PER_MINUTE, HISTORY_ACCEPT_ENTRIES_BURST);
+    const coldQuota = new ReceiveQuota(clock);
 
     for (const item of drained.frames) {
       const env = item.envelope;
@@ -2955,6 +3549,55 @@ export async function relayListenOnce(
       seen.add(env.from, env.id);
       const packet = decrypted.packet as Packet | undefined;
       if (!packet || typeof packet !== 'object') continue;
+      if (isHistoryPacket(packet, agent.roomId)) {
+        if (packet.retryAfterMs !== undefined && packet.entries.length === 0) continue;
+        if (!coldHistoryAcceptLimiter.take(env.from, Math.max(1, packet.entries.length))) continue;
+        const held = new Set(sealed.messages.map(m => messageKey(m.packet.body.deviceId, m.packet.body.id)));
+        const baseMaxSeq = maxSeqByDevice(sealed.messages);
+        const batchAnchor = new Map<string, number>();
+        const accepted: Stored[] = [];
+        for (const entry of packet.entries) {
+          const eb = entry?.body;
+          if (!eb || eb.kind !== 'message' || eb.roomId !== agent.roomId || typeof eb.id !== 'string' || !UUID.test(eb.id) || typeof eb.deviceId !== 'string') continue;
+          const key = messageKey(eb.deviceId, eb.id);
+          if (held.has(key)) continue;
+          if (typeof entry.signature !== 'string' || typeof eb.text !== 'string' || !eb.text.trim() || eb.text.length > 4000 || !Number.isSafeInteger(eb.at) || eb.at < 0 || eb.at > MAX_TIME) continue;
+          if (eb.replyTo !== undefined && (typeof eb.replyTo !== 'string' || !UUID.test(eb.replyTo))) continue;
+          if (eb.attachments !== undefined && !validAttachments(eb.attachments)) continue;
+          if (!validMessageVisibility(eb.visibility) || !validMessageSeq(eb.seq) || !validAudienceUntil(eb.audienceUntil)) continue;
+          const maxHeld = baseMaxSeq.get(eb.deviceId) ?? batchAnchor.get(eb.deviceId) ?? 0;
+          if (!withinSeqJump(eb.seq, maxHeld)) continue;
+          const activeAuthor = findRosterDevice(eb.deviceId);
+          const author = activeAuthor
+            ? (() => {
+                if (activeAuthor.memberId !== eb.memberId) {
+                  const statusDev = status.devices?.find(d => d.id === eb.deviceId);
+                  const prior = statusDev?.priorMembers?.find(p =>
+                    p.memberId === eb.memberId && (p.retiredAt === undefined || eb.at <= p.retiredAt));
+                  if (prior) return { publicKey: activeAuthor.sign, memberId: prior.memberId };
+                }
+                return { publicKey: activeAuthor.sign, memberId: activeAuthor.memberId };
+              })()
+            : (() => {
+                const removed = roster.body.removed.find(r => r.id === eb.deviceId);
+                if (removed?.revoked) return undefined;
+                const former = status.formerDevices?.find(d => d.id === eb.deviceId);
+                if (!former || former.revoked) return undefined;
+                return former.retiredAt === undefined || eb.at <= former.retiredAt ? former : undefined;
+              })();
+          if (!author || eb.memberId !== author.memberId || !await agent.verify(author.publicKey, eb, entry.signature)) continue;
+          if (!coldQuota.take(eb.memberId, 'history')) continue;
+          held.add(key);
+          if (typeof eb.seq === 'number' && !baseMaxSeq.has(eb.deviceId) && !batchAnchor.has(eb.deviceId)) batchAnchor.set(eb.deviceId, eb.seq);
+          const savedEntry: Stored = { packet: { body: eb, signature: entry.signature }, targets: [], receipts: [], receivedAt: Date.now(), replicated: true };
+          accepted.push(sealed.retractOps.some(op => mayRetract(op.body, eb)) ? retractedStub(savedEntry) : savedEntry);
+        }
+        if (accepted.length) {
+          const { messages: merged } = mergeHistoryMessages(sealed.messages, accepted);
+          sealed.messages = windowHistory(merged, awaiting).kept;
+        }
+        continue;
+      }
       const b = (packet as { body?: Record<string, unknown> }).body;
       const sig = (packet as { signature?: unknown }).signature;
       if (!b || typeof sig !== 'string' || b.roomId !== agent.roomId || b.deviceId !== env.from) continue;
@@ -2967,10 +3610,12 @@ export async function relayListenOnce(
           || !Number.isSafeInteger(msg.at) || msg.at < 0 || msg.at > MAX_TIME) continue;
         if (msg.replyTo !== undefined && (typeof msg.replyTo !== 'string' || !UUID.test(msg.replyTo))) continue;
         if (msg.attachments !== undefined && !validAttachments(msg.attachments)) continue;
-        const existing = sealed.messages.find(m => m.packet.body.id === msg.id);
+        if (!validMessageVisibility(msg.visibility) || !validMessageSeq(msg.seq) || !validAudienceUntil(msg.audienceUntil)) continue;
+        const existing = sealed.messages.find(m => m.packet.body.deviceId === msg.deviceId && m.packet.body.id === msg.id);
         if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(msg)) continue;
+        if (!existing && !withinSeqJump(msg.seq, maxSeqForDevice(sealed.messages, msg.deviceId))) continue;
         if (!existing) {
-          const { kept } = windowHistory([...sealed.messages, { packet: { body: msg, signature: sig }, targets: [], receipts: [] }], awaiting);
+          const { kept } = windowHistory([...sealed.messages, { packet: { body: msg, signature: sig }, targets: [], receipts: [], receivedAt: Date.now() }], awaiting);
           sealed.messages = kept;
         }
         // Build signed peer receipt (NEVER relay accepted) and wrap to the sender device.
@@ -3006,15 +3651,20 @@ export async function relayListenOnce(
           sealed.decisionOps = [...sealed.decisionOps, { body: b as unknown as DecisionPacket['body'], signature: sig, seq: nextSeq }];
         }
       } else if (b.kind === 'reaction') {
-        if (validReactionBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.reactionOps.some(op => op.body.id === b.id)) {
+        if (validReactionBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.reactionOps.some(op => opKey(op.body) === opKey(b))) {
           sealed.reactionOps = capReactions([...sealed.reactionOps, { body: b as unknown as ReactionPacket['body'], signature: sig }]);
         }
       } else if (b.kind === 'retract') {
-        if (validRetractBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.retractOps.some(op => op.body.id === b.id)) {
+        if (validRetractBody(b, agent.roomId) && b.memberId === sender.memberId && !sealed.retractOps.some(op => opKey(op.body) === opKey(b))) {
           const added = addRetractions(sealed.retractOps, [{ body: b as unknown as RetractPacket['body'], signature: sig }], sealed.messages);
           sealed.retractOps = added.log;
           const applied = applyRetractions(sealed.messages, added.log.map(op => op.body));
           sealed.messages = applied.messages;
+          if (applied.changed.length) {
+            const stillLive = new Set(sealed.messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+            const fullyRetracted = new Set(applied.changed.filter(id => !stillLive.has(id)));
+            if (fullyRetracted.size) sealed.reactionOps = sealed.reactionOps.filter(op => !fullyRetracted.has(op.body.messageId));
+          }
         }
       }
     }
@@ -3039,6 +3689,7 @@ export async function relayListenOnce(
         roomId: agent.roomId,
         participantId: view.memberId,
         floor: view.floor,
+        historyForNewcomers: view.historyForNewcomers,
         ...result,
         decisionCursor,
         ...(decided ? {
@@ -3140,11 +3791,21 @@ export async function relaySendOnce(
   if (!view.memberId) throw Object.assign(new Error('This agent is not admitted to the browser room.'), { status: 403 });
   if (!input.text.trim() || input.text.length > 4000) throw new Error('Write a message of up to 4,000 characters.');
   if (input.replyTo && !view.messages.some(m => m.id === input.replyTo)) throw new Error('The reply target is not in this browser room.');
-  if (!agent.person && !mayAgentSpeak(view, view.memberId, input.replyTo)) {
-    throw new Error('This room is humans-first: agents speak only when a person addresses them. Reply to a message that mentions you or replies to you.');
+  // Whether the floor lets it speak first (claims aside), so a send refused anyway never takes a claim. Then a reply to a
+  // message that went to every agent claims it: this device has no runner to do that for it.
+  const target = input.replyTo ? resolveMessageById(view.messages, input.replyTo) : undefined;
+  const claimed = !agent.person && !!target && needsClaim(view, target);
+  if (!agent.person && !mayAgentSpeak(view, view.memberId, input.replyTo, input.text, true)) throw new Error(speakRefusal(view.floor));
+  if (claimed) {
+    const refused = await settleClaim(agent, view, target!.id);
+    if (refused?.answeredBy !== undefined) return notSent(input.requestId, refused);
+    if (refused) throw new Error(refused.reason);
   }
 
   const recipients = roster.body.devices.filter(d => d.id !== identity.id);
+  const visibility: MessageVisibility = status.settings?.historyForNewcomers ? 'room' : 'members';
+  const audienceUntil = visibility === 'members' ? currentAudienceUntil(status) : undefined;
+  const seq = nextAuthorSeq(sealed.messages, identity.id, sealed.lastAuthorSeq ?? 0);
   const body: MessageBody = {
     kind: 'message',
     roomId: agent.roomId,
@@ -3153,12 +3814,16 @@ export async function relaySendOnce(
     memberId: view.memberId,
     text: input.text.trim(),
     at: Date.now(),
+    visibility,
+    seq,
+    ...(audienceUntil !== undefined ? { audienceUntil } : {}),
     ...(input.replyTo ? { replyTo: input.replyTo } : {}),
   };
   const packet = { body, signature: await agent.sign(body) };
-  const existing = sealed.messages.find(m => m.packet.body.id === input.requestId);
+  const existing = sealed.messages.find(m => m.packet.body.deviceId === identity.id && m.packet.body.id === input.requestId);
   if (!existing) {
-    sealed.messages = [...sealed.messages, { packet, targets: recipients.map(r => r.id), receipts: [] }];
+    sealed.lastAuthorSeq = seq;
+    sealed.messages = [...sealed.messages, { packet, targets: recipients.map(r => r.id), receipts: [], receivedAt: Date.now() }];
   }
 
   const receivedReceipts = new Set<string>(existing?.receipts ?? []);
@@ -3235,6 +3900,7 @@ export async function relaySendOnce(
     const blob = await sealBoundedState(agent, sealed);
     await relay.putSealedState(blob);
     hydrateAgentFromStatusAndSealed(agent, status, sealed);
+    if (claimed) await claimMessage(agent, target!.id, { answered: true }).catch(() => undefined);
     return {
       messageId: input.requestId,
       status: receivedReceipts.size > 0 ? 'stored-remotely' : 'queued-for-peers',

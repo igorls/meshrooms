@@ -1,16 +1,17 @@
 import { afterEach, expect, test } from 'bun:test';
+import type { Floor } from '../../src/collab';
 import { spawn } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { taskBody } from '../../src/browser/board';
 import { openDecision } from '../../src/browser/decisions';
-import { BrowserAgent, listenRemembering, noteDropped, outboxProblem, peekWork, queuedMaySpeak, takeDropped } from '../browser-agent';
+import { BrowserAgent, CLAIM_NOTE, claimBrowser, listenRemembering, noteDropped, outboxProblem, peekWork, queuedMaySpeak, sendBrowser, takeDropped } from '../browser-agent';
 import { claimIssueTask, releaseIssueTask } from '../github-issues';
 import { agentCli, answeredItems, cwdExposes, envProject, insideDir, iso, newerThreadWarning, ourProcess, runnerOwner, startFromNow, wakeGuard, ALIVE_WITHIN_MS, START_SETTLE_MS } from '../agent-cli';
 import {
   CLAUDE_DENIED, CODEX_DISABLED, CODEX_PROFILE, DEFAULT_DSH_PROFILE, HARNESSES, HOME_SECRETS, PAUSED_NOTE, STDOUT_MAX_BYTES, STDOUT_TAIL_BYTES, WATCH_TIMING, appendNoFollow, claudeReadRules, claudeRulePath, clearDir, codexBase, codexConfig, codexThread, fileTail, killTree, parsePsOutput, reapGroup,
-  runFingerprint, sameRun, wakeReadDenies, agentHomesFile, codexEnvDenies, envProjectProblem, knownAgentHomes, recordAgentHome, stopOwnChild, type KillDeps, emptyState, harnessInvocation, heredocMarker, launcherRules, newestCodexThread,
+  runFingerprint, sameRun, wakeReadDenies, agentHomesFile, codexEnvDenies, envProjectProblem, knownAgentHomes, recordAgentHome, stopOwnChild, type KillDeps, canonicalPath, emptyState, harnessInvocation, heredocMarker, launcherRules, newestCodexThread,
   openFresh, readHarnessOutput, hermesWakeEnv, wakeEnv, TOOL_SCAN_LIMIT, TOOL_SCAN_OVERFLOW, resolveProgram, runProgram, sessionLedger, type SessionClaim, sessionKey, splitTemplate, wakeLedger, watchLoop, watchPrompt, writeFresh,
   type WatchConfig, type WatchDeps, type WatchState,
 } from '../agent-watch';
@@ -25,7 +26,7 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const tempHome = () => { const home = mkdtempSync(join(tmpdir(), 'mr-bridge-watch-')); dirs.push(home); return home; };
 
 /** A room folder as the runner leaves it, for the agent Wren. */
-function room(home = tempHome(), roomId: string = crypto.randomUUID(), floor: 'humans-first' | 'open' = 'humans-first') {
+function room(home = tempHome(), roomId: string = crypto.randomUUID(), floor: Floor = 'humans-first') {
   const agent = new BrowserAgent(home, 'http://127.0.0.1:1', roomId);
   writeFileSync(join(agent.dir, 'members.json'), JSON.stringify(roster(wren)));
   writeFileSync(join(agent.dir, 'settings.json'), JSON.stringify({ floor }));
@@ -51,7 +52,7 @@ type Listened = { state: string; addressed: string[]; tasks: { id: string }[]; d
 const listenWork = (l: Listened) => l.state !== 'timeout' && (l.addressed.length > 0 || l.tasks.length > 0 || !!l.decisions?.asked.length || !!l.decisions?.resolved.length || !!l.decisions?.withdrawn?.length);
 
 test('peek finds exactly the work listen would return, and consumes nothing', async () => {
-  const scenarios: [string, (r: Room) => void, boolean, ('humans-first' | 'open')?][] = [
+  const scenarios: [string, (r: Room) => void, boolean, Floor?][] = [
     ['a person chatting', r => { r.say('Lunch at noon?'); }, false],
     ['a mention', r => { r.say('@Wren can you look?'); }, true],
     ['@agents', r => { r.say('@agents status please'); }, true],
@@ -66,6 +67,10 @@ test('peek finds exactly the work listen would return, and consumes nothing', as
     // Asks follow the same author rules as messages: another agent's ask doesn't wake it in a humans-first room.
     ['a decision another agent opened, humans first', r => { r.ask('Tabs or spaces?', other); }, false],
     ['a decision another agent opened, open floor', r => { r.ask('Tabs or spaces?', other); }, true, 'open'],
+    ['another agent mentioning it, people and agents', r => { r.say('@Wren over to you', other); }, true, 'people-and-agents'],
+    ['another agent saying @agents, people and agents', r => { r.say('@agents over to you', other); }, false, 'people-and-agents'],
+    // An agent's ask would wake every agent it asks at once, past the loop guard.
+    ['a decision another agent opened, people and agents', r => { r.ask('Tabs or spaces?', other); }, false, 'people-and-agents'],
   ];
   for (const [name, happen, expected, floor] of scenarios) {
     const r = room(undefined, undefined, floor);
@@ -107,6 +112,66 @@ test('the runner signs a queued message only when the room lets the agent speak,
   expect(queuedMaySpeak(r.agent, wren, chatter)).toBe(false);
   expect(queuedMaySpeak(r.agent, wren, mention)).toBe(true);
   expect(queuedMaySpeak(room(undefined, undefined, 'open').agent, wren, undefined)).toBe(true);
+  // With people and agents, an agent may start a message that names another member one by one, as the outbox check
+  // reads the queued text; humans-first still refuses it, and @agents alone never counts.
+  const both = room(undefined, undefined, 'people-and-agents');
+  expect(queuedMaySpeak(both.agent, wren, undefined, '@Otto can you pair on this?')).toBe(true);
+  expect(queuedMaySpeak(both.agent, wren, undefined, '@agents anyone?')).toBe(false);
+  expect(outboxProblem(both.agent, wren, { id: crypto.randomUUID(), text: '@Otto can you pair on this?' })).toBeUndefined();
+  expect(queuedMaySpeak(r.agent, wren, undefined, '@Otto can you pair on this?')).toBe(false);
+});
+
+test('open floor: listen hands over a message that went to every agent with a note to claim it, and not one another agent claimed', async () => {
+  const r = room(undefined, undefined, 'open');
+  const morning = r.say('Morning, everyone');
+  await listenRemembering(r.agent, 1);
+  const ask = r.say('Who has the latest logo?'), named = r.say('@Wren the logo please');
+  // Unclaimed, listen hands it over with the note to claim it first; a message naming Wren needs no claim.
+  const heard = await listenRemembering(r.agent, 1) as Listened & { claim?: { messages: string[]; note: string } };
+  expect(heard.addressed).toEqual([ask, named]);
+  expect(heard.claim).toEqual({ messages: [ask], note: CLAIM_NOTE });
+  await expect(claimBrowser(r.agent, named)).rejects.toThrow('needs no claim');
+
+  // Otto claimed the next one before Wren's wake read the room: it is not Wren's, so listen finds nothing (the watcher
+  // counts that run as handled: see the watcher test), the cursor stays for a claim that lapses, and Wren's send is
+  // refused at once.
+  const second = r.say('And the favicon?');
+  const rules = JSON.parse(readFileSync(join(r.agent.dir, 'settings.json'), 'utf8'));
+  writeFileSync(join(r.agent.dir, 'settings.json'), JSON.stringify({ ...rules, claims: [{ messageId: second, memberId: other, at: 1, until: Date.now() + 60_000 }] }));
+  expect(peekWork(r.agent).work).toBe(false);
+  const quiet = await listenRemembering(r.agent, 1) as Listened & { cursor?: string };
+  expect(quiet).toMatchObject({ state: 'timeout' });
+  expect(JSON.parse(r.cursor()).after).toBe(named);
+  expect(queuedMaySpeak(r.agent, wren, second)).toBe(false);
+  expect(await sendBrowser(r.agent, 'Here it is', second, crypto.randomUUID())).toMatchObject({ status: 'not-sent', reason: 'answered-by-another', answeredBy: 'Otto' });
+  expect(readdirSync(join(r.agent.dir, 'outbox')).filter(f => f.endsWith('.json'))).toEqual([]);
+  // The runner's own check leaves claims to the room service, which it asks before signing (see bridge-claim.test.ts).
+  expect(outboxProblem(r.agent, wren, { id: crypto.randomUUID(), text: 'Here it is', replyTo: second })).toBeUndefined();
+  void morning;
+});
+
+test('the runner takes a queued claim only for a message that went to every agent and that wakes the agent', () => {
+  const r = room(undefined, undefined, 'open');
+  const ask = r.say('Anyone around?'), named = r.say('@Otto only you'), mine = r.say('my own', wren);
+  const claim = (messageId: string, release?: true) => outboxProblem(r.agent, wren, { type: 'claim', id: crypto.randomUUID(), messageId, ...(release ? { release } : {}) });
+  expect(claim(ask)).toBeUndefined();
+  expect(claim(named)).toBe('it is not a message that went to every agent');
+  expect(claim(mine)).toBe('it is not a message that went to every agent');
+  expect(claim('nope')).toBe('its message id is not a UUID');
+  expect(claim(ask, true)).toBeUndefined();
+  expect(outboxProblem(r.agent, wren, { type: 'claim', id: crypto.randomUUID(), messageId: ask, release: 'yes' })).toBe('it is neither a claim nor a release');
+});
+
+test('a claim the room service just settled is kept only over rules the runner wrote', () => {
+  const bare = room(undefined, undefined, 'open');
+  rmSync(join(bare.agent.dir, 'settings.json'));
+  bare.agent.noteClaim(crypto.randomUUID(), { messageId: crypto.randomUUID(), memberId: wren, at: 1, until: 2 });
+  expect(existsSync(join(bare.agent.dir, 'settings.json'))).toBe(false);
+  const r = room(undefined, undefined, 'open'), messageId = crypto.randomUUID();
+  r.agent.noteClaim(messageId, { messageId, memberId: wren, at: 1, until: 2 });
+  expect(JSON.parse(readFileSync(join(r.agent.dir, 'settings.json'), 'utf8'))).toEqual({ floor: 'open', claims: [{ messageId, memberId: wren, at: 1, until: 2 }] });
+  r.agent.noteClaim(messageId, null);
+  expect(JSON.parse(readFileSync(join(r.agent.dir, 'settings.json'), 'utf8'))).toEqual({ floor: 'open', claims: [] });
 });
 
 test('an agent not admitted yet has no work and does not fail', () => {
@@ -128,7 +193,7 @@ function harness(r: Room, behave: { reads?: boolean | (() => boolean); replies?:
     const exitCode = behave.exitCode?.() ?? 0;
     if (reads) {
       const listened = await listenRemembering(r.agent, 1) as Listened;
-      addressed = listened.addressed;
+      addressed = listened.addressed ?? []; // A timeout lists nothing.
       if (behave.replies !== false && exitCode === 0) for (const id of addressed) r.say('On it.', wren, id);
     }
     behave.during?.();
@@ -191,6 +256,26 @@ test('work that arrives during a run waits for it to end, then wakes the harness
   await watchLoop(config(), deps(r, h, { until: after(h, 600) }));
   expect(h.overlapped()).toBe(false);
   expect(h.runs.map(run => run.addressed)).toEqual([[first], [second]]);
+}, 60_000);
+
+test('open floor: a wake for a message another agent claimed before the harness read the room counts neither toward a pause nor as handled', async () => {
+  const r = room(undefined, undefined, 'open'); await listened(r);
+  const ask = r.say('Who has the latest logo?');
+  // Otto claims it while Wren's harness is starting: by the time it reads the room, nothing is left for Wren.
+  const claimByOtto = () => {
+    const rules = JSON.parse(readFileSync(join(r.agent.dir, 'settings.json'), 'utf8'));
+    writeFileSync(join(r.agent.dir, 'settings.json'), JSON.stringify({ ...rules, claims: [{ messageId: ask, memberId: other, at: 1, until: Date.now() + 600_000 }] }));
+    return true;
+  };
+  const h = harness(r, { reads: claimByOtto }), state = { value: emptyState() }, logs: string[] = [];
+  expect(await watchLoop(config(), deps(r, h, { until: after(h, 600), state, logs }))).toBe('stopped');
+  expect(h.runs.map(run => run.addressed)).toEqual([[]]);
+  expect(state.value).toMatchObject({ noProgress: 0, lastResult: { progress: false, replied: false } });
+  expect(state.value.paused).toBeUndefined();
+  expect(logs).toContain('another agent took the work this run was woken for; nothing left to do');
+  expect(logs.some(line => line.includes("didn't handle"))).toBe(false);
+  expect(replies(r, ask)).toBe(0);
+
 }, 60_000);
 
 test('runs that do not read the room back off; the third pauses the watcher, which stays up, shows a note, retries every 15 minutes and resumes', async () => {
@@ -892,7 +977,7 @@ test('the runner checks a queued item again, whoever wrote the outbox: ids, the 
   expect(outboxProblem(r.agent, wren, { ...good, text: '  ' })).toContain('empty');
   // Decisions: opening one is speaking; advice only when asked or addressed; only a steward closes.
   const decisionId = crypto.randomUUID();
-  expect(outboxProblem(r.agent, wren, { type: 'decision', action: 'open', id: crypto.randomUUID(), decisionId })).toContain('humans-first');
+  expect(outboxProblem(r.agent, wren, { type: 'decision', action: 'open', id: crypto.randomUUID(), decisionId })).toContain('nothing in this room addressed the agent');
   expect(outboxProblem(r.agent, wren, { type: 'decision', action: 'open', id: crypto.randomUUID(), decisionId, replyTo: mention })).toBeUndefined();
   const notAsking = openDecision({ roomId: r.roomId, deviceId, memberId: alex, question: 'Lunch?', options: ['A', 'B'], askAgents: false });
   writeFileSync(join(r.agent.dir, 'decisions.json'), JSON.stringify([{ body: notAsking, signature: '', seq: 1 }]));
@@ -1517,7 +1602,8 @@ test('Antigravity (agy): invocation, heredoc prompt, stream-json parsing, hook d
   });
 
   // sessionKey normalizes UUIDs and uses AGY_CLI_HOME.
-  expect(sessionKey({ harness: 'agy', cwd: wake, session: session.toUpperCase() }, { AGY_CLI_HOME: '/tmp/agy-cli' })).toBe(`agy:/tmp/agy-cli:id:${session}`);
+  // The store is spelled as the platform spells it (on Windows /tmp/agy-cli is D:\\tmp\\agy-cli, in lower case), so expect that spelling.
+  expect(sessionKey({ harness: 'agy', cwd: wake, session: session.toUpperCase() }, { AGY_CLI_HOME: '/tmp/agy-cli' })).toBe(`agy:${canonicalPath('/tmp/agy-cli')}:id:${session}`);
 
   // wakeEnv keeps GEMINI_*, GOOGLE_*, ANTIGRAVITY_* and withholds unrelated secrets.
   const agyEnv = wakeEnv({ PATH: '/bin', GEMINI_API_KEY: 'gk', GOOGLE_CLOUD_API_KEY: 'gc', ANTIGRAVITY_API_TOKEN: 'at', OPENAI_API_KEY: 'o', GH_TOKEN: 'g' }, 'agy');

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react';
 import { PROMPT_HARNESS_META, agentPrompt, defaultAgentName, isPromptHarness, type PromptHarness } from './agent-prompt';
 import { AGENT_LINK_TTL, agentLinkState, formatCountdown, inviteSteps, type AgentLinkState, type StepStatus } from './invite-state';
 import type { RoomStatus } from './protocol';
@@ -68,8 +68,7 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
   const [copied, setCopied] = useState<'prompt' | 'link'>();
   const [showFull, setShowFull] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [visitedPhone, setVisitedPhone] = useState(false);
-  useEffect(() => { if (tab === 'phone') setVisitedPhone(true); }, [tab]);
+  const stage = useRef<HTMLDivElement>(null);
   const [problem, setProblem] = useState('');
   const [now, setNow] = useState(() => Date.now());
   const wasUsed = useRef(false);
@@ -83,6 +82,25 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
     else if (!open && element.open) element.close();
   }, [open]);
   useEffect(() => { setProblem(''); }, [tab, open]);
+  // Every panel shares one grid cell, so switching tabs never changes the dialog's height. When a panel itself grows past the
+  // others (a prompt was made, a QR code appeared), the dialog eases to its new height instead of jumping.
+  useEffect(() => {
+    const element = stage.current, box = dialog.current;
+    if (!element || !box || typeof ResizeObserver === 'undefined') return;
+    let last = 0, view = '', moving: Animation | undefined;
+    const observer = new ResizeObserver(() => {
+      if (moving) return;
+      const height = box.getBoundingClientRect().height, viewport = `${innerWidth}x${innerHeight}`;
+      if (box.open && last && view === viewport && Math.abs(height - last) > 1 && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        moving = box.animate([{ height: `${last}px` }, { height: `${height}px` }], { duration: 340, easing: 'cubic-bezier(.22,1,.36,1)' });
+        const settle = () => { moving = undefined; last = box.getBoundingClientRect().height; };
+        moving.onfinish = settle; moving.oncancel = settle;
+      }
+      last = box.open ? height : 0; view = viewport;
+    });
+    observer.observe(element);
+    return () => { observer.disconnect(); moving?.cancel(); };
+  }, []);
   useEffect(() => { if (!personCopied) return; const timer = setTimeout(() => setPersonCopied(false), 4000); return () => clearTimeout(timer); }, [personCopied]);
 
   const listed = link && status.agentInvites?.find(i => i.name === link.name);
@@ -139,11 +157,16 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
   function moveTab(event: KeyboardEvent) {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return;
     event.preventDefault();
-    const order: InviteTab[] = phone ? ['person', 'agent', 'phone'] : ['person', 'agent'], at = Math.max(0, order.indexOf(tab));
     const next = event.key === 'Home' ? order[0] : event.key === 'End' ? order[order.length - 1] : order[Math.min(order.length - 1, Math.max(0, at + (event.key === 'ArrowLeft' ? -1 : 1)))];
     onTab(next); tabs.current[next]?.focus();
   }
 
+  const order: InviteTab[] = phone ? ['person', 'agent', 'phone'] : ['person', 'agent'], at = Math.max(0, order.indexOf(tab));
+  /** A panel in the shared cell: the one on show, or hidden and inert to the side it would slide in from. */
+  function slide(key: InviteTab, node: ReactNode) {
+    const index = order.indexOf(key), pos = index === at ? 'on' : index < at ? 'before' : 'after';
+    return <div key={key} className="invite-slide" data-pos={pos} inert={pos !== 'on'}>{node}</div>;
+  }
   const leftover = (status.agentInvites ?? []).filter(i => !link || i.name !== link.name);
   const shown = link?.harness ? PROMPT_HARNESS_META.find(h => h.id === link.harness) : undefined;
   const heading = `Invite to “${roomTitle}”`;
@@ -158,9 +181,10 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
         <ul className="invite-facts">
           <li><Icon kind="shield" /><span>New people wait for the host’s approval. Nobody joins by link alone.</span></li>
           <li><Icon kind="clock" /><span>This link doesn’t expire while the room is in use. Anyone who has it can ask to join.</span></li>
+          <li><Icon kind="check" /><span>{status.settings?.historyForNewcomers ? 'History for newcomers is on: new members can read earlier messages shared with the room.' : 'History for newcomers is off: new members only see messages sent after they join.'}</span></li>
         </ul>
         {problem && <p className="invite-problem" role="alert">{problem}</p>}
-        <p className="invite-cross">Want to bring an <b>AI agent</b> instead? This link <b>won’t work</b> for agents. <button type="button" className="browser-text-link" onClick={() => onTab('agent')}>Invite an agent</button></p>
+        <p className="invite-cross">Want to bring an <b>AI agent</b> instead? This link <b>won’t work</b> for agents. <button type="button" className="browser-text-link" onClick={() => { onTab('agent'); tabs.current.agent?.focus(); }}>Invite an agent</button></p>
       </div>
       <div className="invite-foot"><span className="invite-foot-note">Link looks like <code>…/r/…</code> · people only</span><button type="button" className="secondary" onClick={onClose}>Done</button></div>
     </div>;
@@ -235,7 +259,8 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
     <div className="invite-sheet-grab" aria-hidden="true" />
     <header className="invite-head"><div><h2 id="invite-title">{heading}</h2><p>{phone ? 'Pick who you’re inviting, or connect your own phone. Each uses a different link.' : 'Pick who you’re inviting. A person and an agent use different links.'}</p></div>
       <button type="button" className="invite-x" aria-label="Close" onClick={onClose}><Icon kind="close" /></button></header>
-    <div className={`invite-tabs${phone ? ' has-phone' : ''}`} role="tablist" aria-label="Who to invite" onKeyDown={moveTab}>
+    <div className={`invite-tabs${phone ? ' has-phone' : ''}`} data-tab={tab} role="tablist" aria-label="Who to invite" onKeyDown={moveTab}>
+      <span className="invite-glider" aria-hidden="true" style={{ '--at': at, '--count': order.length } as CSSProperties} />
       <button type="button" role="tab" id="invite-tab-person" ref={element => { tabs.current.person = element; }} aria-selected={tab === 'person'} aria-controls="invite-panel-person" tabIndex={tab === 'person' ? 0 : -1} className={`invite-tab is-person${tab === 'person' ? ' is-on' : ''}`} onClick={() => onTab('person')}>
         <span className="invite-badge is-person" aria-hidden="true"><Icon kind="person" /></span><span className="invite-tab-text"><b><span className="invite-long">A </span>person</b><small>A teammate, in a browser</small></span></button>
       <button type="button" role="tab" id="invite-tab-agent" ref={element => { tabs.current.agent = element; }} aria-selected={tab === 'agent'} aria-controls="invite-panel-agent" tabIndex={tab === 'agent' ? 0 : -1} className={`invite-tab is-agent${tab === 'agent' ? ' is-on' : ''}`} onClick={() => onTab('agent')}>
@@ -243,10 +268,13 @@ export function InviteDialog({ open, tab, onTab, onClose, roomId, roomTitle, roo
       {phone && <button type="button" role="tab" id="invite-tab-phone" ref={element => { tabs.current.phone = element; }} aria-selected={tab === 'phone'} aria-controls="invite-panel-phone" tabIndex={tab === 'phone' ? 0 : -1} className={`invite-tab is-phone${tab === 'phone' ? ' is-on' : ''}`} onClick={() => onTab('phone')}>
         <span className="invite-badge is-phone" aria-hidden="true"><Icon kind="phone" /></span><span className="invite-tab-text"><b>My phone</b><small>Same you, all rooms</small></span></button>}
     </div>
-    {/* Mounted from the first visit on and only hidden after: a code that is waiting for the phone survives a look at the other tabs. */}
-    {phone && (visitedPhone || tab === 'phone') && <div style={{ display: tab === 'phone' ? 'contents' : 'none' }}><PhonePairing active={open && tab === 'phone'} rooms={phone.rooms} name={phone.name} device={phone.device} link={phone.link} command={phone.command} asking={phone.asking} onActiveChange={phone.onActiveChange} onUseCode={phone.onUseCode} onNotice={onNotice} onClose={onClose} /></div>}
-    {tab === 'phone' && phone ? null
-      : tab === 'person' ? personPanel() : localAgents ? localPanel() : link && state ? madeStep(link, state) : chooseStep()}
+    {/* All panels stay mounted in one cell: the tallest sets the height, and a code waiting for the phone survives a look at the
+        other tabs. The phone panel makes no code until it is shown (`active`). */}
+    <div className="invite-stage" ref={stage}>
+      {slide('person', personPanel())}
+      {slide('agent', localAgents ? localPanel() : link && state ? madeStep(link, state) : chooseStep())}
+      {phone && slide('phone', <PhonePairing active={open && tab === 'phone'} rooms={phone.rooms} name={phone.name} device={phone.device} link={phone.link} command={phone.command} asking={phone.asking} onActiveChange={phone.onActiveChange} onUseCode={phone.onUseCode} onNotice={onNotice} onClose={onClose} />)}
+    </div>
     <span className="sr-only" role="status">{personCopied && tab === 'person' ? 'Room link copied' : copied && tab === 'agent' && state === 'open' ? 'Prompt copied. Paste it to your agent' : ''}</span>
   </dialog>;
 }

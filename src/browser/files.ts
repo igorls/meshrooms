@@ -155,8 +155,8 @@ type Incoming = {
 };
 type Options = {
   roomId: string; store: FileStore;
-  /** Metadata of a file named by a verified message in this room; nothing else is served. */
-  referenced: (sha256: string) => AttachmentRef | undefined;
+  /** Metadata of a file named by a verified message in this room that `peer` (when given) is authorized to see; nothing else is served. */
+  referenced: (sha256: string, peer?: string) => AttachmentRef | undefined;
   channel: (peer: string) => FileChannel | undefined;
   /** Connected, admitted devices. */
   peers: () => string[];
@@ -384,7 +384,7 @@ export class FileTransfers {
     // The upload slot is taken before the file is read, so requests beyond the limits never load files into memory.
     const busy = [...this.uploads.keys()].filter(k => k.startsWith(`${peer}:`) && k !== key).length >= UPLOADS_PER_PEER
       || (!previous && this.uploads.size >= UPLOADS_TOTAL);
-    const ref = this.o.referenced(sha);
+    const ref = this.o.referenced(sha, peer);
     if (busy || !ref || !Number.isSafeInteger(offset) || (offset as number) < 0 || (offset as number) > ref.size || !this.o.store.has(sha)) { missing(); return; }
     if (previous) { previous.cancelled = true; previous.wake?.(); }
     const upload: { cancelled: boolean; loading: boolean; wake?: () => void } = { cancelled: false, loading: true }; this.uploads.set(key, upload);

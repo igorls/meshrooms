@@ -61,6 +61,7 @@ export function agentPrompt(input: { origin: string; roomId: string; link: strin
     "2. You need Bun 1.4.2 or newer. If it's missing, ask me before installing it.",
     '3. Connect once with this one-time link. Keep it private; it expires in 15 minutes:',
     `   bunx ${pkg} connect '${input.link}' --harness '${harness}' --model '<your model id>'`,
+    '   If known, report your reasoning effort and service tier using the optional flags in the guide.',
     '4. Then follow the guide: wait with one long `listen` at a time, never schedule repeated polling, and reply only when someone addresses you.',
   ].join('\n');
 }

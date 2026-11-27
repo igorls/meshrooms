@@ -107,13 +107,51 @@ browser smoke with forced relay and inspect selected ICE candidate pairs; merely
 configuring a TURN URL is not qualification. Test the TLS relay separately.
 The HTTP request-body cap, application quotas and relay quotas all remain active.
 
+## A second address
+
+The service can answer at more than one address: the same site, the same rooms. A browser keeps its identity and its
+rooms per address, so an address people have used stays served. A redirect from it would leave them without their
+rooms. The public service answers at `meshrooms.wormdb.dev` and `meshrooms.ai`.
+
+- **Room service:** `MESHROOMS_BROWSER_ORIGIN` is the main origin. `MESHROOMS_BROWSER_ALIASES` lists the others, and
+  each is checked like the main one.
+  - A request is answered as the origin its `Host` names. It must carry that same `Origin`, and a signed command must
+    name it.
+  - Each device is told about the relay at the address it uses. A `MESHROOMS_RELAY_URL` at one of the service's own
+    addresses follows the device the same way. One at a host of its own is given as configured, and that host must
+    take requests from every address.
+- **Bridges and the app:** `PUBLIC_ROOM_SERVICES` in `src/browser/protocol.ts` lists the public addresses, and the
+  desktop app keeps the same list (`desktop/src-tauri/src/join.rs`; a test checks they match). A person app paired
+  through one address joins, pairs and cancels rooms linked through another, through the address it already uses.
+- **MeshGuard:** its gateway paths stay at the first name only.
+- **Nginx and TLS:** `deploy/nginx/meshrooms.conf` names both hosts, and one certificate lineage covers both. The renew
+  hooks and the TURN copy keep their lineage path. Expand the lineage before installing the site file, so that no
+  request to the new name meets a certificate without it:
+
+  ```sh
+  certbot certonly --webroot -w /var/www/certbot --cert-name meshrooms.wormdb.dev --expand \
+    -d meshrooms.wormdb.dev -d meshrooms.ai
+  ```
+
+Order for adding an address:
+1. Point the name's DNS at the host, with DNS only and no proxy in front. Nginx must see each visitor's own address:
+   behind a proxy, every visitor would share the proxy's addresses for the request limits, and the certificate and TLS
+   would no longer end on the host.
+2. Expand the certificate.
+3. Install the site file, run `nginx -t`, then reload.
+4. Add the origin to `MESHROOMS_BROWSER_ALIASES` in `/etc/meshrooms/browser.env` and restart the room service.
+5. Check `/api/lobby/health`, `/rooms` and `/` at both addresses.
+
+Making the new address the main one is the same change the other way round: swap the two variables. Only then do
+releases default to it.
+
 ## Request limits
 
 Two layers bound what one client, and everyone together, can ask of the host.
 
 **Nginx**, in front. `deploy/nginx/meshrooms-limits.conf` defines two zones and `deploy/nginx/meshrooms.conf` applies
 them to the whole site:
-- `meshrooms_addr`: 20 requests a second with a burst of 60 per IPv4 address (including IPv4-mapped IPv6) or IPv6 `/64`
+- `meshrooms_addr`: 60 requests a second with a burst of 200 per IPv4 address (including IPv4-mapped IPv6) or IPv6 `/64`
   (canonical RFC 5952 IPv6 addresses are mapped to their `/64` prefix so rotating interface IDs share one bucket).
 - `meshrooms_all`: 400 requests a second for all addresses together with a burst of 400. `GET /api/lobby/health` is
   exempt from this zone so a flood on `/api/lobby` cannot starve the 2-minute uptime probe. It has no global zone of
@@ -121,7 +159,8 @@ them to the whole site:
   included, at 429. The per-address zone still applies to it.
 
 Requests past a burst get 429 at once (as JSON on `/api/lobby`, including `/api/lobby/health`, so browsers and bridges
-back off cleanly). Install the limits file as `/etc/nginx/conf.d/meshrooms-limits.conf` **before** the site file and
+back off cleanly). On `/api/lobby` and the relay routes they also carry `Retry-After: 5`, as the room service's own 429s
+do; pages and assets get Nginx's plain 429. Install the limits file as `/etc/nginx/conf.d/meshrooms-limits.conf` **before** the site file and
 `/etc/nginx/snippets/meshrooms-browser.conf`: the site and snippet reference its zones, redacted log format
 (`meshrooms_redacted`), and fallback error-page CSP map (`$meshrooms_fallback_csp`), and `nginx -t` fails if any of them
 are missing. Then `nginx -t` and reload. A deploy prints a warning when the live file differs from the release's, as it
@@ -129,8 +168,11 @@ does for the site, snippet and installed systemd units; it never changes them. T
 not been load-tested: raise the shared ceiling only with measurements of what the host serves at its CPU quota.
 
 **The room service**, behind it:
-- 1,200 lobby requests a minute per IPv4 address or IPv6 /64 behind the trusted loopback proxy (240 direct), and five
-  times that (6,000 a minute behind the proxy) for the /48 around a /64. One /48 holds 65,536 separate /64s, so without
+- 3,600 lobby requests a minute per IPv4 address or IPv6 /64 behind the trusted loopback proxy (240 direct;
+  `MESHROOMS_API_LIMIT` sets it), and five times that (18,000 a minute behind the proxy) for the /48 around a /64.
+  One address is often a whole network: several people, and each one's agents. Raise it together with the Nginx zone:
+  past 60 r/s, Nginx refuses first. The trade-off: about seven addresses at their limit now reach the shared
+  400 r/s ceiling, where it took twenty before. One /48 holds 65,536 separate /64s, so without
   the wider count a client with a routed /48 has that many quotas; requests already refused by their own /64 do not
   charge the /48, so one noisy /64 cannot spend its neighbours' quota. Each rate table tracks up to 32,768 active keys
   so one /48 spending its full budget across distinct /64s cannot evict unrelated addresses' counters.

@@ -8,9 +8,23 @@
  * `seq` from the reserved shape is left out until per-device sequence numbers exist (HIST-1).
  */
 
-export type RetractBody = { kind: 'retract'; roomId: string; id: string; deviceId: string; memberId: string; at: number; target: string };
+export type RetractBody = {
+  kind: 'retract';
+  roomId: string;
+  id: string;
+  deviceId: string;
+  memberId: string;
+  at: number;
+  target: string;
+  /** Optional target author device & per-device `seq` so newcomers/late joiners distinguish deletions from missing gaps. */
+  targetDeviceId?: string;
+  seq?: number;
+};
 export type RetractPacket = { body: RetractBody; signature: string };
 export type RetractionSync = { kind: 'retractions'; roomId: string; ops: RetractPacket[] };
+
+/** Composite `(deviceId, id)` key for retraction & reaction operations so another member cannot squat on an op ID. */
+export const opKey = (body: Pick<RetractBody, 'deviceId' | 'id'>) => `${body.deviceId}:${body.id}`;
 
 /** A stored message of either store (browser or bridge). `retracted` sits beside the packet, so it is never signed. */
 type Stored = {
@@ -25,7 +39,9 @@ export function validRetractBody(body: unknown, roomId: string): body is Retract
   if (!body || typeof body !== 'object') return false;
   const b = body as RetractBody;
   return b.kind === 'retract' && b.roomId === roomId && isId(b.id) && isDevice(b.deviceId) && isId(b.memberId) && isId(b.target)
-    && Number.isSafeInteger(b.at) && b.at > 0 && b.at <= 8_640_000_000_000_000;
+    && Number.isSafeInteger(b.at) && b.at > 0 && b.at <= 8_640_000_000_000_000
+    && (b.targetDeviceId === undefined || isDevice(b.targetDeviceId))
+    && (b.seq === undefined || (typeof b.seq === 'number' && Number.isSafeInteger(b.seq) && b.seq >= 1 && b.seq <= 10_000_000));
 }
 
 /**
@@ -78,17 +94,23 @@ export const MAX_UNRESOLVED_PER_MEMBER = 200;
  * message is never dropped: stubs aren't sent, so it is what tells a device that was offline to remove the message.
  */
 export function addRetractions<T extends Pick<RetractPacket, 'body'>>(log: T[], incoming: T[], messages: Pick<Stored, 'packet'>[], max = MAX_RETRACTIONS): { log: T[]; added: T[] } {
-  const held = new Map(messages.map(m => [m.packet.body.id, m.packet.body]));
-  const ids = new Set(log.map(op => op.body.id)), targets = new Set(log.map(op => `${op.body.memberId}\0${op.body.target}`));
+  // Group by message id (not last-wins) so an attacker squatting on another member's message id can never hide the real message from retraction checks.
+  const held = new Map<string, Stored['packet']['body'][]>();
+  for (const m of messages) {
+    const list = held.get(m.packet.body.id);
+    if (list) list.push(m.packet.body);
+    else held.set(m.packet.body.id, [m.packet.body]);
+  }
+  const ids = new Set(log.map(op => opKey(op.body))), targets = new Set(log.map(op => `${op.body.memberId}\0${op.body.target}`));
   const unresolved = new Map<string, number>();
   for (const { body } of log) if (!held.has(body.target)) unresolved.set(body.memberId, (unresolved.get(body.memberId) ?? 0) + 1);
   const added: T[] = [];
   for (const op of incoming) {
-    const { body } = op, key = `${body.memberId}\0${body.target}`, message = held.get(body.target);
-    if (ids.has(body.id) || targets.has(key)) continue;
-    if (message ? !mayRetract(body, message) : (unresolved.get(body.memberId) ?? 0) >= MAX_UNRESOLVED_PER_MEMBER) continue;
-    if (!message) unresolved.set(body.memberId, (unresolved.get(body.memberId) ?? 0) + 1);
-    ids.add(body.id); targets.add(key); added.push(op);
+    const { body } = op, idKey = opKey(body), key = `${body.memberId}\0${body.target}`, matches = held.get(body.target);
+    if (ids.has(idKey) || targets.has(key)) continue;
+    if (matches ? !matches.some(message => mayRetract(body, message)) : (unresolved.get(body.memberId) ?? 0) >= MAX_UNRESOLVED_PER_MEMBER) continue;
+    if (!matches) unresolved.set(body.memberId, (unresolved.get(body.memberId) ?? 0) + 1);
+    ids.add(idKey); targets.add(key); added.push(op);
   }
   if (!added.length) return { log, added };
   let excess = log.length + added.length - max;

@@ -18,10 +18,17 @@ import type { ActivityRecord } from './activity';
 import type { AttachmentRef } from './files';
 import { BrowserPeers, type FileView, type SavedMessage } from './peers';
 import type { ReactionChip, ReactionEmoji } from './reactions';
+import type { RetractBody } from './retractions';
 import { identity, persistStorage, read, readArray, write } from './storage';
 import { BackgroundRooms, announceRooms, announceVisibility, claimRoom, forgetRoom, holdConnection, onRoomsChanged, recordOpened, type RecentRoom } from './background';
 import { clearWaiting, onCountsChanged, publishCount, publishedCounts, readPosition, saveReadPosition, type ReadPosition, type UnreadCount } from './unread';
 import { ROOM_CLOSED, type Command, type JoinRequest, type RoomStatus } from './protocol';
+
+/**
+ * Without status pushed over the relay socket, an open room polls status this often once admitted and connected: inside
+ * the service's 25 s presence window. While pushes arrive, it polls nothing.
+ */
+export const FALLBACK_POLL_MS = 10_000;
 
 /** What an open room tells the screen, as it changes. Nothing is called once the room is disposed. */
 export type RoomEvents = {
@@ -35,6 +42,7 @@ export type RoomEvents = {
   activity(records: Record<string, ActivityRecord>): void;
   decisions(ops: (DecisionBody | VoteBody)[]): void;
   reactions(chips: ReactionChip[]): void;
+  retractions?(ops: RetractBody[]): void;
   /** How far this person has read the room, once its history is loaded. */
   position(position: ReadPosition): void;
   /** The host closed the room, or the service removed it. */
@@ -125,8 +133,8 @@ export interface RoomSource {
   start(): Promise<{ deviceId: string; recent: RecentRoom[]; name: string }>;
   /** What the room service says about itself: whether creating a room needs an invite, the agents' bridge version, and (the local page) which room service new rooms are made on. */
   health(): Promise<{ inviteRequired?: boolean; currentAgentVersion?: string; roomService?: string }>;
-  /** A room's title, or why it is gone. */
-  room(roomId: string): Promise<{ title: string } | { closed: string }>;
+  /** A room's title (and newcomer-history disclosure), or why it is gone. */
+  room(roomId: string): Promise<{ title: string; historyForNewcomers?: boolean } | { closed: string }>;
   /** Opens a room: the events follow until `dispose`. `done` settles when the room stops (closed, lost or disposed). */
   open(roomId: string, deviceId: string, events: RoomEvents): { done: Promise<void>; dispose(): void };
   /** A room service action, signed by this device (or by the person device, for the local page). */
@@ -158,7 +166,11 @@ const isString = (v: unknown): v is string => typeof v === 'string';
 export class BrowserSource implements RoomSource {
   readonly isLocal = false;
   readonly label = 'Browser preview';
-  constructor(private api = new BrowserApi(), private pollMs = 1500, private backoffBaseMs = 15_000) {}
+  /**
+   * `pollMs`: how often status is polled while waiting to be admitted or setting up a peer connection, without pushed
+   * status. `fallbackPollMs`: otherwise, without pushed status. With it, nothing is polled.
+   */
+  constructor(private api = new BrowserApi(), private pollMs = 1500, private backoffBaseMs = 15_000, private fallbackPollMs = FALLBACK_POLL_MS) {}
   async start() {
     const device = await identity();
     const rooms = await readArray<RecentRoom>('recent-rooms', isRecentRoom);
@@ -173,7 +185,7 @@ export class BrowserSource implements RoomSource {
   }
   async room(roomId: string) {
     const response = await fetch(`/api/lobby/rooms/${roomId}`, { signal: AbortSignal.timeout(10_000) });
-    const info = await response.json().catch(() => ({})) as { title?: unknown; error?: string; code?: unknown };
+    const info = await response.json().catch(() => ({})) as { title?: unknown; historyForNewcomers?: unknown; error?: string; code?: unknown };
     if (response.status === 410 && info.code === ROOM_CLOSED) return { closed: info.error as string };
     if (!response.ok) {
       const fallback = response.status === 429
@@ -185,10 +197,15 @@ export class BrowserSource implements RoomSource {
       throw Object.assign(new Error(info.error || fallback), { status: response.status, ...(code ? { code } : {}) });
     }
     if (typeof info.title !== 'string') throw new Error('Room unavailable.');
-    return { title: info.title };
+    return { title: info.title, ...(typeof info.historyForNewcomers === 'boolean' ? { historyForNewcomers: info.historyForNewcomers } : {}) };
   }
-  command(action: RoomAction, roomId: string, payload: Record<string, unknown> = {}) {
-    return this.api.command(action, roomId, payload) as unknown as Promise<Record<string, unknown>>;
+  /** Each open room's loop, woken when the person acts in that room. */
+  private readonly refreshes = new Map<string, () => void>();
+  async command(action: RoomAction, roomId: string, payload: Record<string, unknown> = {}) {
+    const answer = await this.api.command(action, roomId, payload) as unknown as Record<string, unknown>;
+    // What the person just did shows at once (an admitted request leaves the list), not at the next push or poll.
+    if (action !== 'status') this.refreshes.get(roomId)?.();
+    return answer;
   }
   forget(roomId: string) { return forgetRoom(roomId); }
   counts(deviceId: string) { return publishedCounts(deviceId); }
@@ -214,6 +231,8 @@ export class BrowserSource implements RoomSource {
     const wakeNow = () => { clearTimeout(timer); timer = undefined; const resolve = wake; wake = undefined; resolve?.(); };
     const onVisible = () => { if (document.visibilityState === 'visible' && backoff === 0) wakeNow(); };
     const onOnline = () => { if (backoff === 0) wakeNow(); };
+    const refresh = () => { if (backoff === 0) wakeNow(); };
+    this.refreshes.set(urlRoom, refresh);
     const removeListeners = () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible);
       if (typeof removeEventListener === 'function') removeEventListener('online', onOnline);
@@ -235,7 +254,8 @@ export class BrowserSource implements RoomSource {
           if (!disposed) events.messages(m, c, added);
         }, message => { if (!disposed) events.network(message); }, (board, ops) => { if (!disposed) events.board(board, ops); }, view => { if (!disposed) events.files(view); },
         records => { if (!disposed) events.activity(records); }, ops => { if (!disposed) events.decisions(ops); },
-        chips => { if (!disposed) events.reactions(chips); });
+        chips => { if (!disposed) events.reactions(chips); }, undefined,
+        { retractionsChanged: ops => { if (!disposed) events.retractions?.(ops); } });
         // This tab owns the room's records now: a background owner that lost the room can no longer write them.
         const fence = await claimRoom(deviceId, urlRoom);
         engine.fenced(fence);
@@ -262,11 +282,18 @@ export class BrowserSource implements RoomSource {
         if (!disposed) events.position(stored);
         let upgradeFailure: ApiError | undefined;
         // A write that found another tab's claim stops the engine; then this tab stops polling and connecting too.
+        // pushable: the service offers the relay socket, which pushes status. A service without it has no other way,
+        // so the room polls at the rate it always had.
+        let watching = false, pushable = false;
         while (!disposed && !engine.isStopped()) {
           try {
-            const next = await api.command('status', urlRoom, { session, cursor, epoch }, abort.signal);
+            // Pushed over the relay socket while it lasts; polled only without it (see FALLBACK_POLL_MS).
+            const pushed = engine.statusLive() ? engine.takePushedStatus() : undefined;
+            let next = pushed ?? await api.command('status', urlRoom, { session, cursor, epoch }, abort.signal);
             if (disposed) break;
             backoff = 0;
+            // A push may still carry signals handled before its ack reached the service: each is applied once.
+            if (next.epoch === epoch && next.signals?.length) next = { ...next, signals: next.signals.filter(s => s.seq > cursor) };
             if (next.epoch !== epoch) cursor = 0;
             epoch = next.epoch;
             if (!next.memberId && !next.request && lastRequest) {
@@ -293,6 +320,9 @@ export class BrowserSource implements RoomSource {
             }
             await engine.update(next);
             for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
+            pushable = !!next.relayUrl;
+            if (next.memberId && !watching) { watching = true; engine.watchStatus({ session, epoch, cursor }, () => wakeNow()); }
+            else engine.ackStatus(cursor, epoch);
           } catch (e) {
             if (disposed || abort.signal.aborted) break;
             // The host closed the room, or the service removed it: stop polling and say so, instead of retrying forever.
@@ -318,7 +348,11 @@ export class BrowserSource implements RoomSource {
             }
             if (!disposed) events.network((e as Error).message, false, e as ApiError);
           }
-          if (!disposed) await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(() => { timer = undefined; wake = undefined; resolve(); }, this.pollMs + backoff); });
+          // With pushes, wait for the next one (the service pushes at least every 10 s); without, poll slowly, and at the
+          // fast rate only while waiting to be admitted or setting up a peer connection.
+          const waitMs = engine.statusLive() ? engine.statusLiveRemainingMs() : !watching || !pushable || engine.connecting() ? this.pollMs : Math.max(this.pollMs, this.fallbackPollMs);
+          if (!disposed && !(engine.statusLive() && engine.hasPushedStatus()))
+            await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(() => { timer = undefined; wake = undefined; resolve(); }, waitMs + backoff); });
         }
         if (engine.lostRoom() && !disposed) events.lost();
         // Every write finishes before the connection is handed back to the background.
@@ -328,6 +362,6 @@ export class BrowserSource implements RoomSource {
       });
       } finally { removeListeners(); }
     })();
-    return { done, dispose() { disposed = true; abort.abort(); engine?.stop(); wakeNow(); removeListeners(); } };
+    return { done, dispose: () => { disposed = true; abort.abort(); engine?.stop(); wakeNow(); removeListeners(); if (this.refreshes.get(urlRoom) === refresh) this.refreshes.delete(urlRoom); } };
   }
 }

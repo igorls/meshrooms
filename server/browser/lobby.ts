@@ -1,21 +1,28 @@
 import type { Database } from 'bun:sqlite';
+import { CLAIM_TTL_MS, FLOORS, NEW_ROOM_FLOOR, type Claim, type Floor } from '../../src/collab';
 import { sniff } from '../attachments';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { browserProtocol, cleanDisplayName, deviceId, foldDisplayName, MAX_REPOSITORIES, MAX_RENAME_NOTICES, MIN_PROTOCOL_VERSION, validRepository, verify, type BrowserDevice, type BrowserMember, type RenameNotice, type Command, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, type SignedRoster, DEFAULT_ROOM_SETTINGS, PAIR_OFFER_NOT_FOUND, PAIRING_NOT_FOUND, ROOM_CLOSED, type CommandAnswer, type PairingOffer } from '../../src/browser/protocol';
+import { AGENT_RUNTIME_FIELDS, agentRuntimeLabelError, browserProtocol, cleanAgentRuntimeLabel, cleanDisplayName, deviceId, foldDisplayName, MAX_REPOSITORIES, MAX_RENAME_NOTICES, MIN_PROTOCOL_VERSION, validRepository, verify, type BrowserDevice, type BrowserMember, type RenameNotice, type Command, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, type SignedRoster, DEFAULT_ROOM_SETTINGS, PAIR_OFFER_NOT_FOUND, PAIRING_NOT_FOUND, ROOM_CLOSED, type CommandAnswer, type PairingOffer } from '../../src/browser/protocol';
 import { importEncPublicKey, verifyEncBinding, verifyRoster } from '../../src/browser/relay-crypto';
 import { OFFER_LOOKUP, OFFER_MAX_ROOMS, OFFER_TTL_MS, PAIRING_PROOF, PAIRING_SECRET, pairingMessage } from '../../src/browser/pairing';
 import { admitBetaDevice, betaDevices, betaPerson, betaRevoked, consumeInvite, inviteMessages } from './invites';
-import { deleteRetiredDevice, getRetiredDevice, getRoomRoster, listRetiredDevices, openAdmission, retireRoom, revokeRetiredDevice, ROOM_META_VERSION, saveRoom, saveRoomRoster, upsertRetiredDevice, type ClosedReason } from './store';
+import { deleteRetiredDevice, getRetiredDevice, getRoomRoster, listRetiredDevices, MAX_FORMER_DEVICES, MAX_HISTORY_FORMER_DEVICES, openAdmission, retireRoom, revokeRetiredDevice, ROOM_META_VERSION, saveRoom, saveRoomRoster, upsertRetiredDevice, type ClosedReason } from './store';
 
 /** Only a hash of an agent link's token is kept; the link itself is shown once to the person who made it. */
 type StoredInvite = { tokenHash: string; operatorId: string; name: string; expiresAt: number };
 /** Cooldown (`until` timestamp) or permanent block (`until: null`) recorded when the host declines a join request. */
 type BlockedDevice = { deviceId: string; until: number | null };
-type Room = { id: string; title: string; ownerId: string; ownerPerson?: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; blocked?: BlockedDevice[]; settings?: Partial<RoomSettings>; repositories?: string[]; renames?: RenameNotice[] };
+type Room = { id: string; title: string; ownerId: string; ownerPerson?: string; members: BrowserMember[]; devices: BrowserDevice[]; requests: JoinRequest[]; invites?: StoredInvite[]; blocked?: BlockedDevice[]; settings?: Partial<RoomSettings>; historyEverEnabled?: true; repositories?: string[]; renames?: RenameNotice[]; claims?: Claim[] };
 /** How long a declined device waits before asking to join the same room again. */
 export const DECLINE_COOLDOWN_MS = 5 * 60_000;
 /** Maximum decline cooldown / block entries retained per room. */
 export const MAX_BLOCKED_DEVICES = 256;
+/** Claims a room keeps (see `claim`). Answered ones make room first, oldest first. */
+export const MAX_CLAIMS = 64;
+/** Unanswered claims one agent may hold at once, so no agent can hold every open question. */
+export const MAX_LIVE_CLAIMS = 4;
+/** How long an answered claim is kept, so a late agent still sees who answered. */
+export const CLAIM_KEEP_MS = 24 * 3_600_000;
 const INVITE_TTL = 900_000, INVITES_PER_PERSON = 4, AGENTS_PER_OPERATOR = 4;
 /** Devices one member may hold in a room, under the room's 16: one person can't fill the room with devices of their own. */
 export const DEVICES_PER_MEMBER = 4;
@@ -59,17 +66,17 @@ function nameAvailable(room: Room, name: string, pending: StoredInvite[] = [], e
 }
 /** New rooms store their settings; rooms created before hosts approved guests' agents by default keep it off. */
 const LEGACY_SETTINGS: Partial<RoomSettings> = { guestAgentApproval: false };
+/**
+ * The claims that still hold: unanswered ones until they lapse, while their agent is still in the room, and answered ones
+ * for CLAIM_KEEP_MS, so an agent that comes late still learns who answered.
+ */
+const liveClaims = (room: Room, now: number) => (room.claims ?? []).filter(k => k.answered ? now - k.at < CLAIM_KEEP_MS : k.until > now && room.members.some(m => m.id === k.memberId) && room.devices.some(d => d.memberId === k.memberId));
 const settingsOf = (room: Room): RoomSettings => ({ ...DEFAULT_ROOM_SETTINGS, ...LEGACY_SETTINGS, ...room.settings });
-/** A harness or model name as the agent reports it: short plain text, so it can't pose as markup or another line. */
-function runtimeLabel(value: unknown, key: 'harness' | 'model') {
-  if (typeof value !== 'string' || !/^[\p{L}\p{N}][\p{L}\p{N} ._:+()/@-]{0,47}$/u.test(value.trim())) fail(400, `Give a ${key} of up to 48 letters, digits, spaces or . _ : + ( ) / @ -.`);
-  return value.trim();
-}
 /**
  * `maxRooms` caps rooms service-wide (default 256). `invites: 'required'` gates room creation behind operator invite codes.
  * `idleDays` is how long a room lives without an admitted device opening it (default 30).
  */
-export type LobbyOptions = { origin: string; now?: () => number; stunUrls?: string[]; turnUrls?: string[]; turnSecret?: string;
+export type LobbyOptions = { origin: string; /** Other origins of this service, accepted like `origin`. */ aliases?: string[]; now?: () => number; stunUrls?: string[]; turnUrls?: string[]; turnSecret?: string;
   relayUrl?: string; /** Advertise and accept the E2E relay (relay URL, host-signed rosters, device encryption keys). Default true here; the coordinator process passes its `MESHROOMS_RELAY_ENABLED` flag, which defaults to off. */ relayEnabled?: boolean; maxRooms?: number; invites?: 'required' | 'off'; idleDays?: number; maxSignalChars?: number; minProtocolVersion?: number };
 /**
  * Connection offers wait in memory for up to 30 seconds. One queue holds at most 32 of 16,000 characters, but there
@@ -136,7 +143,12 @@ export class BrowserLobby {
   private deviceRemovedListeners = new Set<(roomId: string, deviceId: string) => void>();
   /** Subscribers notified synchronously after a room is closed or expired (used by RelayService). */
   private roomClosedListeners = new Set<(roomId: string) => void>();
+  /** Fired after anything in a room that its devices' status would show changed (`deviceId`: only that device's). */
+  private roomChangedListeners = new Set<(roomId: string, deviceId?: string) => void>();
+  /** The origins a signed command may name: the service's own, and its aliases. */
+  private readonly origins: Set<string>;
   constructor(path: string, private options: LobbyOptions) {
+    this.origins = new Set([options.origin, ...(options.aliases ?? [])]);
     this.now = options.now || Date.now;
     this.lastMemoryPrune = this.now();
     this.lastReceiptPrune = this.now();
@@ -149,11 +161,46 @@ export class BrowserLobby {
   get inviteRequired() { return this.options.invites === 'required'; }
   get minProtocolVersion() { return this.options.minProtocolVersion ?? MIN_PROTOCOL_VERSION; }
   get relayEnabled() { return this.options.relayEnabled !== false; }
-  get relayUrl() { return this.options.relayUrl ?? `${this.options.origin.replace(/^http/, 'ws')}/api/relay/v1`; }
+  get relayUrl() { return this.relayUrlFor(this.options.origin); }
+  /**
+   * The relay a device reaching the service through `origin` is told about: at that origin. A configured relay URL at one
+   * of the service's own addresses moves to the device's address too, since each address only takes its own pages'
+   * requests; one at a host of its own is kept.
+   */
+  relayUrlFor(origin: string) {
+    const ws = origin.replace(/^http/, 'ws');
+    if (!this.options.relayUrl) return `${ws}/api/relay/v1`;
+    try {
+      const url = new URL(this.options.relayUrl);
+      if ([...this.origins].some(own => own.replace(/^http/, 'ws') === url.origin)) return `${ws}${url.pathname}${url.search}`;
+    } catch { /* kept as configured */ }
+    return this.options.relayUrl;
+  }
+  /** Every origin of this service. */
+  get allOrigins() { return [...this.origins]; }
   /** Registers a hook fired immediately after a device is removed from a room. Returns an unsubscribe function. */
   onDeviceRemoved(listener: (roomId: string, deviceId: string) => void): () => void {
     this.deviceRemovedListeners.add(listener);
     return () => { this.deviceRemovedListeners.delete(listener); };
+  }
+  /**
+   * Registers a hook fired after a room's status changed for its devices: a command that changed the room, a device that
+   * came online or changed its session, or (with `deviceId`) a signal queued for one device. The relay pushes status to
+   * the devices that watch it, so they don't have to poll. Returns an unsubscribe function.
+   */
+  onRoomChanged(listener: (roomId: string, deviceId?: string) => void): () => void {
+    this.roomChangedListeners.add(listener);
+    return () => { this.roomChangedListeners.delete(listener); };
+  }
+  private changed(roomId: string, deviceId?: string) {
+    for (const listener of this.roomChangedListeners) { try { listener(roomId, deviceId); } catch { /* a listener never fails a command */ } }
+  }
+  /**
+   * A device's status, as the `status` command answers it, for a device the relay already authenticated in the room:
+   * the same presence, signals and cursor rules. `origin`: the address the device's socket authenticated through.
+   */
+  statusFor(roomId: string, deviceId: string, payload: Record<string, unknown>, origin?: string): RoomStatus {
+    return this.snapshot(this.load(roomId), deviceId, payload, origin && this.origins.has(origin) ? origin : this.options.origin);
   }
   /** Registers a hook fired immediately after a room is closed or retired. Returns an unsubscribe function. */
   onRoomClosed(listener: (roomId: string) => void): () => void {
@@ -170,7 +217,7 @@ export class BrowserLobby {
     expectedAction: Command['action'] | readonly Command['action'][],
   ): Promise<{ command: Command; deviceId: string; publicKey: string }> {
     const c = input?.command;
-    if (!c || c.protocol !== browserProtocol || c.origin !== this.options.origin || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) {
+    if (!c || c.protocol !== browserProtocol || !this.origins.has(c.origin) || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) {
       fail(400, 'This request has expired or is invalid. Try again.');
     }
     const allowed = Array.isArray(expectedAction) ? expectedAction : [expectedAction];
@@ -438,8 +485,15 @@ export class BrowserLobby {
     return row?.body === fingerprint(c);
   }
   publicRoom(id: string) {
-    const row = this.db.query('SELECT id, title, CASE WHEN meta_version >= ? THEN NULL ELSE body END AS body FROM rooms WHERE id=?').get(ROOM_META_VERSION, id) as { id: string; title: string | null; body: string | null } | null;
-    if (row) return { roomId: row.id, title: row.body !== null ? (JSON.parse(row.body) as Room).title : (row.title ?? '') };
+    const row = this.db.query('SELECT id, title, body FROM rooms WHERE id=?').get(id) as { id: string; title: string | null; body: string | null } | null;
+    if (row) {
+      const room = row.body ? JSON.parse(row.body) as Room : undefined;
+      return {
+        roomId: row.id,
+        title: room?.title ?? row.title ?? '',
+        historyForNewcomers: room ? settingsOf(room).historyForNewcomers : DEFAULT_ROOM_SETTINGS.historyForNewcomers,
+      };
+    }
     return this.roomUnavailable(id);
   }
   /** A member's current avatar, only when the hash matches, so an old link never shows a newer picture. */
@@ -476,13 +530,13 @@ export class BrowserLobby {
   }
   async execute(input: SignedCommand, address?: string, admit?: () => void): Promise<RoomStatus | ({ roomId: string; token?: string } & CommandAnswer)> {
     const c = input?.command;
-    if (!c || c.protocol !== browserProtocol || c.origin !== this.options.origin || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) fail(400, 'This request has expired or is invalid. Try again.');
+    if (!c || c.protocol !== browserProtocol || !this.origins.has(c.origin) || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) fail(400, 'This request has expired or is invalid. Try again.');
     if (typeof input.publicKey !== 'string' || typeof input.signature !== 'string' || !await verify(input.publicKey, c, input.signature)) fail(401, 'This device could not be authenticated.');
     const id = await deviceId(input.publicKey);
     admit?.();
     // Read-only commands run outside any BEGIN IMMEDIATE write lock so routine status polls never block writers or each other.
     if (c.action === 'creation-status') return { roomId: c.roomId, admitted: !this.inviteRequired || !!betaPerson(this.db, id) };
-    if (c.action === 'status') return this.snapshot(this.load(c.roomId), id, c.payload);
+    if (c.action === 'status') return this.snapshot(this.load(c.roomId), id, c.payload, c.origin);
     if (c.action === 'pair-offer' || c.action === 'pair-redeem' || c.action === 'pair-cancel') return this.pairOffer(c, id, address);
     // Async cryptographic validation of optional device `enc` keys or `roster-publish` runs before the synchronous IMMEDIATE transaction.
     let prevalidatedEnc: { enc: string; encVersion: number; encSig: string } | undefined;
@@ -513,6 +567,9 @@ export class BrowserLobby {
       for (const room of this.pendingForget) this.forget(room);
       for (const { roomId, deviceIds } of this.pendingDropDevices) this.dropDevices(roomId, deviceIds);
       if (this.pendingReceiptPrune !== undefined) this.lastReceiptPrune = this.pendingReceiptPrune;
+      // A signal is news for its recipient only; anything else may be news for everyone in the room.
+      if (c.action === 'signal') this.changed(c.roomId, typeof c.payload.to === 'string' ? c.payload.to : undefined);
+      else this.changed(c.roomId);
       return result;
     } finally {
       this.pending.clear();
@@ -552,10 +609,11 @@ export class BrowserLobby {
         const existing = this.db.query('SELECT id FROM rooms WHERE id=? UNION SELECT id FROM closed_rooms WHERE id=?').get(c.roomId, c.roomId);
         if (existing) fail(409, 'This room already exists.');
         const memberId = crypto.randomUUID();
+        const createdAt = this.now();
         const room: Room = { id: c.roomId, title: label(c.payload.title), ownerId: memberId,
-          members: [{ id: memberId, name: memberName(c.payload.name) }],
-          devices: [{ id, publicKey: input.publicKey, label: label(c.payload.label), memberId, admittedAt: this.now(), ...prevalidatedEnc }], requests: [],
-          settings: { guestAgentApproval: DEFAULT_ROOM_SETTINGS.guestAgentApproval } };
+          members: [{ id: memberId, name: memberName(c.payload.name), joinedAt: createdAt }],
+          devices: [{ id, publicKey: input.publicKey, label: label(c.payload.label), memberId, admittedAt: createdAt, ...prevalidatedEnc }], requests: [],
+          settings: { guestAgentApproval: DEFAULT_ROOM_SETTINGS.guestAgentApproval, floor: NEW_ROOM_FLOOR } };
         // Last, so nothing above can fail after a use was taken; the transaction rolls it back if anything below does.
         let ownerPerson = person;
         if (this.inviteRequired && !ownerPerson) {
@@ -587,8 +645,14 @@ export class BrowserLobby {
           if (r.kind === 'agent' && (!r.operatorId || !isPerson(room, r.operatorId))) fail(409, 'This agent’s operator is no longer in the room.');
           if (!r.linkedMemberId) nameAvailable(room, r.name, activeInvites());
           const memberId = r.linkedMemberId || crypto.randomUUID();
-          if (!r.linkedMemberId) room.members.push(r.kind === 'agent' ? { id: memberId, name: r.name, role: 'agent', operatorId: r.operatorId } : { id: memberId, name: r.name, role: 'human' });
-          room.devices.push({ ...r.device, memberId, admittedAt: this.now() });
+          const admittedAt = this.now();
+          if (!r.linkedMemberId) room.members.push(r.kind === 'agent' ? { id: memberId, name: r.name, role: 'agent', operatorId: r.operatorId, joinedAt: admittedAt } : { id: memberId, name: r.name, role: 'human', joinedAt: admittedAt });
+          // Preserve a voluntarily departed person device's prior memberId (never a revoked one) so earlier signed messages stay verifiable after rejoining.
+          const retired = r.kind === 'person' && !r.linkedMemberId ? getRetiredDevice(this.db, room.id, r.device.id) : undefined;
+          const priorMembers = retired && !retired.revoked && retired.memberId !== memberId
+            ? [...(r.device.priorMembers ?? []).filter(p => p.memberId !== retired.memberId), { memberId: retired.memberId, ...(retired.retiredAt !== undefined ? { retiredAt: retired.retiredAt } : {}) }].slice(-8)
+            : undefined;
+          room.devices.push({ ...r.device, memberId, admittedAt, ...(priorMembers?.length ? { priorMembers } : {}) });
           // COL-4: Clear any stale retired_devices record for a re-admitted device so active & former records never conflict.
           deleteRetiredDevice(this.db, room.id, r.device.id);
           devicesChanged = true;
@@ -744,8 +808,9 @@ export class BrowserLobby {
               break;
             }
             const memberId = crypto.randomUUID();
-            room.members.push({ id: memberId, name: invite.name, role: 'agent', operatorId: invite.operatorId });
-            room.devices.push({ ...device, memberId, admittedAt: this.now() });
+            const admittedAt = this.now();
+            room.members.push({ id: memberId, name: invite.name, role: 'agent', operatorId: invite.operatorId, joinedAt: admittedAt });
+            room.devices.push({ ...device, memberId, admittedAt });
             deleteRetiredDevice(this.db, room.id, id);
             devicesChanged = true;
             break;
@@ -871,8 +936,9 @@ export class BrowserLobby {
             const target = c.payload.memberId === undefined ? actor.memberId : c.payload.memberId;
             const member = room.members.find(m => m.id === target) || fail(404, 'That person is not in this room.');
             const own = member.id === actor.memberId, operated = member.role === 'agent' && member.operatorId === actor.memberId;
-            const { avatar: encoded, harness, model } = c.payload;
-            if (encoded === undefined && harness === undefined && model === undefined && !prevalidatedEnc) fail(400, 'Choose what to change.');
+            const { avatar: encoded } = c.payload;
+            const runtimeFields = AGENT_RUNTIME_FIELDS.filter(field => c.payload[field] !== undefined);
+            if (encoded === undefined && !runtimeFields.length && !prevalidatedEnc) fail(400, 'Choose what to change.');
             if (prevalidatedEnc) {
               if (!own) fail(403, 'A device can only update its own encryption key.');
               if (actor.encVersion !== undefined && prevalidatedEnc.encVersion < actor.encVersion) {
@@ -883,15 +949,14 @@ export class BrowserLobby {
               actor.encSig = prevalidatedEnc.encSig;
               devicesChanged = true;
             }
-            if (harness !== undefined || model !== undefined) {
-              // Agents say which harness and model they run on; people have neither. Clearing follows the picture rule.
-              if (member.role !== 'agent') fail(400, 'Only agents report a harness and model.');
-              const clearing = (harness === null || harness === undefined) && (model === null || model === undefined);
+            if (runtimeFields.length) {
+              if (member.role !== 'agent') fail(400, 'Only agents report runtime settings.');
+              const clearing = runtimeFields.every(field => c.payload[field] === null);
               if (!own && !operated && !(clearing && isHost)) fail(403, 'Only the agent or its operator can change this.');
-              for (const [key, value] of [['harness', harness], ['model', model]] as const) {
-                if (value === undefined) continue;
-                if (value === null) { delete member[key]; continue; }
-                member[key] = runtimeLabel(value, key);
+              for (const field of runtimeFields) {
+                const value = c.payload[field];
+                if (value === null) { delete member[field]; continue; }
+                member[field] = cleanAgentRuntimeLabel(value) ?? fail(400, agentRuntimeLabelError(field));
               }
             }
             if (encoded === undefined) break;
@@ -943,15 +1008,43 @@ export class BrowserLobby {
             if (!room.repositories?.length) delete room.repositories;
             break;
           }
+          case 'claim': {
+            // A person's message that went to every agent is answered by the first agent to claim it (src/collab.ts,
+            // `needsClaim`). The service never sees messages: it keeps only which agent holds which message id, until
+            // when. Its holder can claim again to keep it, mark it answered, or release it for another agent.
+            if (!actor || room.members.find(m => m.id === actor.memberId)?.role !== 'agent') fail(403, 'Only agents in this room claim messages.');
+            const { messageId, answered, release } = c.payload;
+            if (!uuid(messageId) || (answered !== undefined && answered !== true) || (release !== undefined && release !== true) || (answered && release)) fail(400, 'Claim one message by its id.');
+            const now = this.now();
+            const claims = liveClaims(room, now);
+            const held = claims.find(k => k.messageId === messageId);
+            if (held && held.memberId !== actor.memberId) answer.claim = held;
+            else if (answered && !held) fail(409, 'Claim the message before marking it answered.');
+            else if (release) { answer.claim = held?.answered ? held : null; if (!held?.answered) room.claims = claims.filter(k => k !== held); }
+            else {
+              const next: Claim = { messageId, memberId: actor.memberId, at: held?.at ?? now, until: now + CLAIM_TTL_MS, ...(answered || held?.answered ? { answered: true as const } : {}) };
+              if (!next.answered && !held && claims.filter(k => k.memberId === actor.memberId && !k.answered).length >= MAX_LIVE_CLAIMS) {
+                fail(429, `An agent holds up to ${MAX_LIVE_CLAIMS} unanswered messages at once. Answer or release one first.`);
+              }
+              const rest = claims.filter(k => k !== held);
+              // Over the cap, answered claims go first, oldest first, then the oldest live ones.
+              while (rest.length >= MAX_CLAIMS) { const i = rest.findIndex(k => k.answered); rest.splice(i >= 0 ? i : 0, 1); }
+              room.claims = [...rest, next];
+              answer.claim = next;
+            }
+            if (!room.claims?.length) delete room.claims;
+            break;
+          }
           case 'settings': {
             if (!isHost) fail(403, 'Only the host can change room settings.');
             const next: Partial<RoomSettings> = { ...room.settings };
-            if (c.payload.floor !== undefined) { if (!['humans-first', 'open'].includes(String(c.payload.floor))) fail(400, 'Choose when agents reply.'); next.floor = c.payload.floor as RoomSettings['floor']; }
-            for (const key of ['agentAssignmentsWake', 'guestAgentApproval', 'hostApprovesDevices'] as const) {
+            if (c.payload.floor !== undefined) { if (!FLOORS.includes(c.payload.floor as Floor)) fail(400, 'Choose who wakes agents.'); next.floor = c.payload.floor as RoomSettings['floor']; }
+            for (const key of ['agentAssignmentsWake', 'guestAgentApproval', 'hostApprovesDevices', 'historyForNewcomers'] as const) {
               if (c.payload[key] === undefined) continue;
               if (typeof c.payload[key] !== 'boolean') fail(400, 'Choose on or off.');
               next[key] = c.payload[key] as boolean;
             }
+            if (next.historyForNewcomers) room.historyEverEnabled = true;
             room.settings = next;
             break;
           }
@@ -1129,14 +1222,15 @@ export class BrowserLobby {
     for (const [key, value] of this.linkFailures) if (now - value.since > LINK_FAILURE_WINDOW) this.linkFailures.delete(key);
     this.pruneSignals(now);
   }
-  private snapshot(room: Room, id: string, payload: Record<string, unknown>): RoomStatus {
+  private snapshot(room: Room, id: string, payload: Record<string, unknown>, origin = this.options.origin): RoomStatus {
     const now = this.now();
     this.pruneMemory(now);
     const online = (d: BrowserDevice) => {
       const p = this.presence.get(`${room.id}:${d.id}`);
       return p && p.at > now - PRESENCE_MS ? p.session : undefined;
     };
-    const result: RoomStatus = { roomId: room.id, title: room.title, epoch: this.epoch, deviceId: id, hostOnline: room.devices.some(d => d.memberId === room.ownerId && !!online(d)) };
+    const settings = settingsOf(room);
+    const result: RoomStatus = { roomId: room.id, title: room.title, epoch: this.epoch, deviceId: id, hostOnline: room.devices.some(d => d.memberId === room.ownerId && !!online(d)), historyForNewcomers: settings.historyForNewcomers };
     const actor = room.devices.find(d => d.id === id);
     if (!actor) {
       const request = room.requests.find(r => r.device.id === id);
@@ -1147,16 +1241,30 @@ export class BrowserLobby {
     }
     if (!uuid(payload.session)) fail(400, 'Invalid browser session.');
     result.expiresAt = this.touchStatus(room.id, now) + this.idleMs;
+    const seen = this.presence.get(`${room.id}:${id}`);
     this.presence.set(`${room.id}:${id}`, { session: payload.session, at: now });
+    // A device that came online, or came back with a new session: the others can connect to it now.
+    if (!seen || seen.session !== payload.session || seen.at <= now - PRESENCE_MS) this.changed(room.id);
     result.memberId = actor.memberId; result.ownerId = room.ownerId;
-    result.members = room.members.filter(m => room.devices.some(d => d.memberId === m.id));
+    result.members = room.members
+      .filter(m => room.devices.some(d => d.memberId === m.id))
+      .map(m => {
+        if (m.joinedAt !== undefined) return m;
+        // Backfill legacy rooms created before `joinedAt` existed using the earliest admission time of the member's devices.
+        let earliest: number | undefined;
+        for (const d of room.devices) if (d.memberId === m.id && (earliest === undefined || d.admittedAt < earliest)) earliest = d.admittedAt;
+        return earliest !== undefined ? { ...m, joinedAt: earliest } : m;
+      });
     if (room.renames?.length) result.renames = room.renames;
     result.devices = room.devices.map(d => ({ ...d, session: online(d) }));
     if (actor.memberId === room.ownerId) result.requests = room.requests.filter(r => r.state === 'pending' && r.expiresAt > now).map(r => { const { code, pairing, ...rest } = r; return rest; });
-    const formerDevices = listRetiredDevices(this.db, room.id);
+    const keepMoreRetired = settings.historyForNewcomers || !!room.historyEverEnabled;
+    const formerDevices = listRetiredDevices(this.db, room.id, keepMoreRetired ? MAX_HISTORY_FORMER_DEVICES : MAX_FORMER_DEVICES);
     if (formerDevices.length) result.formerDevices = formerDevices;
-    result.settings = settingsOf(room);
+    result.settings = settings;
     if (room.repositories?.length) result.repositories = room.repositories;
+    const claims = liveClaims(room, now);
+    if (claims.length) result.claims = claims;
     const invites = (room.invites || []).filter(i => i.operatorId === actor.memberId && i.expiresAt > now);
     if (invites.length) result.agentInvites = invites.map(({ name, expiresAt }) => ({ name, expiresAt }));
     const key = `${room.id}:${id}`;
@@ -1181,7 +1289,7 @@ export class BrowserLobby {
     }
     result.iceServers = this.iceServers(room);
     if (this.relayEnabled) {
-      result.relayUrl = this.relayUrl;
+      result.relayUrl = this.relayUrlFor(origin);
       const roster = getRoomRoster<SignedRoster>(this.db, room.id);
       if (roster) result.roster = roster;
     }

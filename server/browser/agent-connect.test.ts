@@ -64,6 +64,74 @@ async function inFreshHome(work: (folder: string) => Promise<void>) {
 }
 const token = 'y'.repeat(43);
 
+test('connect refuses invalid runtime settings before it tries to use the invitation', async () => {
+  const room = crypto.randomUUID();
+  const link = `http://127.0.0.1:9/agent/${room}#${token}`;
+  await expect(agentCli(['connect', link, '--reasoning-effort', '<high>'])).rejects.toThrow('reasoning effort');
+  await expect(agentCli(['connect', link, '--service-tier', 'a\nb'])).rejects.toThrow('service tier');
+});
+
+test('connect reports the new runtime settings immediately and ignores an empty legacy model', () => inFreshHome(async folder => {
+  const room = crypto.randomUUID(), memberId = crypto.randomUUID(), updates: unknown[] = [];
+  let joined = false;
+  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
+    if (request.method === 'GET') return Response.json({ ok: true, revision: 'test' });
+    const { command, publicKey } = await request.json() as { command: { action: string; payload: unknown }; publicKey: string };
+    if (command.action === 'status') {
+      return Response.json({
+        roomId: room, deviceId: await deviceId(publicKey), title: 'Room', epoch: 'e', hostOnline: true,
+        ...(joined ? { memberId, members: [{ id: memberId, name: 'Test agent' }], devices: [] } : {}),
+      });
+    }
+    if (command.action === 'agent-redeem') joined = true;
+    if (command.action === 'profile') updates.push(command.payload);
+    return Response.json({});
+  } });
+  const cli = join(import.meta.dir, '..', 'agent-cli.ts');
+  const run = async (args: string[]) => {
+    const child = Bun.spawn([process.execPath, '--no-install', cli, ...args], {
+      stdout: 'pipe', stderr: 'pipe',
+      env: { ...process.env, MESHROOMS_DAEMON_DIR: join(folder, 'daemon') },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { stdout, stderr, exitCode };
+  };
+  try {
+    const link = `http://127.0.0.1:${server.port}/agent/${room}#${token}`;
+    const result = await run(['connect', link, '--model', '', '--reasoning-effort', ' high ', '--service-tier', 'fast']);
+    expect(result.exitCode, result.stderr).toBe(0);
+    const profile = { reasoningEffort: 'high', serviceTier: 'fast' };
+    expect(JSON.parse(result.stdout)).toMatchObject({ state: 'connected', runtimeState: 'reported', ...profile });
+    expect(updates).toEqual([profile]);
+  } finally {
+    if (joined) await run(['stop', '--room', room]);
+    server.stop(true);
+  }
+}));
+
+test('profile can set either runtime field independently and clear all four fields', () => inFreshHome(async folder => {
+  const room = crypto.randomUUID(), updates: unknown[] = [];
+  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
+    const { command } = await request.json() as { command: { action: string; payload: unknown } };
+    if (command.action !== 'profile') return new Response(null, { status: 400 });
+    updates.push(command.payload);
+    return Response.json({});
+  } });
+  try {
+    const dir = join(folder, 'browser-agents', room);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'room.json'), JSON.stringify({ origin: `http://127.0.0.1:${server.port}` }));
+    await agentCli(['profile', '--room', room, '--reasoning-effort', 'high']);
+    await agentCli(['profile', '--room', room, '--service-tier', 'fast']);
+    await agentCli(['profile', '--room', room, '--clear']);
+    expect(updates).toEqual([
+      { reasoningEffort: 'high' },
+      { serviceTier: 'fast' },
+      { harness: null, model: null, reasoningEffort: null, serviceTier: null },
+    ]);
+  } finally { server.stop(true); }
+}));
+
 test("a 200 that is not the room's answer (a proxy or maintenance page) fails closed too", () => inFreshHome(async folder => {
   const server = fakeRoom({ status: 'maintenance', redeem: 500 }), room = crypto.randomUUID();
   try {

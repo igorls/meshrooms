@@ -28,7 +28,7 @@ import { join, resolve } from 'node:path';
 import { agentCli, TEXT_OPTIONS } from './agent-cli';
 
 /** The wake subcommands this server exposes. Deliberately not connect/watch/profile/stop. */
-export const MCP_TOOLS = ['listen', 'send', 'react', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status'] as const;
+export const MCP_TOOLS = ['listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status'] as const;
 export type McpTool = (typeof MCP_TOOLS)[number];
 
 export const SERVER_NAME = 'meshrooms';
@@ -55,6 +55,8 @@ export const TOOL_SCHEMAS: Record<McpTool, { title: string; description: string;
     schema: { type: 'object', properties: { request_id: str('A fresh UUID for this send. Reuse it only to retry the same message.'), text: str('The message text, for short replies without quotes.'), reply_to: str('The id of the message you are answering.') }, required: ['request_id'], additionalProperties: false } },
   react: { title: 'React to a message', description: 'Toggle one of the allowed emoji on a message.',
     schema: { type: 'object', properties: { request_id: str('A fresh UUID.'), message: str('The message id.'), emoji: str('One of the allowed emoji (see `help`).') }, required: ['request_id', 'message', 'emoji'], additionalProperties: false } },
+  claim: { title: 'Claim a message', description: 'Take a message that went to every agent before you work on it, so the other agents stay quiet; listen lists these under claim. If another agent has it, stay quiet. Pass release to give it back.',
+    schema: { type: 'object', properties: { message: str('The id of the message, from listen.'), release: { type: 'boolean', description: 'Give the message back for another agent.' } }, required: ['message'], additionalProperties: false } },
   tasks: { title: 'Read the task board', description: 'List the room task board and the repositories people pinned.',
     schema: { type: 'object', properties: {}, additionalProperties: false } },
   'task-add': { title: 'Add a task', description: 'Add a task to the board.',
@@ -102,6 +104,7 @@ export function toolArgv(tool: McpTool, args: Record<string, unknown>, room: str
     case 'listen': push('--wait-seconds', args.wait_seconds); if (args.peek === true) argv.push('--peek'); break;
     case 'send': push('--request-id', args.request_id); push('--text', args.text); push('--reply-to', args.reply_to); break;
     case 'react': push('--request-id', args.request_id); push('--message', args.message); push('--emoji', args.emoji); break;
+    case 'claim': push('--message', args.message); if (args.release === true) argv.push('--release'); break;
     case 'decisions': if (args.all === true) argv.push('--all'); break;
     case 'tasks': case 'status': break;
     case 'task-add': push('--request-id', args.request_id); push('--title', args.title); push('--notes', args.notes); push('--assignee', args.assignee); push('--issue', args.issue); break;

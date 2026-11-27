@@ -21,6 +21,8 @@ export const ROOM_META_VERSION = 1;
 export const CURRENT_SCHEMA_VERSION = 3;
 /** Maximum retired devices returned in `RoomStatus.formerDevices` per room (prioritizing revoked entries). */
 export const MAX_FORMER_DEVICES = 2000;
+/** Bounded cap on `RoomStatus.formerDevices` for rooms with newcomer history enabled so invite churn cannot bloat status polls unboundedly. */
+export const MAX_HISTORY_FORMER_DEVICES = 4000;
 
 /** Minimal room shape needed to keep indexed metadata columns and `room_devices` in sync with `rooms.body`. */
 export type StoredRoomProjection = {
@@ -53,8 +55,12 @@ function toFormerDevice(row: RetiredDeviceRow): FormerDevice {
   };
 }
 
-/** Lists retired devices for a room from `retired_devices`, keeping revoked devices ahead of any churn past `limit`. */
-export function listRetiredDevices(db: Database, roomId: string, limit = MAX_FORMER_DEVICES): FormerDevice[] {
+/**
+ * Lists retired devices for a room from `retired_devices`, always bounded by `limit`
+ * (default `MAX_FORMER_DEVICES`, or `MAX_HISTORY_FORMER_DEVICES` for rooms with history enabled)
+ * while keeping revoked devices ahead of any churn past `limit`.
+ */
+export function listRetiredDevices(db: Database, roomId: string, limit: number = MAX_FORMER_DEVICES): FormerDevice[] {
   const rows = db.query(
     `SELECT device_id, public_key, member_id, role, retired_at, revoked
      FROM (
@@ -64,7 +70,7 @@ export function listRetiredDevices(db: Database, roomId: string, limit = MAX_FOR
        ORDER BY revoked DESC, COALESCE(retired_at, 0) DESC, rowid DESC
        LIMIT ?
      )
-     ORDER BY COALESCE(retired_at, 0) ASC, rowid ASC`
+     ORDER BY COALESCE(retired_at, 0) ASC, rowid ASC`,
   ).all(roomId, limit) as RetiredDeviceRow[];
   return rows.map(toFormerDevice);
 }

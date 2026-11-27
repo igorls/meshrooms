@@ -523,6 +523,30 @@ test('the daemon starts at login on every system, from files written only where 
   expect(quotePS("it's")).toBe("'it''s'");
   expect(windows.apply(false).installed).toBe(false);
   expect(values.size).toBe(0);
+  // The value is read back through the reader, never from `reg query` text: reg.exe prints in the OEM code page, so an
+  // accented home folder came back garbled (here as code page 850 bytes read as UTF-8) and never verified.
+  const garbled: Exec = (file, args) => args[0] === 'query' && values.has(args[3])
+    ? { status: 0, stdout: `${args[3]} REG_SZ ${values.get(args[3])!.replace(/ã/g, '\ufffd')}` } : reg(file, args);
+  const accented = { ...item, dir: join(dir, 'João', 'daemon') };
+  const read = (name: string) => values.get(name) ?? null;
+  const viaReader = loginItemManager(accented, { platform: 'win32', home: dir, run: garbled, read, host: { supported: true } });
+  expect(viaReader.apply(true)).toEqual({ installed: true, supported: true });
+  expect(loginItemManager(accented, { platform: 'win32', home: dir, run: garbled, host: { supported: true } }).status().installed).toBe(false);
+  expect(viaReader.apply(false).installed).toBe(false);
+});
+
+// The daemon's login item against the real registry, from a folder with an accented name: written with reg.exe, read
+// back through the registry API. A throwaway value name, so it runs only when asked: MESHROOMS_TEST_RUN_KEY=1.
+test.skipIf(process.platform !== 'win32' || !process.env.MESHROOMS_TEST_RUN_KEY)('the daemon login item verifies under an accented home folder', () => {
+  const dir = tempDir();
+  const item = { name: `MeshroomsTest-${process.pid}`, label: 'dev.wormdb.meshrooms.test', description: 'Meshrooms test', dir: join(dir, 'João Ñandú', 'daemon'),
+    log: join(dir, 'daemon.log'), args: ['bun'], windowsArgs: ['C:\\bun\\bun.exe', 'meshrooms.js', 'daemon', 'start'] };
+  const windows = loginItemManager(item, { platform: 'win32', home: dir, host: { supported: true } });
+  try {
+    expect(windows.apply(true)).toEqual({ installed: true, supported: true });
+    expect(windows.status().installed).toBe(true);
+  } finally { windows.apply(false); }
+  expect(windows.status()).toEqual({ installed: false, supported: true });
 });
 
 test('the real daemon: one per user, seen by status, stopped by stop, and a crashed one\'s lock taken over by the next', async () => {

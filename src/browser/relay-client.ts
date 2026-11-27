@@ -3,6 +3,7 @@ import {
   PROTOCOL_HEADER,
   PROTOCOL_VERSION,
   type Command,
+  type RoomStatus,
   type SignedCommand,
 } from './protocol';
 import {
@@ -40,6 +41,13 @@ export type RelayClientOptions = {
   rosterVersion?: () => number;
   /** Called for every valid `RelayEnvelope` received over WSS or HTTPS long-poll. */
   onEnvelope?: (envelope: RelayEnvelope, meta: RelayReceivedMeta) => void | Promise<void>;
+  /**
+   * Called with each room status the service pushes to a socket that watches it (`watchStatus`): on every change in
+   * the room and every 10 s. While pushes arrive (`statusLive`), the device doesn't poll `status`.
+   */
+  onStatus?: (status: RoomStatus) => void;
+  /** Called when pushed status stops (socket closed, a push failed): a caller waiting for the next push polls instead. */
+  onStatusLost?: () => void;
   /** Called whenever transport mode changes (`disconnected`, `connecting`, `wss`, `https`). */
   onStateChange?: (state: RelayTransportState) => void;
   /** Called when the relay acknowledges accepting a frame (NEVER a peer delivery receipt). */
@@ -108,6 +116,11 @@ export const DEFAULT_WSS_UPGRADE_TIMEOUT_MS = 10_000;
 export const DEFAULT_WSS_RETRY_INTERVAL_MS = 600_000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 25_000;
 export const DEFAULT_POLL_WAIT_SECONDS = 25;
+/**
+ * How long pushed status counts as live after the last push: the service pushes at least every 10 s, so two missed
+ * refreshes mean the push stopped, and the device polls `status` again, still inside the 25 s presence window.
+ */
+export const STATUS_LIVE_MS = 22_000;
 export const DEFAULT_FILE_IN_FLIGHT_CAP_BYTES = 1024 * 1024;
 /** Target batch byte ceiling for `POST /api/relay/v1/send` so JSON + SignedCommand stays <= 64 KB. */
 const HTTPS_SEND_BATCH_MAX_BYTES = 56 * 1024;
@@ -217,6 +230,11 @@ export class RelayClient {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private wssRetryTimer?: ReturnType<typeof setTimeout>;
   private lastPongAt = 0;
+  /** The room status this device watches over the socket, re-sent on every reconnect. */
+  private statusWatch?: { session: string; epoch?: string; cursor: number };
+  /** Whether the service said, in `ready`, that it pushes status. Older services don't. */
+  private pushesStatus = false;
+  private lastStatusAt = 0;
   private reconnectAttempt = 0;
   private nextWssRetryAt = 0;
 
@@ -287,6 +305,46 @@ export class RelayClient {
 
   get currentFileInFlightBytes(): number {
     return this.fileInFlightBytes;
+  }
+
+  /**
+   * Asks the service to push this room's status over the socket, as the lobby session `session` (the one this device
+   * polls status as), from signal cursor `cursor` in `epoch`. Kept across reconnects; sent once the socket is ready.
+   */
+  watchStatus(watch: { session: string; epoch?: string; cursor: number }) {
+    this.statusWatch = { session: watch.session, cursor: watch.cursor, ...(watch.epoch ? { epoch: watch.epoch } : {}) };
+    this.sendWatch();
+  }
+
+  /** Signals up to `cursor` (in `epoch`) were handled: later pushes leave them out. */
+  ackStatus(cursor: number, epoch?: string) {
+    const watch = this.statusWatch;
+    if (!watch || (watch.cursor === cursor && watch.epoch === epoch)) return;
+    watch.cursor = cursor;
+    if (epoch) watch.epoch = epoch;
+    if (!this.wsAuthed || !this.pushesStatus || !this.ws) return;
+    try { this.ws.send(JSON.stringify({ t: 'status-ack', cursor, ...(epoch ? { epoch } : {}) })); } catch { /* the close handler reconnects */ }
+  }
+
+  /** Whether the service pushes this room's status right now: the device needs no status polls while it does. */
+  get statusLive(): boolean {
+    return this.wsAuthed && this.pushesStatus && !!this.statusWatch && this.now() - this.lastStatusAt < STATUS_LIVE_MS;
+  }
+
+  /** How long pushed status stays live without another push: a caller waits this long at most, then polls. */
+  get statusLiveRemainingMs(): number {
+    return this.statusLive ? Math.max(0, STATUS_LIVE_MS - (this.now() - this.lastStatusAt)) : 0;
+  }
+
+  private statusLost() {
+    const was = this.lastStatusAt !== 0;
+    this.lastStatusAt = 0;
+    if (was && this.statusWatch) this.options.onStatusLost?.();
+  }
+
+  private sendWatch() {
+    if (!this.statusWatch || !this.wsAuthed || !this.pushesStatus || !this.ws) return;
+    try { this.ws.send(JSON.stringify({ t: 'status-watch', ...this.statusWatch })); } catch { /* the close handler reconnects */ }
   }
 
   isConnected(): boolean {
@@ -415,6 +473,7 @@ export class RelayClient {
     const ws = this.ws;
     this.ws = undefined;
     this.wsAuthed = false;
+    this.statusLost();
     if (!ws) return;
     try {
       ws.onopen = null;
@@ -696,6 +755,7 @@ export class RelayClient {
       this.ws = undefined;
       const wasAuthed = this.wsAuthed;
       this.wsAuthed = false;
+      this.statusLost();
       this.requeueInFlight();
       if (this.stopped || this.terminalAuthFailed) return;
       const terminalClose = mapWssCloseStatus(event?.code);
@@ -764,6 +824,24 @@ export class RelayClient {
       this.setState('wss');
       this.startHeartbeat(ws);
       this.scheduleDrain();
+      this.pushesStatus = msg.status === true;
+      this.lastStatusAt = 0;
+      this.sendWatch();
+      return;
+    }
+
+    if (t === 'status' && msg.status && typeof msg.status === 'object') {
+      if (this.ws !== ws || !this.statusWatch) return;
+      this.lastStatusAt = this.now();
+      try { this.options.onStatus?.(msg.status as RoomStatus); }
+      catch (error) { this.options.onError?.(error instanceof Error ? error : new Error(String(error))); }
+      return;
+    }
+
+    if (t === 'status-error') {
+      // The push couldn't read the room this time; the device polls as before until a push arrives again.
+      this.statusLost();
+      this.options.onError?.(makeStatusError(wssErrorMessage(msg, 'Status unavailable'), typeof msg.status === 'number' ? msg.status : undefined, typeof msg.code === 'string' ? msg.code : undefined));
       return;
     }
 

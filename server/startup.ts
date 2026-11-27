@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { dlopen, ptr } from 'bun:ffi';
 import { startupHostStatus } from './windows-path';
 
 export type StartupState = { installed: boolean; supported: boolean; message?: string };
@@ -35,31 +36,70 @@ export function startupManager(options: StartupOptions): StartupManager {
 export type Exec = (file: string, args: string[]) => { status: number | null; stdout: string };
 const exec: Exec = (file, args) => { const result = spawnSync(file, args, { windowsHide: true, encoding: 'utf8', timeout: 5000 }); return { status: result.status, stdout: result.stdout ?? '' }; };
 
+/** A Run key value's text, or null when it is missing or not a string. */
+export type ReadRunValue = (valueName: string) => string | null;
+
+let advapi32: { RegGetValueW: (...args: unknown[]) => number } | undefined;
+/**
+ * Reads a value of the per-user Run key through the registry API, in UTF-16. `reg query` output is never parsed for
+ * this: reg.exe prints in the console's OEM code page (850 on a default Portuguese or Western European Windows), so a
+ * home folder with an accent (one named João, say) came back garbled, the entry never matched, and start at login could not be verified.
+ */
+export const readRunValue: ReadRunValue = valueName => {
+  advapi32 ??= dlopen('advapi32.dll', {
+    RegGetValueW: { args: ['u64', 'ptr', 'ptr', 'u32', 'ptr', 'ptr', 'ptr'], returns: 'i32' },
+  }).symbols as unknown as { RegGetValueW: (...args: unknown[]) => number };
+  // HKEY_CURRENT_USER is (HKEY)(LONG)0x80000001: sign-extended to the 64-bit handle.
+  const HKCU = 0xffffffff80000001n, RRF_RT_STRING = 0x2 | 0x4, RRF_NOEXPAND = 0x10000000, ERROR_MORE_DATA = 234;
+  const subKey = Buffer.from('Software\\Microsoft\\Windows\\CurrentVersion\\Run\0', 'utf16le'), value = Buffer.from(`${valueName}\0`, 'utf16le');
+  const size = Buffer.alloc(4);
+  for (let bytes = 2048, attempt = 0; attempt < 3; attempt++) {
+    const data = Buffer.alloc(bytes);
+    size.writeUInt32LE(bytes);
+    const status = advapi32.RegGetValueW(HKCU, ptr(subKey), ptr(value), RRF_RT_STRING | RRF_NOEXPAND, null, ptr(data), ptr(size));
+    if (status === 0) return data.subarray(0, size.readUInt32LE()).toString('utf16le').replace(/\0[\s\S]*$/, '');
+    // Missing (2), not a string (1630) or unreadable: not this entry.
+    if (status !== ERROR_MORE_DATA) return null;
+    bytes = Math.max(size.readUInt32LE(), bytes * 2);
+  }
+  return null;
+};
+
+/** The data `reg query <key> /v <name>` printed for a string value, for an injected reg.exe in tests. */
+const queriedValue = (run: Exec, valueName: string): string | null => {
+  const result = run('reg.exe', ['query', key, '/v', valueName]);
+  if (result.status !== 0) return null;
+  const match = result.stdout.match(/\sREG_(?:EXPAND_)?SZ(?:\s+(.*))?$/m);
+  return match ? (match[1] ?? '').trimEnd() : null;
+};
+
 /**
  * A per-user Run key value that starts a PowerShell script, hidden, at login. The script is kept beside the program's
  * state, and the entry counts as installed only while both the value and the script are exactly what this writes.
  */
-export function runKeyManager(entry: { valueName: string; scriptPath: string; script: string }, options: { run?: Exec; host?: { supported: boolean; message?: string } } = {}): StartupManager {
+export function runKeyManager(entry: { valueName: string; scriptPath: string; script: string }, options: { run?: Exec; read?: ReadRunValue; host?: { supported: boolean; message?: string } } = {}): StartupManager {
   const host = options.host ?? startupHostStatus();
   if (!host.supported) return { status: () => ({ installed: false, ...host }),
     apply(enabled) { if (enabled) throw new Error(host.message); return this.status(); } };
   const { valueName, scriptPath, script } = entry, run = options.run ?? exec;
+  // reg.exe takes its arguments in UTF-16, so writing and deleting through it is exact; reading goes through the API.
+  // An injected reg.exe (tests) is read back through its own `query`.
+  const read = options.read ?? (options.run ? (name: string) => queriedValue(run, name) : readRunValue);
   const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const command = `"${powershell}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${scriptPath}"`;
   const reg = (args: string[]) => run('reg.exe', args);
   const status = (): StartupState => {
-    const result = reg(['query', key, '/v', valueName]);
-    const installed = result.status === 0 && result.stdout.includes(command) && existsSync(scriptPath) && withoutEnv(readFileSync(scriptPath, 'utf8')) === withoutEnv(script);
-    return { installed, supported: true, ...(result.status === 0 && !installed ? { message: 'The startup entry needs repair before it can be marked active.' } : {}) };
+    const data = read(valueName);
+    const installed = data === command && existsSync(scriptPath) && withoutEnv(readFileSync(scriptPath, 'utf8')) === withoutEnv(script);
+    return { installed, supported: true, ...(data !== null && !installed ? { message: 'The startup entry needs repair before it can be marked active.' } : {}) };
   };
   return { status, apply(enabled) {
     if (enabled) {
       mkdirSync(dirname(scriptPath), { recursive: true }); writeFileSync(scriptPath, script, { mode: 0o600 });
       const result = reg(['add', key, '/v', valueName, '/t', 'REG_SZ', '/d', command, '/f']);
       if (result.status !== 0) throw new Error('Windows could not register start at login. Your preference was not saved.');
-    } else {
-      const present = reg(['query', key, '/v', valueName]);
-      if (present.status === 0 && reg(['delete', key, '/v', valueName, '/f']).status !== 0) throw new Error('Windows could not remove the Meshrooms startup entry.');
+    } else if (read(valueName) !== null && reg(['delete', key, '/v', valueName, '/f']).status !== 0) {
+      throw new Error('Windows could not remove the Meshrooms startup entry.');
     }
     const result = status(); if (result.installed !== enabled) throw new Error('The startup preference could not be verified.'); return result;
   } };
@@ -170,7 +210,7 @@ function systemdManager(name: string, unitPath: string, unit: string, run: Exec)
  */
 export type LoginItem = { name: string; label: string; description: string; args: string[]; windowsArgs: string[]; dir: string; log: string; env?: Record<string, string> };
 export function loginItemManager(item: LoginItem, options: { platform?: NodeJS.Platform; home?: string; env?: Record<string, string | undefined>; run?: Exec;
-  host?: { supported: boolean; message?: string } } = {}): StartupManager & { where: string } {
+  read?: ReadRunValue; host?: { supported: boolean; message?: string } } = {}): StartupManager & { where: string } {
   const platform = options.platform ?? process.platform, home = options.home ?? homedir(), env = options.env ?? process.env, run = options.run ?? exec;
   if (platform === 'darwin') {
     const where = join(home, 'Library', 'LaunchAgents', `${item.label}.plist`);
@@ -180,7 +220,9 @@ export function loginItemManager(item: LoginItem, options: { platform?: NodeJS.P
     const where = join(item.dir, 'start-at-login.ps1');
     const variables = Object.entries(item.env ?? {}).map(([name, value]) => `$env:${name} = ${quotePS(value)}\n`).join('');
     const script = `$ErrorActionPreference = 'Stop'\n${variables}& ${item.windowsArgs.map(quotePS).join(' ')}\nexit $LASTEXITCODE\n`;
-    return { where, ...runKeyManager({ valueName: item.name, scriptPath: where, script }, { run, ...(options.host ? { host: options.host } : {}) }) };
+    // Only an injected reg.exe (tests) is passed on: without one, runKeyManager reads the value through the registry API.
+    return { where, ...runKeyManager({ valueName: item.name, scriptPath: where, script },
+      { ...(options.run ? { run: options.run } : {}), ...(options.read ? { read: options.read } : {}), ...(options.host ? { host: options.host } : {}) }) };
   }
   const where = join(env.XDG_CONFIG_HOME ? resolve(env.XDG_CONFIG_HOME) : join(home, '.config'), 'systemd', 'user', `${item.name}.service`);
   return { where, ...systemdManager(item.name, where, systemdUnit(item.description, item.args, item.env), run) };

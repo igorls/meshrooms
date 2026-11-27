@@ -1,4 +1,5 @@
 import type { SignedRoster } from './relay-crypto';
+import type { Claim, Floor } from '../collab';
 export type { SignedRoster } from './relay-crypto';
 
 /** Browser-room v1 is independent of the native node's credentials and grants. */
@@ -15,7 +16,7 @@ export type Command = {
   protocol: typeof browserProtocol; origin: string; id: string; at: number;
   action:
     | 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal'
-    | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'rename' | 'repositories' | 'transfer-host' | 'close'
+    | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'rename' | 'repositories' | 'claim' | 'transfer-host' | 'close'
     | 'pair-offer' | 'pair-redeem' | 'pair-cancel'
     | 'roster-publish' | 'relay-open' | 'relay-send' | 'relay-poll' | 'relay-wake-register' | 'relay-state-get' | 'relay-state-put';
   roomId: string; payload: Record<string, unknown>;
@@ -31,11 +32,33 @@ export type BrowserDevice = {
   encSig?: string;
   /** True for cloud/ephemeral agents that registered a relay inbox and wake trigger. */
   wakeable?: true;
+  /** Earlier non-revoked memberships this same device key held before leaving and rejoining, so earlier signed records stay verifiable. */
+  priorMembers?: { memberId: string; retiredAt?: number }[];
 };
-/** Members without a role joined before agents existed and are people. An agent's operator is the member who confirmed it. */
-/** `avatar` is a short hash of the member's picture; fetch it from /api/lobby/rooms/:room/avatars/:member?h=<hash>. */
-/** Agents report `harness` (e.g. Claude Code) and `model` themselves; the room cannot verify either. */
-export type BrowserMember = { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; avatar?: string; harness?: string; model?: string };
+/** Who may receive a message via peer-to-peer history replication (`docs/flows/history-replication.md`). */
+export type MessageVisibility = 'members' | 'room';
+const agentRuntimeLabels = { harness: 'harness', model: 'model', reasoningEffort: 'reasoning effort', serviceTier: 'service tier' } as const;
+type AgentRuntimeField = keyof typeof agentRuntimeLabels;
+export const AGENT_RUNTIME_FIELDS = Object.keys(agentRuntimeLabels) as AgentRuntimeField[];
+/** Agents report these settings themselves. The room cannot verify them. */
+export type AgentRuntimeProfile = Partial<Record<AgentRuntimeField, string>>;
+
+export function cleanAgentRuntimeLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const label = value.trim();
+  return /^[\p{L}\p{N}][\p{L}\p{N} ._:+()/@-]{0,47}$/u.test(label) ? label : undefined;
+}
+
+export function agentRuntimeLabelError(field: AgentRuntimeField): string {
+  return `Give a ${agentRuntimeLabels[field]} of up to 48 letters, digits, spaces or . _ : + ( ) / @ -.`;
+}
+
+/**
+ * Members without a role joined before agents existed and are people. An agent's operator is the member who confirmed it.
+ * `avatar` is a short hash of the member's picture; fetch it from /api/lobby/rooms/:room/avatars/:member?h=<hash>.
+ * `joinedAt` is the member's first admission time on the room service's clock, preserved when companion devices link later.
+ */
+export type BrowserMember = AgentRuntimeProfile & { id: string; name: string; role?: 'human' | 'agent'; operatorId?: string; avatar?: string; joinedAt?: number };
 /**
  * A rename of an agent after it joined, as the room service reports it. `by` is the member who renamed it (the host or the
  * agent's operator), shown by that member's current name. The service keeps only the latest few, for members still here.
@@ -69,22 +92,33 @@ export type PairingPreview = { requestId: string; label: string; publicKey: stri
 /** What `pair-redeem` gives the phone: the person's name, the trusted device's id and the rooms the offer names. */
 export type PairingOffer = { name: string; device: string; rooms: string[]; expiresAt: number };
 /** What a command can add to its answer: `link` (admitted, preview, revoked), `pair-offer`, `pair-redeem` and `pair-cancel`. */
-export type CommandAnswer = { admitted?: boolean; preview?: PairingPreview; revoked?: number; offer?: PairingOffer | { expiresAt: number }; cancelled?: boolean };
+export type CommandAnswer = { admitted?: boolean; preview?: PairingPreview; revoked?: number; offer?: PairingOffer | { expiresAt: number }; cancelled?: boolean;
+  /** `claim`: who holds the message now (this agent, or the one that got there first); none once released. */
+  claim?: Claim | null };
 /** The public room service (docs/browser-rooms.md): where the desktop app makes new rooms unless told otherwise. */
 export const PUBLIC_ROOM_SERVICE = 'https://meshrooms.wormdb.dev';
+/**
+ * Every address of the public room service. It is one service: the same rooms, reached through each. A browser keeps
+ * its identity and rooms per address, so an address stays served once people have used it.
+ */
+export const PUBLIC_ROOM_SERVICES: readonly string[] = [PUBLIC_ROOM_SERVICE, 'https://meshrooms.ai'];
+/** Whether two room service origins reach the same rooms: the same origin, or two addresses of the public service. */
+export const sameRoomService = (a: string, b: string) => a === b || (PUBLIC_ROOM_SERVICES.includes(a) && PUBLIC_ROOM_SERVICES.includes(b));
 /** Host-controlled room rules. Agents' own bridges enforce the floor and wake rules; the room service enforces admission. */
 export type RoomSettings = {
   /** Agents reply only when addressed, or to every message from a person. */
-  floor: 'humans-first' | 'open';
+  floor: Floor;
   /** Whether a task an agent assigns to another agent wakes it, as a person's assignment does. */
   agentAssignmentsWake: boolean;
   /** Whether agents connected by people other than the host wait for the host to admit them. */
   guestAgentApproval: boolean;
   /** Whether the host also admits each new device a member links to themselves (off: the member's own link admits it). */
   hostApprovesDevices: boolean;
+  /** Whether new messages are signed with `visibility: 'room'` so newcomers and agents admitted later can receive them. */
+  historyForNewcomers: boolean;
 };
 /** Defaults for new rooms. Hosts approve guests' agents unless they turn it off; rooms created before this default keep off. */
-export const DEFAULT_ROOM_SETTINGS: RoomSettings = { floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true, hostApprovesDevices: false };
+export const DEFAULT_ROOM_SETTINGS: RoomSettings = { floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true, hostApprovesDevices: false, historyForNewcomers: false };
 /** A one-time agent link a person created and has not yet been used; the token itself is never stored or returned again. */
 export type AgentInvite = { name: string; expiresAt: number };
 export type Signal = { seq: number; from: string; session: string; targetSession: string; description: RTCSessionDescriptionInit };
@@ -96,8 +130,12 @@ export type RoomStatus = {
   /** Keys of devices that have left, so their earlier signed records still verify for people who join later (see signerOf). */
   formerDevices?: FormerDevice[];
   settings?: RoomSettings;
+  /** Disclosed even before admission so join screens show whether new messages are shared with newcomers. */
+  historyForNewcomers?: boolean;
   /** GitHub `owner/name` repositories people pinned for this room; tasks open issues in them. */
   repositories?: string[];
+  /** Agents' claims on messages that went to every agent (src/collab.ts, `needsClaim`): who answers each. */
+  claims?: Claim[];
   /** When the room service removes this room if no admitted device opens it again (idle expiry). */
   expiresAt?: number;
   /** Host-signed monotonic device roster used as the authoritative recipient set for E2E relay encryption. */
@@ -130,9 +168,21 @@ export type FormerDevice = { id: string; publicKey: string; memberId: string; ro
  * a device that joins later, or was offline, never receives the revoked device's records that nobody else holds in a
  * newer form.
  */
-export function signerOf(status: Pick<RoomStatus, 'devices' | 'formerDevices'> | undefined, deviceId: unknown, at: unknown): { publicKey: string; memberId: string } | undefined {
+export function signerOf(
+  status: Pick<RoomStatus, 'devices' | 'formerDevices'> | undefined,
+  deviceId: unknown,
+  at: unknown,
+  expectedMemberId?: unknown,
+): { publicKey: string; memberId: string } | undefined {
   const current = status?.devices?.find(d => d.id === deviceId);
-  if (current) return current;
+  if (current) {
+    if (expectedMemberId !== undefined && current.memberId !== expectedMemberId && current.priorMembers?.length) {
+      const prior = current.priorMembers.find(p =>
+        p.memberId === expectedMemberId && (p.retiredAt === undefined || (typeof at === 'number' && at <= p.retiredAt)));
+      if (prior) return { publicKey: current.publicKey, memberId: prior.memberId };
+    }
+    return current;
+  }
   const former = status?.formerDevices?.find(d => d.id === deviceId);
   if (!former || former.revoked) return undefined;
   return former.retiredAt === undefined || (typeof at === 'number' && at <= former.retiredAt) ? former : undefined;

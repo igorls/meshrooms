@@ -477,11 +477,13 @@ fn app_origin(app: &AppHandle) -> Url {
 fn show_window(app: &AppHandle) {
     let window = match app.get_webview_window("main") {
         Some(window) => window,
-        None => match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title("Meshrooms")
-            .inner_size(500.0, 760.0)
-            .min_inner_size(400.0, 500.0)
-            .build()
+        None => match home::frame(
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                .title("Meshrooms")
+                .inner_size(500.0, 760.0)
+                .min_inner_size(400.0, 500.0),
+        )
+        .build()
         {
             Ok(window) => window,
             Err(error) => return eprintln!("Cannot open the Meshrooms window: {error}"),
@@ -645,7 +647,7 @@ fn main() {
         .manage(Mutex::new(approvals::Approving::default()))
         .manage(Mutex::new(notify::Posted::default()))
         .invoke_handler(tauri::generate_handler![
-            home::home_view, home::home_action,
+            home::home_view, home::home_action, home::home_window,
             pair::pair_view, pair::pair_check, pair::pair_verify, pair::pair_confirm, pair::pair_reject, pair::pair_cancel, pair::pair_unpair, pair::pair_close, pair::pair_open,
             join::join_view, join::join_confirm, join::join_cancel, join::join_browse,
             review::review_view, review::review_pause, review::review_resume, review::review_close,
@@ -698,16 +700,16 @@ fn main() {
                 stop,
                 login,
             });
-            // macOS uses a monochrome template icon; Linux panels ignore template inversion and are often dark,
-            // so Linux uses the full-color app icon for reliable contrast on both light and dark bars.
-            let tray_icon = if cfg!(target_os = "linux") {
-                Image::from_bytes(include_bytes!("../icons/32x32.png"))?
-            } else {
+            // macOS uses a monochrome template icon; Linux and Windows taskbars ignore template inversion and are
+            // often dark, so they use the full-color tray mark for reliable contrast on both light and dark bars.
+            let tray_icon = if cfg!(target_os = "macos") {
                 Image::from_bytes(include_bytes!("../icons/tray.png"))?
+            } else {
+                Image::from_bytes(include_bytes!("../icons/tray-color.png"))?
             };
             TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
-                .icon_as_template(!cfg!(target_os = "linux"))
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Meshrooms")
                 .menu(&menu)
                 .show_menu_on_left_click(true)

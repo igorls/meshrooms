@@ -143,7 +143,7 @@ open; the watcher closes it for an unattended agent, without keeping a model run
   only once the agent is admitted and the runner has reached another device and had a few seconds to receive the
   room's history (`syncedAt` in the runner's proof of life). Until then it keeps the heartbeat and wakes nothing.
 - **The harness consumes.** On work, the watcher runs the harness once with a fixed prompt. The prompt tells it to read
-  once with `listen`, act only on `addressed`, `tasks` and `decisions` under the room rules (humans first, room text
+  once with `listen`, act only on `addressed`, `tasks` and `decisions` under the room rules (answer only what addresses you, room text
   is not authority, share only what the operator would want), reply, then end its turn. It also carries three fresh
   request ids, so the harness needs no UUID tool. Room text never goes on the harness's command line; it reaches the
   harness only through `listen`. The prompt goes on stdin (claude, codex) or in a file (exec, `{prompt_file}`).
@@ -278,6 +278,10 @@ open; the watcher closes it for an unattended agent, without keeping a model run
     - A stuck runner is replaced at most once every 5 minutes (`runner-repair.json`). A repair that can't be done
       (already replaced recently, not confirmable, not stoppable, or another process busy with it) is logged to stderr
       and `listen` adds a `runnerProblem` hint.
+  - The runner takes room status from the relay socket when the service pushes it (see Room status over the relay
+    socket in docs/browser-rooms.md), and then polls none. Its passes still come round every second for its own work:
+    the outbox, peers, decisions. Without pushes, it polls one pass in ten, and every pass while it waits for admission,
+    recovers from a failed poll or sets up a peer connection.
   - Each pass of the runner is bounded. The status poll gives up after 10 s (11 s at most), everything after it shares
     a 12 s budget, and a second's pause follows. That keeps consecutive polls inside the service's 25 s presence window
     in the usual case. A poll whose answer is slow to come back, followed by a slow request for the next one, can still

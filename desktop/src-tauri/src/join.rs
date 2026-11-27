@@ -60,12 +60,22 @@ pub enum Route {
     Refuse(String),
 }
 
+/// Every address of the public room service: the same rooms through each. Kept equal to `PUBLIC_ROOM_SERVICES` in
+/// src/browser/protocol.ts (server/person.test.ts checks).
+pub const PUBLIC_ROOM_SERVICES: [&str; 2] = ["https://meshrooms.wormdb.dev", "https://meshrooms.ai"];
+
+/// Whether two origins reach the same rooms, as `sameRoomService` in src/browser/protocol.ts: the same origin, or two
+/// addresses of the public service. `person join` then joins through the address the app already uses.
+pub fn same_service(a: &str, b: &str) -> bool {
+    a == b || (PUBLIC_ROOM_SERVICES.contains(&a) && PUBLIC_ROOM_SERVICES.contains(&b))
+}
+
 /// `person status` and `person rooms`, for the room `room` at `origin`. Being in the room wins over everything else; a
-/// room on the list through another origin, or closed, is refused; then pairing decides.
+/// room on the list through another service, or closed, is refused; then pairing decides.
 pub fn classify(status: &Value, rooms: &Value, origin: &str, room: &str) -> Route {
     let listed = rooms.as_array().and_then(|rooms| rooms.iter().find(|row| row["roomId"].as_str() == Some(room)));
     if let Some(row) = listed {
-        if row["origin"].as_str() != Some(origin) {
+        if !row["origin"].as_str().is_some_and(|listed| same_service(listed, origin)) {
             return Route::Refuse("This computer is already in that room through another room service.".into());
         }
         match row["state"].as_str() {
@@ -84,7 +94,7 @@ pub fn classify(status: &Value, rooms: &Value, origin: &str, room: &str) -> Rout
         return Route::NotPaired;
     }
     let name = crate::text::clean(name, 64);
-    if paired_origin != origin {
+    if !same_service(paired_origin, origin) {
         return Route::OtherService { name, origin: crate::text::clean(paired_origin, 120) };
     }
     Route::Ask { name }
@@ -552,6 +562,12 @@ mod tests {
         assert_eq!(classify(&paired("https://other.example"), &none, ORIGIN, ROOM), Route::OtherService { name: "Robin Lee".into(), origin: "https://other.example".into() });
         // Loopback spellings are different origins, as the bridge compares them.
         assert!(matches!(classify(&paired("http://127.0.0.1:4317"), &none, "http://localhost:4317", ROOM), Route::OtherService { .. }));
+        // The public service's two addresses are one service: the room and the pairing hold through either.
+        let [used, other] = PUBLIC_ROOM_SERVICES;
+        assert_eq!(classify(&paired(used), &listed("joined", used), other, ROOM), Route::Open);
+        assert_eq!(classify(&paired(used), &none, other, ROOM), Route::Ask { name: "Robin Lee".into() });
+        assert!(matches!(classify(&paired(used), &listed("joined", ORIGIN), other, ROOM), Route::Refuse(_)));
+        assert!(matches!(classify(&paired(ORIGIN), &none, other, ROOM), Route::OtherService { .. }));
         // Paired, at that service, and not in the room (or declined, expired or removed there): ask.
         assert_eq!(classify(&paired(ORIGIN), &none, ORIGIN, ROOM), Route::Ask { name: "Robin Lee".into() });
         for state in ["declined", "expired", "removed"] {

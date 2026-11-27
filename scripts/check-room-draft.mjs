@@ -1,6 +1,10 @@
 // Shared by the hosted and desktop-local browser smokes: exercise real navigation, reload and unsent file protection.
 import assert from 'node:assert/strict';
 
+// The way back to the room list: the sidebar's wordmark link on a wide screen, the header's back link on a narrow one.
+// Only one of them is shown at a time, so the name matches either and Playwright skips the hidden one.
+export const roomsLink = page => page.getByRole('link', { name: /^(Meshrooms rooms|Your rooms)$/ });
+
 export async function checkRoomDraft(page, roomTitle, replyText) {
   const roomUrl = page.url();
   const composer = () => page.locator('.browser-composer').getByRole('combobox', { name: /^Message / });
@@ -10,7 +14,7 @@ export async function checkRoomDraft(page, roomTitle, replyText) {
   const draft = 'A private draft kept through navigation.\nCafé 日本語 🧪';
   await composer().fill(draft);
   await page.getByText('Draft saved in this tab.', { exact: true }).waitFor();
-  await page.getByRole('link', { name: 'Meshrooms rooms', exact: true }).click();
+  await roomsLink(page).click();
   await page.waitForURL(/\/rooms$/);
   await page.getByRole('link', { name: roomTitle, exact: true }).first().click();
   await composer().waitFor();
@@ -33,7 +37,7 @@ export async function checkRoomDraft(page, roomTitle, replyText) {
   await page.locator('.pending-file.ready').waitFor();
   await Promise.all([
     page.waitForEvent('dialog').then(async warning => { assert.equal(warning.type(), 'beforeunload'); await warning.dismiss(); }),
-    page.getByRole('link', { name: 'Meshrooms rooms', exact: true }).click({ noWaitAfter: true }),
+    roomsLink(page).click({ noWaitAfter: true }),
   ]);
   assert.equal(page.url(), roomUrl);
   await page.getByRole('button', { name: 'Remove unsent-draft.txt', exact: true }).click();

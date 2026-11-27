@@ -20,7 +20,7 @@ describe('MCP server — the tool list', () => {
   test('exposes exactly the wake subcommands, and nothing else', async () => {
     const out: any = await handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { room: ROOM, call: recorder().call });
     const names = out.result.tools.map((t: { name: string }) => t.name);
-    expect(names).toEqual(['listen', 'send', 'react', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status']);
+    expect(names).toEqual(['listen', 'send', 'react', 'claim', 'tasks', 'task-add', 'task-update', 'decisions', 'vote', 'ask', 'decision-wait', 'attachment', 'status']);
     // The commands that must never be reachable from a room: they are operator-only, and exposing
     // them would let room text reconfigure or stop the agent.
     for (const forbidden of ['connect', 'watch', 'watch-stop', 'stop', 'profile', 'avatar', 'rooms', 'run', 'mcp', 'listen-loop']) {

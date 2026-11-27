@@ -1,11 +1,11 @@
-import { expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { LocalNode } from './node';
 import { createHandler } from './http';
 import { NodeAccess } from './access';
 import { testStartupManager } from './startup';
 import { tokenHash } from './model';
-import { evaluateWake, groupTasks, matchesTaskFilter, mayAgentSpeak, mentionSegments, mentionedIds, type Task } from '../src/collab';
+import { AGENT_CHAIN_LIMIT, AGENT_ROOM_LIMIT, CLAIM_TTL_MS, assignmentWakes, authorWakes, chainRoot, claimHolder, claimRefusal, evaluateWake, groupTasks, loopGuard, matchesTaskFilter, mayAgentSpeak, mentionSegments, mentionedIds, needsClaim, proseText, speakRefusal, wakes, type Claim, type Task } from '../src/collab';
 import type { Message } from '../src/room';
 
 const people = [
@@ -160,6 +160,8 @@ test('the node enforces humans-first sends and lets the owner open the floor', (
     send('Because…', followUp.messageId);
     expect(() => node.setFloor({ roomId, requestId: randomUUID(), floor: 'open' }, agent)).toThrow('human session');
     expect(() => node.setFloor({ roomId, requestId: randomUUID(), floor: 'loud' })).toThrow('humans-first or open');
+    // The local node's interface can't show people-and-agents, so it doesn't take it.
+    expect(() => node.setFloor({ roomId, requestId: randomUUID(), floor: 'people-and-agents' })).toThrow('humans-first or open');
     node.setFloor({ roomId, requestId: randomUUID(), floor: 'open' });
     expect(node.snapshot(agent).rooms[0].floor).toBe('open');
     send('Unprompted update');
@@ -386,4 +388,310 @@ test('board filters and groups keep open work in board order and finished work n
   expect(ids(groupTasks(tasks, 'unassigned', 'igor'))).toEqual({ todo: ['c'], doing: [], done: ['e'] });
   expect(ids(groupTasks(tasks, 'member:codex', 'igor'))).toEqual({ todo: [], doing: ['b'], done: ['d'] });
   expect(tasks.map(t => t.id)).toEqual(['a', 'b', 'c', 'd', 'e', 'f']);
+});
+
+test('mentions inside code are quoted, not addressed, and @agents can be left out', () => {
+  expect(mentionedIds('run `notify @Codex` later', people)).toEqual([]);
+  expect(mentionedIds('```\nlog: @Grok failed\n```\n@Codex look', people)).toEqual(['codex']);
+  // An unclosed fence quotes everything after it.
+  expect(mentionedIds('@Grok see\n```\n@Codex', people)).toEqual(['grok']);
+  expect(mentionedIds('@agents and @Grok', people, { broadcast: false })).toEqual(['grok']);
+  expect(mentionedIds('@agents', people, { broadcast: false })).toEqual([]);
+});
+
+test('code is masked the way the room renders it', () => {
+  // Fences open only at the start of a line, with ``` or ~~~, and close with at least as many of the same character.
+  expect(mentionedIds('see ``` @Codex', people)).toEqual(['codex']);
+  expect(mentionedIds('~~~\n@Grok\n~~~\n@Codex', people)).toEqual(['codex']);
+  expect(mentionedIds('````\n```\n@Grok\n````\n@Codex', people)).toEqual(['codex']);
+  expect(mentionedIds('~~~\n@Grok\n```\n@Codex', people)).toEqual([]);
+  expect(mentionedIds('   ```\n@Grok\n```', people)).toEqual([]);
+  // Inline code is a run of backticks closed by a run of exactly as many.
+  expect(mentionedIds('``a ` @Grok`` @Codex', people)).toEqual(['codex']);
+  expect(mentionedIds('`` @Grok ` @Codex', people)).toEqual(['codex', 'grok']);
+  expect(mentionedIds('it`s @Codex', people)).toEqual(['codex']);
+  // It may wrap a line, but not cross a blank line.
+  expect(mentionedIds('`one\n@Grok`', people)).toEqual([]);
+  expect(mentionedIds('`one\n\n@Grok`', people)).toEqual(['grok']);
+  // A stray backtick doesn't hide a mention the room shows as text: inline code ends where the renderer's block does.
+  expect(mentionedIds('- don`t panic\n- @Grok run `make test`', people)).toEqual(['grok']);
+  expect(mentionedIds('> it`s red\n@Grok please run `bun test`', people)).toEqual(['grok']);
+  expect(mentionedIds('# Next `step\n@Grok take `lint`', people)).toEqual(['grok']);
+  expect(mentionedIds('| `x | @Grok` |\n|---|---|', people)).toEqual(['grok']);
+  expect(mentionedIds('`a\r\n\r\n@Grok`', people)).toEqual(['grok']);
+  expect(mentionedIds('\\`@Grok`', people)).toEqual(['grok']);
+  // Fences inside quotes and lists are code too.
+  expect(mentionedIds('> ~~~\n> @Grok\n> ~~~', people)).toEqual([]);
+  expect(mentionedIds('> ```\n> @Grok', people)).toEqual([]);
+  expect(mentionedIds('- ~~~\n  @Grok\n  ~~~', people)).toEqual([]);
+  // Code becomes a space, so the words on either side stay apart.
+  expect(proseText('a `b` c')).toBe('a   c\n');
+  // Emphasis and links keep their names apart from the word before them, as the raw text did.
+  expect(mentionedIds('*hi*@Grok run `x`', people)).toEqual(['grok']);
+  expect(mentionedIds('**done**@Grok `x`', people)).toEqual(['grok']);
+  expect(mentionedIds('[docs](https://x.io)@Grok `x`', people)).toEqual(['grok']);
+  expect(proseText('no code @Grok')).toBe('no code @Grok');
+});
+
+describe('people and agents', () => {
+  const room = (messages: Message[], tasks: Task[] = []) => ({ floor: 'people-and-agents' as const, participants: people, messages, tasks });
+
+  test('anyone’s @Name or reply wakes the agent it names; @agents from an agent and unaddressed messages wake nobody', () => {
+    const msgs = [
+      message('p1', 'igor', 'Morning all'),
+      message('p2', 'igor', '@agents status?'),
+      message('a1', 'grok', '@Codex can you take the tests?'),
+      message('a2', 'grok', '@agents everyone look'),
+      message('a3', 'grok', 'Thinking out loud'),
+      message('a4', 'codex', 'On it', { replyTo: 'a1' }),
+      message('a5', 'grok', '@Igor done'),
+    ];
+    const r = room(msgs);
+    const woke = (id: string, agent: string) => wakes(r, msgs.find(m => m.id === id)!, agent);
+    expect(woke('p1', 'codex')).toBe(false);
+    expect(['codex', 'codex-cli', 'grok'].map(a => woke('p2', a))).toEqual([true, true, true]);
+    expect(woke('a1', 'codex')).toBe(true);
+    expect(woke('a1', 'codex-cli')).toBe(false);
+    expect(['codex', 'codex-cli'].map(a => woke('a2', a))).toEqual([false, false]);
+    expect(woke('a3', 'codex')).toBe(false);
+    expect(woke('a4', 'grok')).toBe(true);
+    expect(woke('a5', 'codex')).toBe(false);
+  });
+
+  test('an agent may start a message that names another member, but not with @agents alone', () => {
+    const msgs = [message('p1', 'igor', 'Just chatting')];
+    const r = room(msgs);
+    expect(mayAgentSpeak(r, 'grok', undefined, '@Codex can you pair on this?')).toBe(true);
+    expect(mayAgentSpeak(r, 'grok', undefined, '@agents anyone?')).toBe(false);
+    expect(mayAgentSpeak(r, 'grok', undefined, 'Unprompted thought')).toBe(false);
+    expect(mayAgentSpeak(r, 'grok', 'p1', 'Replying to people chatter')).toBe(false);
+    expect(mayAgentSpeak(r, 'grok', undefined, 'see `@Codex` in the log')).toBe(false);
+    // Humans-first is unchanged: naming an agent doesn't let an agent speak.
+    expect(mayAgentSpeak({ ...r, floor: 'humans-first' }, 'grok', undefined, '@Codex can you pair on this?')).toBe(false);
+    expect(speakRefusal('people-and-agents')).toContain('@Name');
+    expect(speakRefusal('humans-first')).toContain('humans-first');
+  });
+
+  test('a reply chain pauses after the chain limit of agent-to-agent wakes, and a person in the chain lets it continue', () => {
+    const msgs = [message('root', 'igor', '@Grok and @Codex, settle the API between you')];
+    let previous = 'root';
+    for (let i = 0; i < AGENT_CHAIN_LIMIT + 2; i++) {
+      const [from, to] = i % 2 ? ['codex', 'Grok'] : ['grok', 'Codex'];
+      msgs.push(message(`h${i}`, from, `@${to} point ${i}`, { replyTo: previous }));
+      previous = `h${i}`;
+    }
+    const r = room(msgs);
+    const target = (i: number) => (i % 2 ? 'grok' : 'codex');
+    const wokeAt = (i: number) => wakes(r, msgs.find(m => m.id === `h${i}`)!, target(i));
+    expect(Array.from({ length: AGENT_CHAIN_LIMIT }, (_, i) => wokeAt(i)).every(Boolean)).toBe(true);
+    expect(wokeAt(AGENT_CHAIN_LIMIT)).toBe(false);
+    expect(chainRoot(r, `h${AGENT_CHAIN_LIMIT}`)).toBe('root');
+    expect(loopGuard(r).chains.get('root')).toMatchObject({ paused: true });
+    // The paused agent can't reply into the chain either: nothing there woke it.
+    expect(mayAgentSpeak(r, target(AGENT_CHAIN_LIMIT), `h${AGENT_CHAIN_LIMIT}`)).toBe(false);
+    // A person speaking in the chain lets the agents continue.
+    const resumed = [...msgs, message('p', 'igor', 'Keep going', { replyTo: previous }), message('n', 'grok', '@Codex next', { replyTo: 'p' })];
+    expect(wakes(room(resumed), resumed.at(-1)!, 'codex')).toBe(true);
+    expect(loopGuard(room(resumed)).chains.get('root')).toMatchObject({ hops: 1, paused: false });
+  });
+
+  test('a paused chain leaves other chains alone, and the room pauses at the room limit until a person addresses an agent', () => {
+    const msgs: Message[] = [];
+    let hops = 0, chain = 0;
+    while (hops < AGENT_ROOM_LIMIT) {
+      msgs.push(message(`r${chain}`, 'grok', '@Codex new topic'));
+      hops++;
+      let previous = `r${chain}`;
+      for (let i = 0; i < 2 && hops < AGENT_ROOM_LIMIT; i++, hops++) {
+        msgs.push(message(`r${chain}-${i}`, i % 2 ? 'grok' : 'codex', i % 2 ? '@Codex' : '@Grok', { replyTo: previous }));
+        previous = `r${chain}-${i}`;
+      }
+      chain++;
+    }
+    const r = room(msgs);
+    expect(loopGuard(r)).toMatchObject({ roomHops: AGENT_ROOM_LIMIT, roomPaused: true });
+    expect([...loopGuard(r).chains.values()].every(c => !c.paused)).toBe(true);
+    // A message this device doesn't hold yet is judged as if appended.
+    const fresh = message('late', 'grok', '@Codex one more topic');
+    expect(wakes(r, fresh, 'codex')).toBe(false);
+    // People talking among themselves don't release the room.
+    const chatter = room([...msgs, message('p0', 'igor', 'lunch?'), fresh]);
+    expect(wakes(chatter, fresh, 'codex')).toBe(false);
+    // A person addressing an agent anywhere in the room releases it.
+    const released = room([...msgs, message('p', 'igor', '@agents ok, carry on'), fresh]);
+    expect(loopGuard(released).roomPaused).toBe(false);
+    expect(wakes(released, fresh, 'codex')).toBe(true);
+    // So does a person's reply to an agent's message, which addresses that agent.
+    const replied = room([...msgs, message('p', 'igor', 'thanks', { replyTo: 'r0' }), fresh]);
+    expect(wakes(replied, fresh, 'codex')).toBe(true);
+  });
+
+  test('assignments wake across agents only with the hand-off setting and while the room is not paused; agent decisions never do', () => {
+    const task: Task = { id: 't', title: 'x', notes: '', status: 'todo', assigneeId: 'codex', assignedBy: 'grok', assignedRevision: 1, createdBy: 'grok', updatedBy: 'grok', updatedAt: '', revision: 1 };
+    const quiet = room([message('p', 'igor', '@agents hi')]);
+    expect(assignmentWakes(quiet, task, 'codex')).toBe(false);
+    expect(assignmentWakes({ ...quiet, agentAssignmentsWake: true }, task, 'codex')).toBe(true);
+    const busy = room(Array.from({ length: AGENT_ROOM_LIMIT }, (_, i) => message(`a${i}`, i % 2 ? 'grok' : 'codex', 'progress')));
+    expect(loopGuard(busy).roomPaused).toBe(true);
+    expect(assignmentWakes({ ...busy, agentAssignmentsWake: true }, task, 'codex')).toBe(false);
+    // Humans-first keeps the setting as it was: the guard is only for people-and-agents.
+    expect(assignmentWakes({ ...busy, floor: 'humans-first', agentAssignmentsWake: true }, task, 'codex')).toBe(true);
+    // A decision an agent opens would ask every agent at once: it wakes none here, and still wakes them in an open room.
+    expect(authorWakes(quiet, 'codex', 'grok')).toBe(false);
+    expect(authorWakes({ ...quiet, floor: 'open' }, 'codex', 'grok')).toBe(true);
+    // A person's assignment and decision wake whatever the guard says.
+    expect(assignmentWakes(busy, { ...task, assignedBy: 'igor' }, 'codex')).toBe(true);
+    expect(authorWakes(busy, 'codex', 'igor')).toBe(true);
+  });
+
+  test('every agent message counts, deleted or from a member who left, and a deleted person message resets nothing', () => {
+    const chainOf = (n: number, extra: (i: number) => Partial<Message> = () => ({})) => {
+      const msgs = [message('root', 'igor', '@Grok @Codex go')];
+      for (let i = 0; i < n; i++) msgs.push(message(`h${i}`, i % 2 ? 'codex' : 'grok', i % 2 ? '@Grok' : '@Codex', { replyTo: i ? `h${i - 1}` : 'root', ...extra(i) }));
+      return msgs;
+    };
+    // Deleting the exchange doesn't make room for more of it.
+    const deleted = chainOf(AGENT_CHAIN_LIMIT, i => (i < 4 ? { deleted: true } : {}));
+    const next = message('n', 'grok', '@Codex again', { replyTo: `h${AGENT_CHAIN_LIMIT - 1}` });
+    expect(wakes(room([...deleted, next]), next, 'codex')).toBe(false);
+    // Nor does an agent leaving the room: its messages still count, though the view now calls their author a person.
+    const left = chainOf(AGENT_CHAIN_LIMIT).map(m => (m.authorId === 'codex' ? { ...m, authorId: 'gone', author: 'Gone', role: 'human' as const } : m));
+    const after = message('n', 'grok', '@Codex again', { replyTo: `h${AGENT_CHAIN_LIMIT - 1}` });
+    expect(loopGuard(room([...left, after])).chains.get('root')?.hops).toBe(AGENT_CHAIN_LIMIT + 1);
+    expect(wakes(room([...left, after]), after, 'codex')).toBe(false);
+    // A person's message that was deleted doesn't reset the chain.
+    const undone = [...chainOf(AGENT_CHAIN_LIMIT), message('p', 'igor', 'go on', { replyTo: `h${AGENT_CHAIN_LIMIT - 1}`, deleted: true })];
+    const more = message('m', 'grok', '@Codex go on', { replyTo: 'p' });
+    expect(wakes(room([...undone, more]), more, 'codex')).toBe(false);
+    // A person's message in the chain resets it even when it addresses nobody; the room count stays.
+    const reset = room([...chainOf(AGENT_CHAIN_LIMIT), message('p', 'igor', 'hmm', { replyTo: 'root' })]);
+    expect(loopGuard(reset).chains.get('root')?.hops).toBe(0);
+    expect(loopGuard(reset).roomHops).toBe(AGENT_CHAIN_LIMIT);
+  });
+
+  test('an agent reply to a message this device does not hold wakes nobody', () => {
+    // A device that received only the last two replies of a chain already at the limit: without the rest it can't know.
+    const tail = [
+      message(`h${AGENT_CHAIN_LIMIT}`, 'grok', '@Codex next', { replyTo: `h${AGENT_CHAIN_LIMIT - 1}` }),
+      message(`h${AGENT_CHAIN_LIMIT + 1}`, 'codex', '@Grok next', { replyTo: `h${AGENT_CHAIN_LIMIT}` }),
+    ];
+    const r = room(tail);
+    expect(wakes(r, tail[0], 'codex')).toBe(false);
+    // The second reply's target is here, but its chain still starts at a message the device doesn't hold, so it can't be
+    // counted and wakes nobody either.
+    expect(chainRoot(r, tail[1].id)).toBe(tail[0].id);
+    expect(wakes(r, tail[1], 'grok')).toBe(false);
+    // Nor does a new reply into that chain.
+    expect(wakes(r, message('n', 'grok', '@Codex more', { replyTo: tail[1].id }), 'codex')).toBe(false);
+    // Once the history arrives, the chain is counted from its start.
+    const full = [message('root', 'igor', '@Grok @Codex go'), message('h0', 'grok', '@Codex', { replyTo: 'root' })];
+    expect(wakes(room(full), full[1], 'codex')).toBe(true);
+    // A person's reply to a missing message still wakes the agent it names, as on every floor.
+    const person = message('p', 'igor', '@Codex see above', { replyTo: 'missing' });
+    expect(wakes(room([person]), person, 'codex')).toBe(true);
+  });
+
+  test('a member who left takes the agent path, and without names only replies address agents', () => {
+    const msgs = Array.from({ length: AGENT_ROOM_LIMIT }, (_, i) => message(`a${i}`, 'grok', 'progress'));
+    const gone: Message = { id: 'g', authorId: 'gone', author: 'Gone', role: 'human', text: '@Codex @agents', time: '', mentions: ['codex', 'codex-cli', 'grok'] };
+    const paused = room([...msgs, gone]);
+    expect(loopGuard(paused).roomPaused).toBe(true);
+    expect(wakes(paused, gone, 'codex')).toBe(false);
+    // Unpaused, it wakes only whom it names one by one, as an agent's message would.
+    const quiet = room([message('p', 'igor', '@agents hi'), gone]);
+    expect(['codex', 'codex-cli'].map(a => wakes(quiet, gone, a))).toEqual([true, false]);
+    // A view without names can't tell @Name from @agents: an agent's mentions count for nothing, its reply still does.
+    const nameless = people.map(({ id, role }) => ({ id, role }));
+    const ping = message('x', 'grok', '@agents look'), answer = message('y', 'grok', 'see', { replyTo: 'c1' });
+    const r = { floor: 'people-and-agents' as const, participants: nameless, messages: [message('c1', 'codex', 'q'), ping, answer] };
+    expect(wakes(r, ping, 'codex')).toBe(false);
+    expect(wakes(r, answer, 'codex')).toBe(true);
+  });
+
+  test('a reply stored before the message it answers still counts in its chain', () => {
+    // Messages are stored as they arrive: a2 came before a1, which it answers.
+    const msgs = [message('p', 'igor', '@Grok @Codex go'), message('a2', 'codex', '@Grok b', { replyTo: 'a1' }), message('a1', 'grok', '@Codex a', { replyTo: 'p' }), message('a3', 'grok', '@Codex c', { replyTo: 'a2' })];
+    const r = room(msgs);
+    expect(chainRoot(r, 'a3')).toBe('p');
+    expect(loopGuard(r).chains.get('p')?.hops).toBe(3);
+    expect(wakes(r, msgs[3], 'codex')).toBe(true);
+    expect(wakes(r, message('a4', 'codex', '@Grok d', { replyTo: 'a3' }), 'grok')).toBe(true);
+    // A loop of replies has no beginning: it wakes nobody.
+    const loop = [message('x', 'grok', '@Codex x', { replyTo: 'y' }), message('y', 'codex', '@Grok y', { replyTo: 'x' })];
+    expect(wakes(room(loop), loop[1], 'grok')).toBe(false);
+  });
+
+  test('a second message under a reused id wakes no agent', () => {
+    const msgs = [message('p', 'igor', '@Grok @Codex go'), message('p', 'grok', '@Codex sneaking in', { collidingCopy: true })];
+    expect(wakes(room(msgs), msgs[1], 'codex')).toBe(false);
+    // The first, canonical message keeps its own effect.
+    expect(wakes(room(msgs), msgs[0], 'codex')).toBe(true);
+  });
+
+  test('the guard is recomputed when the same message array grows', () => {
+    const msgs = Array.from({ length: AGENT_ROOM_LIMIT - 1 }, (_, i) => message(`a${i}`, 'grok', 'progress'));
+    const r = room(msgs);
+    expect(loopGuard(r).roomPaused).toBe(false);
+    msgs.push(message('last', 'codex', 'progress'));
+    expect(loopGuard(r).roomPaused).toBe(true);
+  });
+
+  test('refusals name the floor', () => {
+    expect(speakRefusal('people-and-agents')).toContain('@Name');
+    expect(speakRefusal('humans-first')).toContain('humans-first');
+    expect(speakRefusal('open')).toContain('operator');
+  });
+});
+
+test('open floor: a person’s message that names nobody goes to every agent until one claims it, and then only that one answers', () => {
+  const now = Date.now();
+  const ask = message('ask', 'igor', 'Who has the latest logo?');
+  const all = message('all', 'igor', '@agents introduce yourselves');
+  const named = message('named', 'igor', '@Grok the logo please');
+  const reply = message('reply', 'igor', 'thanks', { replyTo: 'ask' });
+  const claims: Claim[] = [];
+  const start = message('start', 'igor', '@Grok morning');
+  const room = { floor: 'open' as const, participants: people, messages: [ask, all, named, reply], tasks: [], boardRevision: 0, claims };
+  // Only the broadcast needs a claim: @agents asks every agent, a name or a reply already says whom it is for.
+  expect([ask, all, named, reply].map(m => needsClaim(room, m))).toEqual([true, false, false, false]);
+  expect(needsClaim({ floor: 'people-and-agents' }, ask)).toBe(false);
+  expect(needsClaim(room, message('agent-ask', 'grok', 'anyone?'))).toBe(false);
+  // Unclaimed, it wakes every agent, and any of them may answer.
+  expect(['codex', 'codex-cli', 'grok'].map(id => wakes(room, ask, id))).toEqual([true, true, true]);
+  expect(mayAgentSpeak(room, 'codex', 'ask', 'I have it')).toBe(true);
+  // Claimed by Grok: it stays Grok's; the others neither wake for it nor may reply to it.
+  claims.push({ messageId: 'ask', memberId: 'grok', at: now, until: now + CLAIM_TTL_MS });
+  expect(claimHolder(room, 'ask', now)).toBe('grok');
+  expect(['codex', 'codex-cli', 'grok'].map(id => wakes(room, ask, id))).toEqual([false, false, true]);
+  expect(mayAgentSpeak(room, 'codex', 'ask', 'I have it')).toBe(false);
+  expect(mayAgentSpeak(room, 'grok', 'ask', 'Here it is')).toBe(true);
+  // Codex may still speak elsewhere on an open floor, and @agents still wakes everyone.
+  expect(mayAgentSpeak(room, 'codex', undefined, 'Something else')).toBe(true);
+  expect(wakes(room, all, 'codex')).toBe(true);
+  expect(evaluateWake(room, 'codex', undefined, 0).addressed).toEqual(['all']);
+  expect(evaluateWake(room, 'grok', undefined, 0).addressed).toEqual(['ask', 'all', 'named']);
+  // Not for Codex while Grok holds it, but still context: the cursor stays, so a claim that lapses wakes Codex again.
+  expect(evaluateWake({ ...room, messages: [start, ask] }, 'codex', 'start', 0)).toMatchObject({ state: 'waiting', cursor: 'start', messages: [ask] });
+  // A claim that lapsed without an answer frees the message again.
+  claims[0] = { ...claims[0], until: now - 1 };
+  expect(claimHolder(room, 'ask')).toBeUndefined();
+  expect(wakes(room, ask, 'codex')).toBe(true);
+  // Marked answered, it holds for good, but only once this device holds Grok's answer: its word alone isn't enough.
+  claims[0] = { ...claims[0], answered: true };
+  expect(claimHolder(room, 'ask')).toBeUndefined();
+  room.messages.push(message('answer', 'grok', 'Here it is', { replyTo: 'ask' }));
+  expect(claimHolder(room, 'ask')).toBe('grok');
+  expect(mayAgentSpeak(room, 'codex', 'ask', 'Late answer')).toBe(false);
+  expect(claimRefusal('Grok')).toContain('Grok is answering this message');
+  // Once this device holds another agent's answer, the message is handled even after the room service forgot the claim.
+  claims.length = 0;
+  expect(wakes(room, ask, 'codex')).toBe(false);
+  expect(wakes(room, ask, 'grok')).toBe(true);
+  // A person's reply, or the agent's own, doesn't count as another agent's answer.
+  const asked = message('asked', 'igor', 'Anyone?'), own = message('own', 'codex', 'me', { replyTo: 'asked' }), person = message('person', 'igor', 'hm', { replyTo: 'asked' });
+  expect(wakes({ ...room, messages: [asked, own, person] }, asked, 'codex')).toBe(true);
+  // On the other floors a claim of a message that isn't a broadcast changes nothing.
+  const quiet = { ...room, floor: 'humans-first' as const, claims: [{ messageId: 'named', memberId: 'codex', at: now, until: now + CLAIM_TTL_MS }] };
+  expect(wakes(quiet, named, 'grok')).toBe(true);
+  expect(mayAgentSpeak(quiet, 'grok', 'named', 'On it')).toBe(true);
 });

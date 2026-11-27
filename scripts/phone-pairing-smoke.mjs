@@ -81,6 +81,7 @@ try {
   await p.goto(roomB); await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).waitFor();
   await host.keyboard.press('Escape');
   await host.getByRole('button', { name: 'Room details' }).click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await host.locator('summary', { hasText: 'Manage your devices' }).click();
   assert.match(await host.locator('.browser-device-details').innerText(), /iPhone \(Safari\)/);
   assert.equal(await host.locator('.browser-roster li, .browser-member').count() >= 0, true);

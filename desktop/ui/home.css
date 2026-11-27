@@ -11,6 +11,22 @@
 .home { --live: #358573; display: block; overflow-y: auto; font-family: 'Manrope Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .home main { width: 100%; max-width: 36rem; margin: 0 auto; padding: 18px 26px 12px; text-align: left; }
 
+/* Windows title bar, drawn by the page (home.rs `frame`): a drag strip with the system's caption buttons, sticky so they
+   stay reachable while the window scrolls. The brand header below is draggable too and replaces the system title. */
+.home-titlebar { position: sticky; top: 0; z-index: 10; display: flex; justify-content: flex-end; width: 100%; height: 32px; background: var(--bg); }
+.home-titlebar[hidden] { display: none; }
+[data-frame="custom"] .home main { padding-top: 0; }
+[data-frame="custom"] .home-brand { cursor: default; }
+.home .home-caption {
+  width: 46px; height: 32px; padding: 0; border: 0; border-radius: 0; display: grid; place-items: center;
+  font: 10px/1 'Segoe Fluent Icons', 'Segoe MDL2 Assets'; color: var(--text); background: transparent;
+}
+.home .home-caption:hover, .home .home-caption:hover:enabled { background: color-mix(in srgb, var(--text) 9%, transparent); }
+.home .home-caption:active { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.home .home-caption-close:hover, .home .home-caption-close:hover:enabled { background: #c42b1c; color: #fff; }
+.home .home-caption-close:active { background: #c84031; color: #fff; }
+.home .home-caption:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
 /* brand */
 .home-brand { display: flex; gap: 12px; align-items: center; }
 .home-brand .mark { width: 34px; height: 34px; color: var(--accent); }

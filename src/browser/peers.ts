@@ -1,7 +1,7 @@
 import { assignmentWakes, authorWakes, mentionedIds, wakes, type Task } from '../collab';
 import type { Message, Participant } from '../room';
 import { COMPACT_AT, MAX_TASK_OPS, capLiveTasks, compactBoard, foldBoard, mayAddTask, syncChunks, taskBody, validTaskBody, withinRevisionJump, type TaskBody, type TaskChange, type TaskPacket } from './board';
-import { signerOf, verify, type BrowserDevice, type RoomStatus } from './protocol';
+import { signerOf, verify, type BrowserDevice, type MessageVisibility, type RoomStatus } from './protocol';
 import { BrowserApi } from './client';
 import {
   COMPACT_DECISIONS_AT, MAX_DECISION_OPS, admissible, castVote, compactDecisions, decisionChunks, nextVoteRevision, openDecision, reviseDecision, validDecisionBody, validVoteBody,
@@ -13,10 +13,18 @@ import {
   foldReactions, isReactionEmoji, mayHoldPending, memberReacted, reactionSyncChunks, validReactionBody,
   type ReactionChip, type ReactionEmoji, type ReactionPacket,
 } from './reactions';
-import { addRetractions, applyRetractions, isRetracted, mayRetract, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket } from './retractions';
+import { addRetractions, applyRetractions, isRetracted, mayRetract, opKey, retractedStub, retractionSyncChunks, validRetractBody, type RetractBody, type RetractPacket } from './retractions';
 import { FenceError, StorageError, decryptWithEncKey, identity, isPlainObject, read, readArray, readRecord, sign, signDeviceEncKey, update, type Fence } from './storage';
 import { isActivityPacket, receiveActivity, validActivityPacket, type ActivityRecord } from './activity';
-import { awaitingDelivery, windowHistory } from './history';
+import { awaitingDelivery, MAX_STORED_MESSAGES, windowHistory } from './history';
+import {
+  buildHistoryHave, canonicalMessageKeys, currentAudienceUntil, HISTORY_ACCEPT_ENTRIES_BURST,
+  HISTORY_ACCEPT_ENTRIES_PER_MINUTE, HISTORY_ROUND_TIMEOUT_MS, HISTORY_SERVE_BURST, HISTORY_SERVE_PER_MINUTE,
+  historyChunks, isHistoryHavePacket, isHistoryPacket, MAX_HISTORY_ROUND_TIMEOUTS, MAX_HISTORY_ROUNDS,
+  maxSeqByDevice, maxSeqForDevice, mayServeMessage, mergeHistoryMessages, messageKey, nextAuthorSeq,
+  PeerRateLimiter, RELAY_HISTORY_RETRY_MS, selectHistoryEntries, validAudienceUntil, validMessageSeq,
+  validMessageVisibility, withinSeqJump, type HistoryCursor, type HistoryHavePacket, type HistoryPacket,
+} from './history-sync';
 import {
   FILE_CHANNEL_LABEL, IncomingGate, PACE_LOW_WATER, PRIMARY_CHANNEL_LABEL, Resync, SYNC_REQUEST, SendQueue,
   answerMatchesOffer, dedupeSignals, evaluatePeerHealth, isLiveOpenPeer, isSyncRequest, sdpIceUfrag,
@@ -30,12 +38,44 @@ import {
 import { RelayClient, type RelayClientOptions } from './relay-client';
 import { RelayReplayGuard } from './relay-replay';
 
-/** `replyTo` and `attachments` are optional so browsers from before them keep verifying and storing these packets. */
-type MessageBody = { kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number; replyTo?: string; attachments?: AttachmentRef[] };
-const isId = (value: unknown) => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
+/** `replyTo`, `attachments`, `visibility`, `seq` and `audienceUntil` are optional so browsers from before them keep verifying and storing these packets. */
+type MessageBody = {
+  kind: 'message'; roomId: string; id: string; deviceId: string; memberId: string; text: string; at: number;
+  replyTo?: string; attachments?: AttachmentRef[]; visibility?: MessageVisibility; seq?: number; audienceUntil?: number;
+};
+const isId = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 type ReceiptBody = { kind: 'receipt'; roomId: string; id: string; deviceId: string };
 type Packet = { body: MessageBody | ReceiptBody | TaskPacket['body'] | DecisionBody | VoteBody | ReactionPacket['body'] | RetractBody; signature: string };
-export type SavedMessage = { packet: Packet & { body: MessageBody }; targets: string[]; receipts: string[]; retracted?: true };
+export type SavedMessage = { packet: Packet & { body: MessageBody }; targets: string[]; receipts: string[]; retracted?: true; receivedAt?: number; replicated?: true };
+
+/**
+ * A room as `src/collab.ts`'s wake rules read it: this browser's messages, members and settings. Relay wake targets and the
+ * room's "agents paused" notices both read it, so the page shows the same loop guard the wakes obey.
+ */
+export function roomViewOf(status: Pick<RoomStatus, 'members' | 'settings' | 'claims'>, messages: SavedMessage[]) {
+  const participants: Participant[] = (status.members ?? []).map(m => ({
+    id: m.id, name: m.name, role: m.role ?? 'human', state: 'remote', detail: '',
+    ...(m.operatorId ? { operatorId: m.operatorId } : {}),
+  }));
+  const floor = status.settings?.floor ?? 'humans-first';
+  const agentAssignmentsWake = !!status.settings?.agentAssignmentsWake;
+  const canonicalKeys = canonicalMessageKeys(messages);
+  const history: Message[] = messages.map(({ packet: { body }, retracted }) => {
+    const author = participants.find(p => p.id === body.memberId);
+    const text = retracted ? 'Message deleted' : shownText(body);
+    const mentions = mentionedIds(text, participants);
+    const collidingCopy = canonicalKeys.get(body.id) !== messageKey(body.deviceId, body.id);
+    return {
+      id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human',
+      text, time: new Date(body.at).toISOString(), deviceId: body.deviceId,
+      ...(collidingCopy ? { collidingCopy: true as const } : {}),
+      ...(retracted ? { deleted: true } : {}),
+      ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+      ...(mentions.length ? { mentions } : {}),
+    };
+  });
+  return { floor, agentAssignmentsWake, participants, messages: history, claims: status.claims ?? [] };
+}
 /**
  * `sent`: when each outbox message was last sent on this connection, so an unconfirmed one isn't resent every tick.
  * `queue` paces this device's board, decisions and reactions onto the channel; `resync` answers the peer's requests for them.
@@ -70,6 +110,9 @@ function isSavedMessage(value: unknown, roomId: string): value is SavedMessage {
     || typeof b.text !== 'string' || typeof b.at !== 'number' || !Number.isFinite(b.at)) return false;
   if (b.replyTo !== undefined && typeof b.replyTo !== 'string') return false;
   if (b.attachments !== undefined && (!Array.isArray(b.attachments) || !b.attachments.every(isAttachmentRefShape))) return false;
+  if (!validMessageVisibility(b.visibility) || !validMessageSeq(b.seq) || !validAudienceUntil(b.audienceUntil)) return false;
+  if (value.receivedAt !== undefined && (typeof value.receivedAt !== 'number' || !Number.isFinite(value.receivedAt))) return false;
+  if (value.replicated !== undefined && value.replicated !== true) return false;
   return isStringArray(value.targets) && isStringArray(value.receipts) && (value.retracted === undefined || value.retracted === true);
 }
 const isTaskPacket = (value: unknown, roomId: string): value is TaskPacket =>
@@ -96,9 +139,9 @@ export class BrowserPeers {
   private stopped = false;
   private incoming = new IncomingGate();
   /** Live packets per member and kind (DEC-6); over-quota packets are dropped unstored, unrelayed and unconfirmed. */
-  private quota = new ReceiveQuota();
-  /** Peers whose task, decision or reaction operations went over quota; asked for their state again after the burst. */
-  private quotaDrops = new QuotaDrops();
+  private quota: ReceiveQuota;
+  /** Peers whose task, decision, reaction or history operations went over quota; asked for their state again after the burst. */
+  private quotaDrops: QuotaDrops;
   private key: string;
   private boardKey: string;
   private ops: TaskPacket[] = [];
@@ -111,6 +154,27 @@ export class BrowserPeers {
   private pendingReactionAt = new Map<string, number>();
   private retractKey: string;
   private retractOps: RetractPacket[] = [];
+  private seqKey: string;
+  /** Highest author `seq` this device ever signed in this room, so evicted/deleted messages never reuse a sequence number. */
+  private lastAuthorSeq = 0;
+  /** Per-peer token buckets for serving `history-have` and accepting `history` entries, independent of request digests. */
+  private historyServeLimiter: PeerRateLimiter;
+  private historyAcceptLimiter: PeerRateLimiter;
+  private historyRounds = new Map<string, number>();
+  /** Per-peer server-side pagination cursor for multi-round history sync. */
+  private historyCursors = new Map<string, HistoryCursor>();
+  /** Peers for which the current history round had a rate-limit or quota drop (keeps start-of-round cursor for retry). */
+  private historyRoundDropped = new Set<string>();
+  /** Scheduled retry timestamps (ms) from serving peers' `retryAfterMs` hints or full send queues. */
+  private historyRetryAt = new Map<string, number>();
+  private historyRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** In-flight `history-have` requests per peer for validating `retryAfterMs` hints and requester-side round timeouts. */
+  private historyInFlight = new Map<string, { sentAt: number; expectReply: boolean; timeouts: number }>();
+  private historyTimeoutTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Online verified-roster peers we have sent a relay `history-have` to, mapped to the send timestamp for retry. */
+  private relayHistorySynced = new Map<string, number>();
+  /** Per-peer resync throttles for `SYNC_REQUEST` received over the E2E relay. */
+  private relayResync = new Map<string, Resync>();
   private filesKey: string;
   private index: FileIndex = {};
   private refs = new Map<string, AttachmentRef>();
@@ -146,6 +210,11 @@ export class BrowserPeers {
   private pinnedHost?: string;
   /** Optional WSS+HTTPS E2E relay client; started when `status.relayUrl` is advertised. */
   private relayClient?: RelayClient;
+  private statusWatch?: { session: string; epoch?: string; cursor: number };
+  /** When this engine first tried to connect to each device session (`device:session`), for connecting(). */
+  private firstOffer = new Map<string, number>();
+  private pushedStatus?: RoomStatus;
+  private onPushedStatus?: () => void;
   /** When each outbox message was last sent over the relay, to obey `RESEND_MS`. */
   private relaySent = new Map<string, number>();
   /** Guard against overlapping encryption-key or roster publication requests. */
@@ -157,6 +226,8 @@ export class BrowserPeers {
   private decryptRelay: (envelope: unknown, options: { room: string; senderSignKey: string; minRosterVersion?: number; expectedFrom?: string }) => Promise<DecryptedRelayEnvelope<unknown>> = decryptWithEncKey;
   /** Injectable relay client factory for tests. */
   private createRelayClient?: (options: RelayClientOptions) => RelayClient;
+  /** Optional listener for verified retraction operations (used by UI gap analysis). */
+  private retractionsChanged: (ops: RetractBody[]) => void = () => {};
   constructor(private api: BrowserApi, private roomId: string, private deviceId: string, private session: string,
     private changed: (messages: SavedMessage[], connected: string[], added?: SavedMessage) => void, private error: (message: string) => void,
     private boardChanged: (tasks: Task[], ops: TaskBody[]) => void = () => {}, private filesChanged: (files: Record<string, FileView>) => void = () => {},
@@ -168,18 +239,37 @@ export class BrowserPeers {
       hostPin?: string;
       createRelayClient?: (options: RelayClientOptions) => RelayClient;
       decryptRelay?: (envelope: unknown, options: { room: string; senderSignKey: string; minRosterVersion?: number; expectedFrom?: string }) => Promise<DecryptedRelayEnvelope<unknown>>;
+      retractionsChanged?: (ops: RetractBody[]) => void;
     }) {
     this.key = `messages:${deviceId}:${roomId}`;
     this.boardKey = `board:${deviceId}:${roomId}`;
     this.decisionKey = `decisions:${deviceId}:${roomId}`;
     this.reactionKey = `reactions:${deviceId}:${roomId}`;
     this.retractKey = `retractions:${deviceId}:${roomId}`;
+    this.seqKey = `seq:${deviceId}:${roomId}`;
     this.relaySeenKey = `relay-seen:${deviceId}:${roomId}`;
     this.filesKey = `files:${deviceId}:${roomId}`;
+    this.quota = new ReceiveQuota(() => this.now());
+    this.quotaDrops = new QuotaDrops(() => this.now());
+    this.historyServeLimiter = new PeerRateLimiter(() => this.now(), HISTORY_SERVE_PER_MINUTE, HISTORY_SERVE_BURST);
+    this.historyAcceptLimiter = new PeerRateLimiter(() => this.now(), HISTORY_ACCEPT_ENTRIES_PER_MINUTE, HISTORY_ACCEPT_ENTRIES_BURST);
     this.pinnedHost = relayOptions?.hostPin ?? (typeof location !== 'undefined' ? parseHostPin(location.hash) : undefined);
     this.createRelayClient = relayOptions?.createRelayClient;
     if (relayOptions?.decryptRelay) this.decryptRelay = relayOptions.decryptRelay;
-    this.files = new FileTransfers({ roomId, referenced: sha => this.refs.get(sha), changed: () => this.notifyFiles(), now: () => this.now(),
+    if (relayOptions?.retractionsChanged) this.retractionsChanged = relayOptions.retractionsChanged;
+    this.files = new FileTransfers({
+      roomId,
+      referenced: (sha, peer) => {
+        if (!peer) return this.refs.get(sha);
+        // Attachments follow message visibility: serve only when referenced by a message `peer` is authorized to see.
+        for (const m of this.messages) {
+          if (!mayServeMessage(m, peer, this.status, this.status?.memberId, this.verifiedRoster)) continue;
+          const match = m.packet.body.attachments?.find(a => a.sha256 === sha);
+          if (match) return match;
+        }
+        return undefined;
+      },
+      changed: () => this.notifyFiles(), now: () => this.now(),
       store: { has: sha => sha in this.index, get: sha => this.readFile(sha), put: (sha, bytes, type) => this.storeFile(sha, bytes, type) },
       channel: id => {
         const peer = this.peers.get(id);
@@ -207,6 +297,38 @@ export class BrowserPeers {
   roster(): SignedRoster | undefined { return this.verifiedRoster; }
   /** Active relay client instance, if started. */
   relay(): RelayClient | undefined { return this.relayClient; }
+  /**
+   * Asks the service to push this room's status over the relay socket, as the lobby session the caller polls as, so it
+   * needn't poll: `onPush` runs on each push, and `takePushedStatus` hands it over. Sent once the relay is up.
+   */
+  watchStatus(watch: { session: string; epoch?: string; cursor: number }, onPush: () => void) {
+    this.statusWatch = { ...watch };
+    this.onPushedStatus = onPush;
+    this.relayClient?.watchStatus(this.statusWatch);
+  }
+  /** Signals up to `cursor` in `epoch` were handled: later pushes leave them out. */
+  ackStatus(cursor: number, epoch: string) {
+    if (this.statusWatch) { this.statusWatch.cursor = cursor; this.statusWatch.epoch = epoch; }
+    this.relayClient?.ackStatus(cursor, epoch);
+  }
+  /** Whether the service pushes this room's status right now (see RelayClient.statusLive). */
+  statusLive(): boolean { return this.relayClient?.statusLive === true; }
+  /** How long pushed status stays live without another push (0 when it isn't). */
+  statusLiveRemainingMs(): number { return this.relayClient?.statusLiveRemainingMs ?? 0; }
+  /** The latest pushed status not yet taken, if any. */
+  takePushedStatus(): RoomStatus | undefined { const next = this.pushedStatus; this.pushedStatus = undefined; return next; }
+  hasPushedStatus(): boolean { return this.pushedStatus !== undefined; }
+  /**
+   * Whether an offer waits for its answer, in its first 10 s: a caller without pushes polls for it sooner. A device that
+   * never answers doesn't keep the caller polling fast.
+   */
+  connecting(): boolean {
+    const at = this.now();
+    // Counted from the first attempt at that device's session, so retries don't keep it going.
+    for (const [id, peer] of this.peers)
+      if (peer.pc.signalingState === 'have-local-offer' && at - (this.firstOffer.get(`${id}:${peer.session}`) ?? peer.started) < 10_000) return true;
+    return false;
+  }
   /** Explicitly pin the expected host key prefix (e.g. from `#h=` fragment). */
   setHostPin(pin: string | undefined) { if (pin) this.pinnedHost = pin; }
   /** Whether a peer currently has a live open WebRTC DataChannel (Section 5.4 WebRTC-first rule). */
@@ -232,10 +354,18 @@ export class BrowserPeers {
    * Signer lookup that uses the verified host-signed roster when available (and strictly for relay frames),
    * preventing coordinator key substitution while remaining backwards-compatible with legacy WebRTC rooms.
    */
-  private signerFor(deviceId: unknown, at: unknown, fromRelay: boolean): { publicKey: string; memberId: string } | undefined {
+  private signerFor(deviceId: unknown, at: unknown, fromRelay: boolean, expectedMemberId?: unknown): { publicKey: string; memberId: string } | undefined {
     if (this.verifiedRoster) {
       const active = this.verifiedRoster.body.devices.find(d => d.id === deviceId);
-      if (active) return { publicKey: active.sign, memberId: active.memberId };
+      if (active) {
+        if (expectedMemberId !== undefined && active.memberId !== expectedMemberId) {
+          const statusDev = this.status?.devices?.find(d => d.id === deviceId);
+          const prior = statusDev?.priorMembers?.find(p =>
+            p.memberId === expectedMemberId && (p.retiredAt === undefined || (typeof at === 'number' && at <= p.retiredAt)));
+          if (prior) return { publicKey: active.sign, memberId: prior.memberId };
+        }
+        return { publicKey: active.sign, memberId: active.memberId };
+      }
       const removed = this.verifiedRoster.body.removed.find(r => r.id === deviceId);
       if (removed?.revoked) return undefined;
       if (fromRelay) {
@@ -246,7 +376,7 @@ export class BrowserPeers {
       }
     }
     if (fromRelay) return undefined;
-    return signerOf(this.status, deviceId, at);
+    return signerOf(this.status, deviceId, at, expectedMemberId);
   }
   /** Recipients from the verified roster that do NOT have a live WebRTC channel (WebRTC-first routing). */
   private relayRecipients(targetIds?: readonly string[]): RosterEntry[] {
@@ -265,25 +395,7 @@ export class BrowserPeers {
     const wakeableAgents = recipients.filter(r => r.wakeable === true && r.role === 'agent');
     if (!wakeableAgents.length || !this.status?.members) return hold ? { hold } : {};
 
-    const participants: Participant[] = this.status.members.map(m => ({
-      id: m.id, name: m.name, role: m.role ?? 'human', state: 'remote', detail: '',
-      ...(m.operatorId ? { operatorId: m.operatorId } : {}),
-    }));
-    const floor = this.status.settings?.floor ?? 'humans-first';
-    const agentAssignmentsWake = !!this.status.settings?.agentAssignmentsWake;
-    const history: Message[] = this.messages.map(({ packet: { body }, retracted }) => {
-      const author = participants.find(p => p.id === body.memberId);
-      const text = retracted ? 'Message deleted' : shownText(body);
-      const mentions = mentionedIds(text, participants);
-      return {
-        id: body.id, authorId: body.memberId, author: author?.name ?? 'Former member', role: author?.role ?? 'human',
-        text, time: new Date(body.at).toISOString(),
-        ...(retracted ? { deleted: true } : {}),
-        ...(body.replyTo ? { replyTo: body.replyTo } : {}),
-        ...(mentions.length ? { mentions } : {}),
-      };
-    });
-    const roomView = { floor, agentAssignmentsWake, participants, messages: history };
+    const roomView = roomViewOf(this.status, this.messages), participants = roomView.participants;
     const body = (packet as { body?: Record<string, unknown> } | null)?.body;
     if (!body || typeof body !== 'object') return hold ? { hold } : {};
 
@@ -379,12 +491,15 @@ export class BrowserPeers {
     this.decisionOps = await readArray(this.decisionKey, (v): v is DecisionPacket => isDecisionPacket(v, this.roomId));
     this.reactionOps = await readArray(this.reactionKey, (v): v is ReactionPacket => isReactionPacket(v, this.roomId));
     this.retractOps = await readArray(this.retractKey, (v): v is RetractPacket => isRetractPacket(v, this.roomId));
+    const savedSeq = await read<number>(this.seqKey, (v): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0);
+    this.lastAuthorSeq = savedSeq ?? 0;
     this.relaySeen = RelayReplayGuard.from(await read<unknown>(this.relaySeenKey));
     this.index = await readRecord(this.filesKey, isFileIndexEntry);
     for (const sha of Object.keys(this.index)) await this.fileUrl(sha);
-    this.notify(); this.notifyBoard(); this.notifyDecisions(); this.notifyReactions(); this.syncFiles();
+    this.notify(); this.notifyBoard(); this.notifyDecisions(); this.notifyReactions(); this.notifyRetractions(); this.syncFiles();
   }
   private notifyReactions() { if (!this.stopped) this.reactionsChanged(foldReactions(this.reactionOps.map(op => op.body))); }
+  private notifyRetractions() { if (!this.stopped) this.retractionsChanged(this.retractOps.map(op => op.body)); }
   chips() { return foldReactions(this.reactionOps.map(op => op.body)); }
   private fileKey(sha: string) { return `file:${this.deviceId}:${this.roomId}:${sha}`; }
   private fileChain<T>(work: () => Promise<T>): Promise<T> { const next = this.fileSerial.then(work); this.fileSerial = next.catch(() => {}); return next; }
@@ -481,8 +596,9 @@ export class BrowserPeers {
     if (!this.pendingReactions.length) return;
     const kept: ReactionPacket[] = [];
     for (const op of this.pendingReactions) {
-      const at = this.pendingReactionAt.get(op.body.id) ?? now;
-      if (now - at > PENDING_REACTION_TTL_MS) this.pendingReactionAt.delete(op.body.id);
+      const k = opKey(op.body);
+      const at = this.pendingReactionAt.get(k) ?? now;
+      if (now - at > PENDING_REACTION_TTL_MS) this.pendingReactionAt.delete(k);
       else kept.push(op);
     }
     this.pendingReactions = kept;
@@ -491,7 +607,7 @@ export class BrowserPeers {
     if (!messageIds.size || !this.pendingReactions.length) return;
     const kept: ReactionPacket[] = [];
     for (const op of this.pendingReactions) {
-      if (messageIds.has(op.body.messageId)) this.pendingReactionAt.delete(op.body.id);
+      if (messageIds.has(op.body.messageId)) this.pendingReactionAt.delete(opKey(op.body));
       else kept.push(op);
     }
     this.pendingReactions = kept;
@@ -504,24 +620,25 @@ export class BrowserPeers {
         : this.pendingReactions.length >= MAX_PENDING_REACTIONS ? 0 : -1;
       if (dropIndex >= 0) {
         const [dropped] = this.pendingReactions.splice(dropIndex, 1);
-        this.pendingReactionAt.delete(dropped.body.id);
+        this.pendingReactionAt.delete(opKey(dropped.body));
       }
     }
     if (mayHoldPending(this.pendingReactions, op)) {
       this.pendingReactions.push(op);
-      this.pendingReactionAt.set(op.body.id, now);
+      this.pendingReactionAt.set(opKey(op.body), now);
     }
   }
   private async addReactionOps(incoming: ReactionPacket[]) {
     const now = this.now();
     this.prunePendingReactions(now);
     const live = new Set(this.messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
-    const retracted = new Set(this.messages.filter(isRetracted).map(m => m.packet.body.id));
-    const known = new Set([...this.reactionOps, ...this.pendingReactions].map(op => op.body.id));
+    const retracted = new Set(this.messages.filter(m => isRetracted(m) && !live.has(m.packet.body.id)).map(m => m.packet.body.id));
+    const known = new Set([...this.reactionOps, ...this.pendingReactions].map(op => opKey(op.body)));
     let ready: ReactionPacket[] = [];
     for (const op of incoming) {
-      if (known.has(op.body.id) || retracted.has(op.body.messageId)) continue;
-      known.add(op.body.id);
+      const k = opKey(op.body);
+      if (known.has(k) || retracted.has(op.body.messageId)) continue;
+      known.add(k);
       if (live.has(op.body.messageId)) ready.push(op);
       else this.parkPendingReaction(op, now);
     }
@@ -543,8 +660,8 @@ export class BrowserPeers {
     return this.transaction(async () => {
       if (!this.status?.memberId || this.stopped) throw new Error('Join the room before reacting.');
       if (!isReactionEmoji(emoji)) throw new Error('Choose one of the room’s reaction emoji.');
-      const message = this.messages.find(m => m.packet.body.id === messageId);
-      if (!message || isRetracted(message)) throw new Error('That message is not in this browser.');
+      const message = this.messages.find(m => m.packet.body.id === messageId && !isRetracted(m));
+      if (!message) throw new Error('That message is not in this browser.');
       const bodies = this.reactionOps.map(op => op.body);
       const remove = memberReacted(this.chips(), messageId, emoji, this.status.memberId);
       const body = {
@@ -564,15 +681,17 @@ export class BrowserPeers {
     if (!added.length) return;
     const { messages, changed } = applyRetractions(this.messages, log.map(op => op.body));
     const puts: [string, unknown][] = [[this.retractKey, log]];
-    const removed = new Set(changed);
-    // A deleted message's reactions go too, so they count toward nobody's cap here or on a device that joins later.
-    const reactions = this.reactionOps.filter(op => !removed.has(op.body.messageId));
+    // Only clear reactions for a retracted message ID when NO live message with that ID remains
+    // (an attacker deleting their own colliding copy must never wipe reactions on the victim's live message).
+    const stillLive = new Set(messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+    const fullyRetracted = new Set(changed.filter(id => !stillLive.has(id)));
+    const reactions = this.reactionOps.filter(op => !fullyRetracted.has(op.body.messageId));
     if (changed.length) puts.push([this.key, messages]);
     if (reactions.length !== this.reactionOps.length) puts.push([this.reactionKey, reactions]);
-    await this.put(puts); this.retractOps = log;
+    await this.put(puts); this.retractOps = log; this.notifyRetractions();
     if (reactions.length !== this.reactionOps.length) { this.reactionOps = reactions; this.notifyReactions(); }
     if (changed.length) {
-      this.dropPendingForMessages(removed);
+      this.dropPendingForMessages(fullyRetracted);
       this.messages = messages; this.notify(); this.syncFiles();
     }
   }
@@ -580,11 +699,17 @@ export class BrowserPeers {
   async retract(messageId: string) {
     return this.transaction(async () => {
       if (!this.status?.memberId || this.stopped) throw new Error('Join the room before deleting a message.');
-      const message = this.messages.find(m => m.packet.body.id === messageId);
+      const message = this.messages.find(m => m.packet.body.id === messageId && m.packet.body.memberId === this.status!.memberId)
+        ?? this.messages.find(m => m.packet.body.id === messageId);
       if (!message) throw new Error('That message is not in this browser.');
       if (message.packet.body.memberId !== this.status.memberId) throw new Error('You can only delete your own messages.');
       if (isRetracted(message)) return;
-      const body: RetractBody = { kind: 'retract', roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId, memberId: this.status.memberId, at: Date.now(), target: messageId };
+      const body: RetractBody = {
+        kind: 'retract', roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId,
+        memberId: this.status.memberId, at: Date.now(), target: messageId,
+        targetDeviceId: message.packet.body.deviceId,
+        ...(message.packet.body.seq !== undefined ? { seq: message.packet.body.seq } : {}),
+      };
       const packet: RetractPacket = { body, signature: await sign(body) };
       await this.addRetractionOps([packet]);
       this.broadcastPacket(packet);
@@ -594,26 +719,31 @@ export class BrowserPeers {
   private async acceptRetractions(sync: { roomId?: unknown; ops?: unknown }, fromRelay = false) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
     const accepted: RetractPacket[] = [];
-    const held = new Set(this.retractOps.map(op => op.body.id));
+    const held = new Set(this.retractOps.map(op => opKey(op.body)));
     for (const op of sync.ops as RetractPacket[]) {
-      if (held.has(op?.body?.id)) continue;
-      const author = this.signerFor(op?.body?.deviceId, op?.body?.at, fromRelay);
-      if (!author || !validRetractBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
-      if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
+      if (!validRetractBody(op?.body, this.roomId) || typeof op.signature !== 'string') continue;
+      const k = opKey(op.body);
+      if (held.has(k)) continue;
+      const author = this.signerFor(op.body.deviceId, op.body.at, fromRelay);
+      if (!author || op.body.memberId !== author.memberId) continue;
+      if (await verify(author.publicKey, op.body, op.signature)) { held.add(k); accepted.push({ body: op.body, signature: op.signature }); }
     }
     await this.addRetractionOps(accepted);
   }
   private async acceptReactions(sync: { roomId?: unknown; ops?: unknown }, fromRelay = false) {
     if (sync.roomId !== this.roomId || !Array.isArray(sync.ops) || sync.ops.length > 500) return;
     const accepted: ReactionPacket[] = [];
-    // Held operations and retracted targets are skipped before signatures are checked.
-    const held = new Set([...this.reactionOps, ...this.pendingReactions].map(op => op.body.id));
-    const retracted = new Set(this.messages.filter(isRetracted).map(m => m.packet.body.id));
+    // Held operations and fully retracted targets are skipped before signatures are checked.
+    const held = new Set([...this.reactionOps, ...this.pendingReactions].map(op => opKey(op.body)));
+    const live = new Set(this.messages.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+    const retracted = new Set(this.messages.filter(m => isRetracted(m) && !live.has(m.packet.body.id)).map(m => m.packet.body.id));
     for (const op of sync.ops as ReactionPacket[]) {
-      if (held.has(op?.body?.id) || retracted.has(op?.body?.messageId)) continue;
-      const author = this.signerFor(op?.body?.deviceId, op?.body?.at, fromRelay);
-      if (!author || !validReactionBody(op.body, this.roomId) || op.body.memberId !== author.memberId || typeof op.signature !== 'string') continue;
-      if (await verify(author.publicKey, op.body, op.signature)) accepted.push({ body: op.body, signature: op.signature });
+      if (!validReactionBody(op?.body, this.roomId) || typeof op.signature !== 'string') continue;
+      const k = opKey(op.body);
+      if (held.has(k) || retracted.has(op.body.messageId)) continue;
+      const author = this.signerFor(op.body.deviceId, op.body.at, fromRelay);
+      if (!author || op.body.memberId !== author.memberId) continue;
+      if (await verify(author.publicKey, op.body, op.signature)) { held.add(k); accepted.push({ body: op.body, signature: op.signature }); }
     }
     try { await this.addReactionOps(accepted); }
     catch { /* Cap full: keep the local log; peers retry after compaction elsewhere. */ }
@@ -632,20 +762,265 @@ export class BrowserPeers {
     }
     await this.addOps(accepted);
   }
-  /** This device's board, decisions and reactions, paced onto the peer's channel (on open, and when it asks again). */
+  /** This device's board, decisions, reactions and retractions, paced onto the peer's channel. */
   private sendState(peer: Peer) {
     if (!peer.queue) return;
-    const chunks = [...syncChunks(this.roomId, this.ops), ...decisionChunks(this.roomId, this.decisionOps), ...reactionSyncChunks(this.roomId, this.reactionOps), ...retractionSyncChunks(this.roomId, this.retractOps)];
+    const chunks = [
+      ...syncChunks(this.roomId, this.ops),
+      ...decisionChunks(this.roomId, this.decisionOps),
+      ...reactionSyncChunks(this.roomId, this.reactionOps),
+      ...retractionSyncChunks(this.roomId, this.retractOps),
+    ];
     if (!chunks.length) return;
     peer.resync.sent();
     peer.queue.push(chunks.map(chunk => JSON.stringify(chunk)));
   }
-  /** Ask a peer for its state again after this device dropped some of its packets under load. */
+  /** Advertises this device's held message history so the peer can serve anything missing. */
+  private sendHistoryHave(peerId: string, peer: Peer, cursor?: HistoryCursor, expectReply = false) {
+    this.sendHistoryHaveTo(peerId, cursor, peer, expectReply, 0);
+  }
+  /** Sends a history replication packet over live WebRTC if open, else over the E2E relay. Returns false if dropped by a full SendQueue or unavailable transport. */
+  private sendHistoryPackets(peerId: string, packets: (HistoryHavePacket | HistoryPacket)[], peer?: Peer): boolean {
+    const active = peer ?? this.peers.get(peerId);
+    if (active?.queue && this.hasLiveWebRtc(peerId) && active.channel?.readyState === 'open') {
+      return active.queue.push(packets.map(p => JSON.stringify(p)));
+    }
+    if (this.relayClient?.isConnected() && this.verifiedRoster?.body.devices.some(d => d.id === peerId)) {
+      for (const packet of packets) this.sendViaRelay(packet, 'primary', [peerId]);
+      return true;
+    }
+    return false;
+  }
+  private clearHistoryTimeout(peerId: string) {
+    const timer = this.historyTimeoutTimers.get(peerId);
+    if (timer) { clearTimeout(timer); this.historyTimeoutTimers.delete(peerId); }
+  }
+  private clearPeerHistoryState(peerId: string) {
+    this.historyRoundDropped.delete(peerId);
+    this.historyRetryAt.delete(peerId);
+    const retryTimer = this.historyRetryTimers.get(peerId);
+    if (retryTimer) { clearTimeout(retryTimer); this.historyRetryTimers.delete(peerId); }
+    this.historyInFlight.delete(peerId);
+    this.clearHistoryTimeout(peerId);
+  }
+  private armHistoryRoundTimeout(peerId: string, timeouts: number) {
+    this.clearHistoryTimeout(peerId);
+    const delay = Math.min(30_000, HISTORY_ROUND_TIMEOUT_MS * (timeouts + 1));
+    this.historyTimeoutTimers.set(peerId, setTimeout(() => {
+      this.historyTimeoutTimers.delete(peerId);
+      if (!this.stopped && this.historyInFlight.has(peerId)) this.flushHistoryRetries();
+    }, delay));
+  }
+  /** Sends a `history-have` with requester-side tracking so full queues, silent rate limits, or lost replies always recover. */
+  private sendHistoryHaveTo(peerId: string, cursor: HistoryCursor | undefined, peer: Peer | undefined, expectReply: boolean, timeouts = 0): boolean {
+    const have = buildHistoryHave(this.roomId, this.messages, cursor ? { cursor } : undefined);
+    const active = peer ?? this.peers.get(peerId);
+    const isWebRtc = !!(active?.queue && this.hasLiveWebRtc(peerId) && active.channel?.readyState === 'open');
+    const sent = this.sendHistoryPackets(peerId, [have], active);
+    if (!sent) {
+      // Full SendQueue on an open WebRTC channel: retry shortly without losing the pagination cursor.
+      if (isWebRtc) this.scheduleHistoryRetry(peerId, 1_500);
+      return false;
+    }
+    if (!isWebRtc) this.relayHistorySynced.set(peerId, this.now());
+    this.historyInFlight.set(peerId, { sentAt: this.now(), expectReply, timeouts });
+    if (expectReply) this.armHistoryRoundTimeout(peerId, timeouts);
+    else this.clearHistoryTimeout(peerId);
+    return true;
+  }
+  /** Schedules a delayed `history-have` retry for `peerId` without losing its pagination cursor. */
+  private scheduleHistoryRetry(peerId: string, delayMs: number) {
+    const clamped = Math.max(250, Math.min(30_000, delayMs));
+    const dueAt = this.now() + clamped;
+    const prev = this.historyRetryAt.get(peerId);
+    if (prev !== undefined && prev <= dueAt) return;
+    this.historyRetryAt.set(peerId, dueAt);
+    const oldTimer = this.historyRetryTimers.get(peerId);
+    if (oldTimer) clearTimeout(oldTimer);
+    this.historyRetryTimers.set(peerId, setTimeout(() => {
+      this.historyRetryTimers.delete(peerId);
+      if (!this.stopped && this.historyRetryAt.has(peerId)) this.flushHistoryRetries();
+    }, clamped));
+  }
+  private flushHistoryRetries() {
+    const at = this.now();
+    for (const [peerId, dueAt] of [...this.historyRetryAt]) {
+      if (at < dueAt) continue;
+      this.historyRetryAt.delete(peerId);
+      const timer = this.historyRetryTimers.get(peerId);
+      if (timer) { clearTimeout(timer); this.historyRetryTimers.delete(peerId); }
+      this.historyRoundDropped.delete(peerId);
+      this.sendHistoryHaveTo(peerId, this.historyCursors.get(peerId), undefined, true, 0);
+    }
+    for (const [peerId, pending] of [...this.historyInFlight]) {
+      if (!pending.expectReply || this.historyRetryAt.has(peerId)) continue;
+      const waitMs = Math.min(30_000, HISTORY_ROUND_TIMEOUT_MS * (pending.timeouts + 1));
+      if (at - pending.sentAt < waitMs) continue;
+      if (pending.timeouts + 1 > MAX_HISTORY_ROUND_TIMEOUTS) {
+        this.historyInFlight.delete(peerId);
+        this.clearHistoryTimeout(peerId);
+        continue;
+      }
+      this.historyRoundDropped.delete(peerId);
+      if (!this.sendHistoryHaveTo(peerId, this.historyCursors.get(peerId), undefined, true, pending.timeouts + 1)) {
+        // Peer is no longer reachable over WebRTC or relay; drop in-flight state until reconnect.
+        if (!this.historyRetryAt.has(peerId)) {
+          this.historyInFlight.delete(peerId);
+          this.clearHistoryTimeout(peerId);
+        }
+      }
+    }
+  }
+  /** Initiates peer-to-peer history sync over the E2E relay for online verified-roster peers without live WebRTC. */
+  private syncHistoryViaRelay() {
+    if (!this.relayClient?.isConnected() || !this.verifiedRoster) return;
+    const at = this.now();
+    for (const entry of this.verifiedRoster.body.devices) {
+      if (entry.id === this.deviceId || this.hasLiveWebRtc(entry.id)) continue;
+      if (!this.status?.devices?.some(d => d.id === entry.id && d.session)) {
+        this.relayHistorySynced.delete(entry.id);
+        continue;
+      }
+      if (this.historyRetryAt.has(entry.id)) continue;
+      const lastSent = this.relayHistorySynced.get(entry.id);
+      if (lastSent !== undefined && at - lastSent < RELAY_HISTORY_RETRY_MS) continue;
+      this.historyRounds.set(entry.id, 0);
+      this.historyRoundDropped.delete(entry.id);
+      this.sendHistoryHaveTo(entry.id, this.historyCursors.get(entry.id), undefined, this.historyCursors.has(entry.id), 0);
+    }
+  }
+  /** Serves missing, authorized message history to `peerId` using a per-peer token bucket with bounded `retryAfterMs` hints. */
+  private serveHistory(peerId: string, have: HistoryHavePacket, _fromRelay: boolean, peer?: Peer) {
+    if (!this.status?.memberId) return;
+    if (!this.historyServeLimiter.take(peerId)) {
+      if (this.historyServeLimiter.report(peerId)) console.debug(`Meshrooms: rate-limited history-have requests from ${peerId.slice(0, 8)}`);
+      if (this.historyServeLimiter.maySendRetryHint(peerId)) {
+        this.sendHistoryPackets(peerId, [{ kind: 'history', roomId: this.roomId, entries: [], retryAfterMs: this.historyServeLimiter.retryAfterMs(peerId) }], peer);
+      }
+      return;
+    }
+    const { entries, more, nextCursor } = selectHistoryEntries(this.messages, have, peerId, this.status, this.status.memberId, undefined, this.verifiedRoster);
+    if (!entries.length) {
+      if (have.cursor) this.sendHistoryPackets(peerId, [{ kind: 'history', roomId: this.roomId, entries: [], done: true }], peer);
+      return;
+    }
+    this.sendHistoryPackets(peerId, historyChunks(this.roomId, entries, more, nextCursor), peer);
+  }
+  /** Verifies and stores replicated history entries from `fromPeerId`, paginating cleanly with retry recovery. */
+  private async acceptHistory(fromPeerId: string, packet: HistoryPacket, fromRelay: boolean, peer?: Peer) {
+    // A serving peer telling us its serve bucket is temporarily full: accept only when we actually have a request in flight.
+    if (packet.retryAfterMs !== undefined && packet.entries.length === 0) {
+      const pending = this.historyInFlight.get(fromPeerId);
+      if (!pending || this.now() - pending.sentAt > 60_000) return;
+      this.historyInFlight.delete(fromPeerId);
+      this.clearHistoryTimeout(fromPeerId);
+      this.scheduleHistoryRetry(fromPeerId, packet.retryAfterMs);
+      return;
+    }
+    this.clearHistoryTimeout(fromPeerId);
+    if (fromRelay) this.relayHistorySynced.set(fromPeerId, this.now());
+    const cost = Math.max(1, packet.entries.length);
+    if (!this.historyAcceptLimiter.take(fromPeerId, cost)) {
+      if (this.historyAcceptLimiter.report(fromPeerId)) console.debug(`Meshrooms: rate-limited history entries from ${fromPeerId.slice(0, 8)}`);
+      this.historyRoundDropped.add(fromPeerId);
+      this.historyInFlight.delete(fromPeerId);
+      this.quotaDrops.drop(fromPeerId);
+      return;
+    }
+    const held = new Set(this.messages.map(m => messageKey(m.packet.body.deviceId, m.packet.body.id)));
+    const baseMaxSeq = maxSeqByDevice(this.messages);
+    const batchAnchor = new Map<string, number>();
+    const accepted: SavedMessage[] = [];
+    let droppedByQuota = false;
+    for (const entry of packet.entries) {
+      const b = entry?.body;
+      if (!b || b.kind !== 'message' || b.roomId !== this.roomId || !isId(b.id) || typeof b.deviceId !== 'string') continue;
+      const key = messageKey(b.deviceId, b.id);
+      if (held.has(key)) continue;
+      if (typeof entry.signature !== 'string') continue;
+      if (typeof b.text !== 'string' || !b.text.trim() || b.text.length > 4000 || !Number.isSafeInteger(b.at) || b.at < 0 || b.at > 8_640_000_000_000_000) continue;
+      if (b.replyTo !== undefined && !isId(b.replyTo)) continue;
+      if (b.attachments !== undefined && !validAttachments(b.attachments)) continue;
+      if (!validMessageVisibility(b.visibility) || !validMessageSeq(b.seq) || !validAudienceUntil(b.audienceUntil)) continue;
+      const maxHeld = baseMaxSeq.get(b.deviceId) ?? batchAnchor.get(b.deviceId) ?? 0;
+      if (!withinSeqJump(b.seq, maxHeld)) continue;
+      const author = this.signerFor(b.deviceId, b.at, fromRelay, b.memberId);
+      if (!author || b.memberId !== author.memberId) continue;
+      if (!await verify(author.publicKey, b, entry.signature)) continue;
+      if (!this.allowed(b.memberId, 'history', fromPeerId)) {
+        droppedByQuota = true;
+        this.historyRoundDropped.add(fromPeerId);
+        continue;
+      }
+      held.add(key);
+      if (typeof b.seq === 'number' && !baseMaxSeq.has(b.deviceId) && !batchAnchor.has(b.deviceId)) batchAnchor.set(b.deviceId, b.seq);
+      const saved: SavedMessage = { packet: { body: b, signature: entry.signature }, targets: [], receipts: [], receivedAt: this.now(), replicated: true };
+      accepted.push(this.retractOps.some(op => mayRetract(op.body, b)) ? retractedStub(saved) : saved);
+    }
+    let windowUnchanged = false;
+    if (accepted.length) {
+      const { messages: merged, added } = mergeHistoryMessages(this.messages, accepted);
+      if (added.length) {
+        const { kept, evicted } = windowHistory(merged, m => this.awaiting(m));
+        const changed = kept.length !== this.messages.length || kept.some((m, i) => m !== this.messages[i]);
+        if (changed) {
+          await this.put([[this.key, kept]]);
+          this.messages = kept;
+          this.receiptsDirty = false;
+          const keptSet = new Set(kept);
+          const retainedAdded = added.filter(m => keptSet.has(m));
+          const liveIds = new Set(kept.filter(m => !isRetracted(m)).map(m => m.packet.body.id));
+          if (evicted.length) this.dropPendingForMessages(new Set(evicted.map(m => m.packet.body.id).filter(id => !liveIds.has(id))));
+          this.notify();
+          if (retainedAdded.some(m => m.packet.body.attachments) || evicted.some(m => m.packet.body.attachments)) this.syncFiles();
+          for (const m of retainedAdded) if (!isRetracted(m)) await this.flushPendingReactions(m.packet.body.id);
+        } else {
+          // Every newly accepted entry was immediately evicted by the full rolling window: skip disk write & churn.
+          windowUnchanged = true;
+        }
+      }
+    }
+    if (packet.more) {
+      if (droppedByQuota || this.historyRoundDropped.has(fromPeerId)) {
+        // Keep the start-of-round cursor so `quotaDrops` -> `requestSync` retries this round without skipping dropped entries.
+        this.historyInFlight.delete(fromPeerId);
+        this.quotaDrops.drop(fromPeerId);
+      } else if (windowUnchanged && this.messages.length >= MAX_STORED_MESSAGES) {
+        this.historyCursors.delete(fromPeerId);
+        this.historyInFlight.delete(fromPeerId);
+      } else {
+        if (packet.nextCursor) this.historyCursors.set(fromPeerId, packet.nextCursor);
+        const rounds = (this.historyRounds.get(fromPeerId) ?? 0) + 1;
+        if (rounds <= MAX_HISTORY_ROUNDS) {
+          this.historyRounds.set(fromPeerId, rounds);
+          this.sendHistoryHaveTo(fromPeerId, this.historyCursors.get(fromPeerId), peer, true, 0);
+        } else {
+          this.historyInFlight.delete(fromPeerId);
+        }
+      }
+    } else if (packet.done && !droppedByQuota && !this.historyRoundDropped.has(fromPeerId)) {
+      this.historyCursors.delete(fromPeerId);
+      this.historyInFlight.delete(fromPeerId);
+    } else if (!droppedByQuota && !this.historyRoundDropped.has(fromPeerId) && packet.entries.length > 0 && this.historyInFlight.has(fromPeerId)) {
+      // Intermediate chunk of a multi-chunk page: refresh the round timeout in case the trailing `more`/`done` chunk is lost.
+      this.historyInFlight.set(fromPeerId, { sentAt: this.now(), expectReply: true, timeouts: 0 });
+      this.armHistoryRoundTimeout(fromPeerId, 0);
+    }
+  }
+  /** Ask a peer for its state and history again after packets were dropped under load (works over WebRTC and relay). */
   private requestSync(id: string) {
-    const channel = this.peers.get(id)?.channel;
-    if (channel?.readyState !== 'open') return;
+    const peer = this.peers.get(id);
+    const channel = peer?.channel;
     const request: SyncRequest = { kind: SYNC_REQUEST, roomId: this.roomId };
-    try { channel.send(JSON.stringify(request)); } catch { /* Asked again after the next drop, or the state is exchanged on reconnect. */ }
+    if (channel?.readyState === 'open') {
+      try { channel.send(JSON.stringify(request)); } catch { /* Asked again after the next drop, or the state is exchanged on reconnect. */ }
+    } else if (this.relayClient?.isConnected() && this.verifiedRoster?.body.devices.some(d => d.id === id)) {
+      this.sendViaRelay(request, 'primary', [id]);
+    }
+    // Never cancel an active server `retryAfterMs` backoff — firing early hits `maySendRetryHint`'s 1s quiet window.
+    if (this.historyRetryAt.has(id)) return;
+    this.historyRoundDropped.delete(id);
+    this.sendHistoryHaveTo(id, this.historyCursors.get(id), peer, true, 0);
   }
   private notifyDecisions() { if (!this.stopped) this.decisionsChanged(this.decisionOps.map(op => op.body)); }
   /** Keeps decision operations we have not seen; a full log refuses new ones rather than dropping live state. */
@@ -716,7 +1091,7 @@ export class BrowserPeers {
     return false;
   }
   private notifyActivity() { if (!this.stopped) this.activityChanged(Object.fromEntries(this.activity)); }
-  private forget(id: string) { if (this.activity.delete(id)) this.notifyActivity(); }
+  private forget(id: string) { this.clearPeerHistoryState(id); if (this.activity.delete(id)) this.notifyActivity(); }
   /** Only an agent's own device speaks for it, on its own channel. */
   private acceptActivity(id: string, packet: unknown) {
     const device = this.status?.devices?.find(d => d.id === id);
@@ -742,7 +1117,12 @@ export class BrowserPeers {
   /** Store `added` at the end of the history, evicting the oldest messages past the rolling window. */
   private async save(added: SavedMessage) {
     const { kept, evicted } = windowHistory([...this.messages, added], m => this.awaiting(m));
-    await this.put([[this.key, kept]]); this.messages = kept; this.receiptsDirty = false;
+    const puts: [string, unknown][] = [[this.key, kept]];
+    if (added.packet.body.deviceId === this.deviceId && typeof added.packet.body.seq === 'number' && added.packet.body.seq > this.lastAuthorSeq) {
+      this.lastAuthorSeq = added.packet.body.seq;
+      puts.push([this.seqKey, this.lastAuthorSeq]);
+    }
+    await this.put(puts); this.messages = kept; this.receiptsDirty = false;
     if (evicted.length) this.dropPendingForMessages(new Set(evicted.map(m => m.packet.body.id)));
     const stored = kept.at(-1) === added;
     this.notify(stored && !isRetracted(added) ? added : undefined);
@@ -769,10 +1149,17 @@ export class BrowserPeers {
       if (files.length && !validAttachments(attachments)) throw new Error('These files cannot be attached. Remove them and attach them again.');
       if (replyTo !== undefined && !this.messages.some(m => m.packet.body.id === replyTo)) throw new Error('The message you replied to is not in this browser.');
       for (const { ref, bytes } of files) if (!this.index[ref.sha256]) await this.storeFile(ref.sha256, bytes, ref.type);
-      const body: MessageBody = { kind: 'message', roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId, memberId: this.status.memberId,
-        text: text.trim() || attachmentText(attachments), at: Date.now(), ...(replyTo ? { replyTo } : {}), ...(files.length ? { attachments } : {}) };
+      const visibility: MessageVisibility = this.status.settings?.historyForNewcomers ? 'room' : 'members';
+      const audienceUntil = visibility === 'members' ? currentAudienceUntil(this.status) : undefined;
+      const seq = nextAuthorSeq(this.messages, this.deviceId, this.lastAuthorSeq);
+      const body: MessageBody = {
+        kind: 'message', roomId: this.roomId, id: crypto.randomUUID(), deviceId: this.deviceId, memberId: this.status.memberId,
+        text: text.trim() || attachmentText(attachments), at: Date.now(), visibility, seq,
+        ...(audienceUntil !== undefined ? { audienceUntil } : {}),
+        ...(replyTo ? { replyTo } : {}), ...(files.length ? { attachments } : {}),
+      };
       const packet = { body, signature: await sign(body) };
-      const saved: SavedMessage = { packet, targets: this.status.devices!.filter(d => d.id !== this.deviceId).map(d => d.id), receipts: [] };
+      const saved: SavedMessage = { packet, targets: this.status.devices!.filter(d => d.id !== this.deviceId).map(d => d.id), receipts: [], receivedAt: this.now() };
       await this.save(saved); this.flush();
     });
   }
@@ -854,10 +1241,25 @@ export class BrowserPeers {
       }
       return;
     }
-    // Cheap and never queued: answered from the tick, at most once per interval.
+    // Cheap and never queued: answered from the tick, at most once per interval (WebRTC or verified-roster relay).
     if (isSyncRequest(packet, this.roomId)) {
-      if (!this.stopped && !fromRelay && peer && this.peers.get(id) === peer && this.status?.devices?.some(d => d.id === id)) {
+      if (this.stopped) return;
+      if (!fromRelay && peer && this.peers.get(id) === peer && this.status?.devices?.some(d => d.id === id)) {
         peer.resync.request(); this.resyncDue(peer);
+      } else if (fromRelay && this.verifiedRoster?.body.devices.some(d => d.id === id)) {
+        let limiter = this.relayResync.get(id);
+        if (!limiter) { limiter = new Resync(); this.relayResync.set(id, limiter); if (this.relayResync.size > 512) this.relayResync.delete(this.relayResync.keys().next().value!); }
+        limiter.request();
+        if (limiter.due({ pending: 0 } as SendQueue)) {
+          limiter.sent();
+          for (const chunk of [
+            ...syncChunks(this.roomId, this.ops),
+            ...decisionChunks(this.roomId, this.decisionOps),
+            ...reactionSyncChunks(this.roomId, this.reactionOps),
+            ...retractionSyncChunks(this.roomId, this.retractOps),
+          ]) this.sendViaRelay(chunk, 'primary', [id]);
+        }
+        if (relayMeta?.cursor !== undefined) this.relayClient?.ackCursor(relayMeta.cursor);
       }
       return;
     }
@@ -876,6 +1278,8 @@ export class BrowserPeers {
       if ((packet as unknown as { kind?: unknown })?.kind === 'decisions') { await this.acceptDecisions(packet as never, fromRelay); return true; }
       if ((packet as unknown as { kind?: unknown })?.kind === 'reactions') { await this.acceptReactions(packet as never, fromRelay); return true; }
       if ((packet as unknown as { kind?: unknown })?.kind === 'retractions') { await this.acceptRetractions(packet as never, fromRelay); return true; }
+      if (isHistoryHavePacket(packet, this.roomId)) { this.serveHistory(id, packet, fromRelay, peer); return true; }
+      if (isHistoryPacket(packet, this.roomId)) { await this.acceptHistory(id, packet, fromRelay, peer); return true; }
       const b = packet?.body;
       if (!b || b.roomId !== this.roomId || b.deviceId !== id || !isId(b.id) || typeof packet.signature !== 'string' || !await verify(device.publicKey, b, packet.signature)) return false;
       if (b.kind === 'message') {
@@ -883,13 +1287,15 @@ export class BrowserPeers {
         // The replied-to message may predate this browser's admission, so only its form is checked.
         if (b.replyTo !== undefined && !isId(b.replyTo)) return false;
         if (b.attachments !== undefined && !validAttachments(b.attachments)) return false;
-        const existing = this.messages.find(m => m.packet.body.id === b.id);
+        if (!validMessageVisibility(b.visibility) || !validMessageSeq(b.seq) || !validAudienceUntil(b.audienceUntil)) return false;
+        const existing = this.messages.find(m => m.packet.body.deviceId === b.deviceId && m.packet.body.id === b.id);
         // A stub no longer matches the original its sender may still be retrying, and it only needs confirming.
         if (existing && !isRetracted(existing) && JSON.stringify(existing.packet.body) !== JSON.stringify(b)) return false;
         // Past the rolling window the oldest messages make room, so a new one is always stored and confirmed.
         if (!existing) {
+          if (!withinSeqJump(b.seq, maxSeqForDevice(this.messages, b.deviceId))) return false;
           if (!this.allowed(device.memberId, 'message', id)) return false; // Unconfirmed, so its sender retries later.
-          const saved: SavedMessage = { packet: packet as SavedMessage['packet'], targets: [], receipts: [] };
+          const saved: SavedMessage = { packet: packet as SavedMessage['packet'], targets: [], receipts: [], receivedAt: this.now() };
           await this.save(this.retractOps.some(op => mayRetract(op.body, b)) ? retractedStub(saved) : saved);
         }
         // A receipt means an IndexedDB transaction completed, not that a person read it.
@@ -908,11 +1314,11 @@ export class BrowserPeers {
           && admissible(this.decisionOps.map(op => op.body), [b]).length && this.allowed(device.memberId, 'decision', id)) await this.addDecisionOps([{ body: b, signature: packet.signature }]);
         return true;
       } else if (b.kind === 'reaction') {
-        if (validReactionBody(b, this.roomId) && b.memberId === device.memberId && ![...this.reactionOps, ...this.pendingReactions].some(op => op.body.id === b.id)
+        if (validReactionBody(b, this.roomId) && b.memberId === device.memberId && ![...this.reactionOps, ...this.pendingReactions].some(op => opKey(op.body) === opKey(b))
           && this.allowed(device.memberId, 'reaction', id)) await this.addReactionOps([{ body: b, signature: packet.signature }]);
         return true;
       } else if (b.kind === 'retract') {
-        if (validRetractBody(b, this.roomId) && b.memberId === device.memberId && !this.retractOps.some(op => op.body.id === b.id)
+        if (validRetractBody(b, this.roomId) && b.memberId === device.memberId && !this.retractOps.some(op => opKey(op.body) === opKey(b))
           && this.allowed(device.memberId, 'retract', id)) await this.addRetractionOps([{ body: b, signature: packet.signature }]);
         return true;
       }
@@ -979,8 +1385,11 @@ export class BrowserPeers {
     const opened = () => {
       if (didOpen || this.stopped || this.peers.get(id) !== peer) return;
       didOpen = true;
+      this.historyRounds.set(id, 0);
+      this.historyCursors.delete(id);
+      this.clearPeerHistoryState(id);
       this.healthOf(peer);
-      this.flush(); this.sendState(peer);
+      this.flush(); this.sendState(peer); this.sendHistoryHave(id, peer);
       if (peer.fileChannel?.readyState !== 'open') this.files.opened(id);
       this.notify();
     };
@@ -1020,6 +1429,7 @@ export class BrowserPeers {
     this.prunePendingReactions();
     for (const peer of this.peers.values()) { peer.queue?.pump(); this.resyncDue(peer); }
     for (const id of this.quotaDrops.due()) this.requestSync(id);
+    this.flushHistoryRetries();
   }
   private retireUfrag(id: string, session: string, ufrag: string | undefined) {
     if (!ufrag) return;
@@ -1055,6 +1465,8 @@ export class BrowserPeers {
   private peer(device: BrowserDevice & { session?: string }) {
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
     const peer: Peer = { pc, session: device.session!, started: this.now(), iceKey: this.iceKey, sent: new Map(), resync: new Resync() };
+    const tried = `${device.id}:${device.session}`;
+    if (!this.firstOffer.has(tried)) { if (this.firstOffer.size >= 256) this.firstOffer.clear(); this.firstOffer.set(tried, peer.started); }
     this.peers.set(device.id, peer);
     pc.ondatachannel = event => event.channel.label === FILE_CHANNEL_LABEL
       ? this.connectFileChannel(peer, device.id, event.channel)
@@ -1181,6 +1593,7 @@ export class BrowserPeers {
     const results = await Promise.allSettled(work);
     for (const result of results) if (result.status === 'rejected' && !this.stopped) this.error('Peer connection interrupted. Reconnecting automatically.');
     this.tick();
+    this.syncHistoryViaRelay();
     this.flush(); this.notify();
   }
   /** Verifies `status.roster` against the pinned host key (or TOFU at first sight) and rejects rollbacks/tampering. */
@@ -1205,6 +1618,7 @@ export class BrowserPeers {
     this.verifiedRoster = incoming;
     this.highestRosterVersion = Math.max(this.highestRosterVersion, incoming.body.version);
     this.pinnedHost = result.hostDeviceId;
+    this.syncHistoryViaRelay();
   }
   /** Publishes this browser device's ECDH public key (`enc`, `encVersion`, `encSig`) to a relay-capable lobby when missing or rotated. */
   private async maybePublishEncKey(status: RoomStatus) {
@@ -1351,9 +1765,14 @@ export class BrowserPeers {
         sign,
         rosterVersion: () => this.verifiedRoster?.body.version ?? 1,
         onEnvelope: (envelope, meta) => this.handleRelayEnvelope(envelope, meta.cursor),
+        onStatus: pushed => { if (this.stopped) return; this.pushedStatus = pushed; this.onPushedStatus?.(); },
+        // Pushes stopped: wake the caller, which polls now rather than at the end of its wait.
+        onStatusLost: () => { if (!this.stopped) this.onPushedStatus?.(); },
         onStateChange: state => {
           if (state === 'wss' || state === 'https') {
+            this.relayHistorySynced.clear();
             this.flush();
+            this.syncHistoryViaRelay();
             this.notify();
           }
         },
@@ -1362,6 +1781,7 @@ export class BrowserPeers {
         },
       };
       this.relayClient = this.createRelayClient ? this.createRelayClient(opts) : new RelayClient(opts);
+      if (this.statusWatch) this.relayClient.watchStatus(this.statusWatch);
       this.relayClient.start();
     } catch {
       // Relay unavailable; WebRTC continues unaffected.
@@ -1380,6 +1800,12 @@ export class BrowserPeers {
     // No file is fetched for a stopped engine: another owner, if any, fetches what the room needs.
     this.files.keep(() => false);
     if (this.receiptTimer) { clearTimeout(this.receiptTimer); this.receiptTimer = undefined; void this.transaction(() => this.writeReceipts()).catch(() => {}); }
+    for (const timer of this.historyRetryTimers.values()) clearTimeout(timer);
+    this.historyRetryTimers.clear();
+    this.historyRetryAt.clear();
+    for (const timer of this.historyTimeoutTimers.values()) clearTimeout(timer);
+    this.historyTimeoutTimers.clear();
+    this.historyInFlight.clear();
     for (const url of this.urls.values()) URL.revokeObjectURL(url); this.urls.clear();
   }
   /**

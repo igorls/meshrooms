@@ -3,6 +3,21 @@ const $ = id => document.getElementById(id);
 const text = (id, value) => { if ($(id).textContent !== value) $(id).textContent = value; };
 const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
 let view, requesting = false, refreshing = false, problem = '', readProblem = '';
+
+// Windows: the app draws this window's title bar (home.rs `frame`), so the page shows its own drag area and caption
+// buttons. They act on this window alone and stay usable while a service action runs.
+const customFrame = window.__MESHROOMS_FRAME__ === 'custom';
+if (customFrame) {
+  document.documentElement.dataset.frame = 'custom';
+  document.querySelector('.home-titlebar').hidden = false;
+  const windowAction = action => invoke('home_window', { action }).catch(() => {});
+  for (const button of document.querySelectorAll('[data-window]')) button.addEventListener('click', () => windowAction(button.dataset.window));
+  document.addEventListener('mousedown', event => {
+    if (event.button !== 0 || event.detail > 1 || !event.target.closest('[data-drag]') || event.target.closest('button, a, input, label')) return;
+    event.preventDefault();
+    windowAction('drag');
+  });
+}
 const roomRows = new Map();
 
 function renderRooms(busy, running) {

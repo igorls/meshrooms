@@ -1,27 +1,35 @@
-import { useId, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import type { BrowserMember } from './protocol';
 import { MAX_AGENT_NAME, renameProblem } from './rename-state';
 
 /**
- * "Rename" on an agent's row in Room details: a link that opens one field in the row, so the name changes where it is
- * shown. The name is checked here as the room service will check it (rename-state.ts), and what the service refuses
- * anyway (someone took the name a moment ago) is shown under the field, not in the room's banner.
+ * "Rename" on an agent's row in Room details: a link (or menu-triggered inline form) that opens one field in the row,
+ * so the name changes where it is shown. The name is checked here as the room service will check it (rename-state.ts),
+ * and what the service refuses anyway (someone took the name a moment ago) is shown under the field, not in the room's banner.
  */
-export function AgentRename({ member, members, reserved, disabled, onRename }: {
+export function AgentRename({ member, members, reserved, disabled, startOpen = false, onClose, onRename }: {
   member: BrowserMember; members: BrowserMember[]; reserved: string[]; disabled: boolean;
+  startOpen?: boolean; onClose?: () => void;
   onRename(name: string): Promise<void>;
 }) {
-  const [editing, setEditing] = useState(false), [value, setValue] = useState(''), [problem, setProblem] = useState(''), [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState(startOpen), [value, setValue] = useState(startOpen ? member.name : ''), [problem, setProblem] = useState(''), [saving, setSaving] = useState(false);
   const opener = useRef<HTMLButtonElement>(null), field = useRef<HTMLInputElement>(null), error = useId();
+  useEffect(() => {
+    if (startOpen) requestAnimationFrame(() => field.current?.select());
+  }, [startOpen]);
   const open = () => { setValue(member.name); setProblem(''); setEditing(true); requestAnimationFrame(() => field.current?.select()); };
-  const close = () => { setEditing(false); setProblem(''); requestAnimationFrame(() => opener.current?.focus()); };
+  const close = () => {
+    setEditing(false); setProblem('');
+    if (onClose) onClose();
+    else requestAnimationFrame(() => opener.current?.focus());
+  };
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (saving) return;
     const found = renameProblem(value, member, members, reserved);
     if (found) { setProblem(found); field.current?.focus(); return; }
     setSaving(true); setProblem('');
-    try { await onRename(value); setEditing(false); }
+    try { await onRename(value); setEditing(false); onClose?.(); }
     catch (e) { setProblem((e as Error).message || 'Could not rename the agent.'); field.current?.focus(); }
     finally { setSaving(false); }
   }

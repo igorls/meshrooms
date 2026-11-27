@@ -345,6 +345,106 @@ test('WSS challenge-response auth, live E2E delivery, session replacement, and a
   }
 });
 
+test('a socket that watches its room gets status pushed: at once, on changes, a signal to its recipient, without it once acked, on refresh; it stays online without polling, and drops out once quiet', async () => {
+  let relay!: RelayService;
+  let handler!: ReturnType<typeof browserHandler>;
+  const server = Bun.serve<RelaySocketData>({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d })),
+    websocket: {
+      open: ws => relay.websocket.open!(ws),
+      message: (ws, m) => relay.websocket.message!(ws, m),
+      drain: ws => relay.websocket.drain!(ws),
+      close: (ws, c, r) => relay.websocket.close!(ws, c, r),
+    },
+  });
+  const origin = `http://127.0.0.1:${server.port}`;
+  const wsUrl = `ws://127.0.0.1:${server.port}/api/relay/v1`;
+  // The room service's and the relay's clock: moved by the test, so presence windows pass in an instant.
+  let now = Date.now();
+  const clock = () => now;
+  const lobby = new BrowserLobby(':memory:', { origin, now: clock });
+  relay = new RelayService({ lobby, heartbeatMs: 60_000, statusRefreshMs: 300, now: clock });
+  handler = browserHandler(lobby, origin, '.', { relay });
+  const open = async (device: RelayTestDevice, room: string) => {
+    const socket = await connectWs(wsUrl);
+    const challenge = await socket.next();
+    socket.sendJson({ t: 'auth', signed: await device.signed('relay-open', room, { nonce: challenge.nonce, session: crypto.randomUUID(), rosterVersion: 1 }) });
+    const ready = await socket.next();
+    // The service says it pushes status, so a client knows to watch instead of polling.
+    expect(ready).toMatchObject({ t: 'ready', status: true });
+    /** The next pushed status that passes `test`, skipping others (refreshes, pongs). */
+    const status = async (test: (status: RoomStatus) => boolean = () => true, timeoutMs = 3000) => {
+      for (const by = Date.now() + timeoutMs; ;) {
+        const message = await socket.next(Math.max(1, by - Date.now()));
+        if (message.t === 'status' && test(message.status as RoomStatus)) return message.status as RoomStatus;
+      }
+    };
+    return { ...socket, status };
+  };
+  try {
+    const { room, host, guest } = await setupRoom(lobby, origin, clock);
+    const hostWs = await open(host, room), guestWs = await open(guest, room);
+
+    // Watching answers at once, as a status poll would, with the device's own session.
+    guestWs.sendJson({ t: 'status-watch', session: guest.session, cursor: 0 });
+    const first = await guestWs.status();
+    expect(first.memberId).toBeTruthy();
+    expect(first.devices!.find(d => d.id === guest.id)!.session).toBe(guest.session);
+    hostWs.sendJson({ t: 'status-watch', session: host.session, cursor: 0 });
+    await hostWs.status();
+
+    // A change in the room reaches the watcher it concerns without a poll.
+    await host.send(lobby, 'agent-invite', room, { name: 'Scout' });
+    expect((await hostWs.status(s => !!s.agentInvites?.some(i => i.name === 'Scout'))).agentInvites).toBeTruthy();
+
+    // A signal is pushed to its recipient. The guest is online for the host through its pushes alone.
+    const offer = { type: 'offer' as const, sdp: 'v=0 offer for the guest' };
+    await host.send(lobby, 'signal', room, { to: guest.id, session: host.session, targetSession: guest.session, description: offer });
+    const signalled = await guestWs.status(s => (s.signals ?? []).length > 0);
+    expect(signalled.signals!.map(s => s.description)).toEqual([offer]);
+    const seq = signalled.signals![0].seq;
+
+    // Once acknowledged, pushes leave it out (the refresh brings one without any change).
+    guestWs.sendJson({ t: 'status-ack', cursor: seq, epoch: signalled.epoch });
+    await guestWs.status(s => !(s.signals ?? []).length, 3000);
+
+    // 45 s of the room's time with no status poll from the guest: it stays online for the host from the pushes alone,
+    // while it still talks (a heartbeat ping each time).
+    for (let i = 0; i < 3; i++) {
+      now += 15_000;
+      guestWs.sendJson({ t: 'ping' });
+      await guestWs.status();
+    }
+    const guestSession = async () => (await host.status(lobby, room)).devices!.find(d => d.id === guest.id)!.session;
+    expect(await guestSession()).toBe(guest.session);
+    // A client silent for over a minute gets no refresh, so it drops out of the room as it would without pushes.
+    now += 61_000;
+    await Bun.sleep(700);
+    expect(await guestSession()).toBeUndefined();
+
+    // A watch that isn't one is refused, and so is a second watch on the same socket.
+    guestWs.sendJson({ t: 'status-watch', session: 'not-a-uuid' });
+    for (;;) { const m = await guestWs.next(); if (m.t === 'error') { expect(m.code).toBe('invalid-watch'); break; } }
+    guestWs.sendJson({ t: 'status-watch', session: crypto.randomUUID(), cursor: 0 });
+    for (;;) { const m = await guestWs.next(); if (m.t === 'error') { expect(m.code).toBe('already-watching'); break; } }
+    guestWs.sendJson({ t: 'status-unwatch' });
+    await Bun.sleep(100);
+    const after: Record<string, unknown>[] = [];
+    const drain = (async () => { try { for (;;) after.push(await guestWs.next(1000)); } catch { /* quiet */ } })();
+    await drain;
+    expect(after.filter(m => m.t === 'status').length).toBeLessThanOrEqual(1);
+
+    hostWs.ws.close();
+    guestWs.ws.close();
+  } finally {
+    relay.close();
+    server.stop(true);
+    lobby.close();
+  }
+});
+
 test('Relay rejects replay, cross-room, spoofed from, reflection, non-increasing seq, oversize, unadmitted recipient, and rate limits', async () => {
   const origin = 'http://127.0.0.1:4320';
   let now = Date.now();
@@ -551,7 +651,9 @@ test('HTTPS fallback open/send/poll/state/wake-register, body limits, long-poll 
     const rlAddr = '198.51.100.77';
     expect((await tightHandler(new Request(`${origin}/api/relay/v1`), rlAddr)).status).toBe(426);
     expect((await tightHandler(new Request(`${origin}/api/relay/v1/open`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: '{}' }), rlAddr)).status).toBe(400);
-    expect((await tightHandler(new Request(`${origin}/api/relay/v1`), rlAddr)).status).toBe(429);
+    const refused = await tightHandler(new Request(`${origin}/api/relay/v1`), rlAddr);
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get('retry-after')).toBe('5');
     expect((await tightHandler(new Request(`${origin}/api/relay/v1/state`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: '{}' }), rlAddr)).status).toBe(429);
   } finally {
     relay.close();

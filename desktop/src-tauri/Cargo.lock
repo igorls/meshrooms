@@ -2130,6 +2130,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-winrt-notification",
  "url",
+ "winreg",
 ]
 
 [[package]]

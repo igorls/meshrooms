@@ -73,6 +73,7 @@ satisfy the browser crypto/storage requirements.
 | --- | --- |
 | MESHROOMS_BROWSER_PORT | Loopback listener, default 4320. |
 | MESHROOMS_BROWSER_ORIGIN | Exact browser origin, default http://127.0.0.1:4320; HTTPS for remote use. |
+| MESHROOMS_BROWSER_ALIASES | Comma-separated other origins of the same service, such as a former or a new domain. Each serves the same rooms; a request is answered as the origin its Host names. None by default. |
 | MESHROOMS_BROWSER_DATA | Coordinator store directory, default .local/browser-rooms. |
 | MESHROOMS_STUN_URLS | Comma-separated STUN URLs; none by default. |
 | MESHROOMS_TURN_URLS | Comma-separated TURN URLs; requires a compatible TURN service. |
@@ -81,6 +82,7 @@ satisfy the browser crypto/storage requirements.
 | MESHROOMS_REVISION | Committed revision reported by /api/lobby/health. |
 | MESHROOMS_INVITES | `required` or `off`: whether a person needs an operator invite code for their first room. Default `required` with an HTTPS origin, `off` on loopback. Joining a room by its link never needs a code. |
 | MESHROOMS_MAX_ROOMS | Rooms the service holds at once, default 256. |
+| MESHROOMS_API_LIMIT | Lobby requests a minute per IPv4 address or IPv6 /64, default 3600 behind the proxy and 240 direct. A refused request gets 429 with `Retry-After`. |
 | MESHROOMS_ROOM_IDLE_DAYS | Days without an admitted device opening a room before it is removed, default 30. |
 
 The browser runtime is separate from the domain's static website. Its HTTPS
@@ -189,10 +191,11 @@ less often, and nothing about messages: there are no server-side unread hints.
 - **Stored like any other message.** Background rooms run the same engine: history,
   receipts, the board, decisions, reactions and files are stored in IndexedDB, so
   opening the room shows them at once, without downloading them again.
-- **Limits.** Background rooms poll every 6 s instead of 1.5 s. It can't be much
-  slower: the service reports a device online only within 10 s of its last poll, and
-  peers drop the connection of a device that isn't online. Polls are spaced from start
-  to start, so a slow connection setup doesn't stretch the gap. At most 10 rooms are
+- **Limits.** With room status pushed over the relay socket (see Room status over
+  the relay socket), background rooms poll nothing. Without it they poll every 10 s.
+  It can't be much slower: the service reports a device online only within 25 s of
+  its last status, and peers drop the connection of a device that isn't online. Polls
+  are spaced from start to start, so a slow connection setup doesn't stretch the gap. At most 10 rooms are
   held in the background, the most recently opened in this browser; rooms past that
   show no count until they are among the 10 again. A 429 answer backs off 30 s, then
   up to a minute.
@@ -238,6 +241,34 @@ less often, and nothing about messages: there are no server-side unread hints.
   room ids shaped like room links.
 
 Agents are unaffected: bridges keep their own connections.
+
+## Room status over the relay socket
+
+A device on the relay socket (`/api/relay/v1`, when the relay is on) gets its room's status pushed instead of polling for
+it. Polling is only the fallback.
+
+- **Watching.** The service's `ready` frame says `status: true`. The device then sends `status-watch` with the lobby
+  session it polls as, its epoch and its signal cursor. The service pushes `{ t: 'status', status }`, the same answer a
+  `status` poll gets:
+  - at once;
+  - after every command that changed the room, and when a device comes online or comes back with a new session;
+  - when a WebRTC signal is queued for this device (only to that device);
+  - every 10 s regardless, which keeps the device inside the 25 s presence window and brings fresh TURN credentials.
+    Only to a client heard from in the last minute (its heartbeat pings every 25 s): a frozen tab or a stuck runner
+    whose socket stays open drops out of the room as it would without pushes.
+  - One watch per socket. A client sends it again on each new socket.
+- **Liveness.** A device counts pushes as live for 22 s after the last one. When the socket closes or a push fails, a
+  device waiting for the next push polls at once.
+- **Signals.** `status-ack` carries the cursor the device has handled, and later pushes leave those signals out, as a
+  poll with that cursor would. Changes that come together are pushed once (50 ms).
+- **Fallback.** A device without pushes polls `status`, and so does one whose pushes stopped (none for 22 s, the socket
+  closed, an older service):
+  - every 10 s (a bridge: one pass in ten, and at least every 8 s);
+  - every pass while it waits for admission, recovers from a failed poll, or sets up a peer connection.
+  - Bridges and pages from before this keep polling as they did.
+  - A service without the relay (`MESHROOMS_RELAY_ENABLED` off) has no socket to push over, so devices there keep
+    polling at the earlier rates: a bridge every pass, an open room every 1.5 s.
+- **Cost.** A push is not a request, so it isn't charged against the per-address request limits.
 
 ## Room lifecycle and invite codes
 
@@ -331,8 +362,8 @@ the host wait for the host to admit them. Rooms created before this default keep
 their previous behavior (off) until the host changes it.
 
 The service logs one JSON line per lobby command (action, status, duration in ms and a
-request id; status polls answered 200 or 410 are not logged, since open tabs poll
-every 1.5 s, background rooms every 6 s, and tabs left on a closed room keep polling until reloaded) and one per server error with its
+request id; status polls answered 200 or 410 are not logged, since tabs and bridges without pushed status poll every
+10 s, and tabs left on a closed room keep polling until reloaded) and one per server error with its
 message and stack. Lines never contain payloads, SDP, keys, invite codes, room ids
 or client addresses. A 500 response carries the same `requestId`.
 

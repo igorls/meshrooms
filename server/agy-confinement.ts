@@ -79,7 +79,7 @@ export function insideAgyWakeDir(target: string, wakeDir: string, allowRoot = fa
  * Splits a single shell command line into words while forbidding every shell metacharacter,
  * operator, expansion, substitution, glob or redirection.
  */
-function tokenizeSafeCommand(line: string): string[] | { error: string } {
+function tokenizeSafeCommand(line: string, platform = process.platform): string[] | { error: string } {
   const words: string[] = [];
   let word = '', quote: "'" | '"' | null = null, started = false;
   const forbiddenUnquoted = /[;&|<>`$(){}*?[\]~\\#\r\n\0]/;
@@ -95,6 +95,10 @@ function tokenizeSafeCommand(line: string): string[] | { error: string } {
     }
     if (quote === '"') {
       if (ch === '"') { quote = null; continue; }
+      // A Windows path is full of backslashes (the prompt names the wake folder in its native spelling), and none of
+      // Windows' shells treats one as an escape inside double quotes. A Bourne-style shell would, before a quote or
+      // another backslash, so those two stay refused: no quote can then end early in one reading and not in the other.
+      if (ch === '\\' && platform === 'win32' && i + 1 < line.length && line[i + 1] !== '"' && line[i + 1] !== '\\') { word += ch; continue; }
       if (forbiddenDouble.test(ch)) return { error: 'Shell expansion and escape characters are not allowed in wake commands.' };
       word += ch;
       continue;
@@ -114,7 +118,7 @@ function tokenizeSafeCommand(line: string): string[] | { error: string } {
 }
 
 /** Validates a `run_command` invocation against the wake policy. */
-export function checkAgyCommand(commandLine: string, policy: AgyHookPolicy, cwd?: string): { ok: true } | { ok: false; reason: string } {
+export function checkAgyCommand(commandLine: string, policy: AgyHookPolicy, cwd?: string, platform = process.platform): { ok: true } | { ok: false; reason: string } {
   if (typeof commandLine !== 'string' || !commandLine.trim()) return { ok: false, reason: 'Empty command.' };
   if (commandLine.includes('\0') || commandLine.includes('\r')) return { ok: false, reason: 'Control characters are not allowed in wake commands.' };
   if (cwd !== undefined && cwd !== '') {
@@ -147,7 +151,7 @@ export function checkAgyCommand(commandLine: string, policy: AgyHookPolicy, cwd?
     usedHeredoc = true;
   }
 
-  const tokens = tokenizeSafeCommand(header);
+  const tokens = tokenizeSafeCommand(header, platform);
   if (!Array.isArray(tokens)) return { ok: false, reason: tokens.error };
   if (tokens.length < 3) return { ok: false, reason: 'Only Meshrooms bridge wake subcommands are allowed.' };
 

@@ -1,18 +1,23 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { browserConfig, RELAY_SECRET_MIN_LENGTH } from './config';
+import { removeWithRetry } from '../test-directory';
 import { CURRENT_SCHEMA_VERSION, openAdmission } from './store';
 import { WakeConnector } from './wake-connector';
 
 const dirs: string[] = [];
-const processes: { kill: () => void }[] = [];
+const processes: { kill: () => void; exited: Promise<unknown> }[] = [];
 const tempDir = () => { const dir = mkdtempSync(join(tmpdir(), 'mr-relay-hardening-')); dirs.push(dir); return dir; };
-afterEach(() => {
-  for (const p of processes.splice(0)) { try { p.kill(); } catch { /* already gone */ } }
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+  // A killed server keeps its database files open until it has really exited (on Windows, kill() returns first), so wait
+  // for the exit before the folders go, and retry the removal for the moment the file system takes to let go.
+  const stopped = processes.splice(0);
+  for (const p of stopped) { try { p.kill(); } catch { /* already gone */ } }
+  await Promise.race([Promise.allSettled(stopped.map(p => p.exited)), Bun.sleep(10_000)]);
+  for (const dir of dirs.splice(0)) removeWithRetry(dir);
 });
 
 describe('MESHROOMS_RELAY_ENABLED (relay ships dark)', () => {
@@ -124,26 +129,29 @@ describe('admission database backup before the one-way v3 migration', () => {
   /** An admission database that has the current tables but reports schema v2, as a pre-relay deployment would. */
   function legacyV2(path: string) {
     const db = openAdmission(path, 1000);
-    db.query('INSERT INTO rooms (id, body, owner_id, title, member_count, device_count, meta_version) VALUES (?,?,?,?,?,?,?)').run('room-1', '{"id":"room-1"}', 'o', 'Old room', 1, 0, 1);
-    db.exec('PRAGMA user_version = 2');
-    db.close();
+    try {
+      db.query('INSERT INTO rooms (id, body, owner_id, title, member_count, device_count, meta_version) VALUES (?,?,?,?,?,?,?)').run('room-1', '{"id":"room-1"}', 'o', 'Old room', 1, 0, 1);
+      db.exec('PRAGMA user_version = 2');
+    } finally { db.close(); }
   }
 
   test('keeps an owner-only copy that still opens as schema v2, once, and never overwrites it', () => {
     const dir = tempDir(), path = join(dir, 'admission.sqlite');
     legacyV2(path);
     const migrated = openAdmission(path, 2000);
-    expect(migrated.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version).toBe(CURRENT_SCHEMA_VERSION);
-    migrated.query("UPDATE rooms SET title = 'changed after migration' WHERE id = 'room-1'").run();
-    migrated.close();
+    try {
+      expect(migrated.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version).toBe(CURRENT_SCHEMA_VERSION);
+      migrated.query("UPDATE rooms SET title = 'changed after migration' WHERE id = 'room-1'").run();
+    } finally { migrated.close(); }
 
     const backup = `${path}.pre-v${CURRENT_SCHEMA_VERSION}-from-v2.bak`;
     expect(existsSync(backup)).toBe(true);
     if (process.platform !== 'win32') expect(statSync(backup).mode & 0o777).toBe(0o600);
     const copy = new Database(backup, { readonly: true });
-    expect(copy.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version).toBe(2);
-    expect(copy.query<{ title: string }, []>("SELECT title FROM rooms WHERE id = 'room-1'").get()?.title).toBe('Old room');
-    copy.close();
+    try {
+      expect(copy.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version).toBe(2);
+      expect(copy.query<{ title: string }, []>("SELECT title FROM rooms WHERE id = 'room-1'").get()?.title).toBe('Old room');
+    } finally { copy.close(); }
 
     // A later start (already v3) neither migrates nor rewrites the backup.
     const before = statSync(backup).mtimeMs;
@@ -169,7 +177,6 @@ describe('admission database backup before the one-way v3 migration', () => {
     mkdirSync(`${path}.pre-v${CURRENT_SCHEMA_VERSION}-from-v2.bak`);
     expect(() => openAdmission(path, 2000)).toThrow(/back up the admission database/);
     const db = new Database(path, { readonly: true });
-    expect(db.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version).toBe(2);
-    db.close();
+    try { expect(db.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version).toBe(2); } finally { db.close(); }
   });
 });

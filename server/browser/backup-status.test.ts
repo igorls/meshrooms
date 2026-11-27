@@ -49,3 +49,17 @@ test('MESHROOMS_BACKUP_MAX_AGE_HOURS is optional and must be positive', () => {
   expect(browserConfig({ MESHROOMS_BACKUP_MAX_AGE_HOURS: '26' }).backupMaxAgeHours).toBe(26);
   expect(() => browserConfig({ MESHROOMS_BACKUP_MAX_AGE_HOURS: '-1' })).toThrow(/MESHROOMS_BACKUP_MAX_AGE_HOURS/);
 });
+
+test('MESHROOMS_BROWSER_ALIASES: other origins of the service, each like the main one; the main one listed again is left out', () => {
+  expect(browserConfig({}).aliases).toEqual([]);
+  expect(browserConfig({ MESHROOMS_BROWSER_ALIASES: 'http://localhost:4320, http://127.0.0.1:4320' }).aliases).toEqual(['http://localhost:4320']);
+  for (const bad of ['http://other.example', 'https://localhost:4320', 'http://localhost:4320/rooms', 'nonsense'])
+    expect(() => browserConfig({ MESHROOMS_BROWSER_ALIASES: bad })).toThrow(/MESHROOMS_BROWSER_ALIASES/);
+});
+
+test('MESHROOMS_API_LIMIT: per-address lobby requests a minute, higher behind the proxy, where one address is often a whole network', () => {
+  expect(browserConfig({}).apiLimit).toBe(240);
+  expect(browserConfig({ MESHROOMS_BROWSER_ORIGIN: 'https://rooms.example', MESHROOMS_TRUST_LOOPBACK_PROXY: '1' }).apiLimit).toBe(3600);
+  expect(browserConfig({ MESHROOMS_API_LIMIT: '600' }).apiLimit).toBe(600);
+  expect(() => browserConfig({ MESHROOMS_API_LIMIT: '0' })).toThrow(/MESHROOMS_API_LIMIT/);
+});

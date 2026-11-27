@@ -2,7 +2,20 @@
 //! commands: the capability is scoped to `main`, and callers must still be on the bundled index page.
 
 use serde_json::{json, Value};
-use tauri::{Manager, WebviewWindow};
+use tauri::{Manager, WebviewWindow, WebviewWindowBuilder};
+
+/// Tells the bundled page it draws the window's title bar (`.home-titlebar` in index.html).
+#[cfg(windows)]
+const CUSTOM_FRAME: &str = "window.__MESHROOMS_FRAME__ = 'custom';";
+
+/// Windows: the status window draws its own title bar, so "Meshrooms" is not shown twice, once by the system frame
+/// and again in the page's brand header. The system shadow, rounded corners and edge resizing stay. Other platforms
+/// keep their native frame.
+pub fn frame<'a, R: tauri::Runtime, M: Manager<R>>(builder: WebviewWindowBuilder<'a, R, M>) -> WebviewWindowBuilder<'a, R, M> {
+    #[cfg(windows)]
+    let builder = builder.decorations(false).shadow(true).initialization_script(CUSTOM_FRAME);
+    builder
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Room {
@@ -130,6 +143,28 @@ pub async fn home_action(window: WebviewWindow, action: String, room: Option<Str
     }).await.map_err(|_| "The desktop action did not finish. Try again.".to_string())?
 }
 
+/// What the page's own title bar may do to its window: move it, minimize it, or close it.
+fn window_action(action: &str) -> bool {
+    matches!(action, "drag" | "minimize" | "close")
+}
+
+/// The title bar's controls act on the calling window alone, and never wait for a service action in progress.
+#[tauri::command]
+pub fn home_window(window: WebviewWindow, action: String) -> Result<(), String> {
+    ours(&window)?;
+    if !window_action(&action) {
+        return Err("That action is not available here.".into());
+    }
+    let done = match action.as_str() {
+        "drag" => window.start_dragging(),
+        "minimize" => window.minimize(),
+        // As the system frame's close button does: the close request hides the window (main.rs) and the app stays in
+        // the tray.
+        _ => window.close(),
+    };
+    done.map_err(|error| format!("The window could not do that: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,13 +226,19 @@ mod tests {
         assert!(!allowed("quit"));
         assert!(!allowed("unpair"));
         assert!(!allowed("daemon start --anything"));
+        for action in ["drag", "minimize", "close"] {
+            assert!(window_action(action), "{action}");
+        }
+        for action in ["maximize", "quit", "set_position", "start_dragging", "", "Close"] {
+            assert!(!window_action(action), "{action}");
+        }
     }
 
     #[test]
     fn the_home_capability_is_local_to_main_and_grants_no_other_commands() {
         let capability: Value = serde_json::from_str(include_str!("../capabilities/home.json")).unwrap();
         assert_eq!(capability["windows"], json!(["main"]));
-        assert_eq!(capability["permissions"], json!(["allow-home-view", "allow-home-action"]));
+        assert_eq!(capability["permissions"], json!(["allow-home-view", "allow-home-action", "allow-home-window"]));
         assert!(capability["remote"].is_null());
     }
 }

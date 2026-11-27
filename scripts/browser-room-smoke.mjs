@@ -40,6 +40,13 @@ async function visible(p, text) { await p.getByText(text, { exact: true }).waitF
 const flat = text => text.replace(/\s+/g, ' ').trim();
 async function visibleMessage(p, text) { await p.waitForFunction(t => [...document.querySelectorAll('.message-text')].some(el => el.innerText.replace(/\s+/g, ' ').trim() === t), flat(text)); }
 async function send(p, text) { await p.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(text); await p.getByRole('button', { name: 'Send', exact: true }).click(); }
+// Room details is a header button in a wide room and a "Room actions" menu item in a narrow one (a phone).
+async function openRoomDetails(p) {
+  const wide = p.getByRole('button', { name: 'Room details', exact: true });
+  if (await wide.isVisible()) return wide.click();
+  await p.getByRole('button', { name: 'Room actions', exact: true }).click();
+  await p.getByRole('menuitem', { name: 'Room details', exact: true }).click();
+}
 async function snapshot(p, name) { await p.evaluate(() => window.scrollTo(0, 0)); await p.screenshot({ path: resolve(output, name), fullPage: true, animations: 'disabled' }); }
 let host, createdRoom = false, testFailed = false;
 try {
@@ -88,26 +95,30 @@ try {
   await companion.getByRole('button', { name: 'Use my existing identity', exact: true }).click();
   const code = await companion.locator('.browser-link-code').innerText();
   await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await host.locator('details.browser-link-device > summary').click();
   await host.getByLabel('Device code', { exact: true }).fill(code);
   await host.getByRole('button', { name: 'Approve my device', exact: true }).click();
   await visible(companion, 'Connected to 2 other devices');
   await visible(host, 'Connected to 2 other devices');
+  await host.locator('details.browser-link-device > summary').click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^Members/ }).click();
   assert.equal(await host.locator('.browser-person').count(), 2);
   assert.equal(await companion.locator('.browser-person').count(), 2);
-  await visible(host, 'Host · 2 devices');
-  assert.equal(await companion.getByText(first, { exact: true }).count(), 0); // This slice does not backfill companion history.
+  await host.locator('#browser-room-details .browser-person', { has: host.locator('.browser-member-badge.is-host') }).getByText('2 devices', { exact: true }).waitFor();
+  // History replication: the person's new device receives her earlier messages from her other devices.
+  await visible(companion, first);
   await send(companion, 'Same person, another device.');
   await visible(host, 'Same person, another device.'); await visible(guest, 'Same person, another device.');
   const author = host.locator('.browser-message').filter({ has: host.getByText('Same person, another device.', { exact: true }) });
   assert.equal(await author.locator('strong').innerText(), 'Alex');
   await visible(companion, 'Stored on 2 of 2 devices');
-  await host.locator('details.browser-link-device > summary').click();
   await host.getByRole('button', { name: 'Close room details', exact: true }).click();
   await snapshot(host, 'desktop.png'); await snapshot(guest, 'mobile.png');
   await host.setViewportSize({ width: 1305, height: 1270 }); await snapshot(host, 'user-1305.png');
   await host.setViewportSize({ width: 1365, height: 900 });
   await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await host.getByText('Manage your devices', { exact: true }).click();
   const labels = await host.locator('.browser-device-details strong').allTextContents();
   assert.equal(labels.length, 2); assert.notEqual(labels[0], labels[1]);
@@ -117,12 +128,13 @@ try {
   // Secondary context must preserve drafts and restore focus when closed.
   const draft = 'A draft that stays while checking people.';
   await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill(draft);
-  await guest.getByRole('button', { name: 'Room details', exact: true }).click();
+  await openRoomDetails(guest);
   assert.equal(await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).isVisible(), false);
   await snapshot(guest, 'details-mobile.png');
   await guest.getByRole('heading', { name: 'Room details', exact: true }).press('Escape');
   assert.equal(await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).inputValue(), draft);
-  assert.equal(await guest.getByRole('button', { name: 'Room details', exact: true }).evaluate(el => el === document.activeElement), true);
+  // Closing the details returns focus to what opened them: the header's "Room actions" on a narrow screen.
+  assert.equal(await guest.getByRole('button', { name: 'Room actions', exact: true }).evaluate(el => el === document.activeElement), true);
   await guest.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).fill('');
   // Tablet/zoom-sized layout and long names keep controls inside the viewport.
   await host.setViewportSize({ width: 820, height: 900 });
@@ -169,8 +181,9 @@ try {
   assert.equal(await guest.getByRole('log', { name: 'Conversation' }).count(), 1);
   await guest.locator('[aria-live="polite"]').filter({ hasText: 'Alex: New message while you read above.' }).waitFor();
   await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await host.getByText('Manage your devices', { exact: true }).click();
-  await host.getByRole('button', { name: /^Remove (Windows |Mac )?browser [0-9A-F]{6}$/i }).click();
+  await host.getByRole('button', { name: /^Remove .+ [0-9A-F]{6}$/ }).click();
   await companion.getByText('This device no longer has access. Ask the host to admit it again.', { exact: true }).waitFor();
   assert.equal(await companion.locator('.browser-composer').getByRole('combobox', { name: /^Message / }).count(), 0);
   await host.getByRole('button', { name: 'Close room details', exact: true }).click();
@@ -236,6 +249,7 @@ try {
     try {
       const details = host.locator('#browser-room-details');
       if (await details.isHidden()) await host.getByRole('button', { name: 'Room details', exact: true }).click();
+      await details.getByRole('tab', { name: /^Rules/ }).click();
       const section = host.locator('.browser-delete-room');
       const confirm = section.getByRole('group', { name: 'Confirm deleting the room' });
       if (!(await confirm.isVisible())) await section.getByRole('button', { name: 'Delete room', exact: true }).click();

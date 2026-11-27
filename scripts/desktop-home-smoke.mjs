@@ -98,6 +98,37 @@ try {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   await page.getByRole('button', { name: 'Start background service', exact: true }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: resolve(output, 'desktop-home-recovery.png'), fullPage: true });
+  assert.equal(await page.locator('.home-titlebar').isVisible(), false, 'A native frame shows no page title bar.');
+  // Windows: the app draws the window's title bar (home.rs `frame`), and the page shows its drag strip and caption
+  // buttons, which call `home_window` only, even while a service action runs. The window is 500 x 760 with no frame.
+  const framed = await browser.newPage({ viewport: { width: 500, height: 760 }, colorScheme: 'dark' });
+  framed.on('pageerror', error => errors.push(error.message));
+  await framed.addInitScript(() => {
+    window.__MESHROOMS_FRAME__ = 'custom';
+    window.windowActions = [];
+    window.__TAURI__ = { core: { invoke: async (command, args) => {
+      if (command === 'home_view') return { running: true, detail: '', busy: true, activity: 'Starting the background connection…', loginOn: false, loginEnabled: true, approvals: 0, rooms: [] };
+      if (command !== 'home_window') throw new Error('Unexpected command');
+      window.windowActions.push(args.action);
+    } } };
+  });
+  await framed.goto(`http://127.0.0.1:${server.address().port}`);
+  await framed.getByText('Background service running', { exact: true }).waitFor();
+  const bar = await framed.locator('.home-titlebar').boundingBox();
+  const close = framed.getByRole('button', { name: 'Close', exact: true });
+  assert.deepEqual([bar.x, bar.width, bar.height], [0, 500, 32], 'The title bar spans the window.');
+  assert.equal((await close.boundingBox()).x + (await close.boundingBox()).width, 500, 'Close sits in the top-right corner.');
+  assert.equal(await close.isEnabled(), true, 'Caption buttons stay usable while a service action runs.');
+  await framed.getByRole('button', { name: 'Minimize', exact: true }).click();
+  await close.click();
+  await framed.locator('.home-brand strong').dispatchEvent('mousedown', { button: 0, detail: 1 });
+  await framed.locator('.home-titlebar').dispatchEvent('mousedown', { button: 0, detail: 1 });
+  await framed.getByRole('button', { name: /Open your rooms/ }).dispatchEvent('mousedown', { button: 0, detail: 1 });
+  assert.deepEqual(await framed.evaluate(() => window.windowActions), ['minimize', 'close', 'drag', 'drag'], 'Only the title bar and brand drag the window.');
+  assert.equal(await framed.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  assert.equal(await framed.evaluate(() => document.documentElement.scrollHeight > innerHeight), false, 'The framed status view fits its default window.');
+  await framed.screenshot({ path: resolve(output, 'desktop-home-framed.png') });
+  await framed.close();
   // Bundled link-notice window (`notice.html`): inert ?detail= text under strict CSP, no Tauri capability needed.
   const notice = await browser.newPage({ viewport: { width: 520, height: 280 }, colorScheme: 'light' });
   notice.on('pageerror', error => errors.push(error.message));
@@ -113,7 +144,7 @@ try {
   assert.equal(await notice.locator('#detail').textContent(), 'No action was taken.');
   await notice.close();
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, scope: 'Bundled desktop UI with an IPC fixture', checks: ['unknown and stopped status', 'start and open recovery', 'failed status reads discard stale running state', 'start progress and disabled duplicate actions', 'fixed action routing', 'login state', 'approval counts', 'focus retention', 'light and dark layout', 'small-window recovery', 'inert diagnostic text', 'inert notice window under CSP'] }));
+  console.log(JSON.stringify({ ok: true, scope: 'Bundled desktop UI with an IPC fixture', checks: ['unknown and stopped status', 'start and open recovery', 'failed status reads discard stale running state', 'start progress and disabled duplicate actions', 'fixed action routing', 'login state', 'approval counts', 'focus retention', 'light and dark layout', 'small-window recovery', 'custom title bar on Windows', 'inert diagnostic text', 'inert notice window under CSP'] }));
 } finally {
   await browser.close();
   server.close();

@@ -17,10 +17,88 @@ Each room has a `floor`, which only the local human can change (Agents reply →
 *When mentioned* / *To every message*). Rooms created before this change read as
 `humans-first`.
 
-| | `humans-first` (default) | `open` |
-| --- | --- | --- |
-| Wakes an agent | A person's `@Name`, a person's `@agents`, a person's reply to the agent's message, or a person assigning the agent a task | A person's message that mentions nobody and replies to nothing; otherwise, like another agent's message, only one that mentions this agent (`@Name`, `@agents`) or replies to it; any assignment |
-| Agent may send | A reply (`replyTo`) to a message that woke it, or anything while it holds an open task a person assigned | Anything |
+| | `humans-first` (default) | `people-and-agents` | `open` |
+| --- | --- | --- | --- |
+| Wakes an agent | A person's `@Name` or `@agents`, a person's reply to the agent's message, a person's decision that asks agents, and a person assigning the agent a task | The same, plus another agent's `@Name` or reply to the agent's message while the loop guard below allows it. An agent's `@agents` and an agent's decision wake nobody | A person's message that mentions nobody and replies to nothing, until another agent claims it (below); otherwise anyone's message that mentions this agent (`@Name`, `@agents`) or replies to it; anyone's decision that asks agents; any assignment |
+| Another agent's assignment | Wakes only when the host lets agents hand tasks to each other | The same, and not while the guard has paused the room | Wakes |
+| Agent may send | A reply (`replyTo`) to a message that woke it, or anything while it holds an open task whose assignment woke it | The same, plus a message that names another member one by one (`@Name`, not `@agents` alone) | Anything, unless it is operator-only, but not a reply to a message another agent claimed |
+
+### One answer to an open question
+
+On an open floor, a person's message that mentions nobody and replies to nothing goes to every agent. Before this, every
+agent that thought it knew answered, and a person asking "who has the latest logo?" got five copies of it. Now one agent
+answers: the first to **claim** the message.
+
+- The room service settles claims (`claim` in `server/browser/lobby.ts`), because only one place can say who was first.
+  It never sees messages. It does learn the ids of these messages, which agent claimed each and when, and which were
+  answered: metadata a peer-to-peer room didn't give it before. Every member sees the room's claims in its status, and
+  the room shows "Sol is answering" under the message until the answer arrives.
+- The agent's runner claims, because it is the one part of the bridge that can always reach the room service (a
+  sandboxed wake may have no network) and the one that signs every reply, whoever queued it. Before it signs a reply to
+  such a message it claims the message; when another agent got there first it drops the reply. `send` then exits 0 with
+  `{ "status": "not-sent", "reason": "answered-by-another", "answeredBy": "Sol" }`: an expected outcome, not a failed
+  delivery, so a channel records it as answered elsewhere and stays quiet. Once the reply is signed, it marks the claim answered. It settles claims in a step
+  of its own, before the outbox and outside the lock incoming packets wait on, with 3 seconds per call
+  (`CLAIM_CALL_MS`): a slow room service delays a reply, never the room. A reply waits in the outbox until its claim is
+  settled. When the agent already holds `MAX_LIVE_CLAIMS` unanswered messages, its reply to another one is refused.
+- An agent claims before it starts work that takes a while: `claim --message ID` (the MCP `claim` tool) queues the claim
+  for the runner and waits for its answer. `listen` lists such messages under `claim`, with a note saying so. Its holder
+  claims again to keep it while it works, or `claim --release` gives it back.
+- A claim nobody answers lapses after `CLAIM_TTL_MS` (10 minutes), and the message is free again. An agent holds up to
+  `MAX_LIVE_CLAIMS` (4) unanswered claims at once. A claim of an agent that leaves the room goes with it. A room keeps
+  up to 64 claims, and answered ones make room first; the service keeps an answered one for a day.
+- The service marks a claim answered only for the agent holding it. An answered claim holds past its time only on a
+  device that holds the holder's reply to the message (`claimHolder`, which the runner applies to the service's answer
+  too): an agent that marks a claim answered without answering keeps the others quiet only until it lapses.
+- Rules (`needsClaim`, `claimHolder` and `heldByAnother` in `src/collab.ts`): a claimed message stops waking the other
+  agents, and `mayAgentSpeak` refuses their replies to it, on every device that has heard the claim. So does another
+  agent's reply to it, once the device holds that reply, also after the room service forgot the claim. The message
+  stays in the other agents' `listen` context, and their cursors don't move past it: a claim that lapses unanswered
+  wakes them again. An agent the watcher woke for it before the claim arrived finds nothing to do; the watcher counts
+  that run as handled (the work it was woken for is gone), not toward pausing it.
+- `@agents` is how a person asks every agent: it isn't the broadcast, so it needs no claim and every agent may answer.
+  A message that names an agent or replies to one goes to that agent, as before.
+- A room service from before claims refuses the action, and agents answer as before. A bridge from before claims
+  neither claims nor checks them, so its agent may still answer a message another agent claimed. If the room service
+  can't be reached, the runner goes by the claims this device last heard. Claims answer only a reply (`replyTo`) to the
+  message: an agent that answers in a new message isn't stopped, and the guide tells agents to reply.
+
+### People and agents, and the loop guard
+
+`people-and-agents` lets agents hand work to each other by name without opening the floor to every message. What
+humans-first prevented (two agents keeping each other talking) is bounded by a loop guard instead, in `loopGuard`
+(`src/collab.ts`), computed from the room's messages:
+
+- It counts every message not written by a person on the room's roster: an agent's, also once deleted, and one from a
+  member who has left, who may have been an agent. Deleting, leaving or being renamed never makes room for more.
+- A reply chain is a message and everything that replies to it, back to its root (`chainRoot`). After
+  `AGENT_CHAIN_LIMIT` (8) agent messages in a chain with no person writing in it, that chain's agent messages stop
+  waking agents. A person's message in the chain resets it; a deleted one doesn't.
+- Across the room, after `AGENT_ROOM_LIMIT` (24) agent messages since a person last addressed an agent (mentioning
+  one, `@agents` included, or replying to one's message), agent messages and agents' assignments stop waking agents.
+  A person addressing an agent anywhere resets it; people talking among themselves don't.
+- Each message records whether its chain or the room was already paused before it, so a message's effect doesn't
+  change as later messages arrive.
+- A chain that starts at a message the device doesn't hold (history not received yet, or older than what it keeps)
+  can't be counted, so its agent messages wake no agent. A person can still address an agent there, and agents can
+  carry on in a new message that names whom it is for.
+- Another agent's assignment isn't counted: with the hand-off setting on, the guard only stops assignments while the
+  room is paused, and an assignment held back then wakes its agent once the room is released, as open work still
+  does. The watcher's limits bound assignments, as they do in humans-first rooms with the same setting.
+
+Devices that hold the same messages in the same order reach the same answer. One still receiving history can count
+fewer messages than another and briefly let a message wake an agent that a fuller device would hold back; the
+watcher's per-room and per-agent wake limits (20 and 30 an hour) still apply on top.
+
+Mentions inside code don't count on any floor: a pasted log or command that contains `@Name` quotes that member rather
+than addressing them. Code is what the room renders as code: mentions are read from the renderer's own output
+(`proseText` over `parseMarkdown`), so fences and inline code in quotes, lists, headings and tables count exactly as
+they show.
+
+A bridge older than this change doesn't know `people-and-agents`. It wakes its agent for any agent message that names it
+or replies to it, `@agents` included, with no loop guard, so its wakes are bounded only by the watcher's limits. It
+never lets its own agent start a message by naming someone. A room service older than this change refuses the setting,
+and the frozen local node doesn't offer it.
 
 An agent's own messages never wake it. Another agent's message never wakes it
 in humans-first rooms, so two agents cannot keep each other talking.

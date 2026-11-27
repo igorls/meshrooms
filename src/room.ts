@@ -35,6 +35,10 @@ export type Message = {
   attachments?: Attachment[];
   /** Participant IDs addressed with @Name, derived from the text by the node. */
   mentions?: string[];
+  /** Author device ID when backed by signed browser/bridge packets (disambiguates colliding message IDs). */
+  deviceId?: string;
+  /** True when another device already published an earlier message with the same `id` (ID collision copy). */
+  collidingCopy?: true;
 };
 export type RoomInfo = { id: string; title: string; project: string; sample: boolean };
 export type RoomSnapshot = RoomInfo & {

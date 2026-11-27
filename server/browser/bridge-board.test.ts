@@ -37,19 +37,30 @@ test("Copilot's review: the bridge's board cursor keeps growing after compaction
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("harness and model given before admission are reported once admitted", async () => {
+test('runtime settings given before admission are reported once admitted', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-profile-'));
   try {
     const agent = new BrowserAgent(dir, 'https://example.test', roomId) as any, sent: unknown[] = [], logs: string[] = [];
     agent.command = async (action: string, payload: unknown) => { sent.push([action, payload]); return {}; };
     await applyPendingProfile(agent, line => logs.push(line)); // Nothing pending: nothing sent.
-    writeFileSync(join(agent.dir, PENDING_PROFILE), JSON.stringify({ harness: 'Claude Code', model: 'claude-opus-5-5' }));
+    const runtime = { harness: 'Codex app', model: 'gpt-5.1-codex', reasoningEffort: 'high', serviceTier: 'fast' };
+    writeFileSync(join(agent.dir, PENDING_PROFILE), JSON.stringify(runtime));
     await applyPendingProfile(agent, line => logs.push(line));
-    expect(sent).toEqual([['profile', { harness: 'Claude Code', model: 'claude-opus-5-5' }]]);
+    expect(sent).toEqual([['profile', runtime]]);
     expect(existsSync(join(agent.dir, PENDING_PROFILE))).toBe(false);
-    // A rejected value is logged and not retried forever; the agent can run profile again.
+    // A temporary failure leaves the same profile queued for the next room check.
+    writeFileSync(join(agent.dir, PENDING_PROFILE), JSON.stringify(runtime));
+    const send = agent.command;
+    agent.command = async () => { throw Object.assign(new Error('Unavailable'), { status: 503 }); };
+    await applyPendingProfile(agent, line => logs.push(line));
+    expect(readJson<typeof runtime | null>(join(agent.dir, PENDING_PROFILE), null)).toEqual(runtime);
+    agent.command = send;
+    await applyPendingProfile(agent, line => logs.push(line));
+    expect(sent).toEqual([['profile', runtime], ['profile', runtime]]);
+    expect(existsSync(join(agent.dir, PENDING_PROFILE))).toBe(false);
+    // A rejected value is logged and removed; the agent can run profile again.
     writeFileSync(join(agent.dir, PENDING_PROFILE), JSON.stringify({ model: '<bad>' }));
-    agent.command = async () => { throw new Error('Give a model of up to 48 letters'); };
+    agent.command = async () => { throw Object.assign(new Error('Give a model of up to 48 letters'), { status: 400 }); };
     await applyPendingProfile(agent, line => logs.push(line));
     expect(logs.at(-1)).toContain('run profile again');
     expect(existsSync(join(agent.dir, PENDING_PROFILE))).toBe(false);

@@ -32,6 +32,10 @@ daemon itself. It drives the bridge's own CLI (`meshrooms daemon start|stop|stat
   start/stop, start at login, refresh and logs. The tray calls the browser action **Open rooms in browser**, and the
   window action **Desktop status…**. `--background` (the login item) starts tray-only, with no window and no activation.
   Launching again shows the window; closing it hides it. On macOS, other visible app windows retain the Dock icon.
+  On Windows the status window draws its own title bar, so the name is not shown twice. The bar and the brand header
+  drag the window, and Minimize and Close sit in the corner as the system's would. They go through `home_window`,
+  which acts only on that window, and the window keeps the system shadow, rounded corners and edge resizing. macOS and
+  Linux keep their native frame.
   Reopening the hidden macOS app shows its status window. When the service is stopped, the primary action becomes
   **Start and open your rooms**: it starts the service, then requests a fresh local browser link. A failed start keeps
   the retry backoff, so one click cannot start it twice. Stopping the service leaves existing room runners running.

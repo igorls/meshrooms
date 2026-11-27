@@ -1,5 +1,6 @@
 // Runs only in the local UI smoke's scratch person home and loopback room service.
 import assert from 'node:assert/strict';
+import { roomsLink } from './check-room-draft.mjs';
 
 export async function checkLocalRecovery(page) {
   const composer = () => page.locator('.browser-composer').getByRole('combobox', { name: /^Message / });
@@ -45,7 +46,7 @@ export async function checkLocalRecovery(page) {
     const roomUrl = page.url();
     await Promise.all([
       page.waitForEvent('dialog').then(async dialog => { assert.equal(dialog.type(), 'beforeunload'); await dialog.dismiss(); }),
-      page.getByRole('link', { name: 'Meshrooms rooms', exact: true }).click({ noWaitAfter: true }),
+      roomsLink(page).click({ noWaitAfter: true }),
     ]);
     assert.equal(page.url(), roomUrl);
   } finally { release(); }

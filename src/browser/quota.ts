@@ -10,8 +10,14 @@
  * flood in an envelope; what that can do is bounded by the per-member caps (live reaction keys, decision shares, task
  * revision jumps) and the room-wide log caps, not by this quota.
  */
-export type QuotaKind = 'message' | 'task' | 'decision' | 'reaction' | 'retract';
+export type QuotaKind = 'message' | 'history' | 'task' | 'decision' | 'reaction' | 'retract';
 export const QUOTA_PER_MINUTE = 60, QUOTA_BURST = 20;
+/**
+ * History replication receive quota per author member: a higher burst (512) and refill (600/min) lets a newcomer
+ * or newly paired device catch up a busy single-author room without stalling while still capping sustained pushes,
+ * with `QuotaDrops` resuming cleanly if a single author exceeds the burst.
+ */
+export const HISTORY_QUOTA_PER_MINUTE = 600, HISTORY_QUOTA_BURST = 512;
 /** A peer whose state was dropped over quota is asked for it again once no drop has happened for this long. */
 export const QUOTA_QUIET_MS = 5000;
 
@@ -37,14 +43,26 @@ const UNIT = 60_000;
 
 export class ReceiveQuota {
   private buckets = new Map<string, Bucket>();
-  constructor(private now: () => number = () => Date.now(), private perMinute = QUOTA_PER_MINUTE, private burst = QUOTA_BURST, private maxBuckets = 512) {}
+  constructor(
+    private now: () => number = () => Date.now(),
+    private perMinute = QUOTA_PER_MINUTE,
+    private burst = QUOTA_BURST,
+    private maxBuckets = 512,
+    private historyPerMinute = HISTORY_QUOTA_PER_MINUTE,
+    private historyBurst = HISTORY_QUOTA_BURST,
+  ) {}
+  private limits(kind: QuotaKind) {
+    return kind === 'history'
+      ? { perMinute: this.historyPerMinute, burst: this.historyBurst }
+      : { perMinute: this.perMinute, burst: this.burst };
+  }
   private bucket(memberId: string, kind: QuotaKind) {
-    const key = `${kind}:${memberId}`, at = this.now();
+    const key = `${kind}:${memberId}`, at = this.now(), { perMinute, burst } = this.limits(kind);
     let bucket = this.buckets.get(key);
     if (bucket) {
       this.buckets.delete(key); // Re-inserted below, so the map stays in least-recently-used order.
-      bucket.tokens = Math.min(this.burst * UNIT, bucket.tokens + Math.max(0, at - bucket.at) * this.perMinute); bucket.at = at;
-    } else bucket = { tokens: this.burst * UNIT, at, reported: -Infinity };
+      bucket.tokens = Math.min(burst * UNIT, bucket.tokens + Math.max(0, at - bucket.at) * perMinute); bucket.at = at;
+    } else bucket = { tokens: burst * UNIT, at, reported: -Infinity };
     this.buckets.set(key, bucket);
     if (this.buckets.size > this.maxBuckets) this.buckets.delete(this.buckets.keys().next().value!);
     return bucket;

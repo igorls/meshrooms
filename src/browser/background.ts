@@ -20,10 +20,11 @@ import { clearWaiting, countUnread, publishCount, publishedCounts, readPosition,
 export type RecentRoom = { id: string; title: string };
 
 /**
- * Background rooms poll room status every 6 s instead of 1.5 s. It can't be much slower: the service reports a device
- * online only within 10 s of its last poll, and peers drop the connection of a device that isn't online.
+ * Without status pushed over the relay socket, background rooms poll room status every 10 s. It can't be much slower:
+ * the service reports a device online only within 25 s of its last status, and peers drop the connection of a device
+ * that isn't online. While pushes arrive (they also keep the device online), a background room polls nothing.
  */
-export const BACKGROUND_POLL_MS = 6000;
+export const BACKGROUND_POLL_MS = 10_000;
 /** At most this many rooms in the background: the most recently opened. Rooms past it show no count. */
 export const BACKGROUND_ROOMS = 10;
 /**
@@ -205,11 +206,15 @@ export class BackgroundRoom {
     this.position = await readPosition(this.deviceId, this.roomId, this.messages.map(m => m.packet.body), fence);
     this.recount();
     // A write fenced out (another tab claimed the room) stops the engine: then this room stops polling too.
+    let watching = false;
     while (!this.stopping && !engine.isStopped()) {
       const started = Date.now();
       try {
-        const next = await this.api.command('status', this.roomId, { session, cursor, epoch }, this.abort.signal);
+        const pushed = engine.statusLive() ? engine.takePushedStatus() : undefined;
+        let next = pushed ?? await this.api.command('status', this.roomId, { session, cursor, epoch }, this.abort.signal);
         if (this.stopping) break;
+        // A push may still carry signals handled before its ack reached the service: each is applied once.
+        if (next.epoch === epoch && next.signals?.length) next = { ...next, signals: next.signals.filter(s => s.seq > cursor) };
         if (next.epoch !== epoch) cursor = 0;
         epoch = next.epoch;
         // Removed from the room (or never admitted on this device): nothing to show here any more.
@@ -217,6 +222,8 @@ export class BackgroundRoom {
         this.status = next;
         await engine.update(next);
         for (const signal of next.signals || []) cursor = Math.max(cursor, signal.seq);
+        if (!watching) { watching = true; engine.watchStatus({ session, epoch, cursor }, () => { const wake = this.wake; this.wake = undefined; if (this.timer) { clearTimeout(this.timer); this.timer = undefined; } wake?.(); }); }
+        else engine.ackStatus(cursor, epoch);
         this.recount(); backoff = 0;
         if (!healthy) { healthy = true; this.events.healthy(); }
       } catch (e) {
@@ -228,9 +235,13 @@ export class BackgroundRoom {
       if (this.stopping) break;
       // Polls are spaced from start to start: a slow connection setup must not stretch the gap past the service's
       // 10 s presence window.
+      if (engine.statusLive() && engine.hasPushedStatus()) continue;
+      // With pushes, wait for the next one (at least every 10 s). Without, polls are spaced from start to start: a slow
+      // connection setup must not stretch the gap past the service's presence window.
+      const waitMs = engine.statusLive() ? engine.statusLiveRemainingMs() : Math.max(0, BACKGROUND_POLL_MS - (Date.now() - started));
       await new Promise<void>(resolve => {
         this.wake = resolve;
-        this.timer = setTimeout(() => { this.timer = undefined; resolve(); }, Math.max(0, BACKGROUND_POLL_MS - (Date.now() - started)) + backoff);
+        this.timer = setTimeout(() => { this.timer = undefined; resolve(); }, waitMs + backoff);
       });
     }
   }

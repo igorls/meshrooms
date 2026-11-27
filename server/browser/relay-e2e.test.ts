@@ -34,6 +34,8 @@ import {
   relayListenOnce,
   relaySendOnce,
   relayWakeRegister,
+  runBridge,
+  CONNECTING_POLL_MS,
 } from '../browser-agent';
 import { agentCli } from '../agent-cli';
 
@@ -192,6 +194,73 @@ async function setupRoomWithAgents(stack: TestStack, agentName = 'CloudBot') {
 }
 
 describe('E2E WSS + HTTPS Relay & Cloud Agent Acceptance Tests (Issue #139 Section 8)', () => {
+  test('RelayClient watches room status: live while pushes come, watched again on each new socket, and says when they stop', async () => {
+    const stack = startTestStack();
+    const { agent } = await setupRoomWithAgents(stack, 'Watcher');
+    const pushes: RoomStatus[] = [];
+    let lost = 0;
+    const client = await agent.createRelayClient({ relayUrl: stack.relayUrl, onStatus: s => { pushes.push(s); }, onStatusLost: () => { lost++; } });
+    client.watchStatus({ session: crypto.randomUUID(), cursor: 0 });
+    client.start();
+    try {
+      await waitFor(() => pushes.length > 0 && client.statusLive);
+      expect(pushes[0].memberId).toBeTruthy();
+      // A new socket watches again by itself.
+      client.stop();
+      expect(client.statusLive).toBe(false);
+      const before = pushes.length, lostBefore = lost;
+      client.start();
+      await waitFor(() => pushes.length > before && client.statusLive);
+      // The service gone: the client says so at once, so a caller waiting for a push polls instead.
+      stack.relay.close();
+      await waitFor(() => lost > lostBefore);
+      expect(client.statusLive).toBe(false);
+    } finally { client.stop(); }
+  }, 30_000);
+
+  test('a bridge runner takes room status from the relay socket and polls none while it does; with the socket gone it falls back to a slow poll', async () => {
+    const stack = startTestStack();
+    const { agent, agentId, roomId } = await setupRoomWithAgents(stack, 'Quiet');
+    // Count the status polls the agent's device makes: pushes never go through execute.
+    let polls = 0;
+    const execute = stack.lobby.execute.bind(stack.lobby);
+    stack.lobby.execute = (async (input: any, ...rest: any[]) => {
+      if (input?.command?.action === 'status' && input.publicKey === agentId.publicKey) polls++;
+      return (execute as any)(input, ...rest);
+    }) as typeof stack.lobby.execute;
+    const controller = new AbortController(), started = Date.now();
+    // Passes come round every 50 ms here instead of every second, so an idle poll without pushes would come every 0.5 s.
+    const bridge = runBridge(agent, () => {}, { signal: controller.signal, pause: ms => Bun.sleep(Math.min(ms, 50)) }).catch(() => undefined);
+    try {
+      // Read from the service's memory, not by a status of the host's, which would bring the host online for the agent
+      // to connect to, and its offers to a device that never answers would be what this measured.
+      const presence = (stack.lobby as unknown as { presence: Map<string, { session: string; at: number }> }).presence;
+      const online = async () => { const seen = presence.get(`${roomId}:${agentId.id}`); return seen && seen.at > Date.now() - 25_000 ? seen.session : undefined; };
+      for (const by = Date.now() + 15_000; !(await online()); await Bun.sleep(100)) if (Date.now() > by) throw new Error('the agent never came online');
+      // Let it settle on the socket, then watch a quiet stretch past one refresh: no status poll at all, while its
+      // presence moves forward from the pushes alone.
+      await Bun.sleep(1500);
+      const before = polls, seenAt = presence.get(`${roomId}:${agentId.id}`)!.at;
+      for (const by = Date.now() + 12_000; presence.get(`${roomId}:${agentId.id}`)!.at <= seenAt; await Bun.sleep(100))
+        if (Date.now() > by) throw new Error('no push refreshed the agent\u2019s presence');
+      expect(polls - before).toBe(0);
+      // The socket gone, and upgrades refused: it polls again, slowly (one pass in ten), never every pass.
+      stack.setBlockWsUpgrade(true);
+      stack.relay.close();
+      // Past the first 10 s of the agent's offer to the host (online from the setup's own status), which polls each pass
+      // for its answer: what's left is the idle fallback.
+      await Bun.sleep(Math.max(500, started + CONNECTING_POLL_MS + 500 - Date.now()));
+      const fallback = polls;
+      await Bun.sleep(2000);
+      const made = polls - fallback;
+      expect(made).toBeGreaterThan(0);
+      expect(made).toBeLessThan(12);
+    } finally {
+      controller.abort();
+      await bridge;
+    }
+  }, 60_000);
+
   test('renaming an agent changes no roster: entries carry ids, never names, so the host-signed roster stays valid and no new version is needed', async () => {
     const stack = startTestStack();
     const { roomId, host, agent, hostId, roster } = await setupRoomWithAgents(stack, 'CloudBot');
@@ -670,7 +739,7 @@ describe('E2E WSS + HTTPS Relay & Cloud Agent Acceptance Tests (Issue #139 Secti
       waitReceiptMs: 5_000,
     });
     expect(sendRes.status).toBe('stored-remotely');
-    expect(sendRes.devices).toBe(1);
+    expect(sendRes).toMatchObject({ devices: 1 });
     expect(hostReplies).toContain('Handled all 5 burst mentions!');
   });
 
@@ -1394,7 +1463,7 @@ describe('E2E WSS + HTTPS Relay & Cloud Agent Acceptance Tests (Issue #139 Secti
       now: () => nowMs,
     });
     expect(okRes.status).toBe('stored-remotely');
-    expect(okRes.devices).toBe(1);
+    expect(okRes).toMatchObject({ devices: 1 });
     expect(hostReceived).toContain('Fresh host-signed roster verified!');
   });
 });

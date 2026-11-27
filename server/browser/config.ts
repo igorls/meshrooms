@@ -22,6 +22,15 @@ export function browserConfig(env: Env = process.env) {
   const url = new URL(origin);
   const https = url.protocol === 'https:';
   if (url.origin !== origin || (!https && !['127.0.0.1', 'localhost'].includes(url.hostname))) throw new Error('Use an HTTPS origin, or loopback for local development.');
+  // Other addresses of the same service: the same rooms, reached through each (a former or a new domain). The main
+  // origin is left out when listed too, since a deploy's candidate is started with whichever origin it checks.
+  const aliases = [...new Set(urls(env.MESHROOMS_BROWSER_ALIASES) ?? [])].filter(alias => alias !== origin);
+  for (const alias of aliases) {
+    let parsed: URL | undefined;
+    try { parsed = new URL(alias); } catch { parsed = undefined; }
+    if (!parsed || parsed.origin !== alias || parsed.protocol !== url.protocol || (!https && !['127.0.0.1', 'localhost'].includes(parsed.hostname)))
+      throw new Error('MESHROOMS_BROWSER_ALIASES must list other origins of this service, each like the main origin (https://host), separated by commas.');
+  }
   const trustLoopbackProxy = env.MESHROOMS_TRUST_LOOPBACK_PROXY === '1';
   // Behind Nginx every request arrives from 127.0.0.1. Without the proxy's X-Real-IP, everyone shares one rate bucket.
   if (https && !trustLoopbackProxy) throw new Error('An HTTPS origin is served through the loopback reverse proxy. Set MESHROOMS_TRUST_LOOPBACK_PROXY=1 once Nginx overwrites X-Real-IP; otherwise every visitor would share one rate limit.');
@@ -48,8 +57,11 @@ export function browserConfig(env: Env = process.env) {
     return clean;
   });
   return {
-    port, origin, trustLoopbackProxy, dataDir: dataDirectory(env), invites: invites as 'required' | 'off',
+    port, origin, aliases, trustLoopbackProxy, dataDir: dataDirectory(env), invites: invites as 'required' | 'off',
     maxRooms: positive(env, 'MESHROOMS_MAX_ROOMS', 256, true), idleDays: idleDays(env),
+    // Lobby requests a minute per address (IPv4, or IPv6 /64). Behind the proxy one address is often a whole network:
+    // several people, and each person's agents, every one of them polling.
+    apiLimit: positive(env, 'MESHROOMS_API_LIMIT', trustLoopbackProxy ? 3600 : 240, true),
     stunUrls: urls(env.MESHROOMS_STUN_URLS), turnUrls: urls(env.MESHROOMS_TURN_URLS), turnSecret: env.MESHROOMS_TURN_SECRET,
     relayEnabled, relayUrl,
     relaySecret: env.MESHROOMS_RELAY_SECRET,

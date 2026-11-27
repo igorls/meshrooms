@@ -57,7 +57,8 @@ test('default RATE_KEYS is large enough that one IPv6 /48 budget cannot evict ot
   expect(RATE_KEYS).toBe(32_768);
   let now = 0;
   const lobby = new BrowserLobby(':memory:', { origin });
-  // Behind Nginx, apiLimit is 1200/min -> one /48 gets 6,000/min across distinct /64s.
+  // A scaled case of the proxy's budget (3,600/min in production -> 18,000/min for a /48): at 1,200/min a /48 gets
+  // 6,000/min across distinct /64s, against the same table.
   const handler = browserHandler(lobby, origin, '.', { apiLimit: 1200, now: () => now, log: () => {} });
   try {
     // Exhaust an IPv4 client's own quota first.

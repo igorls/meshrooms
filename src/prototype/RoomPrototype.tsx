@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import type { Connection, Message, NodeSnapshot, Participant } from '../room';
 import { createRoomTransport } from '../transport';
 import type { Floor, Task } from '../collab';
@@ -25,7 +25,40 @@ function Icon({ name }: { name: IconName }) {
   return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 export function Wordmark({ demo }: { demo: boolean }) {
-  return <div className="wordmark"><svg viewBox="0 0 28 28" width="28" height="28" fill="none" aria-hidden="true"><path d="M5 8h8v8H5zM15 12h8v8h-8zM9 4h10v8M9 16v8h10v-4" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" /></svg>meshrooms<span className="proto-label">{demo ? 'demo' : 'local'}</span></div>;
+  const id = useId();
+  const shape = `${id}-m`, back = `${id}-mb`, k1 = `${id}-k1`, k2 = `${id}-k2`, k3 = `${id}-k3`, k4 = `${id}-k4`;
+  return <div className="wordmark"><svg viewBox="-4 0 208 208" width="28" height="28" aria-hidden="true">
+    <defs>
+      <path id={shape} d="M-29 0 C-29 -35 29 -35 29 0 Q29 5 10 3 L10 25 Q0 30 -10 25 L-10 3 Q-29 5 -29 0Z" />
+      <path id={back} d="M-29 0 C-29 -35 29 -35 29 0 Q29 5 10 3 L10 14 Q0 18 -10 14 L-10 3 Q-29 5 -29 0Z" />
+      <mask id={k1} maskUnits="userSpaceOnUse" x="-40" y="-40" width="280" height="280">
+        <rect x="-40" y="-40" width="280" height="280" fill="#fff" />
+        <use href={`#${back}`} transform="translate(100 61) rotate(10) scale(1.70)" fill="none" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+        <use href={`#${back}`} transform="translate(64 95) rotate(-15) scale(1.70)" fill="#000" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+        <use href={`#${back}`} transform="translate(136 95) rotate(15) scale(1.70)" fill="#000" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+        <use href={`#${shape}`} transform="translate(100 125) rotate(2) scale(1.70)" fill="#000" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+      </mask>
+      <mask id={k2} maskUnits="userSpaceOnUse" x="-40" y="-40" width="280" height="280">
+        <rect x="-40" y="-40" width="280" height="280" fill="#fff" />
+        <use href={`#${back}`} transform="translate(64 95) rotate(-15) scale(1.70)" fill="none" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+        <use href={`#${back}`} transform="translate(136 95) rotate(15) scale(1.70)" fill="#000" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+        <use href={`#${shape}`} transform="translate(100 125) rotate(2) scale(1.70)" fill="#000" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+      </mask>
+      <mask id={k3} maskUnits="userSpaceOnUse" x="-40" y="-40" width="280" height="280">
+        <rect x="-40" y="-40" width="280" height="280" fill="#fff" />
+        <use href={`#${back}`} transform="translate(136 95) rotate(15) scale(1.70)" fill="none" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+        <use href={`#${shape}`} transform="translate(100 125) rotate(2) scale(1.70)" fill="#000" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+      </mask>
+      <mask id={k4} maskUnits="userSpaceOnUse" x="-40" y="-40" width="280" height="280">
+        <rect x="-40" y="-40" width="280" height="280" fill="#fff" />
+        <use href={`#${shape}`} transform="translate(100 125) rotate(2) scale(1.70)" fill="none" stroke="#000" strokeWidth="4.5" strokeLinejoin="round" />
+      </mask>
+    </defs>
+    <g mask={`url(#${k1})`}><g transform="translate(100 61) rotate(10) scale(1.70)"><use href={`#${back}`} fill="#FF5268" /><path d="M-26 -2 C-26 -22 -5 -29 12 -22 C-5 -19 -13 -9 -12 2 Q-22 3 -26 -2Z" fill="#FFFFFF" opacity=".18" /><path d="M-7 4 Q0 6 7 4 L7 13 Q0 16 -7 13Z" fill="#000000" opacity=".18" /></g></g>
+    <g mask={`url(#${k2})`}><g transform="translate(64 95) rotate(-15) scale(1.70)"><use href={`#${back}`} fill="#FFB52E" /><path d="M-26 -2 C-26 -22 -5 -29 12 -22 C-5 -19 -13 -9 -12 2 Q-22 3 -26 -2Z" fill="#FFFFFF" opacity=".18" /><path d="M-7 4 Q0 6 7 4 L7 13 Q0 16 -7 13Z" fill="#000000" opacity=".18" /></g></g>
+    <g mask={`url(#${k3})`}><g transform="translate(136 95) rotate(15) scale(1.70)"><use href={`#${back}`} fill="#00C7A5" /><path d="M-26 -2 C-26 -22 -5 -29 12 -22 C-5 -19 -13 -9 -12 2 Q-22 3 -26 -2Z" fill="#FFFFFF" opacity=".18" /><path d="M-7 4 Q0 6 7 4 L7 13 Q0 16 -7 13Z" fill="#000000" opacity=".18" /></g></g>
+    <g mask={`url(#${k4})`}><g transform="translate(100 125) rotate(2) scale(1.70)"><use href={`#${shape}`} fill="#2657D7" /><path d="M-26 -2 C-26 -22 -5 -29 12 -22 C-5 -19 -13 -9 -12 2 Q-22 3 -26 -2Z" fill="#FFFFFF" opacity=".18" /><path d="M-7 4 Q0 6 7 4 L7 23 Q0 27 -7 23Z" fill="#000000" opacity=".18" /></g></g>
+  </svg>meshrooms<span className="proto-label">{demo ? 'demo' : 'local'}</span></div>;
 }
 function Avatar({ name, agent = false }: { name: string; agent?: boolean }) {
   return <span className={`avatar ${agent ? 'agent' : ''}`} aria-hidden="true">{agent ? <svg width="19" height="19" viewBox="0 0 20 20" fill="none"><path d="M6 4 2 10l4 6m8-12 4 6-4 6M11 3 9 17" stroke="currentColor" strokeWidth="1.7" /></svg> : name.slice(0, 1)}</span>;

@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { base64, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, type RoomStatus } from '../../src/browser/protocol';
-import { BrowserLobby, DECLINE_COOLDOWN_MS, DEVICES_PER_MEMBER, LINK_FAILURES, LINK_FAILURE_WINDOW, MAX_BLOCKED_DEVICES, MAX_SIGNALS_PER_DEVICE, MAX_SIGNALS_PER_SENDER, PRESENCE_MS, SIGNAL_TTL_MS } from './lobby';
+import { BrowserLobby, CLAIM_KEEP_MS, DECLINE_COOLDOWN_MS, MAX_CLAIMS, MAX_LIVE_CLAIMS, DEVICES_PER_MEMBER, LINK_FAILURES, LINK_FAILURE_WINDOW, MAX_BLOCKED_DEVICES, MAX_SIGNALS_PER_DEVICE, MAX_SIGNALS_PER_SENDER, PRESENCE_MS, SIGNAL_TTL_MS } from './lobby';
 import { browserHandler } from './http';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import { testDirectory } from '../test-directory';
@@ -20,7 +20,10 @@ test('proxy quotas isolate real clients and ignore forged forwarding from direct
     expect(await (await handler(new Request(`${origin}/api/lobby/health`), '127.0.0.1')).json()).toMatchObject({ ok: true, revision: 'test-revision', minAgentVersion: MIN_AGENT_VERSION });
     expect((await health('192.0.2.1')).status).toBe(404);
     expect((await health('192.0.2.1')).status).toBe(404);
-    expect((await health('192.0.2.1')).status).toBe(429);
+    const refused = await health('192.0.2.1');
+    expect(refused.status).toBe(429);
+    // Told when to come back, so clients wait instead of retrying at once.
+    expect(refused.headers.get('retry-after')).toBe('5');
     expect((await health('192.0.2.2')).status).toBe(404);
     expect((await health('192.0.2.3', '192.0.2.20')).status).toBe(404);
     expect((await health('192.0.2.4', '192.0.2.20')).status).toBe(404);
@@ -59,7 +62,7 @@ test('link is only a lobby; only host admission exposes members and allows signa
     const host = await client(lobby), guest = await client(lobby), stranger = await client(lobby);
     const room = crypto.randomUUID();
     await host.send('create', room, { title: 'Review', name: 'Alex', label: 'Desktop' });
-    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Review' });
+    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Review', historyForNewcomers: false });
     expect((await guest.status(room)).members).toBeUndefined();
     await guest.send('request', room, { name: 'Sam', label: 'Laptop', kind: 'person' });
     const request = (await host.status(room)).requests![0];
@@ -711,14 +714,14 @@ test('the host controls room settings, and can require approval for guests’ ag
     await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
     const sam = await admitPerson(lobby, host, room, 'Sam');
     // SEC-12: new rooms approve guests' agents by default.
-    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true, hostApprovesDevices: false });
+    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: false, guestAgentApproval: true, hostApprovesDevices: false, historyForNewcomers: false });
     await expect(sam.send('settings', room, { floor: 'open' })).rejects.toThrow('Only the host');
-    await expect(host.send('settings', room, { floor: 'loud' })).rejects.toThrow('when agents reply');
+    await expect(host.send('settings', room, { floor: 'loud' })).rejects.toThrow('who wakes agents');
     await expect(host.send('settings', room, { guestAgentApproval: 'yes' })).rejects.toThrow('on or off');
     await host.send('settings', room, { guestAgentApproval: false, agentAssignmentsWake: true });
-    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: false, hostApprovesDevices: false });
+    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: false, hostApprovesDevices: false, historyForNewcomers: false });
     await host.send('settings', room, { guestAgentApproval: true });
-    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: true, hostApprovesDevices: false });
+    expect((await sam.status(room)).settings).toEqual({ floor: 'humans-first', agentAssignmentsWake: true, guestAgentApproval: true, hostApprovesDevices: false, historyForNewcomers: false });
 
     // A guest's agent waits for the host; the host's own agent joins right away.
     const samAgent = await client(lobby), hostAgent = await client(lobby), orphan = await client(lobby);
@@ -798,7 +801,7 @@ test('members set small pictures for themselves and their agents; the host can o
   } finally { lobby.close(); }
 });
 
-test('agents report their harness and model; only the agent or its operator sets them, and the host can clear them', async () => {
+test('agents report their runtime; only the agent or its operator sets it, and the host can clear it', async () => {
   const lobby = new BrowserLobby(':memory:', { origin });
   try {
     const host = await client(lobby), room = crypto.randomUUID();
@@ -810,17 +813,22 @@ test('agents report their harness and model; only the agent or its operator sets
     const codexId = (await agent.status(room)).memberId!, samId = (await sam.status(room)).memberId!;
     const codex = async () => (await host.status(room)).members!.find(m => m.id === codexId)!;
 
-    await agent.send('profile', room, { harness: ' Codex CLI ', model: 'gpt-5.1-codex' });
-    expect(await codex()).toMatchObject({ harness: 'Codex CLI', model: 'gpt-5.1-codex' });
+    await agent.send('profile', room, { harness: ' Codex CLI ', model: 'gpt-5.1-codex', reasoningEffort: ' high ', serviceTier: 'fast' });
+    expect(await codex()).toMatchObject({ harness: 'Codex CLI', model: 'gpt-5.1-codex', reasoningEffort: 'high', serviceTier: 'fast' });
     await sam.send('profile', room, { model: 'o4-mini', memberId: codexId });
-    expect(await codex()).toMatchObject({ harness: 'Codex CLI', model: 'o4-mini' });
+    expect(await codex()).toMatchObject({ harness: 'Codex CLI', model: 'o4-mini', reasoningEffort: 'high', serviceTier: 'fast' });
+    await sam.send('profile', room, { reasoningEffort: 'medium', memberId: codexId });
+    expect(await codex()).toMatchObject({ reasoningEffort: 'medium', serviceTier: 'fast' });
     // Plain text only: nothing that could render as markup or pose as another line.
     for (const bad of ['<b>x</b>', 'a\nb', '', ' ', 'x'.repeat(49), '**bold**', '`code`']) await expect(agent.send('profile', room, { model: bad })).rejects.toThrow('up to 48');
     await expect(sam.send('profile', room, { harness: 'Claude Code' })).rejects.toThrow('Only agents');
     await expect(host.send('profile', room, { model: 'other', memberId: codexId })).rejects.toThrow('agent or its operator');
-    await host.send('profile', room, { harness: null, model: null, memberId: codexId });
-    expect(await codex()).not.toHaveProperty('model');
-    expect(await codex()).not.toHaveProperty('harness');
+    await expect(agent.send('profile', room, { reasoningEffort: '<high>' })).rejects.toThrow('up to 48');
+    await expect(agent.send('profile', room, { serviceTier: 1 })).rejects.toThrow('up to 48');
+    await expect(sam.send('profile', room, { reasoningEffort: 'high' })).rejects.toThrow('Only agents');
+    await expect(host.send('profile', room, { serviceTier: 'default', reasoningEffort: null, memberId: codexId })).rejects.toThrow('agent or its operator');
+    await host.send('profile', room, { harness: null, model: null, reasoningEffort: null, serviceTier: null, memberId: codexId });
+    for (const key of ['model', 'harness', 'reasoningEffort', 'serviceTier']) expect(await codex()).not.toHaveProperty(key);
     // A picture and the runtime can change together; an empty change is refused.
     await agent.send('profile', room, { avatar: png(32, 32), harness: 'Claude Code' });
     expect(await codex()).toMatchObject({ harness: 'Claude Code', avatar: expect.stringMatching(/^[a-f0-9]{16}$/) });
@@ -854,7 +862,7 @@ test('people pin repositories one at a time; agents and strangers cannot', async
     expect((await host.status(room)).repositories).toHaveLength(7);
     for (const r of (await host.status(room)).repositories!) await host.send('repositories', room, { unpin: r });
     expect((await host.status(room)).repositories).toBeUndefined();
-    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Work' }); // never shown outside the room
+    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Work', historyForNewcomers: false }); // never shown outside the room
   } finally { lobby.close(); }
 });
 
@@ -868,7 +876,7 @@ test('SEC-8: display names and titles normalize NFKC/control chars and enforce c
     await expect(host.send('create', room, { title: 'Work', name: 'Ａｇｅｎｔｓ', label: 'Desktop' })).rejects.toThrow('reserved');
     // Normalized titles and display names strip invisible/bidi chars and collapse whitespace.
     await host.send('create', room, { title: '  \u202eProject   Room\u200b ', name: '  Ａｌｅｘ   M.\u200b ', label: 'Desktop' });
-    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Project Room' });
+    expect(lobby.publicRoom(room)).toEqual({ roomId: room, title: 'Project Room', historyForNewcomers: false });
     expect((await host.status(room)).members![0].name).toBe('Alex M.');
 
     // Lookalike person requests collide via NFKC + case-folding.
@@ -1162,4 +1170,147 @@ test('notices are capped, drop agents that left, and keep the most recent first-
     expect(last.every(r => r.memberId === ids[0])).toBe(true);
     expect(last.at(-1)!.to).toBe('Final');
   } finally { lobby.close(); }
+});
+
+test('the first agent to claim a message holds it; the others are told who, until it lapses, and an answer keeps it', async () => {
+  let now = Date.now(); const clock = () => now;
+  const lobby = new BrowserLobby(':memory:', { origin, now: clock });
+  try {
+    const host = await client(lobby, clock), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const join = async (name: string) => {
+      const agent = await client(lobby, clock);
+      await agent.send('agent-redeem', room, { token: ((await host.send('agent-invite', room, { name })) as { token: string }).token, label: 'Node' });
+      return agent;
+    };
+    const sol = await join('Sol'), neon = await join('Neon');
+    const idOf = async (name: string) => (await host.status(room)).members!.find(m => m.name === name)!.id;
+    const solId = await idOf('Sol'), neonId = await idOf('Neon');
+    const ask = crypto.randomUUID(), other = crypto.randomUUID();
+    const claim = async (who: typeof sol, messageId: string, extra: Record<string, unknown> = {}) => ((await who.send('claim', room, { messageId, ...extra })) as { claim: unknown }).claim;
+
+    // Sol gets there first; Neon is told Sol holds it, and holds nothing itself.
+    expect(await claim(sol, ask)).toMatchObject({ messageId: ask, memberId: solId, until: now + 600_000 });
+    expect(await claim(neon, ask)).toMatchObject({ memberId: solId });
+    // Every member sees who is answering, people included.
+    expect((await host.status(room)).claims).toEqual([expect.objectContaining({ messageId: ask, memberId: solId })]);
+    // Neon can't release Sol's claim; Sol can, and then Neon takes it.
+    expect(await claim(neon, ask, { release: true })).toMatchObject({ memberId: solId });
+    expect(await claim(sol, ask, { release: true })).toBeNull();
+    expect(await claim(neon, ask)).toMatchObject({ memberId: neonId });
+    // A claim nobody answers lapses: then the next agent takes it.
+    now += 600_001;
+    expect((await host.status(room)).claims).toBeUndefined();
+    expect(await claim(sol, ask)).toMatchObject({ memberId: solId });
+    // Its holder marks it answered: it holds past its time, and can't be given back.
+    expect(await claim(sol, ask, { answered: true })).toMatchObject({ memberId: solId, answered: true });
+    now += 3 * 600_000;
+    expect(await claim(neon, ask)).toMatchObject({ memberId: solId, answered: true });
+    expect(await claim(sol, ask, { release: true })).toMatchObject({ answered: true });
+    // An answered claim is kept a day, so a late agent still learns who answered; then it goes.
+    now += CLAIM_KEEP_MS;
+    expect(await claim(neon, ask)).toMatchObject({ memberId: neonId });
+    expect(await claim(neon, other)).toMatchObject({ messageId: other, memberId: neonId });
+
+    // Only a claim the agent holds can be marked answered.
+    await expect(sol.send('claim', room, { messageId: crypto.randomUUID(), answered: true })).rejects.toThrow('Claim the message before');
+    // People don't claim, and a claim names exactly one message.
+    await expect(host.send('claim', room, { messageId: other })).rejects.toThrow('Only agents');
+    await expect(sol.send('claim', room, { messageId: 'nope' })).rejects.toThrow('Claim one message');
+    await expect(sol.send('claim', room, { messageId: other, answered: true, release: true })).rejects.toThrow('Claim one message');
+    // An agent that leaves gives up what it held but didn't answer, in status at once too.
+    await host.send('remove', room, { memberId: neonId });
+    expect((await host.status(room)).claims).toBeUndefined();
+    expect(await claim(sol, other)).toMatchObject({ memberId: solId });
+
+    // No agent holds every open question: a few unanswered ones at a time, though it may keep, answer or release them.
+    const more = Array.from({ length: MAX_LIVE_CLAIMS - 1 }, () => crypto.randomUUID());
+    for (const id of more) await claim(sol, id);
+    await expect(sol.send('claim', room, { messageId: crypto.randomUUID() })).rejects.toThrow(`up to ${MAX_LIVE_CLAIMS} unanswered`);
+    expect(await claim(sol, more[0])).toMatchObject({ memberId: solId });
+    expect(await claim(sol, more[0], { answered: true })).toMatchObject({ answered: true });
+    expect(await claim(sol, crypto.randomUUID())).toMatchObject({ memberId: solId });
+  } finally { lobby.close(); }
+});
+
+test('a room keeps a bounded list of claims, letting answered ones go first', async () => {
+  let now = Date.now(); const clock = () => now;
+  const lobby = new BrowserLobby(':memory:', { origin, now: clock });
+  try {
+    const host = await client(lobby, clock), room = crypto.randomUUID();
+    await host.send('create', room, { title: 'Work', name: 'Alex', label: 'Desktop' });
+    await host.send('settings', room, { guestAgentApproval: false });
+    const agents = [];
+    for (const name of ['Sol', 'Neon']) {
+      const agent = await client(lobby, clock);
+      await agent.send('agent-redeem', room, { token: ((await host.send('agent-invite', room, { name })) as { token: string }).token, label: 'Node' });
+      agents.push(agent);
+    }
+    // Every live claim the agents may hold, then answered ones past the cap.
+    const live: string[] = [];
+    for (const agent of agents) for (let i = 0; i < MAX_LIVE_CLAIMS; i++) { const id = crypto.randomUUID(); live.push(id); await agent.send('claim', room, { messageId: id }); now += 1; }
+    for (let i = 0; i < MAX_CLAIMS; i++) {
+      const agent = agents[i % agents.length], messageId = crypto.randomUUID();
+      // Answered only on a claim the agent holds; its live claims are all taken, so it releases one and takes it back.
+      await agent.send('claim', room, { messageId: live[(i % agents.length) * MAX_LIVE_CLAIMS], release: true });
+      await agent.send('claim', room, { messageId });
+      await agent.send('claim', room, { messageId, answered: true });
+      await agent.send('claim', room, { messageId: live[(i % agents.length) * MAX_LIVE_CLAIMS] });
+      now += 1;
+    }
+    const claims = (await host.status(room)).claims!;
+    expect(claims).toHaveLength(MAX_CLAIMS);
+    // Every live claim is still there: the answered ones made room.
+    for (const id of live) expect(claims.some(k => k.messageId === id && !k.answered)).toBe(true);
+  } finally { lobby.close(); }
+});
+
+test('a service with a second address: commands naming either are accepted, each device hears of the relay at its own, and each request is answered as its host', async () => {
+  const other = 'http://localhost:4320';
+  const lobby = new BrowserLobby(':memory:', { origin, aliases: [other] });
+  try {
+    const room = crypto.randomUUID();
+    const host = await client(lobby), guest = await client(lobby, Date.now, other), stranger = await client(lobby, Date.now, 'http://127.0.0.2:4320');
+    await host.send('create', room, { title: 'Two doors', name: 'Alex', label: 'Laptop' });
+    expect((await host.status(room)).relayUrl).toBe('ws://127.0.0.1:4320/api/relay/v1');
+    // The same room through the other address.
+    await guest.send('request', room, { name: 'Robin', label: 'Phone', kind: 'person' });
+    await host.send('decide', room, { requestId: (await host.status(room)).requests!.find(r => r.name === 'Robin')!.id, admit: true });
+    const seen = await guest.status(room);
+    expect(seen.memberId).toBeTruthy();
+    expect(seen.relayUrl).toBe('ws://localhost:4320/api/relay/v1');
+    await expect(stranger.send('status', room, { session: crypto.randomUUID() })).rejects.toThrow('expired or is invalid');
+
+    const handle = browserHandler(lobby, [origin, other], 'dist');
+    const post = async (host: string, from: string) => (await handle(new Request(`http://${host}/api/lobby`, { method: 'POST',
+      headers: { Host: host, Origin: from, 'Content-Type': 'application/json' }, body: JSON.stringify(await guest.signed('status', room, { session: guest.session })) }))).status;
+    expect(await post('localhost:4320', other)).toBe(200);
+    // A page at one address doesn't speak for the other, and an unknown host is refused.
+    expect(await post('127.0.0.1:4320', other)).toBe(403);
+    expect(await post('localhost:4320', origin)).toBe(403);
+    // A command signed for one address isn't taken at the other, even from a page there.
+    expect(await post('127.0.0.1:4320', origin)).toBe(400);
+    expect((await handle(new Request('http://other.example/rooms', { headers: { Host: 'other.example' } }))).status).toBe(403);
+    // The Host header names the address, whatever the URL says.
+    expect((await handle(new Request(`${origin}/rooms`, { headers: { Host: 'other.example' } }))).status).toBe(403);
+    const health = await handle(new Request(`${origin}/api/lobby/health`, { headers: { Host: 'localhost:4320' } }));
+    expect(health.status).toBe(200);
+    // One policy for every address of the service: each address still takes only its own pages' requests.
+    expect(health.headers.get('content-security-policy')).toContain('ws://127.0.0.1:4320 ws://localhost:4320');
+    // The agent guide names the address it was fetched from.
+    const guide = await (await handle(new Request(`${other}/agent/${room}.md`, { headers: { Host: 'localhost:4320' } }))).text();
+    expect(guide).toContain(other);
+    expect(guide).not.toContain(origin);
+  } finally { lobby.close(); }
+
+  // A configured relay URL at one of the service's own addresses follows each device's address; one elsewhere is kept.
+  for (const [relayUrl, seen] of [['ws://127.0.0.1:4320/api/relay/v1', 'ws://localhost:4320/api/relay/v1'], ['wss://relay.example/api/relay/v1', 'wss://relay.example/api/relay/v1']]) {
+    const configured = new BrowserLobby(':memory:', { origin, aliases: [other], relayUrl });
+    try {
+      const room = crypto.randomUUID(), host = await client(configured, Date.now, other);
+      await host.send('create', room, { title: 'Relay', name: 'Alex', label: 'Laptop' });
+      expect((await host.status(room)).relayUrl).toBe(seen);
+    } finally { configured.close(); }
+  }
 });

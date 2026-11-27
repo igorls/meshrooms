@@ -48,6 +48,9 @@ pub fn parse(raw: &str) -> Result<Request, Invalid> {
     }
     let rest = raw.strip_prefix("meshrooms://").ok_or(Invalid::Shape)?;
     let (action, query) = rest.split_once('?').ok_or(Invalid::Shape)?;
+    // The Windows shell hands a registered scheme's link to its handler with a slash after the host: a browser's
+    // `meshrooms://pair?…` arrives as `meshrooms://pair/?…`. That one slash, and nothing else, is the same link.
+    let action = action.strip_suffix('/').unwrap_or(action);
     if !matches!(action, "join" | "pair") || query.is_empty() || query.contains('#') {
         return Err(Invalid::Shape);
     }
@@ -523,16 +526,40 @@ mod tests {
             "meshrooms://JOIN?x=y",
             "meshrooms://user@join?x=y",
             "meshrooms://join:1?x=y",
-            "meshrooms://join/?x=y",
+            "meshrooms://join//?x=y",
+            "meshrooms://join/x?x=y",
+            "meshrooms://other/?x=y",
             "meshrooms://other?x=y",
             "meshrooms://join?x=y#fragment",
             "meshrooms://join?x=\n",
             "meshrooms://join?x=\\",
             "meshrooms://join?x=é",
-            "meshrooms://pair/?v=2",
+            "meshrooms://pair//?v=2",
             "meshrooms://PAIR?v=2",
+            "meshrooms://PAIR/?v=2",
         ] {
-            assert!(parse(bad).is_err());
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        for bad in [join("https://rooms.example").replace("://join?", "://join//?"), with(&[]).replace("://pair?", "://pair//?")] {
+            assert!(parse(&bad).is_err(), "{bad}");
+        }
+    }
+    /// Windows' shell passes `meshrooms://pair?…` on as `meshrooms://pair/?…` (seen with a logging handler for a
+    /// throwaway scheme): both spellings are the same link, for pairing and for joining.
+    #[test]
+    fn the_slash_windows_adds_after_the_action_is_the_same_link() {
+        let joined = join("https://rooms.example");
+        let slashed = joined.replace("://join?", "://join/?");
+        assert!(matches!(parse(&slashed), Ok(Request::Join { ref room, .. }) if room == ROOM), "{slashed}");
+        assert!(matches!((parse(&joined), parse(&slashed)), (Ok(Request::Join { origin: a, .. }), Ok(Request::Join { origin: b, .. })) if a == b));
+        let paired = with(&[]).replace("://pair?", "://pair/?");
+        match parse(&paired) {
+            Ok(Request::Pair { origin, name, device, rooms, secret }) => {
+                assert_eq!((origin.as_str(), name.as_str(), device.as_str()), ("https://rooms.example", "Robin Lee", DEVICE));
+                assert_eq!(rooms, vec![ROOM.to_string(), ROOM2.to_string()]);
+                assert_eq!(secret, [0u8; 32]);
+            }
+            other => panic!("{paired}: {}", other.is_ok()),
         }
     }
     #[test]

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { launchAgentManager, runKeyManager, type Exec } from './startup';
+import { launchAgentManager, readRunValue, runKeyManager, type Exec } from './startup';
 import { testDirectory } from './test-directory';
 
 const plutil = (...args: string[]) => spawnSync('/usr/bin/plutil', args, { encoding: 'utf8' });
@@ -23,6 +23,24 @@ test('Windows Run-key registration passes -ExecutionPolicy Bypass before -File',
     expect(values.get('Meshrooms-test')).toContain(`-WindowStyle Hidden -ExecutionPolicy Bypass -File "${scriptPath}"`);
     expect(manager.apply(false)).toEqual({ installed: false, supported: true });
   } finally { directory.cleanup(); }
+});
+
+test.skipIf(process.platform !== 'win32')('a missing Run value reads as no value', () => {
+  expect(readRunValue(`MeshroomsMissing-${process.pid}-${Date.now()}`)).toBeNull();
+});
+
+// Writes and removes a throwaway Run value (never one Meshrooms uses), so it runs only when asked:
+// MESHROOMS_TEST_RUN_KEY=1. reg.exe prints in the OEM code page, so before the registry API read, a home folder
+// like this one never matched and start at login could not be verified.
+test.skipIf(process.platform !== 'win32' || !process.env.MESHROOMS_TEST_RUN_KEY)('a Run value with a non-ASCII path reads back exactly', () => {
+  const name = `MeshroomsTest-${process.pid}`, reg = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe');
+  const data = '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -File "C:\\Apps\\Ação Ñandú\\.meshrooms\\daemon\\start-at-login.ps1"';
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+  try {
+    expect(spawnSync(reg, ['add', key, '/v', name, '/t', 'REG_SZ', '/d', data, '/f'], { windowsHide: true }).status).toBe(0);
+    expect(readRunValue(name)).toBe(data);
+  } finally { spawnSync(reg, ['delete', key, '/v', name, '/f'], { windowsHide: true }); }
+  expect(readRunValue(name)).toBeNull();
 });
 
 // Uses a private LaunchAgents directory: the test never registers a real login item.

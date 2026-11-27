@@ -72,11 +72,20 @@ export function MentionText({ text, participants, viewerId, repositories }: { te
   return <>{rendered}</>;
 }
 
+/** Who wakes agents, named by who can do it; the chosen option says what it does. */
+export const FLOOR_OPTIONS: { floor: Floor; label: string; detail: string }[] = [
+  { floor: 'humans-first', label: 'Only people', detail: 'Agents reply when a person @mentions them, replies to them or assigns them a task. Agents can’t wake each other.' },
+  { floor: 'people-and-agents', label: 'People and agents', detail: 'An @mention or reply from anyone, person or agent, wakes the agent it names. A message that names nobody wakes nobody.' },
+  { floor: 'open', label: 'Every message', detail: 'Any @mention or reply wakes the agent it names, and agents may also reply to any message from a person. No pause.' },
+];
+
 export function FloorControl({ floor, disabled, onChange }: { floor: Floor; disabled: boolean; onChange: (floor: Floor) => void }) {
-  return <div className="floor-control" role="group" aria-label="When agents reply">
-    <span>Agents reply</span>
-    <button aria-pressed={floor === 'humans-first'} disabled={disabled} onClick={() => floor !== 'humans-first' && onChange('humans-first')}>When mentioned</button>
-    <button aria-pressed={floor === 'open'} disabled={disabled} onClick={() => floor !== 'open' && onChange('open')}>To every message</button>
+  return <div className="floor-control" role="group" aria-labelledby="floor-control-label">
+    <span id="floor-control-label">Who wakes agents</span>
+    {FLOOR_OPTIONS.map(option => <button key={option.floor} type="button" aria-pressed={floor === option.floor} disabled={disabled}
+      aria-describedby={floor === option.floor ? 'floor-control-detail' : undefined} onClick={() => floor !== option.floor && onChange(option.floor)}>
+      <b>{option.label}</b>{floor === option.floor && <small id="floor-control-detail">{option.detail}</small>}
+    </button>)}
   </div>;
 }
 
@@ -84,7 +93,9 @@ export function floorNote(floor: Floor | undefined, hasAgents: boolean) {
   if (!hasAgents || !floor) return 'Only what you send is shared with this room. Drafts stay in this browser view.';
   return floor === 'humans-first'
     ? 'Agents are listening. They reply only when you @mention them, write @agents, reply to them, or assign them a task.'
-    : 'Open floor: agents may reply to every message from a person. @mention to direct a request.';
+    : floor === 'people-and-agents'
+      ? 'Agents are listening. They reply when a person or another agent @mentions them or replies to them.'
+      : 'Open floor: agents may reply to every message from a person. @mention to direct a request.';
 }
 
 export type MentionOption = { key: string; label: string; detail: string; agent: boolean };

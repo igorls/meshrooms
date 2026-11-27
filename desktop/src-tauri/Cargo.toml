@@ -24,6 +24,8 @@ sha2 = "0.10"
 # through the plugin's notify-rust, at the same version.
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8"
+# The Run key, read and written in UTF-16 (login/windows.rs). Already in the tree through Tauri, at the same version.
+winreg = "0.55"
 
 [profile.release]
 lto = true

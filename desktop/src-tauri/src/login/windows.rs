@@ -1,13 +1,18 @@
 //! Windows: a per-user Run key value. The app's is `Meshrooms` = `"<app exe>" --background`; the bridge's headless one
 //! is `meshrooms-daemon` (server/agent-cli.ts daemonLoginItem), which starts a hidden PowerShell script. Both live under
-//! HKCU, so no elevation is ever needed. Values are read and written with %SystemRoot%\System32\reg.exe, run without a
-//! console window.
+//! HKCU, so no elevation is ever needed.
+//!
+//! Values are read and written through the registry API, in UTF-16, never by parsing `reg.exe` output: reg.exe prints
+//! in the console's OEM code page (850 on a default Portuguese or Western European Windows), so a path with
+//! an accent (a profile folder named João, say) came back garbled, never matched, and Start at login always looked off.
 
 use super::LoginState;
-use crate::bridge::hidden;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
+use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
+use winreg::{RegKey, RegValue};
 
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APP_VALUE: &str = "Meshrooms";
 const HEADLESS_VALUE: &str = "meshrooms-daemon";
 
@@ -26,38 +31,42 @@ fn command(app: &Path) -> String {
     format!("\"{}\" --background", app.display())
 }
 
-/// reg.exe by its full path, never whatever a search of the working folder or PATH finds first.
-fn reg_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").filter(|root| !root.is_empty()).unwrap_or_else(|| r"C:\Windows".into());
-    PathBuf::from(root).join("System32").join("reg.exe")
+/// The Run key, opened to read values, or also to change them.
+fn run_key(write: bool) -> io::Result<RegKey> {
+    let access = if write { KEY_QUERY_VALUE | KEY_SET_VALUE } else { KEY_QUERY_VALUE };
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, access)
 }
 
-fn reg(args: &[&str]) -> Result<(bool, String), String> {
-    let output = hidden(&reg_exe()).args(args).output().map_err(|error| format!("Cannot run reg.exe: {error}"))?;
-    Ok((output.status.success(), String::from_utf8_lossy(&output.stdout).into_owned()))
-}
-
-/// The data of `name` in `reg query <key> /v <name>` output: a line `    <name>    REG_SZ    <data>`. Value names are
-/// case-insensitive in the registry, so they are matched that way.
-fn parse_value(stdout: &str, name: &str) -> Option<String> {
-    stdout.lines().find_map(|line| {
-        let line = line.trim_start();
-        let rest = line.get(name.len()..).filter(|_| line.get(..name.len()).is_some_and(|start| start.eq_ignore_ascii_case(name)))?;
-        let rest = rest.strip_prefix("    ")?.trim_start();
-        let (kind, data) = rest.split_once("    ").unwrap_or((rest, ""));
-        matches!(kind, "REG_SZ" | "REG_EXPAND_SZ").then(|| data.trim_start().trim_end_matches(['\r', '\n']).to_string())
-    })
+/// The text of a string value: UTF-16LE, ending at its first NUL (the stored terminator, when there is one).
+/// Anything but REG_SZ or REG_EXPAND_SZ is not a command line, so it counts as no value.
+fn text_of(value: &RegValue) -> Option<String> {
+    if !matches!(value.vtype, RegType::REG_SZ | RegType::REG_EXPAND_SZ) {
+        return None;
+    }
+    let units: Vec<u16> = value.bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).take_while(|unit| *unit != 0).collect();
+    String::from_utf16(&units).ok()
 }
 
 fn query(name: &str) -> Result<Option<String>, String> {
-    let (found, stdout) = reg(&["query", RUN_KEY, "/v", name])?;
-    // reg.exe exits 1 when the value does not exist.
-    Ok(if found { parse_value(&stdout, name) } else { None })
+    let key = match run_key(false) {
+        Ok(key) => key,
+        // A profile that never had a Run key has no entries in it.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Cannot read the Windows startup entries: {error}")),
+    };
+    match key.get_raw_value(name) {
+        Ok(value) => Ok(text_of(&value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot read the Windows startup entry {name}: {error}")),
+    }
 }
 
 fn set(name: &str, data: &str) -> Result<(), String> {
-    let (done, _) = reg(&["add", RUN_KEY, "/v", name, "/t", "REG_SZ", "/d", data, "/f"])?;
-    if !done || query(name)?.as_deref() != Some(data) {
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey_with_flags(RUN_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE)
+        .map_err(|error| format!("Windows could not register Meshrooms to start at login: {error}"))?;
+    key.set_value(name, &data.to_string()).map_err(|error| format!("Windows could not register Meshrooms to start at login: {error}"))?;
+    if query(name)?.as_deref() != Some(data) {
         return Err("Windows could not register Meshrooms to start at login.".into());
     }
     Ok(())
@@ -65,7 +74,12 @@ fn set(name: &str, data: &str) -> Result<(), String> {
 
 fn remove(name: &str) -> Result<(), String> {
     if query(name)?.is_some() {
-        reg(&["delete", RUN_KEY, "/v", name, "/f"])?;
+        let key = run_key(true).map_err(|error| format!("Windows could not remove the Meshrooms startup entry: {error}"))?;
+        match key.delete_value(name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Windows could not remove the Meshrooms startup entry: {error}")),
+        }
     }
     match query(name)? {
         Some(_) => Err("Windows could not remove the Meshrooms startup entry.".into()),
@@ -99,22 +113,24 @@ pub fn disable() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const QUERY: &str = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    Meshrooms    REG_SZ    \"C:\\Program Files\\Meshrooms\\Meshrooms.exe\" --background\r\n\r\n";
+    fn utf16(text: &str, terminator: bool) -> Vec<u8> {
+        let mut units: Vec<u16> = text.encode_utf16().collect();
+        if terminator {
+            units.push(0);
+        }
+        units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+    }
 
     #[test]
-    fn parses_reg_query_output() {
-        assert_eq!(parse_value(QUERY, "Meshrooms").as_deref(), Some("\"C:\\Program Files\\Meshrooms\\Meshrooms.exe\" --background"));
-        let spaced = "    Docker Desktop    REG_SZ    C:\\Program Files\\Docker\\Docker Desktop.exe\r\n";
-        assert_eq!(parse_value(spaced, "Docker Desktop").as_deref(), Some("C:\\Program Files\\Docker\\Docker Desktop.exe"));
-        let headless = "    meshrooms-daemon    REG_SZ    \"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -WindowStyle Hidden -File \"start-at-login.ps1\"\r\n";
-        assert!(parse_value(headless, HEADLESS_VALUE).unwrap().ends_with("-File \"start-at-login.ps1\""));
-        // A longer name that starts with the one asked for is another value.
-        assert_eq!(parse_value("    Meshrooms-0123456789abcdef    REG_SZ    x\r\n", "Meshrooms"), None);
-        assert_eq!(parse_value("    Meshrooms    REG_DWORD    0x1\r\n", "Meshrooms"), None);
-        assert_eq!(parse_value("", "Meshrooms"), None);
-        // reg.exe prints the name as stored; the registry ignores case.
-        assert!(parse_value("    MESHROOMS-DAEMON    REG_SZ    x\r\n", HEADLESS_VALUE).is_some());
-        assert_eq!(parse_value("    meshrooms    REG_SZ    y\r\n", "Meshrooms").as_deref(), Some("y"));
+    fn string_values_are_read_as_utf16_up_to_their_terminator() {
+        let data = "\"C:\\Apps\\Ação Ñandú\\Meshrooms\\Meshrooms.exe\" --background";
+        let value = |bytes, vtype| RegValue { bytes, vtype };
+        assert_eq!(text_of(&value(utf16(data, true), RegType::REG_SZ)).as_deref(), Some(data));
+        assert_eq!(text_of(&value(utf16(data, false), RegType::REG_SZ)).as_deref(), Some(data), "a value stored without its NUL");
+        assert_eq!(text_of(&value(utf16("%LOCALAPPDATA%\\x.exe", true), RegType::REG_EXPAND_SZ)).as_deref(), Some("%LOCALAPPDATA%\\x.exe"));
+        assert_eq!(text_of(&value(vec![1, 0, 0, 0], RegType::REG_DWORD)), None);
+        assert_eq!(text_of(&value(utf16("a", true), RegType::REG_MULTI_SZ)), None);
+        assert_eq!(text_of(&value(Vec::new(), RegType::REG_SZ)).as_deref(), Some(""));
     }
 
     #[test]
@@ -128,15 +144,17 @@ mod tests {
         assert_eq!(classify(None, false, &expected), LoginState::Off);
         assert_eq!(classify(None, true, &expected), LoginState::Headless);
         assert_eq!(classify(Some(&expected), true, &expected), LoginState::Headless);
+        let accented = command(Path::new(r"C:\Apps\João\Meshrooms\Meshrooms.exe"));
+        assert_eq!(classify(Some(&accented), false, &accented), LoginState::App);
     }
 
-    /// Writes and removes a throwaway Run value (never `Meshrooms` or `meshrooms-daemon`).
-    /// Run with `cargo test -- --ignored`.
+    /// Writes and removes a throwaway Run value (never `Meshrooms` or `meshrooms-daemon`), with a non-ASCII path, the
+    /// case reg.exe's code page broke. Run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn round_trips_a_throwaway_run_value() {
         let name = format!("MeshroomsTest-{}", std::process::id());
-        let data = command(Path::new(r"C:\Program Files\Meshrooms Test\Meshrooms.exe"));
+        let data = command(Path::new(r"C:\Apps\Ação Ñandú\Meshrooms Test\Meshrooms.exe"));
         let result = (|| {
             set(&name, &data)?;
             set(&name, &data)?;
@@ -145,7 +163,9 @@ mod tests {
             remove(&name)?;
             Ok::<_, String>((read, query(&name)?))
         })();
-        let _ = reg(&["delete", RUN_KEY, "/v", &name, "/f"]);
+        if let Ok(key) = run_key(true) {
+            let _ = key.delete_value(&name);
+        }
         let (read, after) = result.unwrap();
         assert_eq!(read.as_deref(), Some(data.as_str()));
         assert_eq!(after, None);

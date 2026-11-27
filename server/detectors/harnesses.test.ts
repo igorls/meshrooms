@@ -289,6 +289,8 @@ test('Antigravity CLI sessions: reads conversation_summaries.db readonly, filter
   insert.run(older, 'Earlier work', JSON.stringify(['file:///home/someone/proj-beta']), oldIso, 0, '', 0);
   insert.run(subagent, 'Subagent run', JSON.stringify([wakeUri]), nowIso, 1, newest, 0);
   insert.run(killed, 'Killed chat', JSON.stringify([wakeUri]), nowIso, 0, '', 1);
+  // A prepared statement that is never finalized keeps the file open after close() on Windows: the folder cannot be removed.
+  insert.finalize();
   db.close();
 
   const { sessions, truncated } = listAgySessions(cliDir);

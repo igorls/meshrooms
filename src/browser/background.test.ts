@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { fakeStorage, installFakeIndexedDB } from './test-indexeddb';
 import { BACKGROUND_POLL_MS, BACKGROUND_ROOMS, BackgroundRoom, BackgroundRooms, RESTART_MAX_MS, Restarts, backgroundRooms, connectionLock, holdConnection } from './background';
 import { claimFence, write } from './storage';
+import { FALLBACK_POLL_MS } from './source';
 
 installFakeIndexedDB();
 
@@ -21,11 +22,11 @@ describe('background rooms', () => {
     expect(backgroundRooms([], {}, new Set())).toEqual([]);
   });
 
-  test('polls inside the service presence window, within the rate budget', () => {
-    // The service reports a device online for 10 s after its last poll.
-    expect(BACKGROUND_POLL_MS).toBeLessThan(10_000 * 0.75);
-    // A foreground room (40 polls a minute) plus a full background stays well under the 240/min loopback limit.
-    const perMinute = 60_000 / 1500 + BACKGROUND_ROOMS * 60_000 / BACKGROUND_POLL_MS;
+  test('without pushed status, polls inside the service presence window, within the rate budget', () => {
+    // The service reports a device online for 25 s after its last status (PRESENCE_MS).
+    expect(BACKGROUND_POLL_MS).toBeLessThan(25_000 * 0.5);
+    // A foreground room at its fallback rate plus a full background stays well under the 240/min loopback limit.
+    const perMinute = 60_000 / FALLBACK_POLL_MS + BACKGROUND_ROOMS * 60_000 / BACKGROUND_POLL_MS;
     expect(perMinute).toBeLessThanOrEqual(240 * 0.6);
   });
 });

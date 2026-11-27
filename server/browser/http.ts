@@ -13,8 +13,9 @@ const explainerHtml = (markdown: string, roomId: string) => '<!doctype html><htm
   + `<meta name="robots" content="noindex"><title>Connect an agent · Meshrooms</title></head><body><main><p><a href="/agent/${roomId}.md">Plain Markdown</a></p><pre>${escape(markdown)}</pre></main></body></html>`;
 
 /**
- * Addresses a rate map tracks at once. Sized well above one IPv6 /48's per-minute budget behind Nginx (6,000 /64s),
- * so rotating /64s within a /48 cannot evict unrelated clients' counters. When full, the oldest entry makes room.
+ * Addresses a rate map tracks at once. Sized above one IPv6 /48's per-minute budget behind Nginx (18,000 /64s at the
+ * default 3,600 a minute), so rotating /64s within a /48 cannot evict unrelated clients' counters; Nginx's 60 r/s per
+ * /64 and 400 r/s overall keep the keys a minute brings in (24,000 at most) under it too. When full, the oldest entry makes room.
  */
 export const RATE_KEYS = 32_768;
 /**
@@ -42,17 +43,21 @@ export function wideKey(key: string): string | undefined {
 }
 /**
  * How many times one /64's quota a whole /48 gets: people of one network share a /48, so it is above one, while
- * staying well under the site-wide Nginx ceiling (behind the proxy, 1,200/min * 5 = 6,000/min = 100 r/s vs 400 r/s).
+ * staying under the site-wide Nginx ceiling (behind the proxy, 3,600/min * 5 = 18,000/min = 300 r/s vs 400 r/s).
  */
 const WIDE_API = 5, WIDE_CREATE = 4;
-const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'pair-offer', 'pair-redeem', 'pair-cancel', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'rename', 'repositories', 'transfer-host', 'roster-publish', 'close']);
+const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'status', 'decide', 'link', 'pair-offer', 'pair-redeem', 'pair-cancel', 'remove', 'signal', 'agent-invite', 'agent-redeem', 'settings', 'profile', 'rename', 'repositories', 'claim', 'transfer-host', 'roster-publish', 'close']);
 /** Route shape for logs: room and member ids are replaced, so a log line never names a room. */
 const route = (path: string) => path.replace(/[a-f0-9-]{36}/g, ':id').slice(0, 120);
 
 /** `log` receives one JSON line per lobby command (status polls answered 200 or 410 excepted) and per 5xx. */
 export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; rateKeys?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void; relay?: RelayService };
-export function browserHandler(lobby: BrowserLobby, origin: string, distDir: string, options: BrowserHttpOptions = {}) {
-  const allowed = new URL(origin);
+/**
+ * `origins`: the service's origin, then any other addresses of it (MESHROOMS_BROWSER_ALIASES). Each request is
+ * answered as the origin its Host names, and a browser or bridge there must send that same Origin.
+ */
+export function browserHandler(lobby: BrowserLobby, origins: string | string[], distDir: string, options: BrowserHttpOptions = {}) {
+  const served = new Map((Array.isArray(origins) ? origins : [origins]).map(origin => [new URL(origin).host, origin] as const));
   const root = resolve(distDir);
   const rates = new Map<string, { at: number; count: number }>();
   const creates = new Map<string, { at: number; count: number }>();
@@ -110,7 +115,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
   };
   /** Gives a reserved creation back. A counter whose window has since restarted is no longer in the map, so this is a no-op for it. */
   const releaseCreate = (held: { count: number }[]) => { for (const rate of held) rate.count = Math.max(0, rate.count - 1); };
-  const wsOrigins = new Set<string>([origin.replace(/^http/, 'ws')]);
+  const wsOrigins = new Set<string>([...served.values()].map(origin => origin.replace(/^http/, 'ws')));
   try {
     if (lobby.relayEnabled && lobby.relayUrl) wsOrigins.add(new URL(lobby.relayUrl).origin);
   } catch { /* ignore invalid test stub */ }
@@ -120,6 +125,8 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   };
   const json = (body: unknown, status = 200) => Response.json(body, { status, headers });
+  /** An address over its request quota: told when to come back, so bridges and pages wait instead of retrying at once. */
+  const busy = () => Response.json({ error: 'Too many requests. Try again shortly.' }, { status: 429, headers: { ...headers, 'Retry-After': '5' } });
   const failure = (error: unknown, status: number, request: string, path: string) =>
     log({ event: 'error', request, status, route: route(path), message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
   /** Streams and parses a JSON request body under a strict byte ceiling, independent of Content-Length. */
@@ -140,7 +147,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     catch { return { ok: false, response: json({ error: 'Invalid request.' }, 400) }; }
   }
   /** A signed room command. Logged with its action and outcome; the body is never logged. */
-  async function command(request: Request, address: string, requestId: string): Promise<Response> {
+  async function command(request: Request, address: string, requestId: string, origin: string): Promise<Response> {
     if (request.headers.get('origin') !== origin || request.headers.get('content-type')?.split(';')[0] !== 'application/json') return json({ error: 'Use the room application to submit requests.' }, 403);
     const minProtocolVersion = lobby.minProtocolVersion ?? MIN_PROTOCOL_VERSION;
     const declaredProtocol = request.headers.get(PROTOCOL_HEADER);
@@ -168,6 +175,8 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     const creating = action === 'create' && !await lobby.answered(input);
     let held: { count: number }[] | undefined;
     try {
+      // Signed for the address it is sent to, so a page or bridge at one address never speaks as another.
+      if ((input as { command?: { origin?: unknown } })?.command?.origin !== origin) { status = 400; return json({ error: 'This request has expired or is invalid. Try again.' }, 400); }
       // Refused at once when nothing is left, before the signature is checked; the slot itself is taken in `admit`.
       if (creating && createsSpent(addressKey(address))) { status = 429; return json({ error: 'Room creation limit reached. Try again in an hour.' }, 429); }
       const admit = creating ? () => { if (!(held = reserveCreate(addressKey(address)))) throw new LobbyError(429, 'Room creation limit reached. Try again in an hour.'); } : undefined;
@@ -197,7 +206,8 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
   ): Promise<Response> => {
     const url = new URL(request.url);
     const requestId = crypto.randomUUID().slice(0, 8);
-    if ((request.headers.get('host') || url.host) !== allowed.host) return json({ error: 'Unexpected host.' }, 403);
+    const origin = served.get(request.headers.get('host') || url.host);
+    if (!origin) return json({ error: 'Unexpected host.' }, 403);
     if (request.headers.get('origin') && request.headers.get('origin') !== origin) return json({ error: 'Unexpected origin.' }, 403);
     // Nginx must overwrite this header. Direct clients can never choose their quota key.
     let address = remoteAddress;
@@ -217,7 +227,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
     try {
       if (url.pathname === '/api/relay/v1') {
         if (!options.relay) return json({ error: 'Relay not enabled.' }, 404);
-        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (!chargeApi(addressKey(address))) return busy();
         if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket' || !upgrade) {
           return json({ error: 'WebSocket upgrade required.' }, 426);
         }
@@ -227,7 +237,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
       }
       if (url.pathname.startsWith('/api/relay/v1/')) {
         if (!options.relay) return json({ error: 'Not found.' }, 404);
-        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (!chargeApi(addressKey(address))) return busy();
         if (request.method !== 'POST') return json({ error: 'Method not allowed.' }, 405);
         if (request.headers.get('origin') !== origin || request.headers.get('content-type')?.split(';')[0] !== 'application/json') {
           return json({ error: 'Use the room application to submit requests.' }, 403);
@@ -235,11 +245,12 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
         const maxBytes = url.pathname === '/api/relay/v1/state' ? RELAY_STATE_MAX_BODY_BYTES : RELAY_SEND_MAX_BODY_BYTES;
         const parsed = await readJsonBody(request, maxBytes);
         if (!parsed.ok) return parsed.response;
+        if ((parsed.value as { command?: { origin?: unknown } })?.command?.origin !== origin) return json({ error: 'This request has expired or is invalid. Try again.' }, 400);
         const result = await options.relay.handleHttp(url.pathname, parsed.value as SignedCommand, request.signal);
         return json(result);
       }
       if (url.pathname.startsWith('/api/lobby')) {
-        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (!chargeApi(addressKey(address))) return busy();
         if (request.method === 'GET' && /^\/api\/lobby\/rooms\/[a-f0-9-]{36}$/.test(url.pathname)) return json(lobby.publicRoom(url.pathname.split('/').at(-1)!));
         // Member ids are only shown to admitted members, and the hash pins one picture, so the response can be cached forever.
         const avatar = /^\/api\/lobby\/rooms\/([a-f0-9-]{36})\/avatars\/([a-f0-9-]{36})$/.exec(url.pathname);
@@ -251,7 +262,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
             'Content-Security-Policy': "default-src 'none'; sandbox", 'Cross-Origin-Resource-Policy': 'same-origin' } });
         }
         if (url.pathname !== '/api/lobby' || request.method !== 'POST') return json({ error: 'Not found.' }, 404);
-        return await command(request, address, requestId);
+        return await command(request, address, requestId, origin);
       }
       if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: 'Method not allowed.' }, 405);
       // The agent bridge is built from the same commit at deploy, next to the browser assets.
@@ -265,7 +276,7 @@ export function browserHandler(lobby: BrowserLobby, origin: string, distDir: str
       const agentPage = /^\/agent\/([a-f0-9-]{36})(\.md)?$/.exec(url.pathname);
       if (agentPage) {
         // This page reads the room from the database, so it shares the request quota of the room commands.
-        if (!chargeApi(addressKey(address))) return json({ error: 'Too many requests. Try again shortly.' }, 429);
+        if (!chargeApi(addressKey(address))) return busy();
         const room = lobby.publicRoom(agentPage[1]);
         const digest = Bun.file(resolve(root, 'agent', 'meshrooms-agent.js.sha256'));
         const sha256 = await digest.exists() ? (await digest.text()).split(/\s/)[0] : 'unavailable: the agent bridge is not built on this server';

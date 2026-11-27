@@ -145,7 +145,7 @@ try {
   const options = await harness.locator('option').evaluateAll(list => list.map(o => ({ text: o.textContent, disabled: o.disabled })));
   assert.deepEqual(options, [
     { text: `Claude Code ${FAKE_VERSION}`, disabled: false }, { text: 'Codex 0.159.0', disabled: false },
-    { text: 'Hermes (not available)', disabled: true }, { text: 'Custom command (in the Meshrooms app)', disabled: true }]);
+    { text: 'Hermes (not available)', disabled: true }, { text: 'Antigravity (not found)', disabled: true }, { text: 'Custom command (in the Meshrooms app)', disabled: true }]);
   await section.getByText('Custom command: Set up custom commands in the Meshrooms app.').waitFor();
   const manageApps = section.getByRole('link', { name: 'Manage agent apps', exact: true });
   await manageApps.waitFor();

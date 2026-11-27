@@ -12,7 +12,7 @@ import { rawPeer } from './browser/raw-peer';
 import { processRuns } from './browser/fake-runner';
 import { localControlToken, readLocalApi, requestBrowserLink } from './local-api';
 import { cancelPairing, createRoom, defaultRoomService, initPerson, joinRoom, pairRooms, personAgent, personHome, personIdentity, personRoomStatus, personRooms, personStatus, queueMessage, queueRetract, recordPersonRoom, roomState, roomTitles, unpairCheck, unpairPerson } from './person';
-import { deviceId } from '../src/browser/protocol';
+import { PUBLIC_ROOM_SERVICES, deviceId } from '../src/browser/protocol';
 import { attachmentRef, type AttachmentRef } from '../src/browser/files';
 const deviceIdOf = async (device: { signed: (a: 'status', r: string) => Promise<{ publicKey: string }> }) => deviceId((await device.signed('status', crypto.randomUUID())).publicKey);
 import { mintInvite } from './browser/invites';
@@ -310,6 +310,32 @@ test('a paired app joins as the paired person, and only at the paired room servi
   expect(await joinRoom({ url: room.url, kind: 'person', label: 'Meshrooms app' }, noRunner, home)).toMatchObject({ roomId: room.roomId, state: 'waiting' });
   expect((await room.host.status(room.roomId)).requests).toEqual([expect.objectContaining({ name: 'Robin Lee', kind: 'person' })]);
   expect(personRooms(home)).toEqual([expect.objectContaining({ roomId: room.roomId, kind: 'person', name: 'Robin Lee' })]);
+});
+
+test('a paired app joins a room linked through another address of the public service, through the address it already uses', async () => {
+  const { home } = folders();
+  await initPerson(home);
+  const [used, other] = PUBLIC_ROOM_SERVICES, roomId = crypto.randomUUID();
+  writeFileSync(join(home, 'pairing.json'), JSON.stringify({ origin: used, device: 'b'.repeat(64), name: 'Robin Lee', at: 1 }));
+  // Already admitted there, as its runner last heard: nothing is asked of any service.
+  recordPersonRoom({ roomId, origin: used, kind: 'person', name: 'Robin Lee', joinedAt: 1 }, home);
+  writeFileSync(join(personAgent(roomId, home, used).dir, 'members.json'), JSON.stringify({ memberId: crypto.randomUUID(), members: [], devices: [] }));
+  expect(await joinRoom({ url: `${other}/r/${roomId}`, kind: 'person', label: 'Meshrooms app' }, noRunner, home)).toMatchObject({ roomId, state: 'joined' });
+  expect(personRooms(home)).toEqual([expect.objectContaining({ roomId, origin: used })]);
+  // A room not on the list yet is joined, and recorded, through the paired address too.
+  const fresh = crypto.randomUUID();
+  writeFileSync(join(personAgent(fresh, home, used).dir, 'members.json'), JSON.stringify({ memberId: crypto.randomUUID(), members: [], devices: [] }));
+  expect(await joinRoom({ url: `${other}/r/${fresh}`, kind: 'person', label: 'Meshrooms app' }, noRunner, home)).toMatchObject({ roomId: fresh, state: 'joined' });
+  expect(personRooms(home).find(r => r.roomId === fresh)).toMatchObject({ origin: used });
+  // Another service is still another service.
+  await expect(joinRoom({ url: `https://rooms.example/r/${crypto.randomUUID()}`, kind: 'person', label: 'Meshrooms app' }, noRunner, home))
+    .rejects.toThrow(`This app is paired with Robin Lee at ${used}, so it can't join a room at https://rooms.example`);
+});
+
+test('the desktop app lists the same public addresses as the bridge', () => {
+  const rust = readFileSync(resolve(import.meta.dir, '../desktop/src-tauri/src/join.rs'), 'utf8');
+  const listed = /PUBLIC_ROOM_SERVICES: \[&str; \d+\] = \[([^\]]*)\]/.exec(rust)?.[1];
+  expect(listed && [...listed.matchAll(/"([^"]+)"/g)].map(m => m[1])).toEqual([...PUBLIC_ROOM_SERVICES]);
 });
 
 test('companion asks to join as a device of an existing person and prints the code; their own link admits it at once', async () => {
@@ -619,6 +645,23 @@ test('create makes a room hosted by the person device, with the invite code the 
   expect(defaultRoomService(home, {})).toBe(origin);
   expect(defaultRoomService(join(home, 'nobody'), {})).toBe('https://meshrooms.wormdb.dev');
   expect(defaultRoomService(home, { MESHROOMS_ROOM_SERVICE: 'https://rooms.example' })).toBe('https://rooms.example');
+});
+
+test('listen carries each message\'s attachments (id, name, type, size, kind) so a wake can fetch them', async () => {
+  const { listenSnapshot } = await import('./browser-agent');
+  const { home } = folders(), roomId = crypto.randomUUID(), alex = crypto.randomUUID(), wren = crypto.randomUUID();
+  const agent = new BrowserAgent(home, 'http://127.0.0.1:1', roomId);
+  writeFileSync(join(agent.dir, 'members.json'), JSON.stringify({ memberId: wren, ownerId: alex, members: [{ id: alex, name: 'Alex', role: 'human' }, { id: wren, name: 'Wren', role: 'agent', operatorId: alex }], devices: [] }));
+  const shot = { id: crypto.randomUUID(), name: 'header.png', type: 'image/png', size: 1234, sha256: 'a'.repeat(64) };
+  const log = { id: crypto.randomUUID(), name: 'build.log', type: 'text/plain', size: 99, sha256: 'b'.repeat(64) };
+  const message = (text: string, at: number, attachments?: object[]) => ({ packet: { body: { kind: 'message', roomId, id: crypto.randomUUID(), deviceId: 'a'.repeat(64), memberId: alex, text, at, ...(attachments ? { attachments } : {}) }, signature: '' }, targets: [], receipts: [] });
+  writeFileSync(join(agent.dir, 'messages.json'), JSON.stringify([message('plain', 1_000), message('@Wren the header overlaps', 2_000, [shot, log])]));
+  const { result } = listenSnapshot(agent, { after: undefined, boardAfter: 0, decisionsAfter: 0, outcomesAfter: undefined, history: true }, true)!;
+  expect(result.messages[0]!.attachments).toBeUndefined();
+  expect(result.messages[1]!.attachments).toMatchObject([
+    { id: shot.id, name: 'header.png', type: 'image/png', size: 1234, kind: 'image' },
+    { id: log.id, name: 'build.log', type: 'text/plain', size: 99, kind: 'file' },
+  ]);
 });
 
 test('out-of-range timestamps, sync envelope caps, retracted reactions, file-want rate limit, askAgents array, and trimmed outbox text', async () => {

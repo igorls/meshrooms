@@ -145,6 +145,7 @@ try {
   // Desktop message preferences are this computer's, available to every person in the local room, never on the host's
   // hosted page. Read failures must not pretend the default was loaded; failed writes keep the last saved selection.
   await host.getByRole('button', { name: 'Room details', exact: true }).click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   assert.equal(await host.getByRole('region', { name: 'Desktop notifications', exact: true }).count(), 0);
   await host.getByRole('button', { name: 'Close room details', exact: true }).click();
   const notifyPath = `**/api/local/rooms/${roomId}/notify`;
@@ -157,6 +158,7 @@ try {
     return route.continue();
   });
   await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   const notifications = local.getByRole('region', { name: 'Desktop notifications', exact: true });
   const notificationChoice = notifications.getByLabel('Message notifications', { exact: true });
   await notifications.getByRole('alert').filter({ hasText: 'could not be read' }).waitFor();
@@ -182,6 +184,7 @@ try {
   await snapshot(local, 'local-ui-notifications-desktop.png');
   await local.reload();
   await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await until(async () => await notificationChoice.inputValue() === 'off' && await notificationChoice.isEnabled(), 'the notification preference after reload');
   await notificationChoice.selectOption('mentions');
   await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
@@ -251,7 +254,8 @@ try {
   cli('person', 'companion', hostedUrl);
   const code = await until(() => cli('person', 'rooms').find(r => r.roomId === hostedId && r.code)?.code, 'the companion code');
   await host.getByRole('button', { name: 'Room details', exact: true }).click();
-  await host.locator('summary', { hasText: 'Add another device' }).click();
+  await host.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
+  await host.locator('details.browser-link-device > summary').click();
   await host.getByLabel('Device code', { exact: true }).fill(code);
   await host.getByRole('button', { name: 'Approve my device', exact: true }).click();
   await until(() => cli('person', 'rooms').some(r => r.roomId === hostedId && r.state === 'joined'), 'the companion to be admitted');
@@ -266,14 +270,17 @@ try {
   await local.locator('.browser-requests').waitFor({ state: 'detached', timeout: 20_000 });
   await visible(local, '2 people in this room');
   await local.getByRole('button', { name: 'Room details', exact: true }).click();
+  await local.locator('#browser-room-details').getByRole('tab', { name: /^You/ }).click();
   await until(async () => await notificationChoice.inputValue() === 'mentions' && await notificationChoice.isEnabled(), 'a second room to keep its own notification preference');
   await notificationChoice.selectOption('all');
   await notifications.getByRole('status').filter({ hasText: 'Saved.' }).waitFor();
   assert.deepEqual(notificationSettings(), { [roomId]: 'off', [hostedId]: 'all' });
+  await local.locator('#browser-room-details').getByRole('tab', { name: /^Rules/ }).click();
   const handOff = local.locator('label.browser-setting', { hasText: 'Agents can hand tasks to each other' }).locator('input');
   await handOff.click();
   await visible(local, 'Agents can now hand tasks to each other.');
   await until(async () => { await host.reload(); await host.getByRole('button', { name: 'Room details', exact: true }).click();
+    await host.locator('#browser-room-details').getByRole('tab', { name: /^Rules/ }).click();
     return host.locator('label.browser-setting', { hasText: 'Agents can hand tasks to each other' }).locator('input').isChecked(); }, 'the setting to reach the host', 45_000);
   await snapshot(local, 'local-ui-host-actions.png');
   await checkLocalHistory(local);

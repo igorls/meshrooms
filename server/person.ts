@@ -23,7 +23,7 @@ import { isReactionEmoji } from '../src/browser/reactions';
 import { isRetracted } from '../src/browser/retractions';
 import { countUnread } from '../src/browser/unread';
 import { DEVICE_ID, PAIRING_MAX_ROOMS, decodeSecret, pairingMessage, pairingName } from '../src/browser/pairing';
-import { PUBLIC_ROOM_SERVICE } from '../src/browser/protocol';
+import { PUBLIC_ROOM_SERVICE, sameRoomService } from '../src/browser/protocol';
 
 /** Files in the person's folder. */
 export const PERSON_IDENTITY = 'identity.json', PERSON_ROOMS = 'rooms.json';
@@ -130,17 +130,20 @@ export function roomState(agent: BrowserAgent): { state: RoomState; code?: strin
  *
  * One person per app: once the app is paired (pairing.json), it joins rooms at that room service only, and as a person
  * under the paired name unless another is given. A room at another service is refused, as another browser's pairing is.
+ * A link through another address of the same service (sameRoomService) is the same room: it is joined through the
+ * address this app already uses.
  */
 export async function joinRoom(input: { url: string; kind: 'person' | 'companion'; name?: string; label: string },
   ensureRunner: (agent: BrowserAgent) => Promise<{ pid?: number; outcome: string }>, home = personHome()) {
   const identity = requireIdentity(home);
-  const { origin, roomId } = parseRoomUrl(input.url);
+  const link = parseRoomUrl(input.url), roomId = link.roomId;
   const paired = pairedWith(home);
-  if (paired && paired.origin !== origin) throw new Error(otherService(paired, origin));
+  if (paired && !sameRoomService(paired.origin, link.origin)) throw new Error(otherService(paired, link.origin));
   const name = input.kind === 'person' ? (input.name ?? paired?.name)?.trim() : 'Companion device';
   if (!name || name.length > 80 || /[\u0000-\u001f]/.test(name)) throw new Error('Give your name with --name (up to 80 characters).');
   const known = personRooms(home).find(r => r.roomId === roomId);
-  if (known && known.origin !== origin) throw new Error(`This person is already in that room through ${known.origin}.`);
+  if (known && !sameRoomService(known.origin, link.origin)) throw new Error(`This person is already in that room through ${known.origin}.`);
+  const origin = known?.origin ?? paired?.origin ?? link.origin;
   const agent = personAgent(roomId, home, origin);
   // Admitted already: the runner's own record says so, and no status poll from here disturbs its presence.
   let status: any = agent.members().memberId ? { memberId: agent.members().memberId, title: agent.members().title } : undefined;
@@ -223,7 +226,7 @@ export async function pairRooms(input: { origin: unknown; rooms: unknown; name: 
   // A claim no room ever confirmed (the browser never linked, and every request expired or was declined) has lapsed:
   // it holds the app for nobody.
   if (paired && !claimHolds(home)) { rmSync(join(home, PAIRED_FILE), { force: true }); paired = undefined; }
-  if (paired && (paired.origin !== origin || paired.device !== device))
+  if (paired && (!sameRoomService(paired.origin, origin) || paired.device !== device))
     throw new Error(`This app is paired with ${paired.name} at ${paired.origin}. Unpair it first in the app.`);
   const rooms = typeof input.rooms === 'string' ? [...new Set(input.rooms.split(','))] : [];
   if (!rooms.length || rooms.length > PAIRING_MAX_ROOMS || !rooms.every(r => UUID.test(r))) throw new Error(`Give the rooms as 1 to ${PAIRING_MAX_ROOMS} room ids, separated by commas.`);
@@ -233,11 +236,15 @@ export async function pairRooms(input: { origin: unknown; rooms: unknown; name: 
   if (!name) throw new Error('Give the name of the person pairing.');
   const made = await initPerson(home), identity = requireIdentity(home);
   const results: PairedRoom[] = [];
+  // Each room through the address it is listed under: another address of the same service is the same room.
+  const through = new Map<string, string>();
   for (const roomId of rooms) {
     try {
       const known = personRooms(home).find(r => r.roomId === roomId);
-      if (known && known.origin !== origin) throw new Error(`This person is already in that room through ${known.origin}.`);
-      const agent = personAgent(roomId, home, origin);
+      if (known && !sameRoomService(known.origin, origin)) throw new Error(`This person is already in that room through ${known.origin}.`);
+      const at = known?.origin ?? origin;
+      through.set(roomId, at);
+      const agent = personAgent(roomId, home, at);
       let status: any = agent.members().memberId ? { memberId: agent.members().memberId, title: agent.members().title } : undefined;
       if (!status) {
         status = await agent.command('status', { session: randomUUID() });
@@ -249,7 +256,7 @@ export async function pairRooms(input: { origin: unknown; rooms: unknown; name: 
           await agent.command('request', { kind: 'companion', name: 'Companion device', label: 'Meshrooms app', pairing });
         }
       }
-      recordPersonRoom({ roomId, origin, kind: known?.kind ?? 'companion', name: known?.name ?? name, joinedAt: Date.now() }, home);
+      recordPersonRoom({ roomId, origin: at, kind: known?.kind ?? 'companion', name: known?.name ?? name, joinedAt: Date.now() }, home);
       results.push({ roomId, state: status.memberId ? 'joined' : 'waiting', title: status.title ?? null });
     } catch (error) {
       // A room that never made it onto the list leaves no folder behind.
@@ -262,22 +269,22 @@ export async function pairRooms(input: { origin: unknown; rooms: unknown; name: 
   // every room failed claims nothing.
   if (!paired && results.some(r => r.state !== 'failed')) replaceFile(join(home, PAIRED_FILE), JSON.stringify({ origin, device, name, at: Date.now() } satisfies PairedWith));
   // The runners once every request is in, together: the browser links the rooms as soon as the app has asked in them.
-  await Promise.all(results.filter(r => r.state !== 'failed').map(r => ensureRunner(personAgent(r.roomId, home, origin)).catch(() => undefined)));
+  await Promise.all(results.filter(r => r.state !== 'failed').map(r => ensureRunner(personAgent(r.roomId, home, through.get(r.roomId)!)).catch(() => undefined)));
   return { deviceId: identity.id, created: made.created, origin, rooms: results };
 }
 
 /** Cancel only the pending companion requests of this pairing. Admitted rooms and the person's key stay intact. */
 export async function cancelPairing(input: { origin: unknown; rooms: unknown; device: unknown }, stop: (agent: BrowserAgent) => Promise<StopOutcome>, home = personHome()) {
   const origin = roomService(input.origin), paired = pairedWith(home);
-  if (!paired || paired.origin !== origin || paired.device !== input.device) throw new Error('This is not the browser pairing held by this app.');
+  if (!paired || !sameRoomService(paired.origin, origin) || paired.device !== input.device) throw new Error('This is not the browser pairing held by this app.');
   const wanted = typeof input.rooms === 'string' ? [...new Set(input.rooms.split(','))] : [];
   if (!wanted.length || wanted.length > PAIRING_MAX_ROOMS || !wanted.every(r => UUID.test(r))) throw new Error('Give the rooms of this pairing as room ids.');
   const identity = requireIdentity(home), cancelled = new Set<string>();
   const rooms: { roomId: string; state: 'cancelled' | 'joined' | 'failed'; title?: string | null; error?: string }[] = [];
   for (const roomId of wanted) {
-    const known = personRooms(home).find(r => r.roomId === roomId && r.origin === origin);
+    const known = personRooms(home).find(r => r.roomId === roomId && sameRoomService(r.origin, origin));
     if (!known) { rooms.push({ roomId, state: 'cancelled' }); continue; }
-    const agent = personAgent(roomId, home, origin);
+    const agent = personAgent(roomId, home, known.origin);
     try {
       const status = await agent.command('status', { session: randomUUID() });
       if (status?.roomId !== roomId || status?.deviceId !== identity.id) throw new Error('The room service gave an unexpected answer.');
@@ -295,7 +302,7 @@ export async function cancelPairing(input: { origin: unknown; rooms: unknown; de
     }
   }
   // Keep caches and the identity, and read the list again so other rooms added meanwhile are preserved.
-  if (cancelled.size) replaceFile(join(home, PERSON_ROOMS), JSON.stringify(personRooms(home).filter(r => r.origin !== origin || !cancelled.has(r.roomId)), null, 2));
+  if (cancelled.size) replaceFile(join(home, PERSON_ROOMS), JSON.stringify(personRooms(home).filter(r => !sameRoomService(r.origin, origin) || !cancelled.has(r.roomId)), null, 2));
   return { cancelled: !rooms.some(r => r.state === 'failed'), rooms };
 }
 
@@ -760,10 +767,16 @@ export function roomView(room: PersonRoom, agent: BrowserAgent, options: { limit
   const { memberId, title } = agent.members();
   return { roomId: room.roomId, origin: room.origin, title: title ?? null, ...roomState(agent), memberId: memberId ?? null,
     status: personRoomStatus(agent) ?? null,
-    messages: page.map(({ packet: { body }, targets, receipts, retracted }) => ({ packet: { body }, targets, receipts, ...(retracted ? { retracted } : {}) })), more: end - page.length > 0,
+    messages: page.map(({ packet: { body }, targets, receipts, retracted, receivedAt, replicated }) => ({
+      packet: { body }, targets, receipts,
+      ...(retracted ? { retracted } : {}),
+      ...(receivedAt !== undefined ? { receivedAt } : {}),
+      ...(replicated ? { replicated } : {}),
+    })), more: end - page.length > 0,
     // Older pages the page already loaded aren't read again, so it hears here of what was deleted in them.
     deleted: all.slice(0, start).filter(isRetracted).map(m => m.packet.body.id),
     taskOps: agent.taskOps().map(p => p.body), decisionOps: agent.decisionOps().map(p => p.body), reactions: agent.reactionChips(),
+    retractOps: agent.retractOps().map(p => p.body),
     files, read: readUpTo(agent, room.joinedAt) };
 }
 

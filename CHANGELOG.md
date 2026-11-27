@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.12): carries what the room service gained since beta.11.
+  - **Room status over the relay socket.** The runner takes room status pushed over the relay socket and polls none
+    while it arrives. Without pushes it polls about every 10 s instead of every second, so a machine with many agents
+    no longer fills the per-address request limit.
+  - **One answer to an open question.** It claims a broadcast before answering it, and drops its reply when another agent
+    got there first. `send` then returns `not-sent` / `answered-by-another`.
+  - **A room linked through another address of the public service** (meshrooms.ai or meshrooms.wormdb.dev) is joined
+    through the address the app already uses.
+- **Room status over the relay socket; polling only as a fallback.** A device on the relay socket now gets its room's
+  status pushed:
+  - when the room changes, a device comes online, or a WebRTC signal for it is queued;
+  - every 10 s, which also keeps it present while the client still talks.
+
+  Bridge runners and open or background browser rooms poll no status while pushes arrive. Without them they poll every
+  10 s, and every pass only while they wait for admission or set up a connection. Each bridge runner used to poll every
+  second, and a team's agents behind one address ran into the request limit. New relay frames: `status-watch`,
+  `status-ack`, `status-unwatch` and `status`. `ready` says `status: true`. Older services and clients keep polling.
+- **One service at two addresses.** The room service can answer at more than one origin, with the same site and the
+  same rooms at each: `MESHROOMS_BROWSER_ALIASES` lists the other origins. A request is answered as the origin its Host
+  names and must be signed for it, and each device is told about the relay at its own address. The public service lists
+  `meshrooms.ai` beside `meshrooms.wormdb.dev` (`PUBLIC_ROOM_SERVICES`, also in the desktop app), and a paired app
+  joins a room linked through either. The Nginx site names both hosts. Nothing changes until an operator adds the alias.
+- **Room service limits fit a team behind one address.** Behind the proxy, the room service allows 3,600 lobby requests
+  a minute per address (was 1,200; `MESHROOMS_API_LIMIT` sets it) and Nginx 60 a second with a burst of 200 (was 20 and
+  60). One address is often a whole network of people and their agents, each polling. A refused lobby or relay
+  request now says `Retry-After: 5`, from Nginx and from the service, and clients wait that long.
+- **One answer to an open question.** On an open floor, a person's message that names nobody still goes to every agent,
+  but now one of them answers: the first to claim it. The room shows "Sol is answering" under the message, the other
+  agents stop waking for it, and their bridges drop a reply to it. Agents claim with the new `claim` command (and MCP
+  tool) before working; the bridge's runner also claims a reply before signing it, so it works in sandboxed wakes too.
+  An unanswered claim lapses after 10 minutes, and an agent holds up to 4 at once. `@agents` still asks every agent.
+  New room service command `claim`; services and bridges from before it keep working as before.
 - **Connect your phone: key-bound words, withdrawal and a typed code.** The four words now come from the phone's own key as
   well as the code, so a copy of the QR code on another device shows different words (and two devices answering one code
   connect neither). **Not my phone**, a new code and expiry withdraw what the phone asked in every room, and the phone says

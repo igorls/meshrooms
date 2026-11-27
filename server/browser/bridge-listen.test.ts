@@ -202,7 +202,8 @@ test('listen and status follow the floor the host sets while the runner is up, e
     for (const by = Date.now() + 8_000; r.agent.settings().floor !== want && Date.now() < by;) await Bun.sleep(100);
     return (await status()).floor;
   };
-  const bridge = runBridge(r.agent, () => {}).catch(error => error);
+  // This fake service pushes nothing: the runner polls each pass, as it would while its pushes are down.
+  const bridge = runBridge(r.agent, () => {}, { idlePollEvery: 1 }).catch(error => error);
   try {
     r.say('Morning');
     expect(await listen(r.agent)).toMatchObject({ state: 'history', floor: 'humans-first' });
