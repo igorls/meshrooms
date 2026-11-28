@@ -63,6 +63,8 @@ import {
 import { hermesBindingProblem, hermesBindingSnippet, hermesConfigPath, readMcpServerArgs, roomToolsetName } from './hermes-binding';
 import { issueLinkFrom } from '../src/browser/board';
 import { cancelPairing, createRoom, defaultRoomService, initPerson, joinRoom, listedAgents, pairRooms, personAgent, personHome, personIdentityFile, personRooms, personStatus, roomSummary, roomTitles, unpairCheck, unpairPerson } from './person';
+import { MachineControl } from './control-socket';
+import { POLICY_FILE, REMOTE_HARNESSES, checkPolicy, defaultPolicy, machineRemoteDeps, readControllers, type readPolicy } from './remote-control';
 import { appRequest, localControlToken, readLocalApi, requestBrowserLink, startLocalApi } from './local-api';
 import { notifyLevel, setNotifyLevel } from './notifications';
 import type { AgentServices } from './local-agents';
@@ -237,7 +239,7 @@ function reportWokenRuns(agent: BrowserAgent) {
 function args(argv: string[]) {
   const [command = 'help', ...rest] = argv; const values: Record<string, string> = {}; const positional: string[] = []; const attach: string[] = []; const options: string[] = [];
   for (let i = 0; i < rest.length; i++) {
-    if (['--clear', '--all', '--withdraw', '--from-start', '--peek', '--last', '--json', '--until-addressed', '--check', '--anyway', '--approvals', '--ping', '--relay-once', '--release', '--reap', '--include-deleted', '--restore'].includes(rest[i])) values[rest[i]] = 'true';
+    if (['--clear', '--all', '--withdraw', '--from-start', '--peek', '--last', '--json', '--until-addressed', '--check', '--anyway', '--approvals', '--ping', '--relay-once', '--release', '--reap', '--include-deleted', '--restore', '--harnesses'].includes(rest[i])) values[rest[i]] = 'true';
     else if (rest[i] === '--allow-tools') { if (rest[i + 1] === undefined) throw new Error('Give a tool rule for --allow-tools.'); options.push(rest[++i]); }
     else if (rest[i] === '--attach') { if (rest[i + 1] === undefined) throw new Error('Give a file path for --attach.'); attach.push(rest[++i]); }
     else if (rest[i] === '--option' && command === 'ask') { if (rest[i + 1] === undefined) throw new Error('Give a label for --option.'); options.push(rest[++i]); }
@@ -1663,13 +1665,17 @@ async function runDaemon(dir = daemonDir(), bin?: string, approvals = false) {
   writeDaemonRecord(dir, record());
   log(`daemon ${BRIDGE_VERSION} started (pid ${process.pid}), looking after the agent folders in ${registry}`);
   // The person's local API (local-api.ts). One that can't start is logged: agents are looked after regardless.
-  let api: ReturnType<typeof startLocalApi> | undefined;
+  let api: ReturnType<typeof startLocalApi> | undefined, control: MachineControl | undefined;
   try {
     // A release serves only its UI's verified files, from memory; a checkout, its dist/ (see local-ui.ts).
     const ui = localUi(BRIDGE_VERSION);
     // Agents, harnesses and sessions for the person's page (local-agents.ts); approvals only for the app, and only on request.
     const agents: AgentServices = { scanner: harnessScanner(), deps: daemonAgentDeps() };
-    api = startLocalApi({ dir, log, ...(ui?.files ? { uiFiles: ui.files } : ui ? { distDir: ui.dir } : {}), agents, ...(approvals ? { approvals: true } : {}) });
+    // Remote control (control-socket.ts): the turn runner's deps shared by the local API's routes and the control socket.
+    const remote = machineRemoteDeps(personHome(), agents.scanner);
+    control = new MachineControl({ home: personHome(), remote, scan: agents.scanner.scan, log });
+    api = startLocalApi({ dir, log, ...(ui?.files ? { uiFiles: ui.files } : ui ? { distDir: ui.dir } : {}), agents, ...(approvals ? { approvals: true } : {}), remote, machine: control });
+    void control.start().catch(error => log(`control: not started: ${error instanceof Error ? error.message : String(error)}`));
     if (approvals) log('local API: the app-only approval routes are on');
     log(ui?.files ? `local API: serving the verified UI from ${ui.dir}` : ui ? `local API: serving the UI built in ${ui.dir}` : 'local API: no verified UI found, so it serves no page');
   } catch (error) { log(`local API not started: ${error instanceof Error ? error.message : String(error)}`); }
@@ -1680,6 +1686,7 @@ async function runDaemon(dir = daemonDir(), bin?: string, approvals = false) {
       for (let waited = 0; waited < DAEMON_TIMING.tickMs && !stopping; waited += 200) await Bun.sleep(200);
     }
   } finally {
+    control?.stop();
     api?.stop();
     writeDaemonRecord(dir, { ...record(), stoppedAt: Date.now() });
     log('daemon stopped; the runners and watchers it started keep running, and the next daemon adopts them');
@@ -1805,6 +1812,13 @@ const sameFolder = (a: string, b: string) => process.platform === 'win32' ? reso
  */
 const stdinLines = async () => (await Bun.stdin.text()).split(/\r?\n/).map(line => line.trim());
 const APP_ONLY = 'Pair and unpair from the Meshrooms app: its window asks you first.';
+const REMOTE_APP_ONLY = 'Remote control is the Meshrooms app\'s: its Remote control window.';
+/** The remote control commands' gate: a daemon that runs (said as such, never as a refusal), then the app's proof. */
+async function remoteApp() {
+  const live = readLocalApi(daemonDir());
+  if (!live || !running(live.pid)) throw new Error("The Meshrooms daemon isn't running. Start it from the tray menu.");
+  await appOnly(stdinLines, daemonDir(), REMOTE_APP_ONLY);
+}
 export async function appOnly(read: () => Promise<string[]>, dir = daemonDir(), refusal = APP_ONLY) {
   // No running daemon, no app to prove anything: refused before stdin is read.
   const live = readLocalApi(dir);
@@ -1821,7 +1835,7 @@ export function appProof(proof: string, dir = daemonDir(), refusal = APP_ONLY) {
     throw new Error(refusal);
 }
 /**
- * `person <init|join|companion|pair|create|rooms|status|open>`: the person using this machine (person.ts). The app drives these.
+ * `person <init|join|companion|pair|control-enrol|remote-policy|create|rooms|status|open>`: the person using this machine (person.ts). The app drives these.
  * join and companion ask to join and make sure the room's runner runs: the daemon's when it runs, as for an agent.
  * join is the app's, like pair: its window shows the room and asks first (a meshrooms://join link), and the app's proof
  * comes on the first line of stdin.
@@ -1861,6 +1875,61 @@ async function personCommand(sub: string, positional: string[], values: Record<s
     if (values['--secret'] !== undefined) throw new Error('The pairing secret is read from stdin, never from the command line.');
     const [secret = ''] = await appOnly(stdinLines);
     return pairRooms({ origin: values['--origin'], rooms: values['--rooms'], name: values['--name'], device: values['--device'], secret }, ensureRunner, folder);
+  }
+  // The app's half of remote control enrolment (control-socket.ts, docs/flows/remote-control.md): its window took the
+  // words the person typed for a meshrooms://control link. The link's secret and the typed words come on stdin after the
+  // app's proof, never on the command line; the daemon checks the words again and holds the secret in memory only.
+  if (sub === 'control-enrol') {
+    if (values['--secret'] !== undefined || values['--words'] !== undefined) throw new Error('The secret and the words are read from stdin, never from the command line.');
+    const [secret = '', words = ''] = await appOnly(stdinLines, daemonDir(), 'Enrol browsers from the Meshrooms app: its window asks you first.');
+    const trusted = values['--trusted'], allow = values['--allow'];
+    if (trusted !== undefined && trusted !== 'yes' && trusted !== 'no') throw new Error('Give --trusted yes or no.');
+    return appRequest(daemonDir(), appDaemon, 'POST', '/api/local/app/remote/enrol', { body: {
+      origin: values['--origin'], name: values['--name'], device: values['--device'], sign: values['--sign'], enc: values['--enc'],
+      encVersion: Number(values['--enc-version']), encSig: values['--enc-sig'], secret, words, ...(trusted ? { trusted: trusted === 'yes' } : {}),
+      // `--allow none` turns remote prompts off; `--allow claude,codex` allows those.
+      ...(allow !== undefined ? { harnesses: allow === 'none' ? [] : allow.split(',') } : {}),
+    } });
+  }
+  // What the app's enrolment window shows before Enrol: remote control's policy here, and the harnesses it can reach.
+  // Reads only.
+  if (sub === 'remote-policy') {
+    const scan = await harnessScanner().scan();
+    // Read strictly: a file that can't be read is unknown (null), never shown as off, so the window leaves it as it is.
+    let policy: ReturnType<typeof readPolicy> | null = defaultPolicy();
+    try { policy = checkPolicy(JSON.parse(readFileSync(join(folder, POLICY_FILE), 'utf8'))); }
+    catch (error) { if ((error as { code?: string }).code !== 'ENOENT') policy = null; }
+    return { policy, controllers: readControllers(folder).length,
+      harnesses: scan.filter(h => (REMOTE_HARNESSES as readonly string[]).includes(h.harness)).map(({ harness, label, detected }) => ({ harness, label, detected })) };
+  }
+  // The app's Remote control window (desktop control-settings): what remote control is here, and the person's changes to
+  // it. Every change goes through the daemon, which holds the running remote turns and stops those a change no longer
+  // allows. All of it is the app's: it proves itself on stdin.
+  if (sub === 'remote-status') {
+    await remoteApp();
+    const overview = await appRequest(daemonDir(), appDaemon, 'GET', '/api/local/app/remote/overview');
+    if (values['--harnesses'] === undefined) return overview;
+    // A scan that fails leaves the harnesses out; the rest still shows, and so does the switch.
+    const scan = await harnessScanner().scan().catch(() => undefined);
+    return { ...overview, ...(scan ? { harnesses: scan.filter(h => (REMOTE_HARNESSES as readonly string[]).includes(h.harness)).map(({ harness, label, detected }) => ({ harness, label, detected })) } : {}) };
+  }
+  if (sub === 'remote-allow') {
+    await remoteApp();
+    const allow = values['--allow'];
+    if (allow === undefined) throw new Error('Give --allow HARNESS,HARNESS, or --allow none to turn remote control off.');
+    return appRequest(daemonDir(), appDaemon, 'POST', '/api/local/app/remote/change', { body: { allow: allow === 'none' ? [] : allow.split(',') } });
+  }
+  if (sub === 'remote-trust') {
+    await remoteApp();
+    const trusted = values['--trusted'];
+    if (trusted !== 'yes' && trusted !== 'no') throw new Error('Give --trusted yes or no.');
+    return appRequest(daemonDir(), appDaemon, 'POST', '/api/local/app/remote/change', { body: { trust: { device: values['--device'] ?? '', trusted: trusted === 'yes' } } });
+  }
+  if (sub === 'remote-revoke') {
+    await remoteApp();
+    const device = values['--device'] ?? '';
+    if (!/^[a-f0-9]{64}$/.test(device)) throw new Error('Give the browser\'s device id as 64 lowercase hex characters.');
+    return appRequest(daemonDir(), appDaemon, 'DELETE', `/api/local/app/remote/controllers/${device}`);
   }
   if (sub === 'cancel-pairing') {
     await appOnly(stdinLines);
@@ -2593,6 +2662,12 @@ export async function agentCli(argv: string[], stdin?: () => Promise<string>): P
     "person pair --origin ORIGIN --rooms ID,ID --name NAME --device BROWSER_DEVICE_ID  (the app only, proving itself on stdin, then the browser's secret on the next line; asks in each room with a proof of it, which only that browser can link; one paired person per app)",
     "person cancel-pairing --origin ORIGIN --rooms ID,ID --device BROWSER_DEVICE_ID  (the app only; withdraws pending companion requests and keeps admitted rooms and the person's key)",
     "person titles --origin ORIGIN --rooms ID,ID  (the rooms' public titles, for the app's pairing window)",
+    "person control-enrol --origin ORIGIN --name NAME --device ID --sign KEY --enc KEY --enc-version N --enc-sig SIG [--trusted yes|no] [--allow HARNESS,HARNESS|none]  (the app only, proving itself on stdin, then the link's secret and the typed words on the next lines; lets a browser control this machine's agents)",
+    "person remote-policy  (reads only: remote control's policy here, how many browsers control this machine, and the harnesses it can reach)",
+    "person remote-status [--harnesses]  (the app only, proving itself on stdin: the policy, the browsers that control this machine and whether each is online, and with --harnesses the harnesses it can reach)",
+    "person remote-allow --allow HARNESS,HARNESS|none  (the app only: the harnesses remote prompts may reach here; none turns remote control off and stops its turns)",
+    "person remote-trust --device ID --trusted yes|no  (the app only: whether that browser may send prompts)",
+    "person remote-revoke --device ID  (the app only: that browser no longer controls this machine, and its turns stop)",
     "person unpair --check  (reads only: the paired person, and the rooms whose only host device this is)",
     "person unpair [--anyway]  (the app only, proving itself on stdin: leaves every room, then deletes this machine's person; nothing is deleted while a room can't be left, and --anyway leaves the rooms this is the only host device of without a host)",
     "person create --title TITLE [--code INVITE_CODE] [--name NAME] [--origin ORIGIN]  (a new room, hosted by this machine's person)",

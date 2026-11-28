@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "control-window",
+  "description": "The enrolment window (a browser asking to control this computer's agents) may call the enrolment commands and nothing else: no core or plugin permissions.",
+  "windows": ["control"],
+  "permissions": [
+    "allow-control-view",
+    "allow-control-check",
+    "allow-control-verify",
+    "allow-control-confirm",
+    "allow-control-reject",
+    "allow-control-close"
+  ]
+}

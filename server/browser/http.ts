@@ -4,7 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { BrowserLobby, LobbyError } from './lobby';
 import { CURRENT_AGENT_VERSION, MIN_AGENT_VERSION } from './agent-version';
 import { MIN_PROTOCOL_VERSION, PROTOCOL_HEADER, PROTOCOL_VERSION, UPGRADE_REQUIRED, type SignedCommand } from '../../src/browser/protocol';
-import { RELAY_SEND_MAX_BODY_BYTES, RELAY_STATE_MAX_BODY_BYTES, type RelayService, type RelaySocketData } from './relay';
+import { RELAY_SEND_MAX_BODY_BYTES, RELAY_STATE_MAX_BODY_BYTES, type RelayService } from './relay';
+import type { ControlService } from './control';
+import type { ServiceSocketData } from './sockets';
 
 const explainer = fileURLToPath(new URL('./agent-join.md', import.meta.url));
 const escape = (text: string) => text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -51,7 +53,9 @@ const ACTIONS = new Set(['creation-status', 'create', 'request', 'cancel', 'stat
 const route = (path: string) => path.replace(/[a-f0-9-]{36}/g, ':id').slice(0, 120);
 
 /** `log` receives one JSON line per lobby command (status polls answered 200 or 410 excepted) and per 5xx. */
-export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; rateKeys?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void; relay?: RelayService };
+export type BrowserHttpOptions = { trustLoopbackProxy?: boolean; apiLimit?: number; createLimit?: number; rateKeys?: number; revision?: string; backupFresh?: () => boolean; now?: () => number; log?: (line: string) => void; relay?: RelayService;
+  /** Remote control's endpoint (`/api/control/v1`, control.ts); without it the path answers 404. */
+  control?: ControlService };
 /**
  * `origins`: the service's origin, then any other addresses of it (MESHROOMS_BROWSER_ALIASES). Each request is
  * answered as the origin its Host names, and a browser or bridge there must send that same Origin.
@@ -202,7 +206,7 @@ export function browserHandler(lobby: BrowserLobby, origins: string | string[], 
   return async (
     request: Request,
     remoteAddress = 'local',
-    upgrade?: (request: Request, data: RelaySocketData) => boolean,
+    upgrade?: (request: Request, data: ServiceSocketData) => boolean,
   ): Promise<Response> => {
     const url = new URL(request.url);
     const requestId = crypto.randomUUID().slice(0, 8);
@@ -220,6 +224,7 @@ export function browserHandler(lobby: BrowserLobby, origins: string | string[], 
       const body = { revision: options.revision || 'development', inviteRequired: lobby.inviteRequired, minAgentVersion: MIN_AGENT_VERSION,
         currentAgentVersion: CURRENT_AGENT_VERSION, protocolVersion: PROTOCOL_VERSION, minProtocolVersion: lobby.minProtocolVersion ?? MIN_PROTOCOL_VERSION,
         ...(options.relay && { relayEnabled: true }),
+        ...(options.control && { controlEnabled: true }),
         ...(options.backupFresh && { backupFresh: options.backupFresh() }) };
       try { return json({ ok: lobby.healthy(), ...body }); }
       catch (error) { failure(error, 503, requestId, url.pathname); return json({ ok: false, ...body }, 503); }
@@ -233,6 +238,14 @@ export function browserHandler(lobby: BrowserLobby, origins: string | string[], 
         }
         const upgraded = upgrade(request, options.relay.createSocketData(addressKey(address)));
         if (!upgraded) return json({ error: 'WebSocket upgrade failed.' }, 400);
+        return undefined as unknown as Response;
+      }
+      // Remote control (control.ts): a WebSocket only, with no room. The signed challenge must name this socket's origin.
+      if (url.pathname === '/api/control/v1') {
+        if (!options.control) return json({ error: 'Not found.' }, 404);
+        if (!chargeApi(addressKey(address))) return busy();
+        if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket' || !upgrade) return json({ error: 'WebSocket upgrade required.' }, 426);
+        if (!upgrade(request, options.control.createSocketData(addressKey(address), origin))) return json({ error: 'WebSocket upgrade failed.' }, 400);
         return undefined as unknown as Response;
       }
       if (url.pathname.startsWith('/api/relay/v1/')) {

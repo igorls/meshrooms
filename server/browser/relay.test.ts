@@ -253,7 +253,7 @@ test('WSS challenge-response auth, live E2E delivery, session replacement, and a
   server = Bun.serve<RelaySocketData>({
     hostname: '127.0.0.1',
     port: 0,
-    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d })),
+    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d as RelaySocketData })),
     websocket: {
       open: ws => relay.websocket.open!(ws),
       message: (ws, m) => relay.websocket.message!(ws, m),
@@ -351,7 +351,7 @@ test('a socket that watches its room gets status pushed: at once, on changes, a 
   const server = Bun.serve<RelaySocketData>({
     hostname: '127.0.0.1',
     port: 0,
-    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d })),
+    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d as RelaySocketData })),
     websocket: {
       open: ws => relay.websocket.open!(ws),
       message: (ws, m) => relay.websocket.message!(ws, m),
@@ -1000,7 +1000,7 @@ test('Device removal immediately closes WSS socket, aborts long-poll, deletes in
   const server = Bun.serve<RelaySocketData>({
     hostname: '127.0.0.1',
     port: 0,
-    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d })),
+    fetch: (req, srv) => handler(req, srv.requestIP(req)?.address || '127.0.0.1', (r, d) => srv.upgrade(r, { data: d as RelaySocketData })),
     websocket: {
       open: ws => relay.websocket.open!(ws),
       message: (ws, m) => relay.websocket.message!(ws, m),

@@ -102,7 +102,7 @@ impl Home {
 }
 
 fn allowed(action: &str) -> bool {
-    matches!(action, "open" | "room" | "start" | "stop" | "login" | "logs" | "review" | "approvals" | "refresh")
+    matches!(action, "open" | "room" | "start" | "stop" | "login" | "logs" | "review" | "approvals" | "remote" | "refresh")
 }
 
 fn trusted(label: &str, url: &tauri::Url, origin: &tauri::Url) -> bool {

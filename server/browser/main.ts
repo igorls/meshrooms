@@ -7,7 +7,9 @@ import { admissionPath, relayPath } from './store';
 import { backupFreshness } from './backup-status';
 import { acquireInstance } from '../instance';
 import { WakeConnector } from './wake-connector';
-import { RELAY_STATE_MAX_BODY_BYTES, RelayService, type RelaySocketData } from './relay';
+import { RELAY_STATE_MAX_BODY_BYTES, RelayService } from './relay';
+import { ControlService } from './control';
+import { serviceWebsocket, type ServiceSocketData } from './sockets';
 
 const config = browserConfig();
 mkdirSync(config.dataDir, { recursive: true });
@@ -29,6 +31,8 @@ const lobby = new BrowserLobby(admissionPath(config.dataDir), {
 // registrations exist, and the relay routes answer 404 exactly as they did before it was added.
 let relay: RelayService | undefined;
 let wakeConnector: WakeConnector | undefined;
+// Remote control's endpoint rides with the relay: it carries the same envelopes, and keeps nothing on disk.
+let control: ControlService | undefined;
 if (config.relayEnabled) {
   const relayDbPath = relayPath(config.dataDir);
   wakeConnector = new WakeConnector({
@@ -44,6 +48,7 @@ if (config.relayEnabled) {
     dbPath: relayDbPath,
     log: line => console.log(line),
   });
+  control = new ControlService({ lobby, log: line => console.log(line) });
 }
 const handle = browserHandler(lobby, [config.origin, ...config.aliases], resolve('dist'), {
   trustLoopbackProxy: config.trustLoopbackProxy,
@@ -51,6 +56,7 @@ const handle = browserHandler(lobby, [config.origin, ...config.aliases], resolve
   revision: config.revision,
   backupFresh: config.backupMaxAgeHours ? backupFreshness(config.dataDir, config.backupMaxAgeHours) : undefined,
   relay,
+  control,
 });
 /** Idle rooms are removed at start and then hourly. */
 const sweep = () => {
@@ -62,7 +68,7 @@ const sweeping = setInterval(sweep, 3_600_000);
 const serve = {
   hostname: '127.0.0.1',
   port: config.port,
-  fetch: (request: Request, srv: Bun.Server<RelaySocketData>) => handle(
+  fetch: (request: Request, srv: Bun.Server<ServiceSocketData>) => handle(
     request,
     srv.requestIP(request)?.address || 'unknown',
     (req, data) => srv.upgrade(req, { data }),
@@ -70,13 +76,14 @@ const serve = {
 };
 // Disabled, the listener keeps its original 24 KB body cap and has no WebSocket handler; the relay's larger caps apply only when it is on.
 const server = relay
-  ? Bun.serve<RelaySocketData>({ ...serve, maxRequestBodySize: RELAY_STATE_MAX_BODY_BYTES, websocket: relay.websocket })
-  : Bun.serve<RelaySocketData>({ ...serve, maxRequestBodySize: 24_000, websocket: { message() {} } });
+  ? Bun.serve<ServiceSocketData>({ ...serve, maxRequestBodySize: RELAY_STATE_MAX_BODY_BYTES, websocket: serviceWebsocket(relay, control) })
+  : Bun.serve<ServiceSocketData>({ ...serve, maxRequestBodySize: 24_000, websocket: { message() {} } });
 console.log(`Browser rooms: ${config.origin}/rooms (listening on loopback port ${server.port}; relay ${config.relayEnabled ? config.relayUrl : 'disabled'}; room creation ${config.invites === 'required' ? 'needs an invite code' : 'is open'}; up to ${config.maxRooms} rooms, removed after ${config.idleDays} idle days)`);
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     clearInterval(sweeping);
     server.stop(true);
+    control?.close();
     relay?.close();
     wakeConnector?.close();
     lobby.close();

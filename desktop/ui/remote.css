@@ -1,0 +1,10 @@
+/* The Remote control window (remote.html): pairing's layout (pair.css) and the enrolment window's choices (control.css). */
+h2 { font-size: 15px; margin: 1.5rem 0 .5rem; text-align: left; }
+#browsers { list-style: none; padding: 0; margin: 0; display: grid; gap: .75rem; text-align: left; }
+#browsers li { border: 1px solid var(--muted); border-radius: 6px; padding: .6rem .75rem; display: grid; gap: .3rem; }
+#browsers li > div:first-child { display: flex; justify-content: space-between; gap: 1rem; }
+#browsers .note { margin: 0; }
+#browsers .online { color: var(--accent); font-size: 13px; }
+#browsers .offline { color: var(--muted); font-size: 13px; }
+.row-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; font-size: 13px; }
+.row-actions button { padding: .3rem .9rem; }

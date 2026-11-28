@@ -64,6 +64,8 @@ export interface RoomSession {
   vote(decision: Decision, optionId: string | null, comment?: string): Promise<void>;
   /** Whether a file of the room was let go here because newer ones filled its storage. */
   evicted(sha: string): boolean;
+  /** How this device reaches each other device right now (device id to path), where the session connects peers itself. */
+  paths?(): Promise<Record<string, 'direct' | 'turn' | 'relay'>>;
   /** Ask peers for an attachment on demand (non-images, or images past the per-sender auto-fetch budget). */
   requestFile(sha: string): void;
   /** The person has read up to this message. */
@@ -269,6 +271,7 @@ export class BrowserSource implements RoomSource {
           reviseDecision: (decision, change) => peers.reviseDecision(decision, change),
           vote: (decision, optionId, comment) => peers.vote(decision, optionId, comment),
           evicted: sha => peers.evicted(sha),
+          paths: () => peers.paths(),
           requestFile: sha => peers.requestFile(sha),
           markRead: messageId => saveReadPosition(deviceId, urlRoom, messageId, fence),
           publishCount: count => publishCount(deviceId, urlRoom, count),

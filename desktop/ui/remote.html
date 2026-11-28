@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshrooms: remote control</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="pair.css">
+  <link rel="stylesheet" href="control.css">
+  <link rel="stylesheet" href="remote.css">
+</head>
+<body>
+  <main>
+    <h1>Remote control</h1>
+    <p id="lead">Reading this computer’s remote control settings…</p>
+    <form id="settings" hidden>
+      <fieldset>
+        <legend>Remote prompts on this computer may reach</legend>
+        <div id="harnesses"></div>
+        <p class="note" id="harnesses-note"></p>
+      </fieldset>
+    </form>
+    <h2 id="browsers-title" hidden>Browsers that can control this computer</h2>
+    <ul id="browsers" hidden></ul>
+    <p id="empty" class="note" hidden>No browser can control this computer. A browser is let in from a meshrooms://control link it opens here, after you type the words it shows.</p>
+    <div class="actions"><button id="off" type="button" class="danger" hidden>Turn off remote control</button></div>
+    <p id="machine" class="note"></p>
+    <p id="problem" class="problem" role="alert"></p>
+    <div class="actions"><button id="close" type="button">Close</button></div>
+  </main>
+  <script src="remote.js"></script>
+</body>
+</html>

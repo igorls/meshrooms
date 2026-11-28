@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remote-trust"
+description = "Enables the remote_trust command without any pre-configured scope."
+commands.allow = ["remote_trust"]
+
+[[permission]]
+identifier = "deny-remote-trust"
+description = "Denies the remote_trust command without any pre-configured scope."
+commands.deny = ["remote_trust"]

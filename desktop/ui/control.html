@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshrooms: control this computer</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="pair.css">
+  <link rel="stylesheet" href="control.css">
+</head>
+<body>
+  <main>
+    <h1 id="title">Control this computer</h1>
+    <p id="lead"></p>
+    <p id="from" class="note"></p>
+    <form id="ask" hidden>
+      <label for="words">Type the five words your browser shows</label>
+      <input id="words" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="100">
+      <p id="problem" class="problem" role="alert"></p>
+      <div class="actions"><button id="next" type="submit" class="primary" disabled>Next</button><button id="reject" type="button">Reject</button></div>
+      <p class="note">The name and address come from the link, not from Meshrooms: only let in a browser you opened yourself. If you didn't ask for this, reject it.</p>
+    </form>
+    <form id="review" hidden>
+      <fieldset id="harnesses-box">
+        <legend>Remote prompts on this computer may reach</legend>
+        <div id="harnesses"></div>
+        <p class="note" id="harnesses-note"></p>
+      </fieldset>
+      <label class="check"><input id="trusted" type="checkbox"> Let this browser send prompts to them</label>
+      <p class="note">Without this, the browser sees this computer and its sessions, but can't prompt them. A prompt runs in the session as you would at this computer, with that session's own permissions.</p>
+      <div class="actions"><button id="enrol" type="submit" class="primary">Let this browser in</button><button id="reject2" type="button">Reject</button></div>
+    </form>
+    <p id="after-problem" class="problem" role="alert"></p>
+    <div class="actions" id="after" hidden><button id="close" type="button">Close</button></div>
+  </main>
+  <script src="control.js"></script>
+</body>
+</html>

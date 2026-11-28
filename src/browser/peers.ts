@@ -144,6 +144,25 @@ const isFileIndexEntry = (value: unknown, sha: string): value is { size: number;
   isSha256(sha) && isPlainObject(value) && typeof value.size === 'number' && Number.isFinite(value.size) && value.size >= 0 && typeof value.type === 'string';
 const isBlob = (value: unknown): value is Blob => typeof Blob !== 'undefined' && value instanceof Blob;
 
+export type PeerPath = 'direct' | 'turn' | 'relay';
+/**
+ * Whether a WebRTC connection's selected candidate pair goes through a TURN server (either end a `relay` candidate)
+ * or straight between the devices. Chrome names the pair on the transport; Firefox marks it `selected`. Only when
+ * neither says which pair is in use does a nominated, succeeded pair stand in for it.
+ */
+export function pathOf(stats: RTCStatsReport): 'direct' | 'turn' {
+  let pairId: string | undefined, selected: any, nominated: any;
+  stats.forEach((report: any) => { if (report.type === 'transport' && report.selectedCandidatePairId) pairId = report.selectedCandidatePairId; });
+  stats.forEach((report: any) => {
+    if (report.type !== 'candidate-pair') return;
+    if (pairId ? report.id === pairId : report.selected) selected = selected ?? report;
+    else if (!pairId && report.nominated && report.state === 'succeeded') nominated = nominated ?? report;
+  });
+  const pair = selected ?? nominated;
+  if (!pair) return 'direct';
+  const local: any = stats.get(pair.localCandidateId), remote: any = stats.get(pair.remoteCandidateId);
+  return local?.candidateType === 'relay' || remote?.candidateType === 'relay' ? 'turn' : 'direct';
+}
 /** Real browser data channels; the lobby carries connection descriptions only. */
 export class BrowserPeers {
   private peers = new Map<string, Peer>();
@@ -380,6 +399,24 @@ export class BrowserPeers {
   vfsTracker(): VfsSyncTracker { return this.vfsSyncTracker; }
   /** Explicitly pin the expected host key prefix (e.g. from `#h=` fragment). */
   setHostPin(pin: string | undefined) { if (pin) this.pinnedHost = pin; }
+  /**
+   * How this device reaches each other device right now, for people to see: `direct` (a WebRTC path between the two
+   * devices), `turn` (WebRTC through a TURN relay), or `relay` (no WebRTC channel; the room service's relay socket
+   * carries it, for devices online now). Devices missing from the result aren't reachable now. Read from the selected
+   * ICE candidate pair.
+   */
+  async paths(): Promise<Record<string, PeerPath>> {
+    const out: Record<string, PeerPath> = {};
+    await Promise.all([...this.peers].map(async ([id, peer]) => {
+      if (peer.channel?.readyState !== 'open') return;
+      try { out[id] = pathOf(await peer.pc.getStats()); } catch { out[id] = 'direct'; }
+    }));
+    // The roster lists every admitted device; only those with a session now are reached through the relay.
+    if (this.relayClient?.isConnected()) for (const device of this.verifiedRoster?.body.devices ?? []) {
+      if (device.id !== this.deviceId && !out[device.id] && this.status?.devices?.some(d => d.id === device.id && d.session)) out[device.id] = 'relay';
+    }
+    return out;
+  }
   /** Whether a peer currently has a live open WebRTC DataChannel (Section 5.4 WebRTC-first rule). */
   private hasLiveWebRtc(id: string): boolean {
     const peer = this.peers.get(id);

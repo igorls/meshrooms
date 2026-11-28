@@ -18,9 +18,17 @@ export type Command = {
     | 'create' | 'creation-status' | 'request' | 'cancel' | 'status' | 'decide' | 'link' | 'remove' | 'signal'
     | 'agent-invite' | 'agent-redeem' | 'settings' | 'profile' | 'rename' | 'repositories' | 'claim' | 'transfer-host' | 'close'
     | 'pair-offer' | 'pair-redeem' | 'pair-cancel'
-    | 'roster-publish' | 'relay-open' | 'relay-send' | 'relay-poll' | 'relay-wake-register' | 'relay-state-get' | 'relay-state-put';
+    | 'roster-publish' | 'relay-open' | 'relay-send' | 'relay-poll' | 'relay-wake-register' | 'relay-state-get' | 'relay-state-put'
+    | 'control-open';
   roomId: string; payload: Record<string, unknown>;
 };
+/**
+ * Remote control (docs/flows/remote-control.md) has no room: its commands carry this roomId, and the control service
+ * accepts no other. A room command can't pass for one, nor the reverse, since the action differs too.
+ */
+export const CONTROL_ROOM_ID = '00000000-0000-0000-0000-000000000000';
+/** The envelope domain of a machine's control traffic, both ways: `control:<its device id>`. */
+export const controlRoom = (machineDeviceId: string) => `control:${machineDeviceId}`;
 export type SignedCommand = { command: Command; publicKey: string; signature: string };
 export type BrowserDevice = {
   id: string; publicKey: string; label: string; memberId: string; admittedAt: number;

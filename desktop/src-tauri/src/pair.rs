@@ -24,7 +24,7 @@ pub const MAX_WRONG: u32 = 5;
 const PROGRESS_EVERY: Duration = Duration::from_secs(2);
 
 /// The word list both sides share (src/browser/pair-words.json): 256 words.
-fn words() -> &'static [String] {
+pub(crate) fn words() -> &'static [String] {
     static WORDS: OnceLock<Vec<String>> = OnceLock::new();
     WORDS.get_or_init(|| serde_json::from_str(include_str!("../../../src/browser/pair-words.json")).expect("pair-words.json is a list of words"))
 }
@@ -49,7 +49,7 @@ pub fn normal(typed: &str) -> String {
 }
 
 /// base64url without padding, as the browser spelled the secret.
-fn encode(bytes: &[u8]) -> String {
+pub(crate) fn encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
@@ -89,7 +89,7 @@ pub(crate) fn app_proof() -> Result<String, String> {
     control_token(&text)
 }
 
-fn wipe(bytes: &mut [u8]) {
+pub(crate) fn wipe(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
         // Volatile, so the compiler can't drop a write it sees no later read of.
         unsafe { std::ptr::write_volatile(byte, 0) };

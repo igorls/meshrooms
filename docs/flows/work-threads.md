@@ -85,7 +85,7 @@ What already holds today and has to keep holding:
 
 ## Clients from before threads
 
-Browsers and bridges from before work threads (`@wormdb/meshrooms` up to 0.2.0-beta.13; 0.2.0-beta.12 ships #166 and #167
+Browsers and bridges from before work threads (`@wormdb/meshrooms` up to 0.2.0-beta.14; 0.2.0-beta.12 ships #166 and #167
 first) check only the fields they know, so a message with
 `threadId` passes their checks, verifies, is stored whole, and is served in history unchanged. They show it on the
 room's timeline as an ordinary message.

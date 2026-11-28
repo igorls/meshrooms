@@ -237,6 +237,10 @@ Turn it on in /etc/meshrooms/browser.env, then restart:
 
 The relay nginx locations in deploy/nginx/meshrooms.conf are harmless while the flag is off (the app answers 404).
 
+Remote control's endpoint (`/api/control/v1`, docs/flows/remote-control.md) comes on with the relay: it carries the
+same envelopes and keeps nothing on disk, so it needs no setting of its own. Health then reports `controlEnabled`. Its
+nginx location sits next to the relay's, with the same timeouts.
+
 **Schema migration.** The first start of a build with the relay code migrates the admission database from schema v2
 to v3 (new `room_rosters` table and device encryption/wake columns), **whether or not the flag is on**: the schema is
 additive but the migration is one-way, and a server that only knows v2 refuses a v3 database. Before migrating a

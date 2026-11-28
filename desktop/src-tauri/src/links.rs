@@ -1,14 +1,20 @@
 //! Untrusted deep links stop at a native window; nothing here acts on its own.
 //! `join` goes to join.rs: a room this computer is already in opens, and anything else waits for the person in the join
 //! window. `pair` opens the pairing window (pair.rs), where the person types the phrase their browser shows before
-//! anything happens.
+//! anything happens. `control` opens the enrolment window (control.rs), where the person types the words their browser
+//! shows before that browser may control this computer's agents.
 //! Do not derive Debug/Serialize for requests or retain/log raw links: a pair link carries the browser's secret.
 
+use sha2::Digest;
 use url::Url;
 
 const MAX_LINK: usize = 8192;
 /// A pairing link is at most 4 KB: 64 rooms and a name fit well within it.
 const MAX_PAIR_LINK: usize = 4096;
+/// An enrolment link: three keys, a secret, an origin and a name, well within 4 KB.
+const MAX_CONTROL_LINK: usize = 4096;
+/// An enrolment link's name as it comes, before cleaning: the words bind it exactly, so it is bounded, not cut.
+const MAX_RAW_NAME: usize = 256;
 const MAX_ORIGIN: usize = 512;
 pub const MAX_PAIR_ROOMS: usize = 64;
 /// A pairing link's name, in characters, once cleaned (src/browser/pairing.ts caps it the same way).
@@ -19,6 +25,9 @@ pub enum Request {
     /// From the person's browser (src/browser/pairing.ts). The secret goes straight into the pending pairing, which
     /// wipes it when it ends; it is never logged, shown, or put on a command line.
     Pair { origin: String, name: String, device: String, rooms: Vec<String>, secret: [u8; 32] },
+    /// From the person's browser (src/browser/control-client.ts controlLink): it asks to control this computer's agents.
+    /// The link wipes its secret when it is dropped.
+    Control(crate::control::Link),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +41,7 @@ pub enum Invalid {
     Name,
     Secret,
     Device,
+    Key,
 }
 
 /// Parse without I/O, resolving names, or changing device/daemon state.
@@ -51,7 +61,7 @@ pub fn parse(raw: &str) -> Result<Request, Invalid> {
     // The Windows shell hands a registered scheme's link to its handler with a slash after the host: a browser's
     // `meshrooms://pair?…` arrives as `meshrooms://pair/?…`. That one slash, and nothing else, is the same link.
     let action = action.strip_suffix('/').unwrap_or(action);
-    if !matches!(action, "join" | "pair") || query.is_empty() || query.contains('#') {
+    if !matches!(action, "join" | "pair" | "control") || query.is_empty() || query.contains('#') {
         return Err(Invalid::Shape);
     }
     // Reject malformed escapes before the URL library's forgiving form decoder.
@@ -106,6 +116,38 @@ pub fn parse(raw: &str) -> Result<Request, Invalid> {
         }
         let secret = decode_secret(&secret).ok_or(Invalid::Secret)?;
         return Ok(Request::Pair { origin, name, device, rooms: list, secret });
+    }
+    if action == "control" {
+        if raw.len() > MAX_CONTROL_LINK {
+            return Err(Invalid::Length);
+        }
+        if query.split('&').any(|item| item.starts_with("v=") && item != "v=1") {
+            return Err(Invalid::Version);
+        }
+        let [version, origin, name, device, sign, enc, enc_version, enc_sig, secret] =
+            fields(query, ["v", "origin", "name", "device", "sign", "enc", "encVersion", "encSig", "secret"])?;
+        if version != "1" {
+            return Err(Invalid::Version);
+        }
+        validate_origin(&origin)?;
+        // The words bind the name as it comes, and it goes on a command line: no control characters (a browser's name
+        // never has one), and not too long.
+        if name.chars().count() > MAX_RAW_NAME || name.chars().any(char::is_control) || crate::text::clean(&name, MAX_NAME).is_empty() {
+            return Err(Invalid::Name);
+        }
+        // Raw uncompressed P-256 points (65 bytes, 0x04 first) and a 64-byte signature, in canonical base64.
+        let point = |text: &str| crate::control::base64_bytes(text).filter(|bytes| bytes.len() == 65 && bytes[0] == 4);
+        let sign_key = point(&sign).ok_or(Invalid::Key)?;
+        if point(&enc).is_none() || crate::control::base64_bytes(&enc_sig).filter(|sig| sig.len() == 64).is_none() {
+            return Err(Invalid::Key);
+        }
+        // The device id is its signing key's sha256 (protocol.ts deviceId): one can't be named with another's key.
+        if device != crate::control::hex(&sha2::Sha256::digest(&sign_key)) {
+            return Err(Invalid::Device);
+        }
+        let enc_version = enc_version.parse::<u32>().ok().filter(|v| *v >= 1 && v.to_string() == enc_version).ok_or(Invalid::Key)?;
+        let secret = decode_secret(&secret).ok_or(Invalid::Secret)?;
+        return Ok(Request::Control(crate::control::Link { origin, name, device, sign, enc, enc_version, enc_sig, secret }));
     }
     let [origin, room] = fields(query, ["origin", "room"])?;
     validate_origin(&origin)?;
@@ -237,6 +279,7 @@ impl Dispatcher {
         Self::worker(move |incoming| match incoming {
             Incoming::Valid(Request::Pair { origin, name, device, rooms, secret }) => crate::pair::open(&app, origin, name, device, rooms, secret),
             Incoming::Valid(Request::Join { origin, room }) => crate::join::open(&app, origin, room),
+            Incoming::Valid(Request::Control(link)) => crate::control::open(&app, link),
             Incoming::Invalid => {
                 notice_limited(&app, "Unsupported or invalid Meshrooms link. No action was taken.");
             }
@@ -445,12 +488,13 @@ mod tests {
         let capability: serde_json::Value = serde_json::from_str(include_str!("../capabilities/notice.json")).unwrap();
         assert_eq!(capability["windows"], serde_json::json!([NOTICE_WINDOW]));
         assert_eq!(capability["permissions"], serde_json::json!(["allow-notice-close"]));
-        for other in ["main", "pair", "join", "review", "approvals"] {
+        for other in ["main", "pair", "join", "review", "approvals", "control"] {
             let text = match other {
                 "main" => include_str!("../capabilities/home.json"),
                 "pair" => include_str!("../capabilities/pair.json"),
                 "join" => include_str!("../capabilities/join.json"),
                 "review" => include_str!("../capabilities/review.json"),
+                "control" => include_str!("../capabilities/control.json"),
                 _ => include_str!("../capabilities/approvals.json"),
             };
             let capability: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -465,7 +509,7 @@ mod tests {
                 assert_eq!(origin, "https://rooms.example");
                 assert_eq!(room, ROOM);
             }
-            Request::Pair { .. } => panic!("a join link is a join"),
+            _ => panic!("a join link is a join"),
         }
     }
     #[test]
@@ -618,12 +662,12 @@ mod tests {
                 assert_eq!(rooms, vec![ROOM.to_string(), ROOM2.to_string()]);
                 assert_eq!(secret, [0u8; 32]);
             }
-            Request::Join { .. } => panic!("a pair link is a pair"),
+            _ => panic!("a pair link is a pair"),
         }
         // The browser's encoding of 0..31 (src/browser/pairing.test.ts).
         match parse(&with(&[("secret", Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()))])).expect("valid") {
             Request::Pair { secret, .. } => assert_eq!(secret.to_vec(), (0u8..32).collect::<Vec<_>>()),
-            Request::Join { .. } => panic!("a pair link is a pair"),
+            _ => panic!("a pair link is a pair"),
         }
     }
     #[test]
@@ -655,12 +699,64 @@ mod tests {
         let bell = char::from_u32(7).unwrap();
         let name = |raw: String| match parse(&with(&[("name", Some(raw))])) {
             Ok(Request::Pair { name, .. }) => Ok(name),
-            Ok(Request::Join { .. }) => panic!("a pair link is a pair"),
+            Ok(_) => panic!("a pair link is a pair"),
             Err(error) => Err(error),
         };
         assert_eq!(name(format!("Ro{rlo}bin{bell}\n Lee")).unwrap(), "Robin Lee");
         assert_eq!(name("Zoë Ångström".into()).unwrap(), "Zoë Ångström");
         assert_eq!(name("é".repeat(100)).unwrap().chars().count(), MAX_NAME);
         assert_eq!(name(format!("{rlo}{bell}")).err(), Some(Invalid::Name));
+    }
+    /// A browser's key (0x04, then 0..63) and its device id, as control-client.ts exports them.
+    const SIGN: &str = "BAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+    fn control_link(changes: &[(&str, Option<String>)]) -> String {
+        let device = crate::control::hex(&sha2::Sha256::digest(crate::control::base64_bytes(SIGN).unwrap()));
+        let mut fields: Vec<(&str, String)> = vec![
+            ("v", "1".into()), ("origin", "https://rooms.example".into()), ("name", "Laptop browser".into()), ("device", device),
+            ("sign", SIGN.into()), ("enc", SIGN.into()), ("encVersion", "1".into()), ("encSig", format!("{}==", "A".repeat(86))), ("secret", ZERO.into()),
+        ];
+        for (key, value) in changes {
+            match value { Some(v) => fields.iter_mut().find(|(k, _)| k == key).unwrap().1 = v.clone(), None => fields.retain(|(k, _)| k != key) }
+        }
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &fields { query.append_pair(key, value); }
+        format!("meshrooms://control?{}", query.finish())
+    }
+    #[test]
+    fn a_control_link_carries_a_browser_whose_device_is_its_key() {
+        match parse(&control_link(&[])) {
+            Ok(Request::Control(link)) => {
+                assert_eq!(link.origin, "https://rooms.example");
+                assert_eq!(link.name, "Laptop browser");
+                assert_eq!(link.sign, SIGN);
+                assert_eq!(link.enc_version, 1);
+                assert_eq!(link.secret, [0; 32]);
+            }
+            _ => panic!("a control link is a control link"),
+        }
+        // As the Windows shell hands it over.
+        assert!(matches!(parse(&control_link(&[]).replacen("control?", "control/?", 1)), Ok(Request::Control(_))));
+        let refused = |changes: &[(&str, Option<String>)]| parse(&control_link(changes)).err();
+        assert_eq!(refused(&[("device", Some("b".repeat(64)))]), Some(Invalid::Device));
+        assert_eq!(refused(&[("sign", Some("A".repeat(88)))]), Some(Invalid::Key));
+        assert_eq!(refused(&[("enc", Some("not a key".into()))]), Some(Invalid::Key));
+        assert_eq!(refused(&[("encSig", Some("AAAA".into()))]), Some(Invalid::Key));
+        assert_eq!(refused(&[("encVersion", Some("0".into()))]), Some(Invalid::Key));
+        assert_eq!(refused(&[("encVersion", Some("01".into()))]), Some(Invalid::Key));
+        assert_eq!(refused(&[("v", Some("2".into()))]), Some(Invalid::Version));
+        assert_eq!(refused(&[("origin", Some("http://rooms.example".into()))]), Some(Invalid::Origin));
+        assert_eq!(refused(&[("secret", Some("short".into()))]), Some(Invalid::Secret));
+        assert_eq!(refused(&[("name", Some("x".repeat(300)))]), Some(Invalid::Name));
+        for control in ["Laptop\u{0}", "Lap\ntop", "Lap\u{7}top", "\u{85}Laptop"] {
+            assert_eq!(refused(&[("name", Some(control.into()))]), Some(Invalid::Name), "{control:?}");
+        }
+        for missing in ["v", "origin", "name", "device", "sign", "enc", "encVersion", "encSig", "secret"] {
+            assert_eq!(refused(&[(missing, None)]), Some(Invalid::Query), "{missing}");
+        }
+        // The name stays as the link carries it (the words bind it); the window shows it cleaned.
+        match parse(&control_link(&[("name", Some("  Zoë  Laptop ".into()))])) {
+            Ok(Request::Control(link)) => assert_eq!(link.name, "  Zoë  Laptop "),
+            _ => panic!("a control link is a control link"),
+        }
     }
 }

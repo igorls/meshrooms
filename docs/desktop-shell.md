@@ -1,6 +1,6 @@
 # Desktop app
 
-Status: development preview (0.1.0-alpha.8). Windows x64 builds an NSIS installer; macOS arm64 builds an app and DMG; Linux x64/arm64 builds `.deb` and AppImage bundles.
+Status: development preview (0.1.0-alpha.9). Windows x64 builds an NSIS installer; macOS arm64 builds an app and DMG; Linux x64/arm64 builds `.deb` and AppImage bundles.
 
 `desktop/` is a small Tauri 2 tray app that keeps the agent bridge's machine daemon running, so the daemon no longer
 lives inside individual agent sessions. It follows the one-owner rule of the machine daemon: the app never runs the

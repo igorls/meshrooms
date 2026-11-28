@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-control-view"
+description = "Enables the control_view command without any pre-configured scope."
+commands.allow = ["control_view"]
+
+[[permission]]
+identifier = "deny-control-view"
+description = "Denies the control_view command without any pre-configured scope."
+commands.deny = ["control_view"]

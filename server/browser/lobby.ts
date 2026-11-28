@@ -2,7 +2,7 @@ import type { Database } from 'bun:sqlite';
 import { CLAIM_TTL_MS, FLOORS, NEW_ROOM_FLOOR, type Claim, type Floor } from '../../src/collab';
 import { sniff } from '../attachments';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { AGENT_RUNTIME_FIELDS, agentRuntimeLabelError, browserProtocol, cleanAgentRuntimeLabel, cleanDisplayName, deviceId, foldDisplayName, MAX_REPOSITORIES, MAX_RENAME_NOTICES, MIN_PROTOCOL_VERSION, validRepository, verify, type BrowserDevice, type BrowserMember, type RenameNotice, type Command, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, type SignedRoster, DEFAULT_ROOM_SETTINGS, PAIR_OFFER_NOT_FOUND, PAIRING_NOT_FOUND, ROOM_CLOSED, type CommandAnswer, type PairingOffer } from '../../src/browser/protocol';
+import { AGENT_RUNTIME_FIELDS, CONTROL_ROOM_ID, agentRuntimeLabelError, browserProtocol, cleanAgentRuntimeLabel, cleanDisplayName, deviceId, foldDisplayName, MAX_REPOSITORIES, MAX_RENAME_NOTICES, MIN_PROTOCOL_VERSION, validRepository, verify, type BrowserDevice, type BrowserMember, type RenameNotice, type Command, type JoinRequest, type RoomSettings, type RoomStatus, type Signal, type SignedCommand, type SignedRoster, DEFAULT_ROOM_SETTINGS, PAIR_OFFER_NOT_FOUND, PAIRING_NOT_FOUND, ROOM_CLOSED, type CommandAnswer, type PairingOffer } from '../../src/browser/protocol';
 import { importEncPublicKey, verifyEncBinding, verifyRoster } from '../../src/browser/relay-crypto';
 import { OFFER_LOOKUP, OFFER_MAX_ROOMS, OFFER_TTL_MS, PAIRING_PROOF, PAIRING_SECRET, pairingMessage } from '../../src/browser/pairing';
 import { admitBetaDevice, betaDevices, betaPerson, betaRevoked, consumeInvite, inviteMessages } from './invites';
@@ -230,6 +230,13 @@ export class BrowserLobby {
     }
     const id = await deviceId(input.publicKey);
     return { command: c, deviceId: id, publicKey: input.publicKey };
+  }
+  /**
+   * Whether a device takes part in Meshrooms here: admitted (not retired) in some room, or admitted to the beta. Remote
+   * control's endpoint (control.ts) serves only these, so a key made a moment ago gets nothing from it.
+   */
+  participantDevice(id: string): boolean {
+    return !!this.db.query('SELECT 1 FROM room_devices WHERE device_id = ? AND retired = 0 LIMIT 1').get(id) || !!betaPerson(this.db, id);
   }
   /** Returns true when `deviceId` is currently an admitted (non-retired) device in `roomId`. */
   isAdmittedDevice(roomId: string, id: string): boolean {
@@ -534,6 +541,8 @@ export class BrowserLobby {
   async execute(input: SignedCommand, address?: string, admit?: () => void): Promise<RoomStatus | ({ roomId: string; token?: string } & CommandAnswer)> {
     const c = input?.command;
     if (!c || c.protocol !== browserProtocol || !this.origins.has(c.origin) || !uuid(c.id) || !uuid(c.roomId) || !Number.isSafeInteger(c.at) || Math.abs(this.now() - c.at) > 60_000 || !c.payload || typeof c.payload !== 'object' || Array.isArray(c.payload)) fail(400, 'This request has expired or is invalid. Try again.');
+    // Remote control's id names no room, and no room may take it.
+    if (c.roomId === CONTROL_ROOM_ID) fail(400, 'This request has expired or is invalid. Try again.');
     if (typeof input.publicKey !== 'string' || typeof input.signature !== 'string' || !await verify(input.publicKey, c, input.signature)) fail(401, 'This device could not be authenticated.');
     const id = await deviceId(input.publicKey);
     admit?.();

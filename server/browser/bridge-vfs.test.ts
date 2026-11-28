@@ -107,7 +107,7 @@ function startLoopbackStack() {
       return handler(
         request,
         srv.requestIP(request)?.address || '127.0.0.1',
-        (req, data) => srv.upgrade(req, { data }),
+        (req, data) => srv.upgrade(req, { data: data as RelaySocketData }),
       );
     },
     websocket: {

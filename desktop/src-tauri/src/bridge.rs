@@ -148,6 +148,9 @@ fn limit(args: &[&str]) -> Duration {
         // Pairing asks in up to 64 rooms, then waits for their runners; creating or joining a room waits for the room
         // service, then for the room's runner.
         ["person", "pair" | "create" | "join", ..] => Duration::from_secs(180),
+        // Enrolling a browser adds it and opens the control socket at its service; the Remote control window's first read
+        // runs each harness to see which are here.
+        ["person", "control-enrol", ..] | ["person", "remote-status", "--harnesses", ..] => Duration::from_secs(60),
         // The notification feed is a long poll of up to 30 s.
         ["person", "notifications", ..] => Duration::from_secs(60),
         _ => Duration::from_secs(30),

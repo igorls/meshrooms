@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-control-reject"
+description = "Enables the control_reject command without any pre-configured scope."
+commands.allow = ["control_reject"]
+
+[[permission]]
+identifier = "deny-control-reject"
+description = "Denies the control_reject command without any pre-configured scope."
+commands.deny = ["control_reject"]

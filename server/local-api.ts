@@ -48,6 +48,8 @@
  *   GET    /api/local/notifications?after=<cursor>        (control token only) the app's notification feed, see Notifier
  *   GET    /api/local/app/review                          (control token only) the bound agents, for the app's start notice
  *   POST   /api/local/app/rooms/:id/agents/:member/pause|resume   (control token only) the app's Review window
+ *   /api/local/app/remote/...                             (control token only) remote control: its policy, controllers
+ *                                                         and turns (remote-control.ts remoteRoute)
  *   POST   /api/local/session {ticket}                    (browser) a session token for the ticket
  *   DELETE /api/local/session                             (browser) ends the session token it is sent with
  *   POST   /api/local/ticket                              (control token) a one-time ticket for a browser
@@ -70,6 +72,7 @@ import {
 import { agentRoute, type AgentServices } from './local-agents';
 import { agentReview, pauseIdentity, resumeIdentity } from './agents';
 import { NotificationWatch, notifyLevel, setNotifyLevel } from './notifications';
+import { machineRemoteDeps, remoteRoute, sweepPromptFiles, type RemoteDeps, type RemoteRouteContext } from './remote-control';
 
 export const LOCAL_API_PORT = 4310;
 /** The endpoint file, in the daemon's folder. */
@@ -281,9 +284,9 @@ async function capped(declaredLength: string | null, stream: ReadableStream<Uint
   }
   return new Uint8Array(Buffer.concat(chunks));
 }
-async function body(request: Request): Promise<Record<string, unknown>> {
+async function body(request: Request, limit = MAX_BODY): Promise<Record<string, unknown>> {
   if (request.headers.get('content-type')?.split(';')[0].trim() !== 'application/json') fail(415, 'Send application/json.');
-  const text = Buffer.from(await bounded(request, MAX_BODY, 'This request is too large.')).toString('utf8');
+  const text = Buffer.from(await bounded(request, limit, 'This request is too large.')).toString('utf8');
   try {
     const value = JSON.parse(text);
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
@@ -306,13 +309,22 @@ export type LocalApiOptions = { access: LocalAccess; port: number; feed: EventFe
   /** The app's notification feed (notifications.ts); without it /api/local/notifications answers 503. */
   notifications?: NotificationWatch;
   /** When the daemon started, so the app's start notice counts an agent whose runner is still starting as starting. */
-  startedAt?: number };
-export function localApiHandler({ access, port, feed, home = personHome(), distDir, uiFiles, agents, approvals = false, notifications, startedAt = Date.now() }: LocalApiOptions) {
+  startedAt?: number;
+  /** Remote turns' deps (remote-control.ts); by default the machine's, with the agent routes' scanner. */
+  remote?: RemoteDeps;
+  /** The daemon's control socket (control-socket.ts), for the enrolment and status routes. */
+  machine?: RemoteRouteContext['machine'] };
+/** What the handler may ask of the server it runs in: a longer idle timeout for one request (a remote turn). */
+export type RequestTimeouts = { timeout(request: Request, seconds: number): void };
+export function localApiHandler({ access, port, feed, home = personHome(), distDir, uiFiles, agents, approvals = false, notifications, startedAt = Date.now(), remote, machine }: LocalApiOptions) {
   // localhost still names this server (a page load), but only the 127.0.0.1 origin may use the API.
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]), pageOrigin = `http://127.0.0.1:${port}`;
   const room = (id: string) => listedAgents(home).find(r => r.room.roomId === id) ?? fail(404, 'This person is not in that room. Join it from its link, in the Meshrooms app.');
   const avatars = new Map<string, { type: string; bytes: Uint8Array }>();
-  return async (request: Request): Promise<Response> => {
+  const remoteDeps = remote ?? (agents ? machineRemoteDeps(home, agents.scanner) : undefined);
+  // Hermes prompt files a turn left when this process last ended mid-turn.
+  if (remoteDeps) sweepPromptFiles(remoteDeps.home);
+  return async (request: Request, server?: RequestTimeouts): Promise<Response> => {
     try {
       const url = new URL(request.url);
       if (!hosts.has(request.headers.get('host') ?? '')) fail(403, 'Use the local address of Meshrooms.');
@@ -383,6 +395,10 @@ export function localApiHandler({ access, port, feed, home = personHome(), distD
         }
         return fail(404, 'Unknown local endpoint.');
       }
+      // Remote control (remote-control.ts): the app's own as well, by the control token.
+      const remoteAnswer = await remoteRoute(url.pathname, request.method, { home, control, body: limit => body(request, limit), ...(remoteDeps ? { deps: remoteDeps } : {}),
+        keepOpen: seconds => server?.timeout(request, seconds), ...(machine ? { machine } : {}) });
+      if (remoteAnswer) return json(remoteAnswer.value, remoteAnswer.status);
       const routed = await agentRoute(url, request.method, { home, control, approvals, body: () => body(request), ...(agents ? { services: agents } : {}) });
       if (routed) return json(routed.value, routed.status);
       const path = /^\/api\/local\/rooms\/([a-f0-9-]{36})\/([a-z-]+)(?:\/([a-f0-9-]{36,64}))?(?:\/(want))?$/.exec(url.pathname);
@@ -559,15 +575,17 @@ export function preferredPort(env: Record<string, string | undefined> = process.
  * and recorded as `preferred`), and writes the endpoint file. `stop` closes it and removes the file. The event feed
  * looks at the rooms once a second meanwhile.
  */
-export function startLocalApi(options: { dir: string; home?: string; port?: number; log: (line: string) => void; distDir?: string; uiFiles?: Map<string, Uint8Array>; agents?: AgentServices; approvals?: boolean }) {
+export function startLocalApi(options: { dir: string; home?: string; port?: number; log: (line: string) => void; distDir?: string; uiFiles?: Map<string, Uint8Array>; agents?: AgentServices; approvals?: boolean;
+  remote?: RemoteDeps; machine?: RemoteRouteContext['machine'] }) {
   const { dir, home = personHome(), log } = options, preferred = options.port ?? preferredPort();
   const access = new LocalAccess(), feed = new EventFeed(home), notifications = new NotificationWatch(home), startedAt = Date.now();
   // Messages already held when the daemon starts are the feed's baseline: they are not news, and don't notify.
   feed.onEvent(event => notifications.event(event));
   feed.poll();
-  let handler: (request: Request) => Promise<Response> = async () => json({ error: 'Starting.' }, 503);
-  // idleTimeout above the longest long poll, so Bun doesn't close a waiting request.
-  const serve = (port: number) => Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: MAX_WAIT_SECONDS + 15, maxRequestBodySize: MAX_ATTACHMENT_BYTES + 64 * 1024, fetch: request => handler(request) });
+  let handler: (request: Request, server?: RequestTimeouts) => Promise<Response> = async () => json({ error: 'Starting.' }, 503);
+  // idleTimeout above the longest long poll, so Bun doesn't close a waiting request (a remote turn asks for its own).
+  const serve = (port: number) => Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: MAX_WAIT_SECONDS + 15, maxRequestBodySize: MAX_ATTACHMENT_BYTES + 64 * 1024,
+    fetch: (request, server) => handler(request, server) });
   let server: ReturnType<typeof serve>;
   try { server = serve(preferred); }
   catch (error) {
@@ -579,7 +597,7 @@ export function startLocalApi(options: { dir: string; home?: string; port?: numb
   }
   const port = server.port!;
   handler = localApiHandler({ access, port, feed, home, ...(options.distDir ? { distDir: options.distDir } : {}), ...(options.uiFiles ? { uiFiles: options.uiFiles } : {}),
-    ...(options.agents ? { agents: options.agents } : {}), ...(options.approvals ? { approvals: true } : {}), notifications, startedAt });
+    ...(options.agents ? { agents: options.agents } : {}), ...(options.approvals ? { approvals: true } : {}), ...(options.remote ? { remote: options.remote } : {}), ...(options.machine ? { machine: options.machine } : {}), notifications, startedAt });
   const ticker = setInterval(() => {
     try { feed.poll(); } catch (error) { log(`local API: ${error instanceof Error ? error.message : String(error)}`); }
     try { notifications.poll(); } catch (error) { log(`notifications: ${error instanceof Error ? error.message : String(error)}`); }
@@ -629,7 +647,7 @@ async function provenDaemon(dir: string, isOurDaemon: (pid: number) => boolean, 
  * bridge's CLI for the app: only to the daemon proven as `requestBrowserLink` proves it, with the control token. Answers
  * the JSON, or throws the local API's error with its status.
  */
-export async function appRequest(dir: string, isOurDaemon: (pid: number) => boolean, method: 'GET' | 'POST', path: string, options: { body?: unknown; waitSeconds?: number } = {}) {
+export async function appRequest(dir: string, isOurDaemon: (pid: number) => boolean, method: 'GET' | 'POST' | 'DELETE', path: string, options: { body?: unknown; waitSeconds?: number } = {}) {
   const { base, record } = await provenDaemon(dir, isOurDaemon, 'nothing was asked of it');
   const response = await fetch(`${base}${path}`, { method, redirect: 'error', signal: AbortSignal.timeout(20_000 + (options.waitSeconds ?? 0) * 1000),
     headers: { Authorization: `Bearer ${localControlToken(record.secret)}`, ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },

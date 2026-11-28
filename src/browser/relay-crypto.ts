@@ -872,6 +872,36 @@ export async function decryptRelayEnvelope<T = unknown>(
   envelope: unknown,
   options: DecryptEnvelopeOptions,
 ): Promise<DecryptedRelayEnvelope<T>> {
+  checkEnvelopeFor(envelope, options);
+  // Authenticate the sender BEFORE any key agreement: `from` is only a claim until this signature verifies.
+  if (typeof options.senderSignKey !== 'string' || !await verifyRelayEnvelopeSig(envelope, options.senderSignKey)) {
+    throw new Error('Relay envelope sender signature invalid');
+  }
+  return openEnvelope<T>(envelope, options);
+}
+
+/**
+ * Opens an envelope from a sender whose signing key only the packet carries: remote control's enrolment
+ * (docs/flows/remote-control.md), where the browser learns the machine's keys from the machine's first message. It
+ * decrypts first, then requires the key `keyOf(packet)` names to hash to `from` and `sig` to verify under it. Anyone can
+ * seal a packet to a device's encryption key, so the caller must also authenticate the packet by other means (the
+ * enrolment's HMAC under the link's secret) before trusting it.
+ */
+export async function decryptSelfCertifiedEnvelope<T = unknown>(
+  envelope: unknown,
+  options: Omit<DecryptEnvelopeOptions, 'senderSignKey'> & { keyOf: (packet: T) => unknown },
+): Promise<DecryptedRelayEnvelope<T> & { senderSignKey: string }> {
+  checkEnvelopeFor(envelope, options);
+  const opened = await openEnvelope<T>(envelope, options);
+  const key = options.keyOf(opened.packet);
+  if (typeof key !== 'string' || !BASE64_STD.test(key) || key.length !== 88) throw new Error('Relay envelope sender signature invalid');
+  const id = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', base64ToBytes(key))), b => b.toString(16).padStart(2, '0')).join('');
+  if (id !== envelope.from || !await verifyRelayEnvelopeSig(envelope, key)) throw new Error('Relay envelope sender signature invalid');
+  return { ...opened, senderSignKey: key };
+}
+
+/** What every envelope must be before anything is derived from it: well formed, in size, for this room and this device. */
+function checkEnvelopeFor(envelope: unknown, options: Pick<DecryptEnvelopeOptions, 'room' | 'selfDeviceId' | 'minRosterVersion' | 'expectedFrom'>): asserts envelope is RelayEnvelope {
   if (!isValidRelayEnvelopeShape(envelope)) {
     throw new Error('Invalid relay envelope shape');
   }
@@ -894,10 +924,10 @@ export async function decryptRelayEnvelope<T = unknown>(
   if (!Object.prototype.hasOwnProperty.call(envelope.to, options.selfDeviceId)) {
     throw new Error('Relay envelope is not addressed to this device');
   }
-  // Authenticate the sender BEFORE any key agreement: `from` is only a claim until this signature verifies.
-  if (typeof options.senderSignKey !== 'string' || !await verifyRelayEnvelopeSig(envelope, options.senderSignKey)) {
-    throw new Error('Relay envelope sender signature invalid');
-  }
+}
+
+/** Unwraps the envelope's key with this device's and decrypts it. The caller has checked it (checkEnvelopeFor). */
+async function openEnvelope<T>(envelope: RelayEnvelope, options: Pick<DecryptEnvelopeOptions, 'selfDeviceId' | 'selfEncPrivateKey' | 'selfEncVersion'>): Promise<DecryptedRelayEnvelope<T>> {
 
   const wrappedBytes = base64ToBytes(envelope.to[options.selfDeviceId]);
   if (wrappedBytes.byteLength !== EXPECTED_WRAPPED_DEK_BYTES) {

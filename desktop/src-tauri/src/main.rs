@@ -7,11 +7,13 @@
 
 mod approvals;
 mod bridge;
+mod control;
 mod home;
 mod join;
 mod links;
 mod pair;
 mod login;
+mod remote;
 mod notify;
 mod review;
 mod runtime;
@@ -521,6 +523,7 @@ fn menu_action(app: &AppHandle, id: &str) {
         "unpair" => pair::ask_unpair(app),
         "review" => review::show(app),
         "approvals" => approvals::show(app),
+        "remote" => remote::show(app),
         "refresh" => act(app, "Checking the background connection…", |_| Ok(())),
         "quit" => app.exit(0),
         _ => if let Some(room) = id.strip_prefix("room:") {
@@ -642,6 +645,10 @@ fn main() {
         // The pairing window's commands (pair.rs), the join window's (join.rs), the Review window's (review.rs) and the
         // Approvals window's (approvals.rs); each answers only to its own window.
         .manage(Mutex::new(pair::Pairing::default()))
+        // The enrolment window's (control.rs): a browser asking to control this computer's agents.
+        .manage(Mutex::new(control::Enrolment::default()))
+        // The Remote control window's (remote.rs): the browsers that control this computer, and remote control's switch.
+        .manage(Mutex::new(remote::Remote::default()))
         .manage(Mutex::new(join::Joining::default()))
         .manage(Mutex::new(review::Reviewing::default()))
         .manage(Mutex::new(approvals::Approving::default()))
@@ -649,6 +656,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             home::home_view, home::home_action, home::home_window,
             pair::pair_view, pair::pair_check, pair::pair_verify, pair::pair_confirm, pair::pair_reject, pair::pair_cancel, pair::pair_unpair, pair::pair_close, pair::pair_open,
+            control::control_view, control::control_check, control::control_verify, control::control_confirm, control::control_reject, control::control_close,
+            remote::remote_view, remote::remote_allow, remote::remote_trust, remote::remote_revoke, remote::remote_close,
             join::join_view, join::join_confirm, join::join_cancel, join::join_browse,
             review::review_view, review::review_pause, review::review_resume, review::review_close,
             approvals::approvals_view, approvals::approvals_approve, approvals::approvals_reject, approvals::approvals_custom_check, approvals::approvals_custom_make, approvals::approvals_custom_edit, approvals::approvals_close,
@@ -676,6 +685,7 @@ fn main() {
                 &MenuItem::with_id(app, "window", "Desktop status…", true, None::<&str>)?,
                 &MenuItem::with_id(app, "review", "Review your agents…", true, None::<&str>)?,
                 &approvals_item,
+                &MenuItem::with_id(app, "remote", "Remote control…", true, None::<&str>)?,
                 &MenuItem::with_id(app, "logs", "Open logs folder", true, None::<&str>)?,
                 &MenuItem::with_id(app, "unpair", "Unpair this computer…", true, None::<&str>)?,
                 &PredefinedMenuItem::separator(app)?,
@@ -737,6 +747,18 @@ fn main() {
                 // Closing the pairing window rejects what waits in it: a hidden one would hold off every other pairing.
                 if window.label() == pair::WINDOW {
                     pair::closed(window.app_handle());
+                    tray_only(window);
+                    return;
+                }
+                // The same for the enrolment window: closing it drops the browser that waits in it, and its secret.
+                if window.label() == control::WINDOW {
+                    control::closed(window.app_handle());
+                    tray_only(window);
+                    return;
+                }
+                // The Remote control window's refresher stops with it.
+                if window.label() == remote::WINDOW {
+                    remote::closed(window.app_handle());
                     tray_only(window);
                     return;
                 }

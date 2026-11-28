@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- The agent bridge (0.2.0-beta.14) and the desktop app (0.1.0-alpha.9): remote control's machine and desktop sides
+  (docs/flows/remote-control.md). Nothing reaches a machine until a browser is let in at it, and the web app that does
+  so comes with the Angular app.
+  - **The remote turn runner** (#196). A prompt from an enrolled browser runs in a session the way the person would run
+    it there:
+    - the harness's own resume, in the folder the session recorded or not at all;
+    - with that session's own permissions;
+    - in an environment without the credentials the harness doesn't sign in with.
+
+    Remote control is off until the person turns it on. A turn takes its turn with room wakes in the same session.
+    Every outcome goes to an audit log that never holds the prompt or the reply.
+  - **The daemon's control socket** (#200). A machine with enrolled browsers connects to the service's `/api/control/v1`
+    and answers their `hello`, `sessions`, `prompt` and `cancel`:
+    - sealed end to end;
+    - each request once and only within its time, and never one from before the daemon started;
+    - at most eight at a time per browser.
+  - **Letting a browser in** (#201). A `meshrooms://control` link opens a window in the desktop app. There the person
+    types the five words the browser shows, which bind the link's service, name, device and key. They choose which
+    harnesses remote prompts may reach and whether this browser may send them.
+  - **The Remote control window** (#204), in the tray and the desktop status window:
+    - each browser that controls this computer, whether it is online, **May send prompts**, and **Remove…**;
+    - the harnesses, where none, or **Turn off remote control**, turns remote control off and stops its prompts running
+      here.
+  - An Antigravity conversation whose workspace list is empty no longer reads as a folder named `[]`.
 - The agent bridge (0.2.0-beta.13): carries what changed since beta.12.
   - **Wakes only for addressed messages.** The relay wakes an agent only for frames addressed to it, eviction takes
     unaddressed frames first, and the bridge acks frames it will never process (#163).
@@ -17,6 +41,19 @@
   with `VFS_DISABLED` instead of waiting for an answer, and `listen` doesn't ask for VFS changes.
 - **Eight agents per person in a room** (was four; `MESHROOMS_AGENTS_PER_OPERATOR` sets it). The room's cap of 16 admitted
   devices still bounds the total.
+- **Mesh: who runs which agent, at a glance.** The agent strip's stack opens a picture of the room (on a phone, so does
+  **Room actions › Mesh**, which also works where a short landscape screen hides the strip). People anchor it,
+  and each agent hangs off the person who runs it. An agent at work breathes amber, with a moving line to whoever it
+  is answering. Picking anyone says what they're doing (or when a person last wrote), with **Mention**, which puts
+  `@Name` in the composer, and **Room details**. The layout is fixed, so the same room always draws the same way.
+  **Connections** shows how your device reaches each member: **direct** (device to device), **through TURN**, or
+  **through the room service's relay**. It reads the WebRTC connection's selected candidate pair, so it tells
+  people where a direct transfer is possible. Browser only: it reads the roster, the agents' activity and this device's
+  connections.
+- **The agent strip fits a busy room.** Only agents at work right now get a card. The rest wait in one stack of faces
+  ("4 idle · 1 offline") that opens the Mesh. The Humans & Outcomes / Full stream switch has its own place at the
+  right and is never cut off. On a phone, the agents at work join the stack with their working dot, and the switch
+  reads Outcomes / All.
 - **This work, beside the conversation.** The side pane now switches between **This work** and **Room details**. This
   work lists the room's tasks in progress, its open decisions, the to-do queue and what finished in the last three days.
   Opening one shows who owns it and who created it, its linked issue or pull request, its notes and its whole history,

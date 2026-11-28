@@ -278,12 +278,13 @@ export const agyCliDir = (env: Record<string, string | undefined> = process.env,
 /** Parses Antigravity's `workspace_uris` (JSON array or comma-separated `file://` URIs / paths) into local paths. */
 function agyWorkspacePaths(raw: unknown): string[] {
   if (typeof raw !== 'string' || !raw.trim()) return [];
-  let items: unknown[] = [];
+  let items: unknown[] | undefined;
   const trimmed = raw.trim();
   if (trimmed.startsWith('[')) {
     try { const parsed = JSON.parse(trimmed); if (Array.isArray(parsed)) items = parsed; } catch { /* Fallback below. */ }
   }
-  if (!items.length) items = trimmed.split(',').map(s => s.trim()).filter(Boolean);
+  // A JSON list, even an empty one, is the answer; only text that isn't one is read as a comma list.
+  if (!items) items = trimmed.split(',').map(s => s.trim()).filter(Boolean);
   return items.flatMap(entry => {
     if (typeof entry !== 'string' || !entry.trim()) return [];
     if (entry.startsWith('file://')) {
@@ -476,6 +477,22 @@ export function claudeSessionFolder(id: string, configDir = claudeConfigDir()): 
     return undefined;
   }
   return undefined;
+}
+
+/** Where an Antigravity conversation works: the first workspace its summary records. Server-side only, like claudeSessionFolder. */
+export function agySessionFolder(id: string, cliDir = agyCliDir()): string | undefined {
+  const dbPath = join(cliDir, 'conversation_summaries.db');
+  if (!existsSync(dbPath)) return undefined;
+  let db: Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const row = db.query<{ workspace_uris: string | null }, [string]>('SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1').get(id);
+    return row ? agyWorkspacePaths(row.workspace_uris)[0] : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* Already closed. */ }
+  }
 }
 
 /** When a file was made: its birth time where the system keeps one, else its last write (never later than its birth). */

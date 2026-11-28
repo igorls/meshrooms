@@ -197,7 +197,8 @@ try {
   // Its state on the people list and the chip, with a way to its sessions.
   const member = panel.locator('.browser-person', { has: local.locator('strong', { hasText: /^Ash$/ }) }).first();
   await member.getByText('Wakes when addressed').waitFor();
-  await until(async () => (await local.locator('.browser-agent-chip', { hasText: 'Ash' }).getAttribute('title') || '').includes('Wakes when addressed'), 'the chip to say it wakes', 30_000);
+  // Its card when it works, or its face in the strip's stack when it doesn't: the tooltip says how it wakes.
+  await until(async () => (await local.locator('.browser-agent-strip [title^="Ash ·"]').first().getAttribute('title') || '').includes('Wakes when addressed'), 'the strip to say it wakes', 30_000);
   await shot(local, 'local-agents-bound.png');
   await shot(local, 'local-agents-people.png', panel.locator('.browser-people'));
   // "Sessions" on the people list brings the person to that agent's controls.

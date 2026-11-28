@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-window",
+  "description": "The Remote control window may call the remote control commands and nothing else: no core or plugin permissions.",
+  "windows": ["remote"],
+  "permissions": [
+    "allow-remote-view",
+    "allow-remote-allow",
+    "allow-remote-trust",
+    "allow-remote-revoke",
+    "allow-remote-close"
+  ]
+}

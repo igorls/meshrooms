@@ -9,6 +9,8 @@ import type { ApiError } from './client';
 import { AttentionStrip } from './AttentionStrip';
 import { attentionAt, decisionMark, loadSeen, markSeen, messageMark, messagesForYou, taskMark } from './attention';
 import { WorkPane } from './WorkPane';
+import { MeshDialog, type MeshNode, type MeshPath } from './MeshDialog';
+import type { PeerPath } from './peers';
 import { resolveWork, taskFromDecision, workList, type WorkRef } from './work-pane';
 import { DecisionCard, DecisionForm, DecisionList } from './DecisionViews';
 import { roomDrafts } from './drafts';
@@ -60,7 +62,7 @@ const incomingPhone = takePhoneLink();
 type ChosenFile = PendingFile & { ref?: AttachmentRef; bytes?: Uint8Array };
 const fileNames = (body: SavedMessage['packet']['body']) => body.attachments?.map(a => a.name).join(', ') || '';
 
-function RoomIcon({ kind }: { kind: 'people' | 'link' | 'close' | 'chat' | 'send' | 'tasks' | 'clip' | 'plus' | 'collapse' | 'expand' | 'vote' | 'back' | 'more' | 'invite' | 'phone' }) {
+function RoomIcon({ kind }: { kind: 'people' | 'link' | 'close' | 'chat' | 'send' | 'tasks' | 'clip' | 'plus' | 'collapse' | 'expand' | 'vote' | 'back' | 'more' | 'invite' | 'phone' | 'mesh' }) {
   const paths = {
     people: <><circle cx="9" cy="8" r="3" /><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6M21 21v-3a6 6 0 0 0-3-5" /></>,
     link: <><path d="m10 14 4-4M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" /></>,
@@ -76,6 +78,7 @@ function RoomIcon({ kind }: { kind: 'people' | 'link' | 'close' | 'chat' | 'send
     back: <path d="m15 6-6 6 6 6" />,
     invite: <><circle cx="10" cy="8" r="4" /><path d="M3 20c0-4 3-6 7-6s7 2 7 6M19 8v6M16 11h6" /></>,
     phone: <><rect x="7" y="2.5" width="10" height="19" rx="2.5" /><path d="M11 18.5h2" /></>,
+    mesh: <><circle cx="12" cy="5" r="2.5" /><circle cx="5" cy="18" r="2.5" /><circle cx="19" cy="18" r="2.5" /><path d="M10.7 7.2 6.3 15.8M13.3 7.2l4.4 8.6M7.5 18h9" /></>,
     more: <><circle cx="12" cy="5" r="1.6" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" /><circle cx="12" cy="19" r="1.6" fill="currentColor" stroke="none" /></>,
   };
   return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[kind]}</svg>;
@@ -288,6 +291,8 @@ function savedSidePanel(): { panel?: 'details' | 'work' | 'tasks' | 'decisions';
   } catch { /* storage or matchMedia unavailable */ }
   return {};
 }
+/** Faces the agent strip's stack shows before "+N". */
+const STRIP_FACES = 5;
 const DETAILS_TABS: { id: DetailsTab; label: string }[] = [
   { id: 'members', label: 'Members' },
   { id: 'shared', label: 'Shared' },
@@ -501,6 +506,19 @@ function Rooms({ source }: { source: RoomSource }) {
   const headerActions = useRef<HTMLDivElement>(null);
   const headerMore = useRef<HTMLButtonElement>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  /** "Mesh": the room's people and the agents they run, opened from the agent strip. */
+  const [meshOpen, setMeshOpen] = useState(false);
+  /** While the mesh is open: how this device reaches each other device (device id to path), read every few seconds. */
+  const [meshPaths, setMeshPaths] = useState<Record<string, PeerPath>>();
+  useEffect(() => {
+    if (!meshOpen) return;
+    let live = true;
+    const read = () => { void peers.current?.paths?.().then(paths => { if (live) setMeshPaths(paths); }).catch(() => {}); };
+    read();
+    const timer = setInterval(read, 4000);
+    // Closed, the mesh forgets them: reopened, it shows no path from before until the first read.
+    return () => { live = false; clearInterval(timer); setMeshPaths(undefined); };
+  }, [meshOpen]);
   useVisualViewport();
   const touchComposer = useRef(false);
   useEffect(() => {
@@ -931,6 +949,26 @@ function Rooms({ source }: { source: RoomSource }) {
   const STRIP_ORDER = { working: 0, idle: 1, online: 2, offline: 3 } as const;
   const present = agents.filter(agent => activities.get(agent.id)!.state !== 'offline')
     .sort((a, b) => STRIP_ORDER[activities.get(a.id)!.state] - STRIP_ORDER[activities.get(b.id)!.state]);
+  /** At work right now (not a stale "busy" that stopped checking in): the agents that get a card in the strip. */
+  const atWork = (agent: BrowserMember) => { const a = activities.get(agent.id)!; return a.state === 'working' && a.quiet === undefined; };
+  // A card for each agent at work; everyone else waits in one stack, so seven idle agents take the room of one. On
+  // compact chrome the agents at work join the stack too, first, with their working dot.
+  const stripCards = compactChrome ? [] : present.filter(atWork);
+  const stripStack = [...present.filter(agent => !stripCards.includes(agent)), ...agents.filter(agent => activities.get(agent.id)!.state === 'offline')];
+  const stripSummary = (() => {
+    // The same words as each face's tooltip: a quiet idle agent is "not listening", a quiet busy one "busy, no check-in".
+    const count = { working: 0, idle: 0, online: 0, quiet: 0, stale: 0, offline: 0 };
+    for (const agent of stripStack) {
+      const a = activities.get(agent.id)!;
+      count[a.state === 'offline' || a.state === 'online' ? a.state : a.quiet === undefined ? a.state : a.state === 'idle' ? 'quiet' : 'stale']++;
+    }
+    const parts = [count.working && `${count.working} working`, count.idle && `${count.idle} idle`, count.online && `${count.online} online`, count.quiet && `${count.quiet} not listening`,
+      count.stale && `${count.stale} busy, no check-in`, count.offline && `${count.offline} offline`].filter((p): p is string => !!p);
+    const all = `${stripStack.length} agent${stripStack.length === 1 ? '' : 's'}`;
+    const label = stripCards.length ? parts.join(' · ') : parts.length === 1 ? `${all} ${parts[0].replace(/^\d+ /, '')}` : `${all} · ${parts.join(' · ')}`;
+    // Compact chrome has room for one fact beside the faces: who is working, or how many there are.
+    return { label, text: compactChrome ? count.working ? `${count.working} working` : all : label };
+  })();
   const { people: sortedPeople, agents: sortedAgents } = sortRoomMembers(status?.members, activities, status?.ownerId, status?.memberId);
   /** Task id → names of agents working on it right now, for markers on the board. */
   const workingOn: Record<string, string[]> = {};
@@ -954,6 +992,61 @@ function Rooms({ source }: { source: RoomSource }) {
     const latest = woke.at(-1)!;
     return <span className="agent-activity is-working">Replying to <button className="agent-activity-link" title="Show the message" onClick={() => showMessage(latest.id)}>{authors.length > 1 ? `${authors.slice(0, -1).join(', ')} and ${authors.at(-1)}` : authors[0]}</button>{age}</span>;
   }
+  /** An agent's state as plain text, for tooltips: "Idle · 9 min", "Working · just now", "Not listening". */
+  function stateText(a: AgentActivity) {
+    if (a.state === 'offline' || a.state === 'online') return a.state === 'offline' ? 'Offline' : 'Online';
+    if (a.quiet !== undefined) return a.state === 'idle' ? 'Not listening' : 'Busy, no check-in';
+    return `${a.state === 'idle' ? 'Idle' : 'Working'} · ${duration(now - a.since)}`;
+  }
+  /** "Ash · Claude Code · claude-opus-5-5 · operated by you · Wakes when addressed". */
+  function agentTitle(agent: BrowserMember, state?: string) {
+    const wakes = wakeOf(agent);
+    return `${agent.name}${state ? ` · ${state}` : ''} · ${runtimeOf(agent) || 'agent'} · operated by ${operatorOf(agent)}${wakes ? ` · ${wakeLabel(wakes.room.binding)}` : ''}`;
+  }
+  /** What an agent is doing, as text: "Replying to you · 1 min", "Working on “Fix header” · 4 min", "Idle · 3 h". */
+  function activityText(a: AgentActivity) {
+    if (a.state === 'offline' || a.state === 'online') return a.state === 'offline' ? 'Offline' : 'Online';
+    if (a.quiet !== undefined) return `${a.state === 'idle' ? 'Not listening' : 'Busy'} · no check-in for ${duration(a.quiet)}`;
+    const age = ` · ${duration(now - a.since)}`;
+    if (a.state === 'idle') return `Idle${age}`;
+    const task = a.on.tasks?.map(id => tasks.find(t => t.id === id)).find(Boolean);
+    if (task) return `Working on “${task.title}”${age}`;
+    const authors = [...new Set(answeringOf(a).map(id => id === status?.memberId ? 'you' : nameOf(id)))];
+    return authors.length ? `Replying to ${authors.length > 1 ? `${authors.slice(0, -1).join(', ')} and ${authors.at(-1)}` : authors[0]}${age}` : `Working${age}`;
+  }
+  /** The people whose messages an agent at work is answering. */
+  function answeringOf(a: AgentActivity) {
+    if (a.state !== 'working' || a.quiet !== undefined) return [];
+    return [...new Set((a.on.messages || []).map(id => canonicalById.get(id)?.packet.body.memberId).filter((m): m is string => !!m))];
+  }
+  /** The mesh's members, read only while it is open. */
+  const meshNodes = useMemo((): MeshNode[] => {
+    if (!meshOpen || !status?.members) return [];
+    const lastWrote = new Map<string, number>();
+    for (const m of canonicalById.values()) lastWrote.set(m.packet.body.memberId, Math.max(lastWrote.get(m.packet.body.memberId) ?? 0, m.packet.body.at));
+    const RANK: Record<PeerPath, number> = { direct: 0, turn: 1, relay: 2 };
+    /** The best path to any of a member's devices; an agent that is offline isn't reached, whatever the relay says. */
+    const pathTo = (memberId: string, offline: boolean): MeshPath | undefined => {
+      if (!meshPaths) return undefined;
+      const found = (status.devices ?? []).filter(d => d.memberId === memberId).map(d => meshPaths[d.id]).filter((p): p is PeerPath => !!p)
+        .sort((a, b) => RANK[a] - RANK[b])[0];
+      return !found || (offline && found === 'relay') ? 'none' : found;
+    };
+    return status.members.map(member => {
+      const you = member.id === status.memberId;
+      if (member.role !== 'agent') {
+        const devices = status.devices?.filter(d => d.memberId === member.id).length ?? 0, at = lastWrote.get(member.id);
+        return { id: member.id, name: member.name, role: 'human' as const, you, answering: [], ...(you ? {} : { path: pathTo(member.id, false) }),
+          kind: `Person${member.id === status.ownerId ? ' · host' : ''}${devices > 1 ? ` · ${devices} devices` : ''}`,
+          // Only the messages loaded here count: with earlier ones still to load, "not yet" may not be true.
+          doing: at ? (now - at < 60_000 ? 'Wrote just now' : `Last wrote ${duration(now - at)} ago`) : olderAvailable ? 'Hasn’t written in the messages loaded here' : 'Hasn’t written here yet' };
+      }
+      const a = activities.get(member.id) ?? { state: 'offline' as const };
+      const quiet = a.state !== 'offline' && a.state !== 'online' && a.quiet !== undefined;
+      return { id: member.id, name: member.name, role: 'agent' as const, operatorId: member.operatorId, you, state: a.state, quiet, answering: answeringOf(a), path: pathTo(member.id, a.state === 'offline'),
+        kind: `Agent · ${runtimeOf(member) || 'agent'} · run by ${operatorOf(member) ?? 'nobody here'}`, doing: activityText(a) };
+    });
+  }, [meshOpen, meshPaths, status?.members, status?.devices, status?.memberId, status?.ownerId, canonicalById, activity, connected, now, tasks, olderAvailable]);
   /** The roster's short state beside an agent's name: "Idle · 9 min", "Working · just now", "Not listening". */
   function rosterState(a: AgentActivity) {
     if (a.state === 'offline' || a.state === 'online') return <span className="browser-person-state">{a.state === 'offline' ? 'Offline' : 'Online'}</span>;
@@ -1393,6 +1486,8 @@ function Rooms({ source }: { source: RoomSource }) {
                 <button type="button" role="menuitem" aria-expanded={decisionsOpen} onClick={() => { setDecisionsOpen(!decisionsOpen); setBoardOpen(false); setDetailsOpen(false); setHeaderMenuOpen(false); }}><RoomIcon kind="vote" />Decisions{openDecisions ? <span className="browser-count">{openDecisions}</span> : null}</button>
                 <button type="button" role="menuitem" aria-expanded={boardOpen} onClick={() => { setBoardOpen(!boardOpen); setDetailsOpen(false); setDecisionsOpen(false); setHeaderMenuOpen(false); }}><RoomIcon kind="tasks" />Tasks{openTasks ? <span className="browser-count">{openTasks}</span> : null}</button>
                 <button type="button" role="menuitem" aria-expanded={detailsOpen && paneTab === 'room'} onClick={() => { if (detailsOpen && paneTab === 'room') closeDetails(); else openDetails(); setHeaderMenuOpen(false); }}><RoomIcon kind="people" />Room details</button>
+                {/* The strip's stack opens the mesh too, but a short landscape screen hides the strip. */}
+                {agents.length > 0 && <button type="button" role="menuitem" aria-haspopup="dialog" onClick={() => { setHeaderMenuOpen(false); setMeshOpen(true); }}><RoomIcon kind="mesh" />Mesh</button>}
                 {!source.isLocal && (appPaired && !desktopPairingActive
                   ? <a role="menuitem" className="browser-open-app" href={joinLink(location.origin, urlRoom)}>Open in Meshrooms</a>
                   : <button type="button" role="menuitem" onClick={() => { setPendingDetailsTarget('desktop-pairing'); openDetails('you'); setHeaderMenuOpen(false); }}>{desktopPairingActive ? 'Finish desktop pairing' : 'Have the desktop app?'}</button>)}
@@ -1400,16 +1495,30 @@ function Rooms({ source }: { source: RoomSource }) {
             </div>
           </header>
           {admitted && agents.length > 0 && <section className="browser-agent-strip" aria-label="Agents in this room">
-            {present.map(agent => {
-              const a = activities.get(agent.id)!, wakes = wakeOf(agent);
-              return <div className={`browser-agent-chip is-${a.state}`} key={agent.id} title={`${agent.name} · ${runtimeOf(agent) || 'agent'} · operated by ${operatorOf(agent)}${wakes ? ` · ${wakeLabel(wakes.room.binding)}` : ''}`}>
-                <span className="browser-person-avatar"><MemberAvatar member={agent} roomId={urlRoom} fallback={agent.name} /><span className={`agent-dot is-${a.state}${a.state !== 'offline' && a.state !== 'online' && a.quiet !== undefined ? ' is-quiet' : ''}`} aria-hidden="true" /></span>
-                <span className="browser-agent-chip-text"><strong>{agent.name}</strong>{activityLine(a)}</span></div>;
-            })}
-            {agents.length > present.length && <button className="browser-text-link browser-agent-strip-more" onClick={() => openDetails('members')}>{present.length ? `${agents.length - present.length} offline` : `${agents.length} agent${agents.length === 1 ? '' : 's'} offline`}</button>}
+            {stripCards.length > 0 && <div className="browser-agent-strip-lane">
+              {stripCards.map(agent => {
+                const a = activities.get(agent.id)!;
+                return <div className={`browser-agent-chip is-${a.state}`} key={agent.id} title={agentTitle(agent)}>
+                  <span className="browser-person-avatar"><MemberAvatar member={agent} roomId={urlRoom} fallback={agent.name} /><span className={`agent-dot is-${a.state}`} aria-hidden="true" /></span>
+                  <span className="browser-agent-chip-text"><strong>{agent.name}</strong>{activityLine(a)}</span></div>;
+              })}
+            </div>}
+            {stripStack.length > 0 && <button type="button" className="browser-agent-roster" aria-label={`${stripSummary.label}. Show the mesh`} aria-haspopup="dialog" onClick={() => setMeshOpen(true)}>
+              <span className="browser-agent-stack">
+                {stripStack.slice(0, STRIP_FACES).map((agent, i) => {
+                  const a = activities.get(agent.id)!;
+                  // Each face sits over the next, so every face keeps its state dot in view.
+                  return <span key={agent.id} className={`browser-agent-face is-${a.state}`} style={{ zIndex: STRIP_FACES - i }} title={agentTitle(agent, stateText(a))}>
+                    <MemberAvatar member={agent} roomId={urlRoom} fallback={agent.name} />
+                    <span className={`agent-dot is-${a.state}${a.state !== 'offline' && a.state !== 'online' && a.quiet !== undefined ? ' is-quiet' : ''}`} aria-hidden="true" /></span>;
+                })}
+                {stripStack.length > STRIP_FACES && <span className="browser-agent-stack-more" aria-hidden="true">+{stripStack.length - STRIP_FACES}</span>}
+              </span>
+              <span className="browser-agent-roster-text" aria-hidden="true">{stripSummary.text}</span>
+            </button>}
             {hasAgentMessages && <div className="browser-timeline-zoom" role="group" aria-label="Conversation view">
-              <button type="button" aria-pressed={timelineZoom === 'focused'} title="Collapse multi-agent bursts into Response Stacks while keeping human messages, decisions, and action items visible" onClick={() => setTimelineZoom('focused')}>Humans &amp; Outcomes</button>
-              <button type="button" aria-pressed={timelineZoom === 'full'} title="Show every agent reply and task update inline" onClick={() => setTimelineZoom('full')}>Full stream</button>
+              <button type="button" aria-pressed={timelineZoom === 'focused'} title="Collapse multi-agent bursts into Response Stacks while keeping human messages, decisions, and action items visible" onClick={() => setTimelineZoom('focused')}>{compactChrome ? 'Outcomes' : 'Humans & Outcomes'}</button>
+              <button type="button" aria-pressed={timelineZoom === 'full'} title="Show every agent reply and task update inline" onClick={() => setTimelineZoom('full')}>{compactChrome ? 'All' : 'Full stream'}</button>
             </div>}
           </section>}
           {status.expiresAt !== undefined && status.expiresAt - Date.now() < EXPIRY_WARNING && <p role="status" className="browser-notice">This room will be removed on {new Date(status.expiresAt).toLocaleDateString(undefined, { dateStyle: 'long' })} if nobody opens it.</p>}
@@ -1940,6 +2049,15 @@ function Rooms({ source }: { source: RoomSource }) {
               </div>
             </aside>
           </div>
+          <MeshDialog open={meshOpen} nodes={meshNodes} connections={!source.isLocal} onClose={() => setMeshOpen(false)}
+            summary={`${people} ${people === 1 ? 'person' : 'people'} and ${agents.length} agent${agents.length === 1 ? '' : 's'}${present.some(atWork) ? ` · ${present.filter(atWork).length} at work` : ''}`}
+            avatar={id => <MemberAvatar member={status.members!.find(m => m.id === id)} roomId={urlRoom} fallback={nameOf(id)} />}
+            onMention={memberName => {
+              setMeshOpen(false);
+              setText(current => `${current}${current && !/\s$/.test(current) ? ' ' : ''}@${memberName} `);
+              requestAnimationFrame(() => { const box = composer.current; if (box) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); } });
+            }}
+            onDetails={() => { setMeshOpen(false); openDetails('members'); }} />
           <InviteDialog key={urlRoom} phone={source.isLocal ? undefined : { rooms: [{ id: urlRoom, title }, ...recent.filter(r => r.id !== urlRoom)], name: self?.name || name, device: deviceId, link: pairRoom, command: pairCommand,
               asking: askingRequest ? { label: askingRequest.device.label, fingerprint: deviceFingerprint(askingRequest.device.id) } : undefined, onActiveChange: setPhonePairingActive, onUseCode: openCodeLink }} open={inviteOpen} tab={inviteTab} onTab={setInviteTab} onClose={() => setInviteOpen(false)} roomId={urlRoom} roomTitle={title} roomOrigin={roomOrigin} personLink={invite}
             agentVersion={agentVersion} status={status} host={host} createAgentLink={createAgentLink} localAgents={!!source.agents}
